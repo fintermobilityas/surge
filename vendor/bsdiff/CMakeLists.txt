@@ -14,6 +14,10 @@ add_library(bzip2 STATIC
     3rdparty/bzip2/randtable.c
 )
 set_property(TARGET bzip2 PROPERTY POSITION_INDEPENDENT_CODE ON)
+# Vendored code: disable warnings-as-errors
+if(NOT MSVC)
+    target_compile_options(bzip2 PRIVATE -Wno-error)
+endif()
 
 # --- libdivsufsort (static) ------------------------------------------------
 function(add_libdivsufsort)
@@ -26,6 +30,16 @@ function(add_libdivsufsort)
 endfunction()
 
 add_libdivsufsort()
+
+# Vendored code: disable warnings-as-errors for libdivsufsort
+if(NOT MSVC)
+    if(TARGET divsufsort)
+        target_compile_options(divsufsort PRIVATE -Wno-error)
+    endif()
+    if(TARGET divsufsort64)
+        target_compile_options(divsufsort64 PRIVATE -Wno-error)
+    endif()
+endif()
 
 # --- bsdiff (static) -------------------------------------------------------
 add_library(bsdiff STATIC
@@ -57,3 +71,7 @@ target_link_libraries(bsdiff
 )
 
 set_property(TARGET bsdiff PROPERTY POSITION_INDEPENDENT_CODE ON)
+# Vendored code: disable warnings-as-errors
+if(NOT MSVC)
+    target_compile_options(bsdiff PRIVATE -Wno-error)
+endif()

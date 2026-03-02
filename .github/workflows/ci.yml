@@ -25,11 +25,30 @@ jobs:
       - name: Restore
         run: dotnet restore
 
-      - name: Build
+      - name: Check formatting
+        run: dotnet format --verify-no-changes --verbosity diagnostic
+
+      - name: Build (warnings as errors)
         run: dotnet build --no-restore --configuration Release
 
       - name: Test
         run: dotnet test --no-build --configuration Release --verbosity normal
+
+  format-check:
+    name: clang-format Check
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang-format
+        run: sudo apt-get update && sudo apt-get install -y clang-format-18
+
+      - name: Check C++ formatting
+        run: |
+          find src include tests -name '*.cpp' -o -name '*.hpp' -o -name '*.h' | \
+            xargs clang-format-18 --dry-run --Werror
 
   native-linux:
     name: Linux x64 (GCC 13)
@@ -46,7 +65,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-13 g++-13 ninja-build
 
-      - name: Configure
+      - name: Configure (warnings as errors)
         run: |
           cmake -B build \
             -G Ninja \

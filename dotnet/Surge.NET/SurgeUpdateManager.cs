@@ -85,7 +85,7 @@ namespace Surge
                     registration = cancellationToken.Register(() =>
                     {
                         if (ctx != IntPtr.Zero)
-                            NativeMethods.Cancel(ctx);
+                            _ = NativeMethods.Cancel(ctx);
                     });
                 }
 
@@ -269,8 +269,12 @@ namespace Surge
 
         private void ThrowIfDisposed()
         {
+#if NET8_0_OR_GREATER
+            ObjectDisposedException.ThrowIf(_disposed, this);
+#else
             if (_disposed)
                 throw new ObjectDisposedException(nameof(SurgeUpdateManager));
+#endif
         }
 
         /// <summary>

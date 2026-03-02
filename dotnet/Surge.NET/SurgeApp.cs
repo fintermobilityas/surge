@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
-using System.Reflection;
 using System.Runtime.InteropServices;
 
 namespace Surge
@@ -245,13 +244,13 @@ namespace Surge
                 {
                     var trimmed = line.Trim();
 
-                    if (trimmed.StartsWith("id:"))
+                    if (trimmed.StartsWith("id:", StringComparison.Ordinal))
                         appId = trimmed.Substring(3).Trim();
-                    else if (trimmed.StartsWith("version:"))
+                    else if (trimmed.StartsWith("version:", StringComparison.Ordinal))
                         version = trimmed.Substring(8).Trim();
-                    else if (trimmed.StartsWith("channel:"))
+                    else if (trimmed.StartsWith("channel:", StringComparison.Ordinal))
                         channel = trimmed.Substring(8).Trim();
-                    else if (trimmed.StartsWith("installDirectory:"))
+                    else if (trimmed.StartsWith("installDirectory:", StringComparison.Ordinal))
                         installDir = trimmed.Substring(17).Trim();
                 }
 
@@ -274,25 +273,11 @@ namespace Surge
 
         private static string GetWorkingDirectory()
         {
-            var assembly = Assembly.GetEntryAssembly() ?? Assembly.GetExecutingAssembly();
-            var location = assembly.Location;
-
-            if (string.IsNullOrEmpty(location))
-            {
-                return AppContext.BaseDirectory;
-            }
-
-            return Path.GetDirectoryName(location) ?? AppContext.BaseDirectory;
+            return AppContext.BaseDirectory;
         }
 
         private static string GetCurrentExePath()
         {
-            var assembly = Assembly.GetEntryAssembly() ?? Assembly.GetExecutingAssembly();
-            var location = assembly.Location;
-
-            if (!string.IsNullOrEmpty(location))
-                return location;
-
             return Environment.GetCommandLineArgs()[0];
         }
 

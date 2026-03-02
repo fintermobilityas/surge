@@ -206,6 +206,9 @@ namespace Surge
         [LibraryImport(LibName, EntryPoint = "surge_cancel")]
         internal static partial int Cancel(IntPtr ctx);
 #else
+        // netstandard2.0: CharSet.Ansi maps to UTF-8 on Linux/.NET Core.
+        // CA2101 is suppressed because there is no StringMarshalling.Utf8 in netstandard2.0.
+#pragma warning disable CA2101
         // --- Lifecycle ---
 
         [DllImport(LibName, EntryPoint = "surge_context_create", CallingConvention = CallingConvention.Cdecl)]
@@ -352,6 +355,7 @@ namespace Surge
 
         [DllImport(LibName, EntryPoint = "surge_cancel", CallingConvention = CallingConvention.Cdecl)]
         internal static extern int Cancel(IntPtr ctx);
+#pragma warning restore CA2101
 #endif
     }
 }

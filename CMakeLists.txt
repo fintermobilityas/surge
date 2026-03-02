@@ -12,6 +12,25 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
 
+# Warnings as errors - enforce high code quality
+if(MSVC)
+    add_compile_options(/W4 /WX /utf-8)
+else()
+    add_compile_options(-Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter)
+endif()
+
+# clang-tidy integration
+option(SURGE_ENABLE_CLANG_TIDY "Enable clang-tidy static analysis" OFF)
+if(SURGE_ENABLE_CLANG_TIDY)
+    find_program(CLANG_TIDY_EXE NAMES "clang-tidy")
+    if(CLANG_TIDY_EXE)
+        set(CMAKE_CXX_CLANG_TIDY "${CLANG_TIDY_EXE}")
+        message(STATUS "clang-tidy found: ${CLANG_TIDY_EXE}")
+    else()
+        message(WARNING "clang-tidy requested but not found")
+    endif()
+endif()
+
 # Export macros
 if(WIN32)
     set(SURGE_API_EXPORT "__declspec(dllexport)")

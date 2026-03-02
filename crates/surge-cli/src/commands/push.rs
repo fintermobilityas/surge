@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use surge_core::config::constants::{DEFAULT_ZSTD_LEVEL, RELEASES_FILE_COMPRESSED, SCHEMA_VERSION};
-use surge_core::config::manifest::SurgeManifest;
+use surge_core::config::manifest::{ShortcutLocation, SurgeManifest};
 use surge_core::context::{Context, StorageConfig, StorageProvider};
 use surge_core::crypto::sha256::sha256_hex_file;
 use surge_core::error::{Result, SurgeError};
@@ -19,6 +19,20 @@ pub async fn execute(
     packages_dir: &Path,
 ) -> Result<()> {
     let manifest = SurgeManifest::from_file(manifest_path)?;
+    let app = manifest
+        .find_app(app_id)
+        .ok_or_else(|| SurgeError::Config(format!("App '{app_id}' not found in manifest")))?;
+    let target = manifest
+        .find_target(app_id, rid)
+        .ok_or_else(|| SurgeError::Config(format!("Target '{rid}' not found for app '{app_id}'")))?;
+    let main_exe = if app.main_exe.is_empty() {
+        app.id.clone()
+    } else {
+        app.main_exe.clone()
+    };
+    let icon = target.icon.clone();
+    let shortcuts = target.shortcuts.clone();
+
     let storage_config = build_storage_config(&manifest)?;
     let backend = storage::create_storage_backend(&storage_config)?;
 
@@ -69,6 +83,9 @@ pub async fn execute(
         delta_filename,
         delta_size,
         delta_sha256,
+        main_exe,
+        icon,
+        shortcuts,
     )
     .await?;
 
@@ -89,6 +106,9 @@ async fn update_release_index(
     delta_filename: String,
     delta_size: i64,
     delta_sha256: String,
+    main_exe: String,
+    icon: String,
+    shortcuts: Vec<ShortcutLocation>,
 ) -> Result<()> {
     let mut index = match backend.get_object(RELEASES_FILE_COMPRESSED).await {
         Ok(data) => decompress_release_index(&data)?,
@@ -144,6 +164,9 @@ async fn update_release_index(
         delta_sha256,
         created_utc: chrono::Utc::now().to_rfc3339(),
         release_notes: String::new(),
+        main_exe,
+        icon,
+        shortcuts,
     });
 
     index.last_write_utc = chrono::Utc::now().to_rfc3339();

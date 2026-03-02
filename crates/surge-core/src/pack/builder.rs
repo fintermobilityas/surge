@@ -7,7 +7,7 @@ use tracing::{debug, info, warn};
 
 use crate::archive::packer::ArchivePacker;
 use crate::config::constants::{RELEASES_FILE_COMPRESSED, SCHEMA_VERSION};
-use crate::config::manifest::SurgeManifest;
+use crate::config::manifest::{ShortcutLocation, SurgeManifest};
 use crate::context::Context;
 use crate::crypto::sha256::sha256_hex_file;
 use crate::error::{Result, SurgeError};
@@ -35,10 +35,12 @@ pub struct PackageArtifact {
 #[allow(dead_code)]
 pub struct PackBuilder {
     ctx: Arc<Context>,
-    manifest: SurgeManifest,
     app_id: String,
     rid: String,
     version: String,
+    main_exe: String,
+    icon: String,
+    shortcuts: Vec<ShortcutLocation>,
     artifacts_dir: PathBuf,
     storage: Box<dyn StorageBackend>,
     artifacts: Vec<PackageArtifact>,
@@ -65,10 +67,19 @@ impl PackBuilder {
     ) -> Result<Self> {
         let manifest = SurgeManifest::from_file(Path::new(manifest_path))?;
 
-        // Validate the app exists in the manifest
-        if manifest.find_app(app_id).is_none() {
-            return Err(SurgeError::Config(format!("App '{app_id}' not found in manifest")));
-        }
+        let app = manifest
+            .find_app(app_id)
+            .ok_or_else(|| SurgeError::Config(format!("App '{app_id}' not found in manifest")))?;
+        let target = app
+            .targets
+            .iter()
+            .find(|t| t.rid == rid)
+            .ok_or_else(|| SurgeError::Config(format!("Target '{rid}' not found for app '{app_id}'")))?;
+        let main_exe = if app.main_exe.is_empty() {
+            app.id.clone()
+        } else {
+            app.main_exe.clone()
+        };
 
         let storage_cfg = ctx.storage_config();
         let storage = create_storage_backend(&storage_cfg)?;
@@ -80,12 +91,36 @@ impl PackBuilder {
             )));
         }
 
+        if !target.shortcuts.is_empty() {
+            let exe_path = artifacts_path.join(&main_exe);
+            if !exe_path.is_file() {
+                return Err(SurgeError::Pack(format!(
+                    "Configured main executable '{}' not found in artifacts: {}",
+                    main_exe,
+                    exe_path.display()
+                )));
+            }
+        }
+
+        if !target.icon.is_empty() {
+            let icon_path = artifacts_path.join(&target.icon);
+            if !icon_path.is_file() {
+                return Err(SurgeError::Pack(format!(
+                    "Configured icon '{}' not found in artifacts: {}",
+                    target.icon,
+                    icon_path.display()
+                )));
+            }
+        }
+
         Ok(Self {
             ctx,
-            manifest,
             app_id: app_id.to_string(),
             rid: rid.to_string(),
             version: version.to_string(),
+            main_exe,
+            icon: target.icon.clone(),
+            shortcuts: target.shortcuts.clone(),
             artifacts_dir: artifacts_path,
             storage,
             artifacts: Vec::new(),
@@ -279,6 +314,9 @@ impl PackBuilder {
         // Find the most recent release before this version
         let mut previous: Option<&ReleaseEntry> = None;
         for release in &index.releases {
+            if !release.rid.is_empty() && release.rid != self.rid {
+                continue;
+            }
             if crate::releases::version::compare_versions(&release.version, &self.version) == std::cmp::Ordering::Less {
                 if let Some(prev) = previous {
                     if crate::releases::version::compare_versions(&release.version, &prev.version)
@@ -328,10 +366,15 @@ impl PackBuilder {
             delta_sha256: delta.map_or(String::new(), |a| a.sha256.clone()),
             created_utc: chrono::Utc::now().to_rfc3339(),
             release_notes: String::new(),
+            main_exe: self.main_exe.clone(),
+            icon: self.icon.clone(),
+            shortcuts: self.shortcuts.clone(),
         };
 
-        // Remove any existing entry for this version and add the new one
-        index.releases.retain(|r| r.version != self.version);
+        // Remove any existing entry for this version/RID pair and add the new one.
+        index
+            .releases
+            .retain(|r| !(r.version == self.version && r.rid == self.rid));
         index.releases.push(entry);
 
         index.last_write_utc = chrono::Utc::now().to_rfc3339();

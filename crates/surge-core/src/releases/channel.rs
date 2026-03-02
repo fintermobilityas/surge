@@ -156,6 +156,9 @@ mod tests {
             delta_sha256: String::new(),
             created_utc: "2025-01-01T00:00:00Z".to_string(),
             release_notes: String::new(),
+            main_exe: "test-app".to_string(),
+            icon: String::new(),
+            shortcuts: Vec::new(),
         }
     }
 

@@ -32,11 +32,14 @@ pub async fn execute(
         apps: vec![AppConfig {
             id: app_id.to_string(),
             name: name.unwrap_or(app_id).to_string(),
+            main_exe: app_id.to_string(),
             targets: vec![TargetConfig {
                 rid,
                 artifacts_dir: String::new(),
                 include: vec![],
                 exclude: vec![],
+                icon: String::new(),
+                shortcuts: vec![],
             }],
         }],
     };

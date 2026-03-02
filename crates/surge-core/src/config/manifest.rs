@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::Path;
 
 use crate::error::{Result, SurgeError};
@@ -34,6 +35,10 @@ pub struct TargetConfig {
     pub include: Vec<String>,
     #[serde(default)]
     pub exclude: Vec<String>,
+    #[serde(default)]
+    pub icon: String,
+    #[serde(default)]
+    pub shortcuts: Vec<ShortcutLocation>,
 }
 
 /// Per-app configuration.
@@ -43,7 +48,18 @@ pub struct AppConfig {
     #[serde(default)]
     pub name: String,
     #[serde(default)]
+    pub main_exe: String,
+    #[serde(default)]
     pub targets: Vec<TargetConfig>,
+}
+
+/// Supported shortcut locations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShortcutLocation {
+    StartMenu,
+    Desktop,
+    Startup,
 }
 
 /// Top-level surge.yml manifest.
@@ -110,6 +126,25 @@ impl SurgeManifest {
         for app in &self.apps {
             if app.id.is_empty() {
                 return Err(SurgeError::Config("App id is required".to_string()));
+            }
+
+            for target in &app.targets {
+                if target.rid.is_empty() {
+                    return Err(SurgeError::Config(format!(
+                        "Target rid is required for app '{}'",
+                        app.id
+                    )));
+                }
+
+                let mut seen = HashSet::new();
+                for shortcut in &target.shortcuts {
+                    if !seen.insert(shortcut) {
+                        return Err(SurgeError::Config(format!(
+                            "Duplicate shortcut location '{shortcut:?}' for app '{}' target '{}'",
+                            app.id, target.rid
+                        )));
+                    }
+                }
             }
         }
 

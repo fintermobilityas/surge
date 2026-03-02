@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::manifest::ShortcutLocation;
 use crate::error::{Result, SurgeError};
 use crate::releases::version::compare_versions;
 
@@ -36,6 +37,12 @@ pub struct ReleaseEntry {
     pub created_utc: String,
     #[serde(default)]
     pub release_notes: String,
+    #[serde(default)]
+    pub main_exe: String,
+    #[serde(default)]
+    pub icon: String,
+    #[serde(default)]
+    pub shortcuts: Vec<ShortcutLocation>,
 }
 
 /// The top-level release index (releases.yml).
@@ -190,6 +197,9 @@ mod tests {
             delta_sha256: if has_delta { "def456".to_string() } else { String::new() },
             created_utc: "2025-01-01T00:00:00Z".to_string(),
             release_notes: String::new(),
+            main_exe: "test-app".to_string(),
+            icon: String::new(),
+            shortcuts: Vec::new(),
         }
     }
 

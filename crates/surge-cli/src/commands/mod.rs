@@ -13,7 +13,9 @@ mod tests {
     use std::path::Path;
 
     use surge_core::config::constants::RELEASES_FILE_COMPRESSED;
+    use surge_core::config::manifest::ShortcutLocation;
     use surge_core::platform::detect::current_rid;
+    use surge_core::platform::fs::make_executable;
     use surge_core::releases::manifest::{ReleaseIndex, decompress_release_index};
 
     fn write_manifest(path: &Path, store_dir: &Path, app_id: &str, rid: &str) {
@@ -25,8 +27,13 @@ storage:
 apps:
   - id: {app_id}
     name: Test App
+    main_exe: demoapp
     targets:
       - rid: {rid}
+        icon: icon.png
+        shortcuts:
+          - desktop
+          - startup
 ",
             bucket = store_dir.display()
         );
@@ -53,6 +60,9 @@ apps:
         std::fs::create_dir_all(&artifacts_dir).unwrap();
         std::fs::create_dir_all(&packages_dir).unwrap();
         std::fs::write(artifacts_dir.join("payload.txt"), b"smoke payload").unwrap();
+        std::fs::write(artifacts_dir.join("demoapp"), b"#!/bin/sh\necho smoke\n").unwrap();
+        make_executable(&artifacts_dir.join("demoapp")).unwrap();
+        std::fs::write(artifacts_dir.join("icon.png"), b"icon").unwrap();
         write_manifest(&manifest_path, &store_dir, app_id, &rid);
 
         super::pack::execute(&manifest_path, app_id, version, &rid, &artifacts_dir, &packages_dir)
@@ -72,6 +82,12 @@ apps:
         assert_eq!(index.releases[0].version, version);
         assert_eq!(index.releases[0].rid, rid);
         assert_eq!(index.releases[0].channels, vec!["stable"]);
+        assert_eq!(index.releases[0].main_exe, "demoapp");
+        assert_eq!(index.releases[0].icon, "icon.png");
+        assert_eq!(
+            index.releases[0].shortcuts,
+            vec![ShortcutLocation::Desktop, ShortcutLocation::Startup]
+        );
 
         super::promote::execute(&manifest_path, app_id, version, &rid, "beta")
             .await

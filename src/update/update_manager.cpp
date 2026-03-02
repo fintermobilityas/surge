@@ -4,17 +4,19 @@
  */
 
 #include "update/update_manager.hpp"
-#include "core/context.hpp"
-#include "storage/storage_backend.hpp"
-#include "releases/release_manifest.hpp"
+
 #include "archive/extractor.hpp"
-#include "diff/bsdiff_wrapper.hpp"
-#include "crypto/sha256.hpp"
 #include "config/constants.hpp"
-#include <spdlog/spdlog.h>
-#include <fmt/format.h>
+#include "core/context.hpp"
+#include "crypto/sha256.hpp"
+#include "diff/bsdiff_wrapper.hpp"
+#include "releases/release_manifest.hpp"
+#include "storage/storage_backend.hpp"
+
 #include <filesystem>
+#include <fmt/format.h>
 #include <fstream>
+#include <spdlog/spdlog.h>
 
 namespace surge::update {
 
@@ -34,23 +36,17 @@ struct UpdateManager::Impl {
     explicit Impl(Context& c) : ctx(c) {}
 };
 
-UpdateManager::UpdateManager(Context& ctx,
-                              std::string app_id,
-                              std::string current_version,
-                              std::string channel,
-                              std::filesystem::path install_dir)
-    : impl_(std::make_unique<Impl>(ctx))
-{
+UpdateManager::UpdateManager(Context& ctx, std::string app_id, std::string current_version, std::string channel,
+                             std::filesystem::path install_dir)
+    : impl_(std::make_unique<Impl>(ctx)) {
     impl_->app_id = std::move(app_id);
     impl_->current_version = std::move(current_version);
     impl_->channel = std::move(channel);
     impl_->install_dir = std::move(install_dir);
-    impl_->storage = std::shared_ptr<storage::IStorageBackend>(
-        storage::create_storage_backend(ctx.storage_config()));
+    impl_->storage = std::shared_ptr<storage::IStorageBackend>(storage::create_storage_backend(ctx.storage_config()));
 
-    spdlog::debug("UpdateManager: app_id={}, current={}, channel={}, install_dir={}",
-                   impl_->app_id, impl_->current_version, impl_->channel,
-                   impl_->install_dir.string());
+    spdlog::debug("UpdateManager: app_id={}, current={}, channel={}, install_dir={}", impl_->app_id,
+                  impl_->current_version, impl_->channel, impl_->install_dir.string());
 }
 
 UpdateManager::~UpdateManager() = default;
@@ -81,8 +77,7 @@ std::optional<UpdateInfo> UpdateManager::check_for_updates() {
     }
 
     // Find newer releases
-    auto newer = releases::get_releases_newer_than(
-        impl_->cached_index, impl_->current_version, impl_->channel);
+    auto newer = releases::get_releases_newer_than(impl_->cached_index, impl_->current_version, impl_->channel);
 
     if (newer.empty()) {
         spdlog::info("Already up to date");
@@ -94,8 +89,8 @@ std::optional<UpdateInfo> UpdateManager::check_for_updates() {
     info.latest_version = info.available_releases.back().version;
 
     // Check if delta path exists
-    auto delta_chain = releases::get_delta_chain(
-        impl_->cached_index, impl_->current_version, info.latest_version, impl_->channel);
+    auto delta_chain =
+        releases::get_delta_chain(impl_->cached_index, impl_->current_version, info.latest_version, impl_->channel);
     info.delta_available = !delta_chain.empty();
 
     // Calculate download size
@@ -107,19 +102,18 @@ std::optional<UpdateInfo> UpdateManager::check_for_updates() {
         info.download_size = info.available_releases.back().full_size;
     }
 
-    spdlog::info("Found {} updates available, latest: {}",
-                  info.available_releases.size(), info.latest_version);
+    spdlog::info("Found {} updates available, latest: {}", info.available_releases.size(), info.latest_version);
     return info;
 }
 
-int32_t UpdateManager::download_and_apply(const UpdateInfo& info,
-                                            ProgressCallback progress) {
+int32_t UpdateManager::download_and_apply(const UpdateInfo& info, ProgressCallback progress) {
     if (info.available_releases.empty()) {
         spdlog::warn("No releases to apply");
         return SURGE_NOT_FOUND;
     }
 
-    if (impl_->ctx.is_cancelled()) return SURGE_CANCELLED;
+    if (impl_->ctx.is_cancelled())
+        return SURGE_CANCELLED;
 
     auto& target = info.available_releases.back();
     spdlog::info("Downloading and applying update to {}", target.version);
@@ -133,7 +127,8 @@ int32_t UpdateManager::download_and_apply(const UpdateInfo& info,
         progress(p);
     }
 
-    if (impl_->ctx.is_cancelled()) return SURGE_CANCELLED;
+    if (impl_->ctx.is_cancelled())
+        return SURGE_CANCELLED;
 
     // Phase 2: Download
     auto packages_dir = impl_->install_dir / constants::PACKAGES_DIR;
@@ -239,18 +234,20 @@ int32_t UpdateManager::download_and_apply(const UpdateInfo& info,
 
     std::error_code ec;
     for (auto& entry : fs::directory_iterator(impl_->install_dir, ec)) {
-        if (!entry.is_directory()) continue;
+        if (!entry.is_directory())
+            continue;
         auto dirname = entry.path().filename().string();
-        if (!dirname.starts_with(constants::APP_DIR_PREFIX)) continue;
+        if (!dirname.starts_with(constants::APP_DIR_PREFIX))
+            continue;
         auto ver = dirname.substr(std::strlen(constants::APP_DIR_PREFIX));
-        if (ver == target.version) continue;
+        if (ver == target.version)
+            continue;
         version_dirs.push_back({entry.path(), ver});
     }
 
-    std::sort(version_dirs.begin(), version_dirs.end(),
-              [](const VersionDir& a, const VersionDir& b) {
-                  return releases::compare_versions(a.version, b.version) < 0;
-              });
+    std::sort(version_dirs.begin(), version_dirs.end(), [](const VersionDir& a, const VersionDir& b) {
+        return releases::compare_versions(a.version, b.version) < 0;
+    });
 
     if (static_cast<int>(version_dirs.size()) > RETENTION_LIMIT) {
         int to_remove = static_cast<int>(version_dirs.size()) - RETENTION_LIMIT;
@@ -288,4 +285,4 @@ const std::filesystem::path& UpdateManager::install_dir() const {
     return impl_->install_dir;
 }
 
-} // namespace surge::update
+}  // namespace surge::update

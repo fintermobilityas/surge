@@ -4,6 +4,8 @@
  *        and mock storage backend update simulation.
  */
 
+#include "storage/storage_backend.hpp"
+
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -14,8 +16,6 @@
 #include <span>
 #include <string>
 #include <vector>
-
-#include "storage/storage_backend.hpp"
 
 namespace {
 
@@ -35,18 +35,33 @@ struct SemVer {
     }
 
     int compare(const SemVer& other) const {
-        if (major != other.major) return major < other.major ? -1 : 1;
-        if (minor != other.minor) return minor < other.minor ? -1 : 1;
-        if (patch != other.patch) return patch < other.patch ? -1 : 1;
+        if (major != other.major)
+            return major < other.major ? -1 : 1;
+        if (minor != other.minor)
+            return minor < other.minor ? -1 : 1;
+        if (patch != other.patch)
+            return patch < other.patch ? -1 : 1;
         return 0;
     }
 
-    bool operator<(const SemVer& o) const { return compare(o) < 0; }
-    bool operator==(const SemVer& o) const { return compare(o) == 0; }
-    bool operator>(const SemVer& o) const { return compare(o) > 0; }
-    bool operator<=(const SemVer& o) const { return compare(o) <= 0; }
-    bool operator>=(const SemVer& o) const { return compare(o) >= 0; }
-    bool operator!=(const SemVer& o) const { return compare(o) != 0; }
+    bool operator<(const SemVer& o) const {
+        return compare(o) < 0;
+    }
+    bool operator==(const SemVer& o) const {
+        return compare(o) == 0;
+    }
+    bool operator>(const SemVer& o) const {
+        return compare(o) > 0;
+    }
+    bool operator<=(const SemVer& o) const {
+        return compare(o) <= 0;
+    }
+    bool operator>=(const SemVer& o) const {
+        return compare(o) >= 0;
+    }
+    bool operator!=(const SemVer& o) const {
+        return compare(o) != 0;
+    }
 };
 
 // --------------------------------------------------------------------------
@@ -59,11 +74,8 @@ public:
     int get_call_count = 0;
     int put_call_count = 0;
 
-    int32_t put_object(
-        const std::string& key,
-        std::span<const uint8_t> data,
-        const std::string& /*content_type*/) override
-    {
+    int32_t put_object(const std::string& key, std::span<const uint8_t> data,
+                       const std::string& /*content_type*/) override {
         put_call_count++;
         objects[key] = {data.begin(), data.end()};
         return 0;
@@ -74,23 +86,19 @@ public:
         return put_object(key, std::span<const uint8_t>(data), "application/octet-stream");
     }
 
-    int32_t get_object(
-        const std::string& key,
-        std::vector<uint8_t>& out_data) override
-    {
+    int32_t get_object(const std::string& key, std::vector<uint8_t>& out_data) override {
         get_call_count++;
         auto it = objects.find(key);
-        if (it == objects.end()) return -3; // SURGE_NOT_FOUND
+        if (it == objects.end())
+            return -3;  // SURGE_NOT_FOUND
         out_data = it->second;
         return 0;
     }
 
-    int32_t head_object(
-        const std::string& key,
-        surge::storage::ObjectInfo& out_info) override
-    {
+    int32_t head_object(const std::string& key, surge::storage::ObjectInfo& out_info) override {
         auto it = objects.find(key);
-        if (it == objects.end()) return -3;
+        if (it == objects.end())
+            return -3;
         out_info.key = key;
         out_info.size = static_cast<int64_t>(it->second.size());
         return 0;
@@ -101,12 +109,8 @@ public:
         return 0;
     }
 
-    int32_t list_objects(
-        const std::string& prefix,
-        surge::storage::ListResult& out_result,
-        const std::string& /*marker*/,
-        int max_keys) override
-    {
+    int32_t list_objects(const std::string& prefix, surge::storage::ListResult& out_result,
+                         const std::string& /*marker*/, int max_keys) override {
         out_result.objects.clear();
         int count = 0;
         for (const auto& [key, data] : objects) {
@@ -121,19 +125,13 @@ public:
         return 0;
     }
 
-    int32_t download_to_file(
-        const std::string& /*key*/,
-        const std::filesystem::path& /*dest*/,
-        std::function<void(int64_t, int64_t)> /*progress*/) override
-    {
+    int32_t download_to_file(const std::string& /*key*/, const std::filesystem::path& /*dest*/,
+                             std::function<void(int64_t, int64_t)> /*progress*/) override {
         return 0;
     }
 
-    int32_t upload_from_file(
-        const std::string& /*key*/,
-        const std::filesystem::path& /*src*/,
-        std::function<void(int64_t, int64_t)> /*progress*/) override
-    {
+    int32_t upload_from_file(const std::string& /*key*/, const std::filesystem::path& /*src*/,
+                             std::function<void(int64_t, int64_t)> /*progress*/) override {
         return 0;
     }
 };
@@ -174,7 +172,7 @@ TEST(VersionComparison, TransitiveOrdering) {
 
     EXPECT_TRUE(a < b);
     EXPECT_TRUE(b < c);
-    EXPECT_TRUE(a < c); // transitive
+    EXPECT_TRUE(a < c);  // transitive
 }
 
 TEST(VersionComparison, LargeVersionNumbers) {
@@ -194,11 +192,8 @@ struct MockRelease {
     int64_t delta_size;
 };
 
-std::vector<std::string> resolve_delta_chain(
-    const std::vector<MockRelease>& releases,
-    const std::string& current_version,
-    const std::string& target_version)
-{
+std::vector<std::string> resolve_delta_chain(const std::vector<MockRelease>& releases,
+                                             const std::string& current_version, const std::string& target_version) {
     std::map<std::string, std::string> base_map;
     for (const auto& r : releases) {
         if (!r.base_version.empty()) {
@@ -212,9 +207,11 @@ std::vector<std::string> resolve_delta_chain(
     while (v != current_version) {
         chain.push_back(v);
         auto it = base_map.find(v);
-        if (it == base_map.end()) return {};
+        if (it == base_map.end())
+            return {};
         v = it->second;
-        if (chain.size() > releases.size()) return {};
+        if (chain.size() > releases.size())
+            return {};
     }
 
     std::reverse(chain.begin(), chain.end());
@@ -223,7 +220,7 @@ std::vector<std::string> resolve_delta_chain(
 
 TEST(DeltaChain, LinearChain) {
     std::vector<MockRelease> releases = {
-        {"1.0.0", "",      10000, 0},
+        {"1.0.0", "", 10000, 0},
         {"1.1.0", "1.0.0", 11000, 2000},
         {"1.2.0", "1.1.0", 12000, 3000},
         {"1.3.0", "1.2.0", 13000, 2500},
@@ -238,7 +235,7 @@ TEST(DeltaChain, LinearChain) {
 
 TEST(DeltaChain, SingleStep) {
     std::vector<MockRelease> releases = {
-        {"1.0.0", "",      10000, 0},
+        {"1.0.0", "", 10000, 0},
         {"1.1.0", "1.0.0", 11000, 1500},
     };
 
@@ -249,7 +246,7 @@ TEST(DeltaChain, SingleStep) {
 
 TEST(DeltaChain, BrokenChain_ReturnsEmpty) {
     std::vector<MockRelease> releases = {
-        {"1.0.0", "",      10000, 0},
+        {"1.0.0", "", 10000, 0},
         // Gap: 1.1.0 is missing
         {"1.2.0", "1.1.0", 12000, 3000},
     };
@@ -293,7 +290,7 @@ TEST(MockStorage, GetNonExistent_ReturnsNotFound) {
 
     std::vector<uint8_t> out;
     auto result = storage.get_object("nonexistent", out);
-    EXPECT_EQ(result, -3); // SURGE_NOT_FOUND
+    EXPECT_EQ(result, -3);  // SURGE_NOT_FOUND
 }
 
 TEST(MockStorage, HeadObject) {
@@ -377,4 +374,4 @@ TEST(MockStorage, SimulateUpdateCheck) {
     EXPECT_TRUE(fetched_str.find("1.1.0") != std::string::npos);
 }
 
-} // anonymous namespace
+}  // anonymous namespace

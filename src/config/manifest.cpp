@@ -1,35 +1,35 @@
 #include "config/manifest.hpp"
-#include <yaml-cpp/yaml.h>
+
+#include <fmt/format.h>
 #include <fstream>
 #include <spdlog/spdlog.h>
-#include <fmt/format.h>
+#include <yaml-cpp/yaml.h>
 
 namespace surge::config {
 
 namespace {
 
 // Helper: read a YAML node by trying camelCase first, then snake_case.
-template<typename T>
-T yaml_get(const YAML::Node& node,
-           const std::string& camel_key,
-           const std::string& snake_key,
-           const T& default_val) {
-    if (node[camel_key]) return node[camel_key].as<T>(default_val);
-    if (node[snake_key]) return node[snake_key].as<T>(default_val);
+template <typename T>
+T yaml_get(const YAML::Node& node, const std::string& camel_key, const std::string& snake_key, const T& default_val) {
+    if (node[camel_key])
+        return node[camel_key].as<T>(default_val);
+    if (node[snake_key])
+        return node[snake_key].as<T>(default_val);
     return default_val;
 }
 
 // Helper: return the first present YAML node for the given keys.
-YAML::Node yaml_node(const YAML::Node& parent,
-                     const std::string& camel_key,
-                     const std::string& snake_key) {
-    if (parent[camel_key]) return parent[camel_key];
+YAML::Node yaml_node(const YAML::Node& parent, const std::string& camel_key, const std::string& snake_key) {
+    if (parent[camel_key])
+        return parent[camel_key];
     return parent[snake_key];
 }
 
 TargetConfig parse_target(const YAML::Node& node) {
     TargetConfig target;
-    if (!node) return target;
+    if (!node)
+        return target;
 
     target.os = node["os"].as<std::string>("");
     target.rid = node["rid"].as<std::string>("");
@@ -44,8 +44,7 @@ TargetConfig parse_target(const YAML::Node& node) {
 
     if (auto env = node["environment"]) {
         for (auto it = env.begin(); it != env.end(); ++it) {
-            target.environment[it->first.as<std::string>()] =
-                it->second.as<std::string>();
+            target.environment[it->first.as<std::string>()] = it->second.as<std::string>();
         }
     }
 
@@ -54,7 +53,8 @@ TargetConfig parse_target(const YAML::Node& node) {
 
 MetadataConfig parse_metadata(const YAML::Node& node) {
     MetadataConfig meta;
-    if (!node) return meta;
+    if (!node)
+        return meta;
     meta.description = node["description"].as<std::string>("");
     meta.authors = node["authors"].as<std::string>("");
     return meta;
@@ -142,7 +142,7 @@ void emit_app(YAML::Emitter& out, const AppConfig& app) {
     out << YAML::EndMap;
 }
 
-} // anonymous namespace
+}  // anonymous namespace
 
 SurgeManifest parse_manifest(const std::filesystem::path& path) {
     spdlog::debug("Parsing manifest from: {}", path.string());
@@ -151,13 +151,11 @@ SurgeManifest parse_manifest(const std::filesystem::path& path) {
     try {
         root = YAML::LoadFile(path.string());
     } catch (const YAML::Exception& e) {
-        throw std::runtime_error(
-            fmt::format("Failed to parse manifest YAML '{}': {}", path.string(), e.what()));
+        throw std::runtime_error(fmt::format("Failed to parse manifest YAML '{}': {}", path.string(), e.what()));
     }
 
     if (!root.IsMap()) {
-        throw std::runtime_error(
-            fmt::format("Manifest '{}' is not a valid YAML mapping", path.string()));
+        throw std::runtime_error(fmt::format("Manifest '{}' is not a valid YAML mapping", path.string()));
     }
 
     SurgeManifest manifest;
@@ -202,8 +200,8 @@ SurgeManifest parse_manifest(const std::filesystem::path& path) {
         }
     }
 
-    spdlog::debug("Parsed manifest: schema={}, {} channels, {} apps",
-                  manifest.schema, manifest.channels.size(), manifest.apps.size());
+    spdlog::debug("Parsed manifest: schema={}, {} channels, {} apps", manifest.schema, manifest.channels.size(),
+                  manifest.apps.size());
 
     return manifest;
 }
@@ -272,15 +270,13 @@ void write_manifest(const SurgeManifest& manifest, const std::filesystem::path& 
 
     std::ofstream file(path);
     if (!file.is_open()) {
-        throw std::runtime_error(
-            fmt::format("Failed to open manifest file for writing: '{}'", path.string()));
+        throw std::runtime_error(fmt::format("Failed to open manifest file for writing: '{}'", path.string()));
     }
     file << out.c_str();
     file.close();
 
     if (file.fail()) {
-        throw std::runtime_error(
-            fmt::format("Failed to write manifest file: '{}'", path.string()));
+        throw std::runtime_error(fmt::format("Failed to write manifest file: '{}'", path.string()));
     }
 
     spdlog::info("Manifest written to: {}", path.string());
@@ -291,8 +287,7 @@ std::vector<std::string> validate_manifest(const SurgeManifest& manifest) {
 
     // Schema version
     if (manifest.schema != 1) {
-        errors.push_back(fmt::format(
-            "Unsupported schema version: {} (expected 1)", manifest.schema));
+        errors.push_back(fmt::format("Unsupported schema version: {} (expected 1)", manifest.schema));
     }
 
     // Generic section — token is optional (e.g. filesystem provider needs no auth)
@@ -303,8 +298,7 @@ std::vector<std::string> validate_manifest(const SurgeManifest& manifest) {
     } else {
         const auto& p = manifest.storage.provider;
         if (p != "s3" && p != "azure_blob" && p != "gcs" && p != "filesystem") {
-            errors.push_back(fmt::format(
-                "storage.provider '{}' must be one of: s3, azure_blob, gcs, filesystem", p));
+            errors.push_back(fmt::format("storage.provider '{}' must be one of: s3, azure_blob, gcs, filesystem", p));
         }
     }
 
@@ -341,4 +335,4 @@ std::vector<std::string> validate_manifest(const SurgeManifest& manifest) {
     return errors;
 }
 
-} // namespace surge::config
+}  // namespace surge::config

@@ -60,4 +60,4 @@ std::optional<std::string> get_env(std::string_view name);
  */
 bool set_env(std::string_view name, std::string_view value);
 
-} // namespace surge::platform
+}  // namespace surge::platform

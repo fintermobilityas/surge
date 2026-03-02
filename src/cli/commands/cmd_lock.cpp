@@ -3,14 +3,15 @@
  * @brief `surge lock` and `surge unlock` - Manage distributed locks.
  */
 
-#include <cxxopts.hpp>
-#include <spdlog/spdlog.h>
-#include <fmt/format.h>
-#include <filesystem>
-#include <iostream>
-#include <cstdlib>
 #include "config/constants.hpp"
 #include "config/manifest.hpp"
+
+#include <cstdlib>
+#include <cxxopts.hpp>
+#include <filesystem>
+#include <fmt/format.h>
+#include <iostream>
+#include <spdlog/spdlog.h>
 
 namespace fs = std::filesystem;
 
@@ -27,17 +28,14 @@ fs::path find_manifest(const std::string& path_override) {
     return {};
 }
 
-} // anonymous namespace
+}  // anonymous namespace
 
 int cmd_lock(int argc, char* argv[]) {
     cxxopts::Options options("surge lock", "Acquire a distributed lock");
 
-    options.add_options()
-        ("name", "Lock name (required)", cxxopts::value<std::string>())
-        ("timeout", "Lock timeout in seconds", cxxopts::value<int>()->default_value("300"))
-        ("manifest", "Path to surge.yml", cxxopts::value<std::string>()->default_value(""))
-        ("h,help", "Show help")
-    ;
+    options.add_options()("name", "Lock name (required)", cxxopts::value<std::string>())(
+        "timeout", "Lock timeout in seconds", cxxopts::value<int>()->default_value("300"))(
+        "manifest", "Path to surge.yml", cxxopts::value<std::string>()->default_value(""))("h,help", "Show help");
 
     auto result = options.parse(argc, argv);
 
@@ -57,8 +55,7 @@ int cmd_lock(int argc, char* argv[]) {
     // Locate manifest for lock server config
     auto manifest_path = find_manifest(result["manifest"].as<std::string>());
     if (manifest_path.empty() || !fs::exists(manifest_path)) {
-        spdlog::error("Cannot find {}. Run 'surge init' first or specify --manifest",
-                       surge::constants::MANIFEST_FILE);
+        spdlog::error("Cannot find {}. Run 'surge init' first or specify --manifest", surge::constants::MANIFEST_FILE);
         return 1;
     }
 
@@ -104,7 +101,8 @@ int cmd_lock(int argc, char* argv[]) {
 
     spdlog::info("Lock acquired successfully");
     std::cout << "CHALLENGE=<token>\n";
-    spdlog::info("Save the challenge token above. Use 'surge unlock --name {} --challenge <token>' to release.", lock_name);
+    spdlog::info("Save the challenge token above. Use 'surge unlock --name {} --challenge <token>' to release.",
+                 lock_name);
 
     return 0;
 }
@@ -112,13 +110,10 @@ int cmd_lock(int argc, char* argv[]) {
 int cmd_unlock(int argc, char* argv[]) {
     cxxopts::Options options("surge unlock", "Release a distributed lock");
 
-    options.add_options()
-        ("name", "Lock name (required)", cxxopts::value<std::string>())
-        ("challenge", "Challenge token from lock acquisition", cxxopts::value<std::string>()->default_value(""))
-        ("force", "Force-release the lock without a challenge token")
-        ("manifest", "Path to surge.yml", cxxopts::value<std::string>()->default_value(""))
-        ("h,help", "Show help")
-    ;
+    options.add_options()("name", "Lock name (required)", cxxopts::value<std::string>())(
+        "challenge", "Challenge token from lock acquisition", cxxopts::value<std::string>()->default_value(""))(
+        "force", "Force-release the lock without a challenge token")(
+        "manifest", "Path to surge.yml", cxxopts::value<std::string>()->default_value(""))("h,help", "Show help");
 
     auto result = options.parse(argc, argv);
 
@@ -144,8 +139,7 @@ int cmd_unlock(int argc, char* argv[]) {
     // Locate manifest for lock server config
     auto manifest_path = find_manifest(result["manifest"].as<std::string>());
     if (manifest_path.empty() || !fs::exists(manifest_path)) {
-        spdlog::error("Cannot find {}. Run 'surge init' first or specify --manifest",
-                       surge::constants::MANIFEST_FILE);
+        spdlog::error("Cannot find {}. Run 'surge init' first or specify --manifest", surge::constants::MANIFEST_FILE);
         return 1;
     }
 

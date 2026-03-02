@@ -1,9 +1,10 @@
 #include "async/thread_pool.hpp"
-#include <queue>
-#include <mutex>
+
+#include <atomic>
 #include <condition_variable>
 #include <functional>
-#include <atomic>
+#include <mutex>
+#include <queue>
 #include <spdlog/spdlog.h>
 
 namespace surge::async {
@@ -23,9 +24,7 @@ struct ThreadPool::Impl {
         spdlog::debug("Creating thread pool with {} threads", count);
         workers.reserve(static_cast<size_t>(count));
         for (int32_t i = 0; i < count; ++i) {
-            workers.emplace_back([this](std::stop_token stop_token) {
-                worker_loop(stop_token);
-            });
+            workers.emplace_back([this](std::stop_token stop_token) { worker_loop(stop_token); });
         }
     }
 
@@ -40,12 +39,11 @@ struct ThreadPool::Impl {
 
             {
                 std::unique_lock lock(mutex);
-                cv.wait(lock, stop_token, [this] {
-                    return shutdown || !tasks.empty() || !cancellable_tasks.empty();
-                });
+                cv.wait(lock, stop_token, [this] { return shutdown || !tasks.empty() || !cancellable_tasks.empty(); });
 
                 if (tasks.empty() && cancellable_tasks.empty()) {
-                    if (shutdown || stop_token.stop_requested()) return;
+                    if (shutdown || stop_token.stop_requested())
+                        return;
                     continue;
                 }
 
@@ -80,7 +78,8 @@ struct ThreadPool::Impl {
     void do_shutdown() {
         {
             std::unique_lock lock(mutex);
-            if (shutdown) return;
+            if (shutdown)
+                return;
             shutdown = true;
         }
         cv.notify_all();
@@ -103,8 +102,7 @@ struct ThreadPool::Impl {
 ThreadPool::ThreadPool(int32_t thread_count) {
     int32_t count = thread_count;
     if (count <= 0) {
-        count = static_cast<int32_t>(
-            std::max(1u, std::thread::hardware_concurrency()));
+        count = static_cast<int32_t>(std::max(1u, std::thread::hardware_concurrency()));
     }
     impl_ = std::make_unique<Impl>(count);
 }
@@ -152,10 +150,8 @@ void ThreadPool::request_stop() {
 void ThreadPool::wait_all() {
     std::unique_lock lock(impl_->mutex);
     impl_->idle_cv.wait(lock, [this] {
-        return impl_->tasks.empty() &&
-               impl_->cancellable_tasks.empty() &&
-               impl_->active_count.load() == 0;
+        return impl_->tasks.empty() && impl_->cancellable_tasks.empty() && impl_->active_count.load() == 0;
     });
 }
 
-} // namespace surge::async
+}  // namespace surge::async

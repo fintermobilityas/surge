@@ -4,24 +4,25 @@
  */
 
 #include "supervisor/stub_executable.hpp"
+
 #include "config/constants.hpp"
 #include "releases/release_manifest.hpp"
-#include <spdlog/spdlog.h>
-#include <fmt/format.h>
 
 #include <algorithm>
 #include <charconv>
 #include <cstring>
 #include <filesystem>
+#include <fmt/format.h>
+#include <spdlog/spdlog.h>
 #include <string>
 #include <vector>
 
 #ifdef _WIN32
-#include <windows.h>
 #include <process.h>
+#include <windows.h>
 #else
-#include <unistd.h>
 #include <sys/types.h>
+#include <unistd.h>
 #endif
 
 namespace surge::supervisor {
@@ -33,10 +34,8 @@ struct StubExecutable::Impl {
     std::string app_main;
 };
 
-StubExecutable::StubExecutable(std::filesystem::path install_dir,
-                               std::string app_main)
-    : impl_(std::make_unique<Impl>())
-{
+StubExecutable::StubExecutable(std::filesystem::path install_dir, std::string app_main)
+    : impl_(std::make_unique<Impl>()) {
     impl_->install_dir = std::move(install_dir);
     impl_->app_main = std::move(app_main);
 }
@@ -45,7 +44,8 @@ StubExecutable::~StubExecutable() = default;
 
 std::optional<std::filesystem::path> StubExecutable::find_latest_app_dir() const {
     auto dirs = list_app_dirs();
-    if (dirs.empty()) return std::nullopt;
+    if (dirs.empty())
+        return std::nullopt;
 
     // dirs are sorted newest first
     auto exe_path = dirs.front() / impl_->app_main;
@@ -56,7 +56,8 @@ std::optional<std::filesystem::path> StubExecutable::find_latest_app_dir() const
     // Try other versions
     for (auto& dir : dirs) {
         auto path = dir / impl_->app_main;
-        if (fs::exists(path)) return path;
+        if (fs::exists(path))
+            return path;
     }
 
     return std::nullopt;
@@ -65,8 +66,8 @@ std::optional<std::filesystem::path> StubExecutable::find_latest_app_dir() const
 int32_t StubExecutable::run(const std::vector<std::string>& args) {
     auto exe = find_latest_app_dir();
     if (!exe) {
-        spdlog::error("Could not find any app-* directories with executable '{}' in: {}",
-                       impl_->app_main, impl_->install_dir.string());
+        spdlog::error("Could not find any app-* directories with executable '{}' in: {}", impl_->app_main,
+                      impl_->install_dir.string());
         return 1;
     }
 
@@ -101,16 +102,8 @@ int32_t StubExecutable::run(const std::vector<std::string>& args) {
     PROCESS_INFORMATION pi{};
     si.cb = sizeof(si);
 
-    if (!CreateProcessA(
-            exe->string().c_str(),
-            cmd_line.data(),
-            nullptr, nullptr,
-            FALSE,
-            0,
-            nullptr,
-            app_dir.string().c_str(),
-            &si, &pi))
-    {
+    if (!CreateProcessA(exe->string().c_str(), cmd_line.data(), nullptr, nullptr, FALSE, 0, nullptr,
+                        app_dir.string().c_str(), &si, &pi)) {
         spdlog::error("CreateProcess failed: {}", GetLastError());
         return 1;
     }
@@ -129,36 +122,39 @@ std::vector<std::filesystem::path> StubExecutable::list_app_dirs() const {
     std::error_code ec;
 
     for (auto& entry : fs::directory_iterator(impl_->install_dir, ec)) {
-        if (!entry.is_directory()) continue;
+        if (!entry.is_directory())
+            continue;
 
         auto dirname = entry.path().filename().string();
-        if (!dirname.starts_with(constants::APP_DIR_PREFIX)) continue;
+        if (!dirname.starts_with(constants::APP_DIR_PREFIX))
+            continue;
 
         auto ver = version_from_dir_name(dirname);
-        if (!ver) continue;
+        if (!ver)
+            continue;
 
         result.push_back(entry.path());
     }
 
     // Sort newest first
-    std::sort(result.begin(), result.end(),
-        [](const fs::path& a, const fs::path& b) {
-            auto va = StubExecutable::version_from_dir_name(a.filename().string());
-            auto vb = StubExecutable::version_from_dir_name(b.filename().string());
-            if (!va || !vb) return false;
-            return releases::compare_versions(*va, *vb) > 0;
-        });
+    std::sort(result.begin(), result.end(), [](const fs::path& a, const fs::path& b) {
+        auto va = StubExecutable::version_from_dir_name(a.filename().string());
+        auto vb = StubExecutable::version_from_dir_name(b.filename().string());
+        if (!va || !vb)
+            return false;
+        return releases::compare_versions(*va, *vb) > 0;
+    });
 
     return result;
 }
 
-std::optional<std::string> StubExecutable::version_from_dir_name(
-    const std::string& dir_name) {
+std::optional<std::string> StubExecutable::version_from_dir_name(const std::string& dir_name) {
     if (!dir_name.starts_with(constants::APP_DIR_PREFIX)) {
         return std::nullopt;
     }
     auto version = dir_name.substr(std::strlen(constants::APP_DIR_PREFIX));
-    if (version.empty()) return std::nullopt;
+    if (version.empty())
+        return std::nullopt;
 
     // Validate it looks like a version (starts with a digit)
     if (!std::isdigit(static_cast<unsigned char>(version.front()))) {
@@ -168,4 +164,4 @@ std::optional<std::string> StubExecutable::version_from_dir_name(
     return version;
 }
 
-} // namespace surge::supervisor
+}  // namespace surge::supervisor

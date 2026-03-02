@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include "surge/surge_api.h"
+
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -13,8 +15,6 @@
 #include <string>
 #include <vector>
 
-#include "surge/surge_api.h"
-
 namespace surge {
 class Context;
 }
@@ -22,7 +22,7 @@ class Context;
 namespace surge::releases {
 struct ReleaseEntry;
 struct ReleaseIndex;
-}
+}  // namespace surge::releases
 
 namespace surge::update {
 
@@ -68,10 +68,7 @@ public:
      * @param channel         Release channel to track.
      * @param install_dir     Root installation directory.
      */
-    UpdateManager(Context& ctx,
-                  std::string app_id,
-                  std::string current_version,
-                  std::string channel,
+    UpdateManager(Context& ctx, std::string app_id, std::string current_version, std::string channel,
                   std::filesystem::path install_dir);
     ~UpdateManager();
 
@@ -99,8 +96,7 @@ public:
      * @param progress Optional progress callback.
      * @return 0 on success, negative error code on failure.
      */
-    int32_t download_and_apply(const UpdateInfo& info,
-                               ProgressCallback progress = nullptr);
+    int32_t download_and_apply(const UpdateInfo& info, ProgressCallback progress = nullptr);
 
     /** Return the currently installed version. */
     const std::string& current_version() const;
@@ -119,4 +115,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-} // namespace surge::update
+}  // namespace surge::update

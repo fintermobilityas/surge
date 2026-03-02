@@ -3,6 +3,8 @@
  * @brief Tests for tar.zst archive creation, extraction, and content verification.
  */
 
+#include "archive/packer.hpp"
+
 #include <gtest/gtest.h>
 
 #include <cstdint>
@@ -10,8 +12,6 @@
 #include <fstream>
 #include <string>
 #include <vector>
-
-#include "archive/packer.hpp"
 
 namespace fs = std::filesystem;
 
@@ -31,7 +31,9 @@ protected:
         fs::remove_all(temp_dir_, ec);
     }
 
-    void write_file(const fs::path& path, const std::string& content, fs::perms perms = fs::perms::owner_read | fs::perms::owner_write | fs::perms::group_read | fs::perms::others_read) {
+    void write_file(const fs::path& path, const std::string& content,
+                    fs::perms perms = fs::perms::owner_read | fs::perms::owner_write | fs::perms::group_read |
+                                      fs::perms::others_read) {
         fs::create_directories(path.parent_path());
         std::ofstream ofs(path, std::ios::binary);
         ofs << content;
@@ -85,8 +87,8 @@ TEST_F(ArchiveTest, PermissionPreservation_0755) {
     auto source_dir = temp_dir_ / "perms";
     auto script_path = source_dir / "run.sh";
     write_file(script_path, "#!/bin/bash\necho hello",
-               fs::perms::owner_all | fs::perms::group_read | fs::perms::group_exec |
-               fs::perms::others_read | fs::perms::others_exec);
+               fs::perms::owner_all | fs::perms::group_read | fs::perms::group_exec | fs::perms::others_read |
+                   fs::perms::others_exec);
 
     auto archive_path = temp_dir_ / "perms.tar.zst";
 
@@ -103,8 +105,7 @@ TEST_F(ArchiveTest, PermissionPreservation_0644) {
     auto source_dir = temp_dir_ / "perms644";
     auto config_path = source_dir / "config.yml";
     write_file(config_path, "key: value",
-               fs::perms::owner_read | fs::perms::owner_write |
-               fs::perms::group_read | fs::perms::others_read);
+               fs::perms::owner_read | fs::perms::owner_write | fs::perms::group_read | fs::perms::others_read);
 
     auto archive_path = temp_dir_ / "perms644.tar.zst";
 
@@ -182,8 +183,7 @@ TEST_F(ArchiveTest, DoubleFinalize_IsNoOp) {
 TEST_F(ArchiveTest, ProgressCallback_IsCalled) {
     auto source_dir = temp_dir_ / "progress";
     for (int i = 0; i < 5; ++i) {
-        write_file(source_dir / ("file" + std::to_string(i) + ".txt"),
-                   std::string(100, static_cast<char>('A' + i)));
+        write_file(source_dir / ("file" + std::to_string(i) + ".txt"), std::string(100, static_cast<char>('A' + i)));
     }
 
     auto archive_path = temp_dir_ / "progress.tar.zst";
@@ -205,4 +205,4 @@ TEST_F(ArchiveTest, ProgressCallback_IsCalled) {
     EXPECT_GT(callback_count, 0) << "Progress callback should have been called at least once";
 }
 
-} // anonymous namespace
+}  // anonymous namespace

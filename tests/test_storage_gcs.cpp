@@ -3,6 +3,9 @@
  * @brief Google Cloud Storage HMAC signing tests.
  */
 
+#include "crypto/hmac.hpp"
+#include "crypto/sha256.hpp"
+
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -12,9 +15,6 @@
 #include <string>
 #include <utility>
 #include <vector>
-
-#include "crypto/hmac.hpp"
-#include "crypto/sha256.hpp"
 
 namespace {
 
@@ -43,14 +43,9 @@ std::string payload_hash(std::span<const uint8_t> payload) {
     return surge::crypto::sha256_hex(payload);
 }
 
-std::string make_canonical_request(
-    const std::string& method,
-    const std::string& uri,
-    const std::string& query_string,
-    const std::vector<std::pair<std::string, std::string>>& headers,
-    const std::string& signed_headers,
-    const std::string& payload_hash_hex)
-{
+std::string make_canonical_request(const std::string& method, const std::string& uri, const std::string& query_string,
+                                   const std::vector<std::pair<std::string, std::string>>& headers,
+                                   const std::string& signed_headers, const std::string& payload_hash_hex) {
     std::string result;
     result += method + "\n";
     result += uri + "\n";
@@ -66,41 +61,28 @@ std::string make_canonical_request(
     return result;
 }
 
-std::vector<uint8_t> derive_signing_key(
-    const std::string& secret_key,
-    const std::string& datestamp,
-    const std::string& region,
-    const std::string& service = "storage")
-{
+std::vector<uint8_t> derive_signing_key(const std::string& secret_key, const std::string& datestamp,
+                                        const std::string& region, const std::string& service = "storage") {
     // GCS HMAC uses the same key derivation as AWS SigV4
-    auto k_date = surge::crypto::hmac_sha256(
-        to_bytes("GOOG4" + secret_key), to_bytes(datestamp));
+    auto k_date = surge::crypto::hmac_sha256(to_bytes("GOOG4" + secret_key), to_bytes(datestamp));
     auto k_region = surge::crypto::hmac_sha256(k_date, to_bytes(region));
     auto k_service = surge::crypto::hmac_sha256(k_region, to_bytes(service));
     auto k_signing = surge::crypto::hmac_sha256(k_service, to_bytes("goog4_request"));
     return k_signing;
 }
 
-std::string make_string_to_sign(
-    const std::string& timestamp,
-    const std::string& scope,
-    const std::string& canonical_request_hash)
-{
+std::string make_string_to_sign(const std::string& timestamp, const std::string& scope,
+                                const std::string& canonical_request_hash) {
     return "GOOG4-HMAC-SHA256\n" + timestamp + "\n" + scope + "\n" + canonical_request_hash;
 }
 
-std::string make_authorization_header(
-    const std::string& access_key,
-    const std::string& scope,
-    const std::string& signed_headers,
-    const std::string& signature)
-{
-    return "GOOG4-HMAC-SHA256 Credential=" + access_key + "/" + scope +
-           ", SignedHeaders=" + signed_headers +
+std::string make_authorization_header(const std::string& access_key, const std::string& scope,
+                                      const std::string& signed_headers, const std::string& signature) {
+    return "GOOG4-HMAC-SHA256 Credential=" + access_key + "/" + scope + ", SignedHeaders=" + signed_headers +
            ", Signature=" + signature;
 }
 
-} // namespace gcs_sigv4
+}  // namespace gcs_sigv4
 
 // --------------------------------------------------------------------------
 // GCS HMAC Signing Tests
@@ -133,13 +115,8 @@ TEST(GcsHmac, CanonicalRequest_GetObject) {
         {"x-goog-date", "20240101T000000Z"},
     };
 
-    auto canonical = gcs_sigv4::make_canonical_request(
-        "GET",
-        "/my-bucket/my-object",
-        "",
-        headers,
-        "host;x-goog-content-sha256;x-goog-date",
-        p_hash);
+    auto canonical = gcs_sigv4::make_canonical_request("GET", "/my-bucket/my-object", "", headers,
+                                                       "host;x-goog-content-sha256;x-goog-date", p_hash);
 
     EXPECT_TRUE(canonical.find("GET") == 0);
     EXPECT_TRUE(canonical.find("/my-bucket/my-object") != std::string::npos);
@@ -157,13 +134,8 @@ TEST(GcsHmac, CanonicalRequest_PutObject) {
         {"x-goog-date", "20240101T120000Z"},
     };
 
-    auto canonical = gcs_sigv4::make_canonical_request(
-        "PUT",
-        "/my-bucket/uploads/file.bin",
-        "",
-        headers,
-        "content-type;host;x-goog-content-sha256;x-goog-date",
-        p_hash);
+    auto canonical = gcs_sigv4::make_canonical_request("PUT", "/my-bucket/uploads/file.bin", "", headers,
+                                                       "content-type;host;x-goog-content-sha256;x-goog-date", p_hash);
 
     EXPECT_TRUE(canonical.find("PUT") == 0);
     EXPECT_TRUE(canonical.find("application/octet-stream") != std::string::npos);
@@ -188,8 +160,7 @@ TEST(GcsHmac, AuthorizationHeaderFormat) {
     std::string signed_headers = "host;x-goog-content-sha256;x-goog-date";
     std::string signature = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
 
-    auto auth = gcs_sigv4::make_authorization_header(
-        access_key, scope, signed_headers, signature);
+    auto auth = gcs_sigv4::make_authorization_header(access_key, scope, signed_headers, signature);
 
     EXPECT_TRUE(auth.find("GOOG4-HMAC-SHA256") == 0);
     EXPECT_TRUE(auth.find("Credential=GOOGEXAMPLEACCESSKEY/") != std::string::npos);
@@ -215,8 +186,8 @@ TEST(GcsHmac, FullSigningFlow) {
     };
     std::string signed_headers = "host;x-goog-content-sha256;x-goog-date";
 
-    auto canonical = gcs_sigv4::make_canonical_request(
-        "GET", "/bucket/object.txt", "", headers, signed_headers, p_hash);
+    auto canonical =
+        gcs_sigv4::make_canonical_request("GET", "/bucket/object.txt", "", headers, signed_headers, p_hash);
     auto canonical_hash = surge::crypto::sha256_hex(to_bytes(canonical));
 
     // 3. String to sign
@@ -231,8 +202,7 @@ TEST(GcsHmac, FullSigningFlow) {
     EXPECT_EQ(signature.size(), 64u);
 
     // 6. Authorization header
-    auto auth = gcs_sigv4::make_authorization_header(
-        access_key, scope, signed_headers, signature);
+    auto auth = gcs_sigv4::make_authorization_header(access_key, scope, signed_headers, signature);
     EXPECT_TRUE(auth.find("GOOG4-HMAC-SHA256") == 0);
 }
 
@@ -246,4 +216,4 @@ TEST(GcsHmac, DifferentRegions_DifferentKeys) {
     EXPECT_NE(key_auto, key_us);
 }
 
-} // anonymous namespace
+}  // anonymous namespace

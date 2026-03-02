@@ -1,4 +1,5 @@
 #include "platform/pal.hpp"
+
 #include <algorithm>
 #include <cstdlib>
 #include <optional>
@@ -8,9 +9,9 @@
 #ifdef _WIN32
 #include <windows.h>
 #else
-#include <unistd.h>
-#include <sys/sysinfo.h>
 #include <pwd.h>
+#include <sys/sysinfo.h>
+#include <unistd.h>
 #endif
 
 namespace surge::platform {
@@ -42,18 +43,34 @@ Architecture current_arch() noexcept {
 std::string current_rid() {
     std::string os_part;
     switch (current_os()) {
-    case OperatingSystem::Windows: os_part = "win";   break;
-    case OperatingSystem::Linux:   os_part = "linux"; break;
-    case OperatingSystem::MacOS:   os_part = "osx";   break;
-    default:                       os_part = "unknown"; break;
+    case OperatingSystem::Windows:
+        os_part = "win";
+        break;
+    case OperatingSystem::Linux:
+        os_part = "linux";
+        break;
+    case OperatingSystem::MacOS:
+        os_part = "osx";
+        break;
+    default:
+        os_part = "unknown";
+        break;
     }
 
     std::string arch_part;
     switch (current_arch()) {
-    case Architecture::X86_64: arch_part = "x64";   break;
-    case Architecture::Arm64:  arch_part = "arm64"; break;
-    case Architecture::X86:    arch_part = "x86";   break;
-    default:                   arch_part = "unknown"; break;
+    case Architecture::X86_64:
+        arch_part = "x64";
+        break;
+    case Architecture::Arm64:
+        arch_part = "arm64";
+        break;
+    case Architecture::X86:
+        arch_part = "x86";
+        break;
+    default:
+        arch_part = "unknown";
+        break;
     }
 
     return os_part + "-" + arch_part;
@@ -73,7 +90,7 @@ int64_t available_memory() noexcept {
     }
     return 0;
 #else
-    struct sysinfo info {};
+    struct sysinfo info{};
     if (sysinfo(&info) == 0) {
         return static_cast<int64_t>(info.freeram) * static_cast<int64_t>(info.mem_unit);
     }
@@ -84,7 +101,8 @@ int64_t available_memory() noexcept {
 std::filesystem::path temp_dir() {
     std::error_code ec;
     auto tmp = std::filesystem::temp_directory_path(ec);
-    if (ec) return "/tmp";
+    if (ec)
+        return "/tmp";
     return tmp;
 }
 
@@ -116,7 +134,8 @@ std::filesystem::path home_dir() {
 std::optional<std::string> get_env(std::string_view name) {
     std::string name_str(name);
     auto* val = std::getenv(name_str.c_str());
-    if (!val) return std::nullopt;
+    if (!val)
+        return std::nullopt;
     return std::string(val);
 }
 
@@ -130,4 +149,4 @@ bool set_env(std::string_view name, std::string_view value) {
 #endif
 }
 
-} // namespace surge::platform
+}  // namespace surge::platform

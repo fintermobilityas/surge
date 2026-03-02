@@ -3,24 +3,28 @@
  * @brief `surge push` - Upload packages to cloud storage.
  */
 
-#include <cxxopts.hpp>
-#include <spdlog/spdlog.h>
-#include <fmt/format.h>
-#include <filesystem>
-#include <iostream>
-#include <chrono>
-#include <vector>
 #include "config/constants.hpp"
 #include "config/manifest.hpp"
+
+#include <chrono>
+#include <cxxopts.hpp>
+#include <filesystem>
+#include <fmt/format.h>
+#include <iostream>
+#include <spdlog/spdlog.h>
+#include <vector>
 
 namespace fs = std::filesystem;
 
 namespace {
 
 std::string format_size(int64_t bytes) {
-    if (bytes < 1024) return fmt::format("{} B", bytes);
-    if (bytes < 1024 * 1024) return fmt::format("{:.1f} KB", bytes / 1024.0);
-    if (bytes < 1024 * 1024 * 1024) return fmt::format("{:.1f} MB", bytes / (1024.0 * 1024.0));
+    if (bytes < 1024)
+        return fmt::format("{} B", bytes);
+    if (bytes < 1024 * 1024)
+        return fmt::format("{:.1f} KB", bytes / 1024.0);
+    if (bytes < 1024 * 1024 * 1024)
+        return fmt::format("{:.1f} MB", bytes / (1024.0 * 1024.0));
     return fmt::format("{:.2f} GB", bytes / (1024.0 * 1024.0 * 1024.0));
 }
 
@@ -35,18 +39,15 @@ fs::path find_manifest(const std::string& path_override) {
     return {};
 }
 
-} // anonymous namespace
+}  // anonymous namespace
 
 int cmd_push(int argc, char* argv[]) {
     cxxopts::Options options("surge push", "Upload packages to cloud storage");
 
-    options.add_options()
-        ("app", "Application ID", cxxopts::value<std::string>()->default_value(""))
-        ("channel", "Target release channel (required)", cxxopts::value<std::string>())
-        ("version", "Release version to push", cxxopts::value<std::string>()->default_value(""))
-        ("manifest", "Path to surge.yml", cxxopts::value<std::string>()->default_value(""))
-        ("h,help", "Show help")
-    ;
+    options.add_options()("app", "Application ID", cxxopts::value<std::string>()->default_value(""))(
+        "channel", "Target release channel (required)", cxxopts::value<std::string>())(
+        "version", "Release version to push", cxxopts::value<std::string>()->default_value(""))(
+        "manifest", "Path to surge.yml", cxxopts::value<std::string>()->default_value(""))("h,help", "Show help");
 
     auto result = options.parse(argc, argv);
 
@@ -65,8 +66,7 @@ int cmd_push(int argc, char* argv[]) {
     // Locate manifest
     auto manifest_path = find_manifest(result["manifest"].as<std::string>());
     if (manifest_path.empty() || !fs::exists(manifest_path)) {
-        spdlog::error("Cannot find {}. Run 'surge init' first or specify --manifest",
-                       surge::constants::MANIFEST_FILE);
+        spdlog::error("Cannot find {}. Run 'surge init' first or specify --manifest", surge::constants::MANIFEST_FILE);
         return 1;
     }
 
@@ -118,9 +118,8 @@ int cmd_push(int argc, char* argv[]) {
     }
 
     // Locate packages directory
-    fs::path packages_dir = manifest.generic.packages.empty()
-        ? fs::path(surge::constants::PACKAGES_DIR)
-        : fs::path(manifest.generic.packages);
+    fs::path packages_dir = manifest.generic.packages.empty() ? fs::path(surge::constants::PACKAGES_DIR)
+                                                              : fs::path(manifest.generic.packages);
 
     if (!fs::exists(packages_dir) || !fs::is_directory(packages_dir)) {
         spdlog::error("Packages directory not found: {}. Run 'surge pack' first.", packages_dir.string());
@@ -168,10 +167,7 @@ int cmd_push(int argc, char* argv[]) {
     for (size_t i = 0; i < package_files.size(); ++i) {
         const auto& pkg = package_files[i];
         auto file_size = fs::file_size(pkg);
-        spdlog::info("  [{}/{}] {} ({})",
-                     i + 1, package_files.size(),
-                     pkg.filename().string(),
-                     format_size(file_size));
+        spdlog::info("  [{}/{}] {} ({})", i + 1, package_files.size(), pkg.filename().string(), format_size(file_size));
 
         // TODO: Integrate with storage backend.
         // std::string key = fmt::format("{}/{}/{}/{}",

@@ -3,6 +3,8 @@
  * @brief Tests for binary diff and patch round-trip operations.
  */
 
+#include "surge/surge_api.h"
+
 #include <gtest/gtest.h>
 
 #include <cstdint>
@@ -10,14 +12,11 @@
 #include <numeric>
 #include <vector>
 
-#include "surge/surge_api.h"
-
 namespace {
 
 class BsdiffTest : public ::testing::Test {
 protected:
-    void verify_round_trip(const std::vector<uint8_t>& old_data,
-                           const std::vector<uint8_t>& new_data) {
+    void verify_round_trip(const std::vector<uint8_t>& old_data, const std::vector<uint8_t>& new_data) {
         // Create diff
         surge_bsdiff_ctx diff_ctx{};
         diff_ctx.older = old_data.data();
@@ -119,14 +118,14 @@ TEST_F(BsdiffTest, LargerFiles_RoundTrip) {
 TEST_F(BsdiffTest, SizeIncrease_RoundTrip) {
     std::vector<uint8_t> old_data = {'s', 'h', 'o', 'r', 't'};
     std::vector<uint8_t> new_data = {'m', 'u', 'c', 'h', ' ', 'l', 'o', 'n', 'g', 'e', 'r',
-                                      ' ', 'd', 'a', 't', 'a', ' ', 'h', 'e', 'r', 'e'};
+                                     ' ', 'd', 'a', 't', 'a', ' ', 'h', 'e', 'r', 'e'};
 
     verify_round_trip(old_data, new_data);
 }
 
 TEST_F(BsdiffTest, SizeDecrease_RoundTrip) {
-    std::vector<uint8_t> old_data = {'l', 'o', 'n', 'g', 'e', 'r', ' ', 'o', 'r',
-                                      'i', 'g', 'i', 'n', 'a', 'l', ' ', 'f', 'i', 'l', 'e'};
+    std::vector<uint8_t> old_data = {'l', 'o', 'n', 'g', 'e', 'r', ' ', 'o', 'r', 'i',
+                                     'g', 'i', 'n', 'a', 'l', ' ', 'f', 'i', 'l', 'e'};
     std::vector<uint8_t> new_data = {'s', 'm', 'a', 'l', 'l'};
 
     verify_round_trip(old_data, new_data);
@@ -148,4 +147,4 @@ TEST_F(BsdiffTest, FreeNullContext_NoOp) {
     surge_bspatch_free(&patch_ctx);
 }
 
-} // anonymous namespace
+}  // anonymous namespace

@@ -3,6 +3,8 @@
  * @brief Supervisor process management tests.
  */
 
+#include "surge/surge_api.h"
+
 #include <gtest/gtest.h>
 
 #include <csignal>
@@ -10,8 +12,6 @@
 #include <fstream>
 #include <string>
 #include <vector>
-
-#include "surge/surge_api.h"
 
 namespace fs = std::filesystem;
 
@@ -39,42 +39,23 @@ protected:
 };
 
 TEST_F(SupervisorTest, SupervisorStart_NullExePath_ReturnsError) {
-    surge_result result = surge_supervisor_start(
-        nullptr,
-        temp_dir_.c_str(),
-        "test-supervisor",
-        0,
-        nullptr);
+    surge_result result = surge_supervisor_start(nullptr, temp_dir_.c_str(), "test-supervisor", 0, nullptr);
     EXPECT_EQ(result, SURGE_ERROR);
 }
 
 TEST_F(SupervisorTest, SupervisorStart_NullWorkingDir_ReturnsError) {
-    surge_result result = surge_supervisor_start(
-        "/usr/bin/test",
-        nullptr,
-        "test-supervisor",
-        0,
-        nullptr);
+    surge_result result = surge_supervisor_start("/usr/bin/test", nullptr, "test-supervisor", 0, nullptr);
     EXPECT_EQ(result, SURGE_ERROR);
 }
 
 TEST_F(SupervisorTest, SupervisorStart_NullSupervisorId_ReturnsError) {
-    surge_result result = surge_supervisor_start(
-        "/usr/bin/test",
-        temp_dir_.c_str(),
-        nullptr,
-        0,
-        nullptr);
+    surge_result result = surge_supervisor_start("/usr/bin/test", temp_dir_.c_str(), nullptr, 0, nullptr);
     EXPECT_EQ(result, SURGE_ERROR);
 }
 
 TEST_F(SupervisorTest, SupervisorStart_NonExistentExe_ReturnsError) {
-    surge_result result = surge_supervisor_start(
-        "/nonexistent/path/to/binary",
-        temp_dir_.c_str(),
-        "test-supervisor",
-        0,
-        nullptr);
+    surge_result result =
+        surge_supervisor_start("/nonexistent/path/to/binary", temp_dir_.c_str(), "test-supervisor", 0, nullptr);
     EXPECT_EQ(result, SURGE_ERROR);
 }
 
@@ -88,12 +69,7 @@ TEST_F(SupervisorTest, SupervisorStart_WithArguments) {
 
     // Note: This may or may not succeed depending on the environment.
     // We primarily test that the API handles arguments correctly.
-    surge_result result = surge_supervisor_start(
-        script_path.c_str(),
-        temp_dir_.c_str(),
-        "test-supervisor",
-        3,
-        args);
+    surge_result result = surge_supervisor_start(script_path.c_str(), temp_dir_.c_str(), "test-supervisor", 3, args);
 
     // Result may be OK or ERROR depending on implementation state
     // The important thing is it doesn't crash
@@ -105,12 +81,8 @@ TEST_F(SupervisorTest, SupervisorStart_ZeroArgs) {
     write_file(script_path, "#!/bin/bash\ntrue\n");
     fs::permissions(script_path, fs::perms::owner_all);
 
-    surge_result result = surge_supervisor_start(
-        script_path.c_str(),
-        temp_dir_.c_str(),
-        "no-args-supervisor",
-        0,
-        nullptr);
+    surge_result result =
+        surge_supervisor_start(script_path.c_str(), temp_dir_.c_str(), "no-args-supervisor", 0, nullptr);
 
     EXPECT_TRUE(result == SURGE_OK || result == SURGE_ERROR);
 }
@@ -138,8 +110,7 @@ TEST(SupervisorId, UniquePerApp) {
 
 TEST(ProcessEvents, NullCallbacks_NoOp) {
     // Calling process_events with no callbacks should not crash
-    surge_result result = surge_process_events(
-        0, nullptr, nullptr, nullptr, nullptr, nullptr);
+    surge_result result = surge_process_events(0, nullptr, nullptr, nullptr, nullptr, nullptr);
 
     // May return OK or ERROR depending on args validation
     EXPECT_TRUE(result == SURGE_OK || result == SURGE_ERROR);
@@ -150,15 +121,9 @@ TEST(ProcessEvents, WithCallbacks) {
     [[maybe_unused]] static bool installed_called = false;
     [[maybe_unused]] static bool updated_called = false;
 
-    surge_event_callback on_first_run = [](const char*, void*) {
-        first_run_called = true;
-    };
-    surge_event_callback on_installed = [](const char*, void*) {
-        installed_called = true;
-    };
-    surge_event_callback on_updated = [](const char*, void*) {
-        updated_called = true;
-    };
+    surge_event_callback on_first_run = [](const char*, void*) { first_run_called = true; };
+    surge_event_callback on_installed = [](const char*, void*) { installed_called = true; };
+    surge_event_callback on_updated = [](const char*, void*) { updated_called = true; };
 
     const char* args[] = {"testapp"};
 
@@ -201,4 +166,4 @@ TEST(SupervisorArgs, ArgcArgvConversion) {
     EXPECT_STREQ(argv[2], "arg3");
 }
 
-} // anonymous namespace
+}  // anonymous namespace

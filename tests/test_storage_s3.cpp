@@ -3,6 +3,9 @@
  * @brief AWS SigV4 signing tests using known test vectors from AWS documentation.
  */
 
+#include "crypto/hmac.hpp"
+#include "crypto/sha256.hpp"
+
 #include <gtest/gtest.h>
 
 #include <cstdint>
@@ -11,9 +14,6 @@
 #include <string>
 #include <utility>
 #include <vector>
-
-#include "crypto/sha256.hpp"
-#include "crypto/hmac.hpp"
 
 namespace {
 
@@ -39,14 +39,9 @@ std::string payload_hash(std::span<const uint8_t> payload) {
     return surge::crypto::sha256_hex(payload);
 }
 
-std::string make_canonical_request(
-    const std::string& method,
-    const std::string& uri,
-    const std::string& query_string,
-    const std::vector<std::pair<std::string, std::string>>& headers,
-    const std::string& signed_headers,
-    const std::string& payload_hash_hex)
-{
+std::string make_canonical_request(const std::string& method, const std::string& uri, const std::string& query_string,
+                                   const std::vector<std::pair<std::string, std::string>>& headers,
+                                   const std::string& signed_headers, const std::string& payload_hash_hex) {
     std::string result;
     result += method + "\n";
     result += uri + "\n";
@@ -62,41 +57,27 @@ std::string make_canonical_request(
     return result;
 }
 
-std::string make_string_to_sign(
-    const std::string& algorithm,
-    const std::string& timestamp,
-    const std::string& scope,
-    const std::string& canonical_request_hash)
-{
+std::string make_string_to_sign(const std::string& algorithm, const std::string& timestamp, const std::string& scope,
+                                const std::string& canonical_request_hash) {
     return algorithm + "\n" + timestamp + "\n" + scope + "\n" + canonical_request_hash;
 }
 
-std::vector<uint8_t> derive_signing_key(
-    const std::string& secret_key,
-    const std::string& datestamp,
-    const std::string& region,
-    const std::string& service)
-{
-    auto k_date = surge::crypto::hmac_sha256(
-        to_bytes("AWS4" + secret_key), to_bytes(datestamp));
+std::vector<uint8_t> derive_signing_key(const std::string& secret_key, const std::string& datestamp,
+                                        const std::string& region, const std::string& service) {
+    auto k_date = surge::crypto::hmac_sha256(to_bytes("AWS4" + secret_key), to_bytes(datestamp));
     auto k_region = surge::crypto::hmac_sha256(k_date, to_bytes(region));
     auto k_service = surge::crypto::hmac_sha256(k_region, to_bytes(service));
     auto k_signing = surge::crypto::hmac_sha256(k_service, to_bytes("aws4_request"));
     return k_signing;
 }
 
-std::string make_authorization_header(
-    const std::string& access_key,
-    const std::string& scope,
-    const std::string& signed_headers,
-    const std::string& signature)
-{
-    return "AWS4-HMAC-SHA256 Credential=" + access_key + "/" + scope +
-           ", SignedHeaders=" + signed_headers +
+std::string make_authorization_header(const std::string& access_key, const std::string& scope,
+                                      const std::string& signed_headers, const std::string& signature) {
+    return "AWS4-HMAC-SHA256 Credential=" + access_key + "/" + scope + ", SignedHeaders=" + signed_headers +
            ", Signature=" + signature;
 }
 
-} // namespace sigv4
+}  // namespace sigv4
 
 // --------------------------------------------------------------------------
 // AWS SigV4 Test Vectors
@@ -115,13 +96,13 @@ TEST(AwsSigV4, CanonicalRequestConstruction) {
     std::string signed_headers = "host;x-amz-content-sha256;x-amz-date";
     std::string payload_hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
-    auto canonical = sigv4::make_canonical_request(
-        method, uri, query_string, headers, signed_headers, payload_hash);
+    auto canonical = sigv4::make_canonical_request(method, uri, query_string, headers, signed_headers, payload_hash);
 
     // Verify structure: 7 lines minimum (method, uri, query, headers..., blank, signed_headers, payload)
     int newline_count = 0;
     for (char c : canonical)
-        if (c == '\n') newline_count++;
+        if (c == '\n')
+            newline_count++;
     EXPECT_GE(newline_count, 6);
 
     // Verify starts with method
@@ -145,7 +126,8 @@ TEST(AwsSigV4, StringToSign) {
     // Should have 4 lines
     int newline_count = 0;
     for (char c : sts)
-        if (c == '\n') newline_count++;
+        if (c == '\n')
+            newline_count++;
     EXPECT_EQ(newline_count, 3);
 
     EXPECT_EQ(sts.substr(0, 16), "AWS4-HMAC-SHA256");
@@ -178,8 +160,7 @@ TEST(AwsSigV4, AuthorizationHeaderFormat) {
     std::string signed_headers = "host;x-amz-content-sha256;x-amz-date";
     std::string signature = "aaaaaabbbbbbccccccddddddeeeeee0000001111";
 
-    auto auth = sigv4::make_authorization_header(
-        access_key, scope, signed_headers, signature);
+    auto auth = sigv4::make_authorization_header(access_key, scope, signed_headers, signature);
 
     // Verify format
     EXPECT_TRUE(auth.find("AWS4-HMAC-SHA256") != std::string::npos);
@@ -223,8 +204,7 @@ TEST(AwsSigV4, FullSigningFlow) {
     };
     std::string signed_headers = "host;x-amz-content-sha256;x-amz-date";
 
-    auto canonical = sigv4::make_canonical_request(
-        "GET", "/test.txt", "", headers, signed_headers, p_hash);
+    auto canonical = sigv4::make_canonical_request("GET", "/test.txt", "", headers, signed_headers, p_hash);
     auto canonical_hash = surge::crypto::sha256_hex(to_bytes(canonical));
 
     // 3. String to sign
@@ -243,4 +223,4 @@ TEST(AwsSigV4, FullSigningFlow) {
     EXPECT_TRUE(auth.find("AWS4-HMAC-SHA256") == 0);
 }
 
-} // anonymous namespace
+}  // anonymous namespace

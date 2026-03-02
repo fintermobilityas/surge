@@ -3,6 +3,9 @@
  * @brief SHA-256 and HMAC-SHA256 tests against known test vectors.
  */
 
+#include "crypto/hmac.hpp"
+#include "crypto/sha256.hpp"
+
 #include <gtest/gtest.h>
 
 #include <cstdint>
@@ -11,9 +14,6 @@
 #include <span>
 #include <string>
 #include <vector>
-
-#include "crypto/sha256.hpp"
-#include "crypto/hmac.hpp"
 
 namespace {
 
@@ -171,4 +171,4 @@ TEST(HMAC_SHA256, EmptyData) {
     EXPECT_EQ(result.size(), 64u);
 }
 
-} // anonymous namespace
+}  // anonymous namespace

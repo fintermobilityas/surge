@@ -3,6 +3,9 @@
  * @brief Package builder tests with temp directories.
  */
 
+#include "config/constants.hpp"
+#include "config/manifest.hpp"
+
 #include <gtest/gtest.h>
 
 #include <cstdint>
@@ -10,9 +13,6 @@
 #include <fstream>
 #include <string>
 #include <vector>
-
-#include "config/manifest.hpp"
-#include "config/constants.hpp"
 
 namespace fs = std::filesystem;
 
@@ -70,8 +70,7 @@ protected:
 TEST_F(PackTest, ManifestForPack_IsValid) {
     auto manifest = create_test_manifest();
     auto issues = surge::config::validate_manifest(manifest);
-    EXPECT_TRUE(issues.empty())
-        << "Test manifest should be valid: " << (issues.empty() ? "" : issues[0]);
+    EXPECT_TRUE(issues.empty()) << "Test manifest should be valid: " << (issues.empty() ? "" : issues[0]);
 }
 
 TEST_F(PackTest, PrepareDirectories) {
@@ -102,7 +101,8 @@ TEST_F(PackTest, ArtifactLayout) {
     // Count files
     int file_count = 0;
     for (auto& entry : fs::recursive_directory_iterator(artifacts_dir)) {
-        if (entry.is_regular_file()) file_count++;
+        if (entry.is_regular_file())
+            file_count++;
     }
     EXPECT_EQ(file_count, 3);
 }
@@ -191,4 +191,4 @@ TEST_F(PackTest, MultipleAppManifest) {
     EXPECT_EQ(manifest.apps.size(), 3u);
 }
 
-} // anonymous namespace
+}  // anonymous namespace

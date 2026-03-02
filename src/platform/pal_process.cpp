@@ -1,27 +1,25 @@
 #include "platform/pal_process.hpp"
-#include <spdlog/spdlog.h>
+
 #include <cerrno>
 #include <cstring>
+#include <spdlog/spdlog.h>
 
 #ifdef _WIN32
-#include <windows.h>
 #include <tlhelp32.h>
+#include <windows.h>
 #else
-#include <unistd.h>
-#include <sys/wait.h>
 #include <signal.h>
 #include <spawn.h>
+#include <sys/wait.h>
+#include <unistd.h>
 extern char** environ;
 #endif
 
 namespace surge::platform {
 
-std::optional<ProcessHandle> spawn_process(
-    const std::filesystem::path& exe_path,
-    const std::vector<std::string>& args,
-    const std::filesystem::path& working_dir,
-    const std::vector<std::string>& env) {
-
+std::optional<ProcessHandle> spawn_process(const std::filesystem::path& exe_path, const std::vector<std::string>& args,
+                                           const std::filesystem::path& working_dir,
+                                           const std::vector<std::string>& env) {
 #ifdef _WIN32
     // Build command line
     std::wstring cmd_line = L"\"" + exe_path.wstring() + L"\"";
@@ -52,19 +50,11 @@ std::optional<ProcessHandle> spawn_process(
     }
 
     BOOL ok = CreateProcessW(
-        nullptr,
-        cmd_line.data(),
-        nullptr, nullptr,
-        FALSE,
-        CREATE_NEW_PROCESS_GROUP | CREATE_UNICODE_ENVIRONMENT,
-        env_block.empty() ? nullptr : env_block.data(),
-        work_dir.empty() ? nullptr : work_dir.c_str(),
-        &si, &pi
-    );
+        nullptr, cmd_line.data(), nullptr, nullptr, FALSE, CREATE_NEW_PROCESS_GROUP | CREATE_UNICODE_ENVIRONMENT,
+        env_block.empty() ? nullptr : env_block.data(), work_dir.empty() ? nullptr : work_dir.c_str(), &si, &pi);
 
     if (!ok) {
-        spdlog::error("CreateProcess failed for '{}': error {}",
-                      exe_path.string(), GetLastError());
+        spdlog::error("CreateProcess failed for '{}': error {}", exe_path.string(), GetLastError());
         return std::nullopt;
     }
 
@@ -108,8 +98,7 @@ std::optional<ProcessHandle> spawn_process(
             for (const auto& e : env) {
                 auto pos = e.find('=');
                 if (pos != std::string::npos) {
-                    setenv(e.substr(0, pos).c_str(),
-                           e.substr(pos + 1).c_str(), 1);
+                    setenv(e.substr(0, pos).c_str(), e.substr(pos + 1).c_str(), 1);
                 }
             }
 
@@ -128,8 +117,7 @@ std::optional<ProcessHandle> spawn_process(
 
     // Simple case: use posix_spawn
     pid_t pid = 0;
-    int rc = posix_spawn(&pid, exe_path.c_str(), nullptr, nullptr,
-                         const_cast<char* const*>(argv.data()), environ);
+    int rc = posix_spawn(&pid, exe_path.c_str(), nullptr, nullptr, const_cast<char* const*>(argv.data()), environ);
     if (rc != 0) {
         spdlog::error("posix_spawn failed for '{}': {}", exe_path.string(), strerror(rc));
         return std::nullopt;
@@ -225,7 +213,8 @@ bool terminate_process(const ProcessHandle& handle) {
         spdlog::debug("Sent SIGTERM to PID {}", handle.pid);
         return true;
     }
-    if (errno == ESRCH) return true; // Already dead
+    if (errno == ESRCH)
+        return true;  // Already dead
     spdlog::warn("kill(SIGTERM) failed for PID {}: {}", handle.pid, strerror(errno));
     return false;
 #endif
@@ -234,8 +223,7 @@ bool terminate_process(const ProcessHandle& handle) {
 bool kill_process(const ProcessHandle& handle) {
 #ifdef _WIN32
     if (!TerminateProcess(handle.handle, 1)) {
-        spdlog::warn("TerminateProcess failed for PID {}: error {}",
-                      handle.pid, GetLastError());
+        spdlog::warn("TerminateProcess failed for PID {}: error {}", handle.pid, GetLastError());
         return false;
     }
     return true;
@@ -245,7 +233,8 @@ bool kill_process(const ProcessHandle& handle) {
         spdlog::debug("Sent SIGKILL to PID {}", handle.pid);
         return true;
     }
-    if (errno == ESRCH) return true;
+    if (errno == ESRCH)
+        return true;
     spdlog::warn("kill(SIGKILL) failed for PID {}: {}", handle.pid, strerror(errno));
     return false;
 #endif
@@ -253,14 +242,18 @@ bool kill_process(const ProcessHandle& handle) {
 
 bool is_process_running(const ProcessHandle& handle) {
 #ifdef _WIN32
-    if (!handle.handle) return false;
+    if (!handle.handle)
+        return false;
     DWORD exit_code = 0;
-    if (!GetExitCodeProcess(handle.handle, &exit_code)) return false;
+    if (!GetExitCodeProcess(handle.handle, &exit_code))
+        return false;
     return exit_code == STILL_ACTIVE;
 #else
     auto pid = static_cast<pid_t>(handle.pid);
-    if (pid <= 0) return false;
-    if (::kill(pid, 0) == 0) return true;
+    if (pid <= 0)
+        return false;
+    if (::kill(pid, 0) == 0)
+        return true;
     return errno != ESRCH;
 #endif
 }
@@ -273,8 +266,7 @@ int64_t current_pid() {
 #endif
 }
 
-int exec_replace(const std::filesystem::path& exe_path,
-                 const std::vector<std::string>& args) {
+int exec_replace(const std::filesystem::path& exe_path, const std::vector<std::string>& args) {
 #ifdef _WIN32
     // Windows doesn't have exec - spawn new process and exit
     auto handle = spawn_process(exe_path, args);
@@ -298,4 +290,4 @@ int exec_replace(const std::filesystem::path& exe_path,
 #endif
 }
 
-} // namespace surge::platform
+}  // namespace surge::platform

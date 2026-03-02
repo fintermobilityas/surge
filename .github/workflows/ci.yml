@@ -8,7 +8,7 @@ on:
 
 jobs:
   dotnet:
-    name: .NET Build and Test
+    name: .NET
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -28,14 +28,14 @@ jobs:
       - name: Check formatting
         run: dotnet format --verify-no-changes --verbosity diagnostic
 
-      - name: Build (warnings as errors)
+      - name: Build
         run: dotnet build --no-restore --configuration Release
 
       - name: Test
         run: dotnet test --no-build --configuration Release --verbosity normal
 
   format-check:
-    name: clang-format Check
+    name: clang-format
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
 
@@ -45,47 +45,84 @@ jobs:
       - name: Install clang-format
         run: sudo apt-get update && sudo apt-get install -y clang-format-18
 
-      - name: Check C++ formatting
+      - name: Check formatting
         run: |
           find src include tests -name '*.cpp' -o -name '*.hpp' -o -name '*.h' | \
             xargs clang-format-18 --dry-run --Werror
 
-  native-linux:
-    name: Linux x64 (GCC 13)
-    runs-on: ubuntu-latest
+  native:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x64 (GCC 13)
+            os: ubuntu-latest
+            triplet: x64-linux
+            cc: gcc-13
+            cxx: g++-13
+            install: sudo apt-get update && sudo apt-get install -y gcc-13 g++-13 ninja-build
+            generator: Ninja
+          - name: Windows x64 (MSVC)
+            os: windows-latest
+            triplet: x64-windows
+            generator: Ninja
+          - name: macOS x64 (AppleClang)
+            os: macos-latest
+            triplet: x64-osx
+            generator: Ninja
 
     env:
-      VCPKG_ROOT: /usr/local/share/vcpkg
       VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.vcpkg-cache
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Create vcpkg binary cache directory
-        run: mkdir -p $VCPKG_DEFAULT_BINARY_CACHE
+      - name: Create vcpkg binary cache
+        run: mkdir -p ${{ github.workspace }}/.vcpkg-cache
+        shell: bash
 
       - name: Cache vcpkg packages
         uses: actions/cache@v4
         with:
           path: .vcpkg-cache
-          key: vcpkg-linux-x64-${{ hashFiles('vcpkg.json') }}
+          key: vcpkg-${{ matrix.triplet }}-${{ hashFiles('vcpkg.json') }}
           restore-keys: |
-            vcpkg-linux-x64-
+            vcpkg-${{ matrix.triplet }}-
 
-      - name: Install build tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-13 g++-13 ninja-build
+      - name: Install build tools (Linux)
+        if: runner.os == 'Linux'
+        run: ${{ matrix.install }}
 
-      - name: Configure (warnings as errors)
+      - name: Setup MSVC (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install Ninja (Windows)
+        if: runner.os == 'Windows'
+        run: choco install ninja -y
+
+      - name: Install Ninja (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+
+      - name: Configure
         run: |
           cmake -B build \
-            -G Ninja \
-            -DCMAKE_C_COMPILER=gcc-13 \
-            -DCMAKE_CXX_COMPILER=g++-13 \
+            -G "${{ matrix.generator }}" \
+            ${{ matrix.cc && format('-DCMAKE_C_COMPILER={0}', matrix.cc) || '' }} \
+            ${{ matrix.cxx && format('-DCMAKE_CXX_COMPILER={0}', matrix.cxx) || '' }} \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_TOOLCHAIN_FILE=$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake \
+            -DCMAKE_TOOLCHAIN_FILE=${{ env.VCPKG_ROOT }}/scripts/buildsystems/vcpkg.cmake \
+            -DVCPKG_TARGET_TRIPLET=${{ matrix.triplet }} \
             -DBUILD_TESTING=ON
+        shell: bash
 
       - name: Build
         run: cmake --build build --parallel

@@ -4,15 +4,17 @@
  */
 
 #include "releases/release_manifest.hpp"
+
 #include "crypto/sha256.hpp"
-#include <yaml-cpp/yaml.h>
-#include <spdlog/spdlog.h>
-#include <fmt/format.h>
-#include <zstd.h>
+
 #include <algorithm>
 #include <charconv>
+#include <fmt/format.h>
+#include <spdlog/spdlog.h>
 #include <sstream>
 #include <stdexcept>
+#include <yaml-cpp/yaml.h>
+#include <zstd.h>
 
 namespace surge::releases {
 
@@ -25,7 +27,8 @@ std::vector<int> parse_version_parts(const std::string& version) {
     while (!sv.empty()) {
         int value = 0;
         auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), value);
-        if (ec != std::errc{}) break;
+        if (ec != std::errc{})
+            break;
         parts.push_back(value);
         sv = std::string_view(ptr, sv.data() + sv.size() - ptr);
         if (!sv.empty() && sv.front() == '.') {
@@ -35,7 +38,7 @@ std::vector<int> parse_version_parts(const std::string& version) {
     return parts;
 }
 
-} // anonymous namespace
+}  // anonymous namespace
 
 int compare_versions(const std::string& a, const std::string& b) {
     auto parts_a = parse_version_parts(a);
@@ -46,8 +49,10 @@ int compare_versions(const std::string& a, const std::string& b) {
     parts_b.resize(max_len, 0);
 
     for (size_t i = 0; i < max_len; ++i) {
-        if (parts_a[i] < parts_b[i]) return -1;
-        if (parts_a[i] > parts_b[i]) return 1;
+        if (parts_a[i] < parts_b[i])
+            return -1;
+        if (parts_a[i] > parts_b[i])
+            return 1;
     }
     return 0;
 }
@@ -58,20 +63,30 @@ ReleaseIndex parse_release_index(const std::vector<uint8_t>& yaml_data) {
     std::string yaml_str(reinterpret_cast<const char*>(yaml_data.data()), yaml_data.size());
     YAML::Node doc = YAML::Load(yaml_str);
 
-    if (doc["app_id"]) index.app_id = doc["app_id"].as<std::string>();
-    if (doc["pack_id"]) index.pack_id = doc["pack_id"].as<std::string>();
-    if (doc["schema"]) index.schema = doc["schema"].as<int>();
-    if (doc["last_write_utc"]) index.last_write_utc = doc["last_write_utc"].as<std::string>();
+    if (doc["app_id"])
+        index.app_id = doc["app_id"].as<std::string>();
+    if (doc["pack_id"])
+        index.pack_id = doc["pack_id"].as<std::string>();
+    if (doc["schema"])
+        index.schema = doc["schema"].as<int>();
+    if (doc["last_write_utc"])
+        index.last_write_utc = doc["last_write_utc"].as<std::string>();
 
     if (doc["releases"] && doc["releases"].IsSequence()) {
         for (const auto& rel_node : doc["releases"]) {
             ReleaseEntry entry;
-            if (rel_node["version"]) entry.version = rel_node["version"].as<std::string>();
-            if (rel_node["os"]) entry.os = rel_node["os"].as<std::string>();
-            if (rel_node["rid"]) entry.rid = rel_node["rid"].as<std::string>();
-            if (rel_node["is_genesis"]) entry.is_genesis = rel_node["is_genesis"].as<bool>();
-            if (rel_node["created_utc"]) entry.created_utc = rel_node["created_utc"].as<std::string>();
-            if (rel_node["release_notes"]) entry.release_notes = rel_node["release_notes"].as<std::string>();
+            if (rel_node["version"])
+                entry.version = rel_node["version"].as<std::string>();
+            if (rel_node["os"])
+                entry.os = rel_node["os"].as<std::string>();
+            if (rel_node["rid"])
+                entry.rid = rel_node["rid"].as<std::string>();
+            if (rel_node["is_genesis"])
+                entry.is_genesis = rel_node["is_genesis"].as<bool>();
+            if (rel_node["created_utc"])
+                entry.created_utc = rel_node["created_utc"].as<std::string>();
+            if (rel_node["release_notes"])
+                entry.release_notes = rel_node["release_notes"].as<std::string>();
 
             if (rel_node["channels"] && rel_node["channels"].IsSequence()) {
                 for (const auto& ch : rel_node["channels"]) {
@@ -79,13 +94,19 @@ ReleaseIndex parse_release_index(const std::vector<uint8_t>& yaml_data) {
                 }
             }
 
-            if (rel_node["full_filename"]) entry.full_filename = rel_node["full_filename"].as<std::string>();
-            if (rel_node["full_size"]) entry.full_size = rel_node["full_size"].as<int64_t>();
-            if (rel_node["full_sha256"]) entry.full_sha256 = rel_node["full_sha256"].as<std::string>();
+            if (rel_node["full_filename"])
+                entry.full_filename = rel_node["full_filename"].as<std::string>();
+            if (rel_node["full_size"])
+                entry.full_size = rel_node["full_size"].as<int64_t>();
+            if (rel_node["full_sha256"])
+                entry.full_sha256 = rel_node["full_sha256"].as<std::string>();
 
-            if (rel_node["delta_filename"]) entry.delta_filename = rel_node["delta_filename"].as<std::string>();
-            if (rel_node["delta_size"]) entry.delta_size = rel_node["delta_size"].as<int64_t>();
-            if (rel_node["delta_sha256"]) entry.delta_sha256 = rel_node["delta_sha256"].as<std::string>();
+            if (rel_node["delta_filename"])
+                entry.delta_filename = rel_node["delta_filename"].as<std::string>();
+            if (rel_node["delta_size"])
+                entry.delta_size = rel_node["delta_size"].as<int64_t>();
+            if (rel_node["delta_sha256"])
+                entry.delta_sha256 = rel_node["delta_sha256"].as<std::string>();
 
             index.releases.push_back(std::move(entry));
         }
@@ -143,27 +164,22 @@ std::vector<uint8_t> serialize_release_index(const ReleaseIndex& index) {
     return {yaml_str.begin(), yaml_str.end()};
 }
 
-std::vector<uint8_t> compress_release_index(const ReleaseIndex& index,
-                                             int zstd_level) {
+std::vector<uint8_t> compress_release_index(const ReleaseIndex& index, int zstd_level) {
     auto yaml_data = serialize_release_index(index);
 
     size_t bound = ZSTD_compressBound(yaml_data.size());
     std::vector<uint8_t> compressed(bound);
 
-    size_t compressed_size = ZSTD_compress(
-        compressed.data(), compressed.size(),
-        yaml_data.data(), yaml_data.size(),
-        zstd_level);
+    size_t compressed_size =
+        ZSTD_compress(compressed.data(), compressed.size(), yaml_data.data(), yaml_data.size(), zstd_level);
 
     if (ZSTD_isError(compressed_size)) {
-        throw std::runtime_error(fmt::format("Zstd compression failed: {}",
-                                              ZSTD_getErrorName(compressed_size)));
+        throw std::runtime_error(fmt::format("Zstd compression failed: {}", ZSTD_getErrorName(compressed_size)));
     }
 
     compressed.resize(compressed_size);
-    spdlog::debug("Compressed release index: {} -> {} bytes ({:.1f}%)",
-                   yaml_data.size(), compressed_size,
-                   100.0 * static_cast<double>(compressed_size) / static_cast<double>(yaml_data.size()));
+    spdlog::debug("Compressed release index: {} -> {} bytes ({:.1f}%)", yaml_data.size(), compressed_size,
+                  100.0 * static_cast<double>(compressed_size) / static_cast<double>(yaml_data.size()));
     return compressed;
 }
 
@@ -179,24 +195,18 @@ ReleaseIndex decompress_release_index(std::span<const uint8_t> compressed) {
     }
 
     std::vector<uint8_t> decompressed(decompressed_size);
-    size_t actual = ZSTD_decompress(
-        decompressed.data(), decompressed.size(),
-        compressed.data(), compressed.size());
+    size_t actual = ZSTD_decompress(decompressed.data(), decompressed.size(), compressed.data(), compressed.size());
 
     if (ZSTD_isError(actual)) {
-        throw std::runtime_error(fmt::format("Zstd decompression failed: {}",
-                                              ZSTD_getErrorName(actual)));
+        throw std::runtime_error(fmt::format("Zstd decompression failed: {}", ZSTD_getErrorName(actual)));
     }
 
     decompressed.resize(actual);
     return parse_release_index(decompressed);
 }
 
-std::vector<ReleaseEntry> get_releases_newer_than(
-    const ReleaseIndex& index,
-    const std::string& version,
-    const std::string& channel)
-{
+std::vector<ReleaseEntry> get_releases_newer_than(const ReleaseIndex& index, const std::string& version,
+                                                  const std::string& channel) {
     std::vector<ReleaseEntry> newer;
 
     for (auto& rel : index.releases) {
@@ -204,9 +214,13 @@ std::vector<ReleaseEntry> get_releases_newer_than(
         if (!channel.empty()) {
             bool on_channel = false;
             for (auto& ch : rel.channels) {
-                if (ch == channel) { on_channel = true; break; }
+                if (ch == channel) {
+                    on_channel = true;
+                    break;
+                }
             }
-            if (!on_channel) continue;
+            if (!on_channel)
+                continue;
         }
         if (compare_versions(rel.version, version) > 0) {
             newer.push_back(rel);
@@ -215,33 +229,29 @@ std::vector<ReleaseEntry> get_releases_newer_than(
 
     // Sort by version ascending
     std::sort(newer.begin(), newer.end(),
-              [](const ReleaseEntry& a, const ReleaseEntry& b) {
-                  return compare_versions(a.version, b.version) < 0;
-              });
+              [](const ReleaseEntry& a, const ReleaseEntry& b) { return compare_versions(a.version, b.version) < 0; });
 
     return newer;
 }
 
-std::vector<ReleaseEntry> get_delta_chain(
-    const ReleaseIndex& index,
-    const std::string& from_version,
-    const std::string& to_version,
-    const std::string& channel)
-{
+std::vector<ReleaseEntry> get_delta_chain(const ReleaseIndex& index, const std::string& from_version,
+                                          const std::string& to_version, const std::string& channel) {
     std::vector<ReleaseEntry> chain;
 
     // Get all versions between current and target
     auto newer = get_releases_newer_than(index, from_version, channel);
 
     for (auto& rel : newer) {
-        if (compare_versions(rel.version, to_version) > 0) break;
+        if (compare_versions(rel.version, to_version) > 0)
+            break;
 
         chain.push_back(rel);
 
-        if (rel.version == to_version) break;
+        if (rel.version == to_version)
+            break;
     }
 
     return chain;
 }
 
-} // namespace surge::releases
+}  // namespace surge::releases

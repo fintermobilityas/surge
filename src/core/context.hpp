@@ -5,12 +5,12 @@
 
 #pragma once
 
+#include "surge/surge_api.h"
+
 #include <memory>
 #include <optional>
 #include <stop_token>
 #include <string>
-
-#include "surge/surge_api.h"
 
 namespace surge {
 
@@ -78,4 +78,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-} // namespace surge
+}  // namespace surge

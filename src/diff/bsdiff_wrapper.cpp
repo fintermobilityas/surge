@@ -15,14 +15,13 @@ extern "C" {
 #include "bsdiff.h"
 }
 
-#include <spdlog/spdlog.h>
 #include <cstring>
+#include <spdlog/spdlog.h>
 #include <stdexcept>
 
 namespace surge::diff {
 
-DiffResult bsdiff(std::span<const uint8_t> old_data,
-                  std::span<const uint8_t> new_data) {
+DiffResult bsdiff(std::span<const uint8_t> old_data, std::span<const uint8_t> new_data) {
     DiffResult result;
 
     struct bsdiff_stream oldfile = {};
@@ -31,28 +30,22 @@ DiffResult bsdiff(std::span<const uint8_t> old_data,
     struct bsdiff_ctx ctx = {};
     struct bsdiff_patch_packer packer = {};
 
-    int ret = bsdiff_open_memory_stream(BSDIFF_MODE_READ,
-        old_data.data(), old_data.size(), &oldfile);
+    int ret = bsdiff_open_memory_stream(BSDIFF_MODE_READ, old_data.data(), old_data.size(), &oldfile);
     if (ret != BSDIFF_SUCCESS) {
-        throw std::runtime_error(
-            fmt::format("bsdiff: failed to open old stream: {}", ret));
+        throw std::runtime_error(fmt::format("bsdiff: failed to open old stream: {}", ret));
     }
 
-    ret = bsdiff_open_memory_stream(BSDIFF_MODE_READ,
-        new_data.data(), new_data.size(), &newfile);
+    ret = bsdiff_open_memory_stream(BSDIFF_MODE_READ, new_data.data(), new_data.size(), &newfile);
     if (ret != BSDIFF_SUCCESS) {
         bsdiff_close_stream(&oldfile);
-        throw std::runtime_error(
-            fmt::format("bsdiff: failed to open new stream: {}", ret));
+        throw std::runtime_error(fmt::format("bsdiff: failed to open new stream: {}", ret));
     }
 
-    ret = bsdiff_open_memory_stream(BSDIFF_MODE_WRITE,
-        nullptr, 0, &patchfile);
+    ret = bsdiff_open_memory_stream(BSDIFF_MODE_WRITE, nullptr, 0, &patchfile);
     if (ret != BSDIFF_SUCCESS) {
         bsdiff_close_stream(&newfile);
         bsdiff_close_stream(&oldfile);
-        throw std::runtime_error(
-            fmt::format("bsdiff: failed to open patch stream: {}", ret));
+        throw std::runtime_error(fmt::format("bsdiff: failed to open patch stream: {}", ret));
     }
 
     ret = bsdiff_open_bz2_patch_packer(BSDIFF_MODE_WRITE, &patchfile, &packer);
@@ -60,8 +53,7 @@ DiffResult bsdiff(std::span<const uint8_t> old_data,
         bsdiff_close_stream(&patchfile);
         bsdiff_close_stream(&newfile);
         bsdiff_close_stream(&oldfile);
-        throw std::runtime_error(
-            fmt::format("bsdiff: failed to open patch packer: {}", ret));
+        throw std::runtime_error(fmt::format("bsdiff: failed to open patch packer: {}", ret));
     }
 
     ret = ::bsdiff(&ctx, &oldfile, &newfile, &packer);
@@ -70,8 +62,7 @@ DiffResult bsdiff(std::span<const uint8_t> old_data,
         bsdiff_close_patch_packer(&packer);
         bsdiff_close_stream(&newfile);
         bsdiff_close_stream(&oldfile);
-        throw std::runtime_error(
-            fmt::format("bsdiff: diff computation failed: {}", ret));
+        throw std::runtime_error(fmt::format("bsdiff: diff computation failed: {}", ret));
     }
 
     // Read the patch buffer BEFORE closing the packer. The bsdiff() C function
@@ -91,13 +82,11 @@ DiffResult bsdiff(std::span<const uint8_t> old_data,
     bsdiff_close_stream(&newfile);
     bsdiff_close_stream(&oldfile);
 
-    spdlog::debug("bsdiff: created patch: old={} new={} patch={}",
-                   old_data.size(), new_data.size(), patch_buffer_len);
+    spdlog::debug("bsdiff: created patch: old={} new={} patch={}", old_data.size(), new_data.size(), patch_buffer_len);
     return result;
 }
 
-PatchResult bspatch(std::span<const uint8_t> old_data,
-                    std::span<const uint8_t> patch_data) {
+PatchResult bspatch(std::span<const uint8_t> old_data, std::span<const uint8_t> patch_data) {
     PatchResult result;
 
     struct bsdiff_stream oldfile = {};
@@ -106,28 +95,22 @@ PatchResult bspatch(std::span<const uint8_t> old_data,
     struct bsdiff_ctx ctx = {};
     struct bsdiff_patch_packer packer = {};
 
-    int ret = bsdiff_open_memory_stream(BSDIFF_MODE_READ,
-        old_data.data(), old_data.size(), &oldfile);
+    int ret = bsdiff_open_memory_stream(BSDIFF_MODE_READ, old_data.data(), old_data.size(), &oldfile);
     if (ret != BSDIFF_SUCCESS) {
-        throw std::runtime_error(
-            fmt::format("bspatch: failed to open old stream: {}", ret));
+        throw std::runtime_error(fmt::format("bspatch: failed to open old stream: {}", ret));
     }
 
-    ret = bsdiff_open_memory_stream(BSDIFF_MODE_WRITE,
-        nullptr, 0, &newfile);
+    ret = bsdiff_open_memory_stream(BSDIFF_MODE_WRITE, nullptr, 0, &newfile);
     if (ret != BSDIFF_SUCCESS) {
         bsdiff_close_stream(&oldfile);
-        throw std::runtime_error(
-            fmt::format("bspatch: failed to open new stream: {}", ret));
+        throw std::runtime_error(fmt::format("bspatch: failed to open new stream: {}", ret));
     }
 
-    ret = bsdiff_open_memory_stream(BSDIFF_MODE_READ,
-        patch_data.data(), patch_data.size(), &patchfile);
+    ret = bsdiff_open_memory_stream(BSDIFF_MODE_READ, patch_data.data(), patch_data.size(), &patchfile);
     if (ret != BSDIFF_SUCCESS) {
         bsdiff_close_stream(&newfile);
         bsdiff_close_stream(&oldfile);
-        throw std::runtime_error(
-            fmt::format("bspatch: failed to open patch stream: {}", ret));
+        throw std::runtime_error(fmt::format("bspatch: failed to open patch stream: {}", ret));
     }
 
     ret = bsdiff_open_bz2_patch_packer(BSDIFF_MODE_READ, &patchfile, &packer);
@@ -135,8 +118,7 @@ PatchResult bspatch(std::span<const uint8_t> old_data,
         bsdiff_close_stream(&patchfile);
         bsdiff_close_stream(&newfile);
         bsdiff_close_stream(&oldfile);
-        throw std::runtime_error(
-            fmt::format("bspatch: failed to open patch packer: {}", ret));
+        throw std::runtime_error(fmt::format("bspatch: failed to open patch packer: {}", ret));
     }
 
     ret = ::bspatch(&ctx, &oldfile, &newfile, &packer);
@@ -145,8 +127,7 @@ PatchResult bspatch(std::span<const uint8_t> old_data,
         bsdiff_close_patch_packer(&packer);
         bsdiff_close_stream(&newfile);
         bsdiff_close_stream(&oldfile);
-        throw std::runtime_error(
-            fmt::format("bspatch: patch application failed: {}", ret));
+        throw std::runtime_error(fmt::format("bspatch: patch application failed: {}", ret));
     }
 
     // Extract the output buffer from newfile (independent of packer/patchfile)
@@ -163,9 +144,8 @@ PatchResult bspatch(std::span<const uint8_t> old_data,
     bsdiff_close_stream(&newfile);
     bsdiff_close_stream(&oldfile);
 
-    spdlog::debug("bspatch: applied patch: old={} patch={} new={}",
-                   old_data.size(), patch_data.size(), new_buffer_len);
+    spdlog::debug("bspatch: applied patch: old={} patch={} new={}", old_data.size(), patch_data.size(), new_buffer_len);
     return result;
 }
 
-} // namespace surge::diff
+}  // namespace surge::diff

@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include "storage_backend.hpp"
+
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -13,8 +15,6 @@
 #include <string>
 #include <string_view>
 #include <vector>
-
-#include "storage_backend.hpp"
 
 namespace surge {
 struct StorageConfig;
@@ -30,18 +30,13 @@ namespace surge::storage {
  */
 class AwsSigV4Signer {
 public:
-    AwsSigV4Signer(std::string_view access_key,
-                   std::string_view secret_key,
-                   std::string_view region,
+    AwsSigV4Signer(std::string_view access_key, std::string_view secret_key, std::string_view region,
                    std::string_view service = "s3");
 
     /** Build the full Authorization header value for a request. */
-    std::string sign_request(
-        std::string_view method,
-        std::string_view uri,
-        std::string_view query_string,
-        const std::vector<std::pair<std::string, std::string>>& headers,
-        std::span<const uint8_t> payload) const;
+    std::string sign_request(std::string_view method, std::string_view uri, std::string_view query_string,
+                             const std::vector<std::pair<std::string, std::string>>& headers,
+                             std::span<const uint8_t> payload) const;
 
     /** Compute the SHA-256 hash of the payload for the x-amz-content-sha256 header. */
     static std::string payload_hash(std::span<const uint8_t> payload);
@@ -75,36 +70,23 @@ public:
     S3StorageBackend(const S3StorageBackend&) = delete;
     S3StorageBackend& operator=(const S3StorageBackend&) = delete;
 
-    int32_t put_object(
-        const std::string& key,
-        std::span<const uint8_t> data,
-        const std::string& content_type = "application/octet-stream") override;
+    int32_t put_object(const std::string& key, std::span<const uint8_t> data,
+                       const std::string& content_type = "application/octet-stream") override;
 
-    int32_t get_object(
-        const std::string& key,
-        std::vector<uint8_t>& out_data) override;
+    int32_t get_object(const std::string& key, std::vector<uint8_t>& out_data) override;
 
-    int32_t head_object(
-        const std::string& key,
-        ObjectInfo& out_info) override;
+    int32_t head_object(const std::string& key, ObjectInfo& out_info) override;
 
     int32_t delete_object(const std::string& key) override;
 
-    int32_t list_objects(
-        const std::string& prefix,
-        ListResult& out_result,
-        const std::string& marker = "",
-        int max_keys = 1000) override;
+    int32_t list_objects(const std::string& prefix, ListResult& out_result, const std::string& marker = "",
+                         int max_keys = 1000) override;
 
-    int32_t download_to_file(
-        const std::string& key,
-        const std::filesystem::path& dest,
-        std::function<void(int64_t, int64_t)> progress = nullptr) override;
+    int32_t download_to_file(const std::string& key, const std::filesystem::path& dest,
+                             std::function<void(int64_t, int64_t)> progress = nullptr) override;
 
-    int32_t upload_from_file(
-        const std::string& key,
-        const std::filesystem::path& src,
-        std::function<void(int64_t, int64_t)> progress = nullptr) override;
+    int32_t upload_from_file(const std::string& key, const std::filesystem::path& src,
+                             std::function<void(int64_t, int64_t)> progress = nullptr) override;
 
 private:
     struct Impl;
@@ -117,4 +99,4 @@ private:
     std::string prefixed_key(const std::string& key) const;
 };
 
-} // namespace surge::storage
+}  // namespace surge::storage

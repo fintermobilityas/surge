@@ -29,8 +29,7 @@ struct PatchResult {
  * @return DiffResult containing the patch bytes.
  * @throws std::runtime_error if the diff operation fails.
  */
-DiffResult bsdiff(std::span<const uint8_t> old_data,
-                  std::span<const uint8_t> new_data);
+DiffResult bsdiff(std::span<const uint8_t> old_data, std::span<const uint8_t> new_data);
 
 /**
  * Apply a binary patch to reconstruct the new file from the old file.
@@ -40,7 +39,6 @@ DiffResult bsdiff(std::span<const uint8_t> old_data,
  * @return PatchResult containing the reconstructed new file contents.
  * @throws std::runtime_error if the patch operation fails.
  */
-PatchResult bspatch(std::span<const uint8_t> old_data,
-                    std::span<const uint8_t> patch_data);
+PatchResult bspatch(std::span<const uint8_t> old_data, std::span<const uint8_t> patch_data);
 
-} // namespace surge::diff
+}  // namespace surge::diff

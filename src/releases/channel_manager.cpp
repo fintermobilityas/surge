@@ -4,14 +4,16 @@
  */
 
 #include "releases/channel_manager.hpp"
+
+#include "config/constants.hpp"
+#include "core/context.hpp"
+#include "crypto/sha256.hpp"
 #include "releases/release_manifest.hpp"
 #include "storage/storage_backend.hpp"
-#include "core/context.hpp"
-#include "config/constants.hpp"
-#include "crypto/sha256.hpp"
-#include <spdlog/spdlog.h>
-#include <fmt/format.h>
+
 #include <algorithm>
+#include <fmt/format.h>
+#include <spdlog/spdlog.h>
 #include <stdexcept>
 
 namespace surge::releases {
@@ -68,27 +70,23 @@ struct ChannelManager::Impl {
     }
 };
 
-ChannelManager::ChannelManager(Context& ctx, const std::string& app_id)
-    : impl_(std::make_unique<Impl>(ctx))
-{
+ChannelManager::ChannelManager(Context& ctx, const std::string& app_id) : impl_(std::make_unique<Impl>(ctx)) {
     impl_->app_id = app_id;
     // Create storage backend from context config
-    impl_->storage = std::shared_ptr<storage::IStorageBackend>(
-        storage::create_storage_backend(ctx.storage_config()));
+    impl_->storage = std::shared_ptr<storage::IStorageBackend>(storage::create_storage_backend(ctx.storage_config()));
 }
 
 ChannelManager::~ChannelManager() = default;
 
-int32_t ChannelManager::promote(const std::string& version,
-                                 const std::string& source_channel,
-                                 const std::string& target_channel) {
-    spdlog::info("Promoting {} from channel '{}' to channel '{}'",
-                  version, source_channel, target_channel);
+int32_t ChannelManager::promote(const std::string& version, const std::string& source_channel,
+                                const std::string& target_channel) {
+    spdlog::info("Promoting {} from channel '{}' to channel '{}'", version, source_channel, target_channel);
 
     // Download and parse current release index
     ReleaseIndex index;
     auto rc = impl_->load_index(index);
-    if (rc != SURGE_OK) return rc;
+    if (rc != SURGE_OK)
+        return rc;
 
     // Find the release on source channel
     bool found = false;
@@ -97,9 +95,13 @@ int32_t ChannelManager::promote(const std::string& version,
             // Check if it's on the source channel
             bool on_source = source_channel.empty();
             for (auto& ch : rel.channels) {
-                if (ch == source_channel) { on_source = true; break; }
+                if (ch == source_channel) {
+                    on_source = true;
+                    break;
+                }
             }
-            if (!on_source) continue;
+            if (!on_source)
+                continue;
 
             // Check if already on target channel
             for (auto& ch : rel.channels) {
@@ -123,19 +125,20 @@ int32_t ChannelManager::promote(const std::string& version,
 
     // Save the updated index
     rc = impl_->save_index(index);
-    if (rc != SURGE_OK) return rc;
+    if (rc != SURGE_OK)
+        return rc;
 
     spdlog::info("Successfully promoted {} to channel '{}'", version, target_channel);
     return SURGE_OK;
 }
 
-int32_t ChannelManager::demote(const std::string& version,
-                                const std::string& channel) {
+int32_t ChannelManager::demote(const std::string& version, const std::string& channel) {
     spdlog::info("Demoting {} from channel '{}'", version, channel);
 
     ReleaseIndex index;
     auto rc = impl_->load_index(index);
-    if (rc != SURGE_OK) return rc;
+    if (rc != SURGE_OK)
+        return rc;
 
     // Remove the channel from the release entry
     bool found = false;
@@ -156,7 +159,8 @@ int32_t ChannelManager::demote(const std::string& version,
     }
 
     rc = impl_->save_index(index);
-    if (rc != SURGE_OK) return rc;
+    if (rc != SURGE_OK)
+        return rc;
 
     spdlog::info("Successfully demoted {} from channel '{}'", version, channel);
     return SURGE_OK;
@@ -165,7 +169,8 @@ int32_t ChannelManager::demote(const std::string& version,
 std::vector<std::string> ChannelManager::list_channels() {
     ReleaseIndex index;
     auto rc = impl_->load_index(index);
-    if (rc != SURGE_OK) return {};
+    if (rc != SURGE_OK)
+        return {};
 
     std::vector<std::string> channels;
     for (auto& rel : index.releases) {
@@ -183,13 +188,17 @@ std::vector<std::string> ChannelManager::list_channels() {
 std::vector<ReleaseEntry> ChannelManager::list_releases(const std::string& channel) {
     ReleaseIndex index;
     auto rc = impl_->load_index(index);
-    if (rc != SURGE_OK) return {};
+    if (rc != SURGE_OK)
+        return {};
 
     std::vector<ReleaseEntry> result;
     for (auto& rel : index.releases) {
         bool on_channel = channel.empty();
         for (auto& ch : rel.channels) {
-            if (ch == channel) { on_channel = true; break; }
+            if (ch == channel) {
+                on_channel = true;
+                break;
+            }
         }
         if (on_channel) {
             result.push_back(rel);
@@ -198,9 +207,7 @@ std::vector<ReleaseEntry> ChannelManager::list_releases(const std::string& chann
 
     // Sort newest first
     std::sort(result.begin(), result.end(),
-              [](const ReleaseEntry& a, const ReleaseEntry& b) {
-                  return compare_versions(a.version, b.version) > 0;
-              });
+              [](const ReleaseEntry& a, const ReleaseEntry& b) { return compare_versions(a.version, b.version) > 0; });
 
     return result;
 }
@@ -211,4 +218,4 @@ ReleaseIndex ChannelManager::fetch_index() {
     return index;
 }
 
-} // namespace surge::releases
+}  // namespace surge::releases

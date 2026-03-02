@@ -4,13 +4,15 @@
  */
 
 #include "lock/distributed_mutex.hpp"
+
 #include "core/context.hpp"
-#include <curl/curl.h>
-#include <nlohmann/json.hpp>
-#include <spdlog/spdlog.h>
-#include <fmt/format.h>
+
 #include <chrono>
 #include <cstring>
+#include <curl/curl.h>
+#include <fmt/format.h>
+#include <nlohmann/json.hpp>
+#include <spdlog/spdlog.h>
 #include <thread>
 
 namespace surge::lock {
@@ -24,7 +26,7 @@ size_t write_string_callback(char* ptr, size_t size, size_t nmemb, void* userdat
     return total;
 }
 
-} // anonymous namespace
+}  // anonymous namespace
 
 struct DistributedMutex::Impl {
     std::string server_url;
@@ -32,10 +34,10 @@ struct DistributedMutex::Impl {
     std::string challenge_token;
     bool acquired = false;
 
-    int32_t http_post_json(const std::string& url, const nlohmann::json& body,
-                            std::string& response) {
+    int32_t http_post_json(const std::string& url, const nlohmann::json& body, std::string& response) {
         auto* curl = curl_easy_init();
-        if (!curl) return SURGE_ERROR;
+        if (!curl)
+            return SURGE_ERROR;
 
         std::string json_str = body.dump();
 
@@ -68,10 +70,10 @@ struct DistributedMutex::Impl {
         return SURGE_OK;
     }
 
-    int32_t http_delete_json(const std::string& url, const nlohmann::json& body,
-                              std::string& response) {
+    int32_t http_delete_json(const std::string& url, const nlohmann::json& body, std::string& response) {
         auto* curl = curl_easy_init();
-        if (!curl) return SURGE_ERROR;
+        if (!curl)
+            return SURGE_ERROR;
 
         std::string json_str = body.dump();
 
@@ -94,15 +96,15 @@ struct DistributedMutex::Impl {
         curl_slist_free_all(headers);
         curl_easy_cleanup(curl);
 
-        if (res != CURLE_OK) return SURGE_ERROR;
-        if (http_code < 200 || http_code >= 300) return SURGE_ERROR;
+        if (res != CURLE_OK)
+            return SURGE_ERROR;
+        if (http_code < 200 || http_code >= 300)
+            return SURGE_ERROR;
         return SURGE_OK;
     }
 };
 
-DistributedMutex::DistributedMutex(Context& ctx, std::string name)
-    : impl_(std::make_unique<Impl>())
-{
+DistributedMutex::DistributedMutex(Context& ctx, std::string name) : impl_(std::make_unique<Impl>()) {
     impl_->server_url = ctx.lock_config().server_url;
     impl_->name = std::move(name);
 }
@@ -120,15 +122,14 @@ bool DistributedMutex::try_acquire(int32_t timeout_seconds) {
         return false;
     }
 
-    auto deadline = std::chrono::steady_clock::now() +
-                    std::chrono::seconds(timeout_seconds);
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_seconds);
 
     while (std::chrono::steady_clock::now() < deadline) {
         spdlog::info("Attempting to acquire mutex: {}", impl_->name);
 
         nlohmann::json body;
         body["name"] = impl_->name;
-        body["duration"] = "24:00:00"; // 24 hours
+        body["duration"] = "24:00:00";  // 24 hours
 
         std::string response;
         std::string lock_url = impl_->server_url + "/lock";
@@ -154,14 +155,15 @@ bool DistributedMutex::try_acquire(int32_t timeout_seconds) {
 }
 
 bool DistributedMutex::try_release() {
-    if (!impl_->acquired) return false;
+    if (!impl_->acquired)
+        return false;
 
     spdlog::info("Attempting to release mutex: {}", impl_->name);
 
     nlohmann::json body;
     body["name"] = impl_->name;
     body["challenge"] = impl_->challenge_token;
-    body["breakPeriod"] = "00:00:00"; // immediate
+    body["breakPeriod"] = "00:00:00";  // immediate
 
     std::string response;
     std::string unlock_url = impl_->server_url + "/unlock";
@@ -194,10 +196,7 @@ std::optional<std::string> DistributedMutex::challenge() const {
 
 // ----- DistributedLockGuard -----
 
-DistributedLockGuard::DistributedLockGuard(DistributedMutex& mutex,
-                                            int32_t timeout_seconds)
-    : mutex_(mutex)
-{
+DistributedLockGuard::DistributedLockGuard(DistributedMutex& mutex, int32_t timeout_seconds) : mutex_(mutex) {
     locked_ = mutex_.try_acquire(timeout_seconds);
 }
 
@@ -211,4 +210,4 @@ bool DistributedLockGuard::owns_lock() const {
     return locked_;
 }
 
-} // namespace surge::lock
+}  // namespace surge::lock

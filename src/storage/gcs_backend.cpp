@@ -4,20 +4,22 @@
  */
 
 #include "storage/gcs_backend.hpp"
+
 #include "core/context.hpp"
 #include "crypto/hmac.hpp"
 #include "crypto/sha256.hpp"
-#include <curl/curl.h>
-#include <nlohmann/json.hpp>
-#include <spdlog/spdlog.h>
-#include <fmt/format.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <curl/curl.h>
+#include <fmt/format.h>
 #include <fstream>
 #include <map>
 #include <mutex>
+#include <nlohmann/json.hpp>
+#include <spdlog/spdlog.h>
 #include <sstream>
 
 namespace surge::storage {
@@ -69,22 +71,22 @@ std::string url_encode(std::string_view input) {
     return result;
 }
 
-int xfer_callback(void* clientp, curl_off_t dltotal, curl_off_t dlnow,
-                  curl_off_t ultotal, curl_off_t ulnow) {
+int xfer_callback(void* clientp, curl_off_t dltotal, curl_off_t dlnow, curl_off_t ultotal, curl_off_t ulnow) {
     auto* cb = static_cast<std::function<void(int64_t, int64_t)>*>(clientp);
-    if (cb && *cb) (*cb)(static_cast<int64_t>(dlnow + ulnow), static_cast<int64_t>(dltotal + ultotal));
+    if (cb && *cb)
+        (*cb)(static_cast<int64_t>(dlnow + ulnow), static_cast<int64_t>(dltotal + ultotal));
     return 0;
 }
 
-} // anonymous namespace
+}  // anonymous namespace
 
 // ----- GcsHmacAuth -----
 GcsHmacAuth::GcsHmacAuth(std::string_view access_key, std::string_view secret_key)
     : access_key_(access_key), secret_key_(secret_key) {}
 
-std::vector<std::pair<std::string, std::string>>
-GcsHmacAuth::auth_headers(std::string_view, std::string_view, std::span<const uint8_t>) {
-    return {}; // HMAC auth headers would be built here
+std::vector<std::pair<std::string, std::string>> GcsHmacAuth::auth_headers(std::string_view, std::string_view,
+                                                                           std::span<const uint8_t>) {
+    return {};  // HMAC auth headers would be built here
 }
 
 // ----- GcsOAuth2Auth -----
@@ -106,8 +108,8 @@ GcsOAuth2Auth::GcsOAuth2Auth(std::string_view credentials_json) : impl_(std::mak
     }
 }
 
-std::vector<std::pair<std::string, std::string>>
-GcsOAuth2Auth::auth_headers(std::string_view, std::string_view, std::span<const uint8_t>) {
+std::vector<std::pair<std::string, std::string>> GcsOAuth2Auth::auth_headers(std::string_view, std::string_view,
+                                                                             std::span<const uint8_t>) {
     return {{"Authorization", "Bearer " + impl_->cached_token}};
 }
 
@@ -138,8 +140,7 @@ struct GcsBackend::Impl {
     }
 };
 
-GcsBackend::GcsBackend(const StorageConfig& config)
-    : impl_(std::make_unique<Impl>()) {
+GcsBackend::GcsBackend(const StorageConfig& config) : impl_(std::make_unique<Impl>()) {
     impl_->bucket = config.bucket;
     impl_->prefix = config.prefix;
 
@@ -168,25 +169,32 @@ std::string GcsBackend::build_url(const std::string& key) const {
 }
 
 std::string GcsBackend::prefixed_key(const std::string& key) const {
-    if (impl_->prefix.empty()) return key;
-    if (impl_->prefix.back() == '/') return impl_->prefix + key;
+    if (impl_->prefix.empty())
+        return key;
+    if (impl_->prefix.back() == '/')
+        return impl_->prefix + key;
     return impl_->prefix + "/" + key;
 }
 
-int32_t GcsBackend::put_object(const std::string& key, std::span<const uint8_t> data,
-                                const std::string& content_type) {
+int32_t GcsBackend::put_object(const std::string& key, std::span<const uint8_t> data, const std::string& content_type) {
     auto token = impl_->get_access_token();
     auto full_key = prefixed_key(key);
-    std::string url = fmt::format("{}/b/{}/o?uploadType=media&name={}", GCS_UPLOAD_API, impl_->bucket, url_encode(full_key));
+    std::string url =
+        fmt::format("{}/b/{}/o?uploadType=media&name={}", GCS_UPLOAD_API, impl_->bucket, url_encode(full_key));
 
     auto* curl = curl_easy_init();
-    if (!curl) return SURGE_ERROR;
+    if (!curl)
+        return SURGE_ERROR;
 
     struct curl_slist* hdr_list = nullptr;
-    if (!token.empty()) hdr_list = curl_slist_append(hdr_list, fmt::format("Authorization: Bearer {}", token).c_str());
+    if (!token.empty())
+        hdr_list = curl_slist_append(hdr_list, fmt::format("Authorization: Bearer {}", token).c_str());
     hdr_list = curl_slist_append(hdr_list, fmt::format("Content-Type: {}", content_type).c_str());
 
-    struct ReadState { const uint8_t* ptr; size_t remaining; };
+    struct ReadState {
+        const uint8_t* ptr;
+        size_t remaining;
+    };
     ReadState read_state{data.data(), data.size()};
     std::vector<uint8_t> response;
 
@@ -196,12 +204,13 @@ int32_t GcsBackend::put_object(const std::string& key, std::span<const uint8_t> 
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdr_list);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-    curl_easy_setopt(curl, CURLOPT_READFUNCTION,
-        +[](char* ptr, size_t size, size_t nmemb, void* ud) -> size_t {
+    curl_easy_setopt(
+        curl, CURLOPT_READFUNCTION, +[](char* ptr, size_t size, size_t nmemb, void* ud) -> size_t {
             auto* state = static_cast<ReadState*>(ud);
             size_t to_copy = std::min(size * nmemb, state->remaining);
             std::memcpy(ptr, state->ptr, to_copy);
-            state->ptr += to_copy; state->remaining -= to_copy;
+            state->ptr += to_copy;
+            state->remaining -= to_copy;
             return to_copy;
         });
     curl_easy_setopt(curl, CURLOPT_READDATA, &read_state);
@@ -212,7 +221,8 @@ int32_t GcsBackend::put_object(const std::string& key, std::span<const uint8_t> 
     curl_slist_free_all(hdr_list);
     curl_easy_cleanup(curl);
 
-    if (res != CURLE_OK || http_code < 200 || http_code >= 300) return SURGE_ERROR;
+    if (res != CURLE_OK || http_code < 200 || http_code >= 300)
+        return SURGE_ERROR;
     return SURGE_OK;
 }
 
@@ -222,10 +232,12 @@ int32_t GcsBackend::get_object(const std::string& key, std::vector<uint8_t>& out
     std::string url = fmt::format("{}/{}/{}?alt=media", GCS_DOWNLOAD_BASE, impl_->bucket, full_key);
 
     auto* curl = curl_easy_init();
-    if (!curl) return SURGE_ERROR;
+    if (!curl)
+        return SURGE_ERROR;
 
     struct curl_slist* hdr_list = nullptr;
-    if (!token.empty()) hdr_list = curl_slist_append(hdr_list, fmt::format("Authorization: Bearer {}", token).c_str());
+    if (!token.empty())
+        hdr_list = curl_slist_append(hdr_list, fmt::format("Authorization: Bearer {}", token).c_str());
 
     out_data.clear();
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
@@ -239,9 +251,12 @@ int32_t GcsBackend::get_object(const std::string& key, std::vector<uint8_t>& out
     curl_slist_free_all(hdr_list);
     curl_easy_cleanup(curl);
 
-    if (res != CURLE_OK) return SURGE_ERROR;
-    if (http_code == 404) return SURGE_NOT_FOUND;
-    if (http_code < 200 || http_code >= 300) return SURGE_ERROR;
+    if (res != CURLE_OK)
+        return SURGE_ERROR;
+    if (http_code == 404)
+        return SURGE_NOT_FOUND;
+    if (http_code < 200 || http_code >= 300)
+        return SURGE_ERROR;
     return SURGE_OK;
 }
 
@@ -251,10 +266,12 @@ int32_t GcsBackend::head_object(const std::string& key, ObjectInfo& out_info) {
     std::string url = fmt::format("{}/b/{}/o/{}", GCS_JSON_API, impl_->bucket, url_encode(full_key));
 
     auto* curl = curl_easy_init();
-    if (!curl) return SURGE_ERROR;
+    if (!curl)
+        return SURGE_ERROR;
 
     struct curl_slist* hdr_list = nullptr;
-    if (!token.empty()) hdr_list = curl_slist_append(hdr_list, fmt::format("Authorization: Bearer {}", token).c_str());
+    if (!token.empty())
+        hdr_list = curl_slist_append(hdr_list, fmt::format("Authorization: Bearer {}", token).c_str());
 
     std::string response_str;
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
@@ -268,17 +285,24 @@ int32_t GcsBackend::head_object(const std::string& key, ObjectInfo& out_info) {
     curl_slist_free_all(hdr_list);
     curl_easy_cleanup(curl);
 
-    if (res != CURLE_OK) return SURGE_ERROR;
-    if (http_code == 404) return SURGE_NOT_FOUND;
-    if (http_code < 200 || http_code >= 300) return SURGE_ERROR;
+    if (res != CURLE_OK)
+        return SURGE_ERROR;
+    if (http_code == 404)
+        return SURGE_NOT_FOUND;
+    if (http_code < 200 || http_code >= 300)
+        return SURGE_ERROR;
 
     auto json = nlohmann::json::parse(response_str, nullptr, false);
-    if (json.is_discarded()) return SURGE_ERROR;
+    if (json.is_discarded())
+        return SURGE_ERROR;
 
     out_info.key = key;
-    if (json.contains("size")) out_info.size = std::stoll(json["size"].get<std::string>());
-    if (json.contains("etag")) out_info.etag = json["etag"].get<std::string>();
-    if (json.contains("updated")) out_info.last_modified = json["updated"].get<std::string>();
+    if (json.contains("size"))
+        out_info.size = std::stoll(json["size"].get<std::string>());
+    if (json.contains("etag"))
+        out_info.etag = json["etag"].get<std::string>();
+    if (json.contains("updated"))
+        out_info.last_modified = json["updated"].get<std::string>();
     return SURGE_OK;
 }
 
@@ -288,10 +312,12 @@ int32_t GcsBackend::delete_object(const std::string& key) {
     std::string url = fmt::format("{}/b/{}/o/{}", GCS_JSON_API, impl_->bucket, url_encode(full_key));
 
     auto* curl = curl_easy_init();
-    if (!curl) return SURGE_ERROR;
+    if (!curl)
+        return SURGE_ERROR;
 
     struct curl_slist* hdr_list = nullptr;
-    if (!token.empty()) hdr_list = curl_slist_append(hdr_list, fmt::format("Authorization: Bearer {}", token).c_str());
+    if (!token.empty())
+        hdr_list = curl_slist_append(hdr_list, fmt::format("Authorization: Bearer {}", token).c_str());
 
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
@@ -303,14 +329,17 @@ int32_t GcsBackend::delete_object(const std::string& key) {
     curl_slist_free_all(hdr_list);
     curl_easy_cleanup(curl);
 
-    if (res != CURLE_OK) return SURGE_ERROR;
-    if (http_code >= 200 && http_code < 300) return SURGE_OK;
-    if (http_code == 404) return SURGE_OK;
+    if (res != CURLE_OK)
+        return SURGE_ERROR;
+    if (http_code >= 200 && http_code < 300)
+        return SURGE_OK;
+    if (http_code == 404)
+        return SURGE_OK;
     return SURGE_ERROR;
 }
 
-int32_t GcsBackend::list_objects(const std::string& prefix, ListResult& out_result,
-                                  const std::string& marker, int max_keys) {
+int32_t GcsBackend::list_objects(const std::string& prefix, ListResult& out_result, const std::string& marker,
+                                 int max_keys) {
     out_result.objects.clear();
     out_result.truncated = false;
     out_result.next_marker.clear();
@@ -319,20 +348,26 @@ int32_t GcsBackend::list_objects(const std::string& prefix, ListResult& out_resu
 }
 
 int32_t GcsBackend::download_to_file(const std::string& key, const std::filesystem::path& dest,
-                                      std::function<void(int64_t, int64_t)> progress) {
+                                     std::function<void(int64_t, int64_t)> progress) {
     auto token = impl_->get_access_token();
     auto full_key = prefixed_key(key);
     std::string url = fmt::format("{}/{}/{}?alt=media", GCS_DOWNLOAD_BASE, impl_->bucket, full_key);
 
     auto* curl = curl_easy_init();
-    if (!curl) return SURGE_ERROR;
+    if (!curl)
+        return SURGE_ERROR;
 
     struct curl_slist* hdr_list = nullptr;
-    if (!token.empty()) hdr_list = curl_slist_append(hdr_list, fmt::format("Authorization: Bearer {}", token).c_str());
+    if (!token.empty())
+        hdr_list = curl_slist_append(hdr_list, fmt::format("Authorization: Bearer {}", token).c_str());
 
     std::filesystem::create_directories(dest.parent_path());
     std::ofstream file(dest, std::ios::binary);
-    if (!file) { curl_slist_free_all(hdr_list); curl_easy_cleanup(curl); return SURGE_ERROR; }
+    if (!file) {
+        curl_slist_free_all(hdr_list);
+        curl_easy_cleanup(curl);
+        return SURGE_ERROR;
+    }
 
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdr_list);
@@ -359,21 +394,28 @@ int32_t GcsBackend::download_to_file(const std::string& key, const std::filesyst
 }
 
 int32_t GcsBackend::upload_from_file(const std::string& key, const std::filesystem::path& src,
-                                      std::function<void(int64_t, int64_t)> progress) {
+                                     std::function<void(int64_t, int64_t)> progress) {
     auto token = impl_->get_access_token();
     auto full_key = prefixed_key(key);
     auto file_size = std::filesystem::file_size(src);
-    std::string url = fmt::format("{}/b/{}/o?uploadType=media&name={}", GCS_UPLOAD_API, impl_->bucket, url_encode(full_key));
+    std::string url =
+        fmt::format("{}/b/{}/o?uploadType=media&name={}", GCS_UPLOAD_API, impl_->bucket, url_encode(full_key));
 
     auto* curl = curl_easy_init();
-    if (!curl) return SURGE_ERROR;
+    if (!curl)
+        return SURGE_ERROR;
 
     struct curl_slist* hdr_list = nullptr;
-    if (!token.empty()) hdr_list = curl_slist_append(hdr_list, fmt::format("Authorization: Bearer {}", token).c_str());
+    if (!token.empty())
+        hdr_list = curl_slist_append(hdr_list, fmt::format("Authorization: Bearer {}", token).c_str());
     hdr_list = curl_slist_append(hdr_list, "Content-Type: application/octet-stream");
 
     std::ifstream file(src, std::ios::binary);
-    if (!file) { curl_slist_free_all(hdr_list); curl_easy_cleanup(curl); return SURGE_ERROR; }
+    if (!file) {
+        curl_slist_free_all(hdr_list);
+        curl_easy_cleanup(curl);
+        return SURGE_ERROR;
+    }
 
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_POST, 1L);
@@ -388,8 +430,9 @@ int32_t GcsBackend::upload_from_file(const std::string& key, const std::filesyst
     curl_slist_free_all(hdr_list);
     curl_easy_cleanup(curl);
 
-    if (res != CURLE_OK || http_code < 200 || http_code >= 300) return SURGE_ERROR;
+    if (res != CURLE_OK || http_code < 200 || http_code >= 300)
+        return SURGE_ERROR;
     return SURGE_OK;
 }
 
-} // namespace surge::storage
+}  // namespace surge::storage

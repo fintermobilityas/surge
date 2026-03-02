@@ -3,16 +3,17 @@
  * @brief `surge restore` - Reconstruct a full package from delta chain.
  */
 
-#include <cxxopts.hpp>
-#include <spdlog/spdlog.h>
-#include <fmt/format.h>
-#include <yaml-cpp/yaml.h>
-#include <filesystem>
-#include <iostream>
-#include <vector>
-#include <chrono>
 #include "config/constants.hpp"
 #include "config/manifest.hpp"
+
+#include <chrono>
+#include <cxxopts.hpp>
+#include <filesystem>
+#include <fmt/format.h>
+#include <iostream>
+#include <spdlog/spdlog.h>
+#include <vector>
+#include <yaml-cpp/yaml.h>
 
 namespace fs = std::filesystem;
 
@@ -30,9 +31,12 @@ fs::path find_manifest(const std::string& path_override) {
 }
 
 [[maybe_unused]] std::string format_size(int64_t bytes) {
-    if (bytes < 1024) return fmt::format("{} B", bytes);
-    if (bytes < 1024 * 1024) return fmt::format("{:.1f} KB", bytes / 1024.0);
-    if (bytes < 1024 * 1024 * 1024) return fmt::format("{:.1f} MB", bytes / (1024.0 * 1024.0));
+    if (bytes < 1024)
+        return fmt::format("{} B", bytes);
+    if (bytes < 1024 * 1024)
+        return fmt::format("{:.1f} KB", bytes / 1024.0);
+    if (bytes < 1024 * 1024 * 1024)
+        return fmt::format("{:.1f} MB", bytes / (1024.0 * 1024.0));
     return fmt::format("{:.2f} GB", bytes / (1024.0 * 1024.0 * 1024.0));
 }
 
@@ -42,18 +46,15 @@ struct DeltaChainEntry {
     bool is_genesis;
 };
 
-} // anonymous namespace
+}  // anonymous namespace
 
 int cmd_restore(int argc, char* argv[]) {
     cxxopts::Options options("surge restore", "Reconstruct a full package from delta chain");
 
-    options.add_options()
-        ("app", "Application ID", cxxopts::value<std::string>()->default_value(""))
-        ("version", "Target version to restore (required)", cxxopts::value<std::string>())
-        ("output", "Output directory for restored package", cxxopts::value<std::string>()->default_value("restored"))
-        ("manifest", "Path to surge.yml", cxxopts::value<std::string>()->default_value(""))
-        ("h,help", "Show help")
-    ;
+    options.add_options()("app", "Application ID", cxxopts::value<std::string>()->default_value(""))(
+        "version", "Target version to restore (required)", cxxopts::value<std::string>())(
+        "output", "Output directory for restored package", cxxopts::value<std::string>()->default_value("restored"))(
+        "manifest", "Path to surge.yml", cxxopts::value<std::string>()->default_value(""))("h,help", "Show help");
 
     auto result = options.parse(argc, argv);
 
@@ -73,8 +74,7 @@ int cmd_restore(int argc, char* argv[]) {
     // Locate manifest
     auto manifest_path = find_manifest(result["manifest"].as<std::string>());
     if (manifest_path.empty() || !fs::exists(manifest_path)) {
-        spdlog::error("Cannot find {}. Run 'surge init' first or specify --manifest",
-                       surge::constants::MANIFEST_FILE);
+        spdlog::error("Cannot find {}. Run 'surge init' first or specify --manifest", surge::constants::MANIFEST_FILE);
         return 1;
     }
 

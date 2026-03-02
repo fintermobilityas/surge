@@ -4,13 +4,14 @@
  */
 
 #include "archive/packer.hpp"
+
 #include <archive.h>
 #include <archive_entry.h>
-#include <spdlog/spdlog.h>
-#include <fmt/format.h>
 #include <cstring>
 #include <filesystem>
+#include <fmt/format.h>
 #include <fstream>
+#include <spdlog/spdlog.h>
 #include <stdexcept>
 
 namespace surge::archive {
@@ -27,8 +28,7 @@ struct ArchivePacker::Impl {
 };
 
 ArchivePacker::ArchivePacker(const std::filesystem::path& output_path, const PackerOptions& options)
-    : impl_(std::make_unique<Impl>())
-{
+    : impl_(std::make_unique<Impl>()) {
     impl_->output_path = output_path;
     impl_->options = options;
 
@@ -46,8 +46,7 @@ ArchivePacker::ArchivePacker(const std::filesystem::path& output_path, const Pac
     if (zstd_ret != ARCHIVE_OK && zstd_ret != ARCHIVE_WARN) {
         auto err = archive_error_string(impl_->archive);
         archive_write_free(impl_->archive);
-        throw std::runtime_error(
-            fmt::format("Failed to set zstd compression filter: {}", err ? err : "unknown error"));
+        throw std::runtime_error(fmt::format("Failed to set zstd compression filter: {}", err ? err : "unknown error"));
     }
 
     // Use PAX restricted (POSIX tar) format
@@ -79,22 +78,19 @@ ArchivePacker::~ArchivePacker() {
     }
 }
 
-void ArchivePacker::add_file(const std::filesystem::path& source,
-                              const std::string& archive_path) {
+void ArchivePacker::add_file(const std::filesystem::path& source, const std::string& archive_path) {
     if (impl_->finalized) {
         throw std::runtime_error("Cannot add files to finalized archive");
     }
 
     std::error_code ec;
     if (!fs::exists(source, ec)) {
-        throw std::runtime_error(
-            fmt::format("Source file does not exist: {}", source.string()));
+        throw std::runtime_error(fmt::format("Source file does not exist: {}", source.string()));
     }
 
     auto file_size = static_cast<int64_t>(fs::file_size(source, ec));
     if (ec) {
-        throw std::runtime_error(
-            fmt::format("Failed to get file size: {}", source.string()));
+        throw std::runtime_error(fmt::format("Failed to get file size: {}", source.string()));
     }
 
     auto* entry = archive_entry_new();
@@ -123,19 +119,16 @@ void ArchivePacker::add_file(const std::filesystem::path& source,
     }
 
     if (archive_write_header(impl_->archive, entry) != ARCHIVE_OK) {
-        spdlog::error("Failed to write header for {}: {}",
-                       archive_path, archive_error_string(impl_->archive));
+        spdlog::error("Failed to write header for {}: {}", archive_path, archive_error_string(impl_->archive));
         archive_entry_free(entry);
-        throw std::runtime_error(
-            fmt::format("Failed to write archive header for {}", archive_path));
+        throw std::runtime_error(fmt::format("Failed to write archive header for {}", archive_path));
     }
 
     // Write file contents
     std::ifstream file(source, std::ios::binary);
     if (!file) {
         archive_entry_free(entry);
-        throw std::runtime_error(
-            fmt::format("Failed to open source file: {}", source.string()));
+        throw std::runtime_error(fmt::format("Failed to open source file: {}", source.string()));
     }
 
     constexpr size_t BUFFER_SIZE = 65536;
@@ -144,11 +137,9 @@ void ArchivePacker::add_file(const std::filesystem::path& source,
         file.read(buffer, BUFFER_SIZE);
         auto bytes_read = file.gcount();
         if (bytes_read > 0) {
-            if (archive_write_data(impl_->archive, buffer,
-                                   static_cast<size_t>(bytes_read)) < 0) {
+            if (archive_write_data(impl_->archive, buffer, static_cast<size_t>(bytes_read)) < 0) {
                 archive_entry_free(entry);
-                throw std::runtime_error(
-                    fmt::format("Failed to write data for {}", archive_path));
+                throw std::runtime_error(fmt::format("Failed to write data for {}", archive_path));
             }
         }
     }
@@ -162,32 +153,30 @@ void ArchivePacker::add_file(const std::filesystem::path& source,
     }
 }
 
-void ArchivePacker::add_directory(const std::filesystem::path& source_dir,
-                                   const std::string& archive_prefix) {
+void ArchivePacker::add_directory(const std::filesystem::path& source_dir, const std::string& archive_prefix) {
     if (impl_->finalized) {
         throw std::runtime_error("Cannot add files to finalized archive");
     }
 
     std::error_code ec;
     if (!fs::is_directory(source_dir, ec)) {
-        throw std::runtime_error(
-            fmt::format("Not a directory: {}", source_dir.string()));
+        throw std::runtime_error(fmt::format("Not a directory: {}", source_dir.string()));
     }
 
     for (auto& entry : fs::recursive_directory_iterator(source_dir, ec)) {
         if (ec) {
-            throw std::runtime_error(
-                fmt::format("Error iterating directory: {}", ec.message()));
+            throw std::runtime_error(fmt::format("Error iterating directory: {}", ec.message()));
         }
 
-        if (!entry.is_regular_file()) continue;
+        if (!entry.is_regular_file())
+            continue;
 
         auto relative = fs::relative(entry.path(), source_dir, ec);
-        if (ec) continue;
+        if (ec)
+            continue;
 
-        std::string archive_path = archive_prefix.empty()
-            ? relative.string()
-            : archive_prefix + "/" + relative.string();
+        std::string archive_path =
+            archive_prefix.empty() ? relative.string() : archive_prefix + "/" + relative.string();
 
         // Normalize path separators
         std::replace(archive_path.begin(), archive_path.end(), '\\', '/');
@@ -196,9 +185,7 @@ void ArchivePacker::add_directory(const std::filesystem::path& source_dir,
     }
 }
 
-void ArchivePacker::add_buffer(const std::string& archive_path,
-                                std::span<const uint8_t> data,
-                                mode_t permissions) {
+void ArchivePacker::add_buffer(const std::string& archive_path, std::span<const uint8_t> data, mode_t permissions) {
     if (impl_->finalized) {
         throw std::runtime_error("Cannot add files to finalized archive");
     }
@@ -217,18 +204,15 @@ void ArchivePacker::add_buffer(const std::string& archive_path,
     archive_entry_set_mtime(entry, now, 0);
 
     if (archive_write_header(impl_->archive, entry) != ARCHIVE_OK) {
-        spdlog::error("Failed to write header for {}: {}",
-                       archive_path, archive_error_string(impl_->archive));
+        spdlog::error("Failed to write header for {}: {}", archive_path, archive_error_string(impl_->archive));
         archive_entry_free(entry);
-        throw std::runtime_error(
-            fmt::format("Failed to write archive header for {}", archive_path));
+        throw std::runtime_error(fmt::format("Failed to write archive header for {}", archive_path));
     }
 
     if (!data.empty()) {
         if (archive_write_data(impl_->archive, data.data(), data.size()) < 0) {
             archive_entry_free(entry);
-            throw std::runtime_error(
-                fmt::format("Failed to write buffer data for {}", archive_path));
+            throw std::runtime_error(fmt::format("Failed to write buffer data for {}", archive_path));
         }
     }
 
@@ -238,17 +222,16 @@ void ArchivePacker::add_buffer(const std::string& archive_path,
 }
 
 void ArchivePacker::finalize() {
-    if (impl_->finalized) return;
+    if (impl_->finalized)
+        return;
 
     if (archive_write_close(impl_->archive) != ARCHIVE_OK) {
-        throw std::runtime_error(
-            fmt::format("Failed to close archive: {}",
-                         archive_error_string(impl_->archive)));
+        throw std::runtime_error(fmt::format("Failed to close archive: {}", archive_error_string(impl_->archive)));
     }
 
     impl_->finalized = true;
-    spdlog::info("Archive finalized: {} files, {} bytes total, output: {}",
-                  impl_->files_added, impl_->total_bytes, impl_->output_path.string());
+    spdlog::info("Archive finalized: {} files, {} bytes total, output: {}", impl_->files_added, impl_->total_bytes,
+                 impl_->output_path.string());
 }
 
-} // namespace surge::archive
+}  // namespace surge::archive

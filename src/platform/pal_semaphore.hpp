@@ -78,4 +78,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-} // namespace surge::platform
+}  // namespace surge::platform

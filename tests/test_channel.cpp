@@ -29,7 +29,8 @@ public:
     // Promote a version to a channel. Returns true if successful.
     bool promote(const std::string& version, const std::string& channel) {
         auto it = find_release(version);
-        if (it == releases.end()) return false;
+        if (it == releases.end())
+            return false;
         it->channels.insert(channel);
         return true;
     }
@@ -37,7 +38,8 @@ public:
     // Demote (remove) a version from a channel. Returns true if successful.
     bool demote(const std::string& version, const std::string& channel) {
         auto it = find_release(version);
-        if (it == releases.end()) return false;
+        if (it == releases.end())
+            return false;
         return it->channels.erase(channel) > 0;
     }
 
@@ -55,21 +57,20 @@ public:
     // Get the latest release in a channel
     const Release* get_latest(const std::string& channel) const {
         auto channel_releases = get_channel_releases(channel);
-        if (channel_releases.empty()) return nullptr;
+        if (channel_releases.empty())
+            return nullptr;
         // Assume releases are ordered newest first
         return channel_releases.front();
     }
 
     // Check if a version exists in any channel
     bool has_version(const std::string& version) const {
-        return std::any_of(releases.begin(), releases.end(),
-            [&](const Release& r) { return r.version == version; });
+        return std::any_of(releases.begin(), releases.end(), [&](const Release& r) { return r.version == version; });
     }
 
 private:
     std::vector<Release>::iterator find_release(const std::string& version) {
-        return std::find_if(releases.begin(), releases.end(),
-            [&](const Release& r) { return r.version == version; });
+        return std::find_if(releases.begin(), releases.end(), [&](const Release& r) { return r.version == version; });
     }
 };
 
@@ -94,8 +95,7 @@ TEST_F(ChannelTest, PromoteToNewChannel) {
     EXPECT_TRUE(mgr.promote("2.0.0", "stable"));
 
     auto stable = mgr.get_channel_releases("stable");
-    bool found = std::any_of(stable.begin(), stable.end(),
-        [](const Release* r) { return r->version == "2.0.0"; });
+    bool found = std::any_of(stable.begin(), stable.end(), [](const Release* r) { return r->version == "2.0.0"; });
     EXPECT_TRUE(found);
 }
 
@@ -105,7 +105,8 @@ TEST_F(ChannelTest, PromoteAlreadyInChannel_IsIdempotent) {
 
     int count = 0;
     for (const auto* r : stable) {
-        if (r->version == "1.0.0") count++;
+        if (r->version == "1.0.0")
+            count++;
     }
     EXPECT_EQ(count, 1);
 }
@@ -118,8 +119,8 @@ TEST_F(ChannelTest, PromoteToMultipleChannels) {
     EXPECT_TRUE(mgr.promote("2.0.0", "stable"));
     EXPECT_TRUE(mgr.promote("2.0.0", "nightly"));
 
-    auto it = std::find_if(mgr.releases.begin(), mgr.releases.end(),
-        [](const Release& r) { return r.version == "2.0.0"; });
+    auto it =
+        std::find_if(mgr.releases.begin(), mgr.releases.end(), [](const Release& r) { return r.version == "2.0.0"; });
     ASSERT_NE(it, mgr.releases.end());
     EXPECT_TRUE(it->channels.count("beta"));
     EXPECT_TRUE(it->channels.count("stable"));
@@ -134,14 +135,12 @@ TEST_F(ChannelTest, DemoteFromChannel) {
     EXPECT_TRUE(mgr.demote("1.1.0", "beta"));
 
     auto beta = mgr.get_channel_releases("beta");
-    bool found = std::any_of(beta.begin(), beta.end(),
-        [](const Release* r) { return r->version == "1.1.0"; });
+    bool found = std::any_of(beta.begin(), beta.end(), [](const Release* r) { return r->version == "1.1.0"; });
     EXPECT_FALSE(found);
 
     // Should still be in stable
     auto stable = mgr.get_channel_releases("stable");
-    found = std::any_of(stable.begin(), stable.end(),
-        [](const Release* r) { return r->version == "1.1.0"; });
+    found = std::any_of(stable.begin(), stable.end(), [](const Release* r) { return r->version == "1.1.0"; });
     EXPECT_TRUE(found);
 }
 
@@ -157,8 +156,8 @@ TEST_F(ChannelTest, DemoteFromAllChannels) {
     EXPECT_TRUE(mgr.demote("1.1.0", "beta"));
     EXPECT_TRUE(mgr.demote("1.1.0", "stable"));
 
-    auto it = std::find_if(mgr.releases.begin(), mgr.releases.end(),
-        [](const Release& r) { return r.version == "1.1.0"; });
+    auto it =
+        std::find_if(mgr.releases.begin(), mgr.releases.end(), [](const Release& r) { return r.version == "1.1.0"; });
     ASSERT_NE(it, mgr.releases.end());
     EXPECT_TRUE(it->channels.empty());
 }
@@ -169,10 +168,10 @@ TEST_F(ChannelTest, DemoteFromAllChannels) {
 
 TEST_F(ChannelTest, GetChannelReleases_ReturnsCorrectCount) {
     auto stable = mgr.get_channel_releases("stable");
-    EXPECT_EQ(stable.size(), 2u); // 1.0.0 and 1.1.0
+    EXPECT_EQ(stable.size(), 2u);  // 1.0.0 and 1.1.0
 
     auto beta = mgr.get_channel_releases("beta");
-    EXPECT_EQ(beta.size(), 2u); // 2.0.0 and 1.1.0
+    EXPECT_EQ(beta.size(), 2u);  // 2.0.0 and 1.1.0
 }
 
 TEST_F(ChannelTest, GetLatest_ReturnsNewest) {
@@ -216,19 +215,19 @@ TEST_F(ChannelTest, DemoteOldStableAfterPromotion) {
     auto stable = mgr.get_channel_releases("stable");
     EXPECT_EQ(stable.size(), 2u);
 
-    bool old_present = std::any_of(stable.begin(), stable.end(),
-        [](const Release* r) { return r->version == "1.0.0"; });
+    bool old_present =
+        std::any_of(stable.begin(), stable.end(), [](const Release* r) { return r->version == "1.0.0"; });
     EXPECT_FALSE(old_present);
 }
 
 TEST_F(ChannelTest, CrossChannelRelease) {
     // A release can be in multiple channels simultaneously
-    auto it = std::find_if(mgr.releases.begin(), mgr.releases.end(),
-        [](const Release& r) { return r.version == "1.1.0"; });
+    auto it =
+        std::find_if(mgr.releases.begin(), mgr.releases.end(), [](const Release& r) { return r.version == "1.1.0"; });
     ASSERT_NE(it, mgr.releases.end());
     EXPECT_EQ(it->channels.size(), 2u);
     EXPECT_TRUE(it->channels.count("beta"));
     EXPECT_TRUE(it->channels.count("stable"));
 }
 
-} // anonymous namespace
+}  // anonymous namespace

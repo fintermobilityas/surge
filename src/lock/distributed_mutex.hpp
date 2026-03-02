@@ -87,8 +87,7 @@ public:
      * @param mutex           Mutex to lock.
      * @param timeout_seconds Maximum time to wait for acquisition.
      */
-    explicit DistributedLockGuard(DistributedMutex& mutex,
-                                  int32_t timeout_seconds = 30);
+    explicit DistributedLockGuard(DistributedMutex& mutex, int32_t timeout_seconds = 30);
     ~DistributedLockGuard();
 
     DistributedLockGuard(const DistributedLockGuard&) = delete;
@@ -99,7 +98,7 @@ public:
 
 private:
     DistributedMutex& mutex_;
-    bool              locked_ = false;
+    bool locked_ = false;
 };
 
-} // namespace surge::lock
+}  // namespace surge::lock

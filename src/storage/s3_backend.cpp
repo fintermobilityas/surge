@@ -4,18 +4,20 @@
  */
 
 #include "storage/s3_backend.hpp"
+
 #include "core/context.hpp"
 #include "crypto/hmac.hpp"
 #include "crypto/sha256.hpp"
-#include <curl/curl.h>
-#include <spdlog/spdlog.h>
-#include <fmt/format.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <curl/curl.h>
+#include <fmt/format.h>
 #include <fstream>
 #include <map>
+#include <spdlog/spdlog.h>
 #include <sstream>
 #include <string_view>
 
@@ -108,8 +110,7 @@ struct CurlProgressData {
     bool is_upload;
 };
 
-int xfer_callback(void* clientp, curl_off_t dltotal, curl_off_t dlnow,
-                  curl_off_t ultotal, curl_off_t ulnow) {
+int xfer_callback(void* clientp, curl_off_t dltotal, curl_off_t dlnow, curl_off_t ultotal, curl_off_t ulnow) {
     auto* data = static_cast<CurlProgressData*>(clientp);
     if (data && data->callback) {
         if (data->is_upload) {
@@ -121,25 +122,18 @@ int xfer_callback(void* clientp, curl_off_t dltotal, curl_off_t dlnow,
     return 0;
 }
 
-} // anonymous namespace
+}  // anonymous namespace
 
 // ----- AwsSigV4Signer -----
 
-AwsSigV4Signer::AwsSigV4Signer(std::string_view access_key,
-                                 std::string_view secret_key,
-                                 std::string_view region,
-                                 std::string_view service)
-    : access_key_(access_key)
-    , secret_key_(secret_key)
-    , region_(region)
-    , service_(service) {}
+AwsSigV4Signer::AwsSigV4Signer(std::string_view access_key, std::string_view secret_key, std::string_view region,
+                               std::string_view service)
+    : access_key_(access_key), secret_key_(secret_key), region_(region), service_(service) {}
 
-std::string AwsSigV4Signer::sign_request(
-    std::string_view /*method*/,
-    std::string_view /*uri*/,
-    std::string_view /*query_string*/,
-    const std::vector<std::pair<std::string, std::string>>& /*headers*/,
-    std::span<const uint8_t> /*payload*/) const {
+std::string AwsSigV4Signer::sign_request(std::string_view /*method*/, std::string_view /*uri*/,
+                                         std::string_view /*query_string*/,
+                                         const std::vector<std::pair<std::string, std::string>>& /*headers*/,
+                                         std::span<const uint8_t> /*payload*/) const {
     // Placeholder - full SigV4 signing implemented inline in the backend methods
     return {};
 }
@@ -148,13 +142,15 @@ std::string AwsSigV4Signer::payload_hash(std::span<const uint8_t> payload) {
     return crypto::sha256_hex(payload);
 }
 
-std::string AwsSigV4Signer::iso8601_now() { return utc_datetime(); }
-std::string AwsSigV4Signer::datestamp_now() { return utc_date(); }
+std::string AwsSigV4Signer::iso8601_now() {
+    return utc_datetime();
+}
+std::string AwsSigV4Signer::datestamp_now() {
+    return utc_date();
+}
 
 std::vector<uint8_t> AwsSigV4Signer::derive_signing_key(std::string_view datestamp) const {
-    auto key_bytes = [](const std::string& s) -> std::vector<uint8_t> {
-        return {s.begin(), s.end()};
-    };
+    auto key_bytes = [](const std::string& s) -> std::vector<uint8_t> { return {s.begin(), s.end()}; };
 
     auto k_secret = key_bytes("AWS4" + secret_key_);
     auto date_bytes = std::vector<uint8_t>(datestamp.begin(), datestamp.end());
@@ -181,31 +177,33 @@ struct S3StorageBackend::Impl {
 
     std::string host_for_signing() const {
         std::string_view ep = endpoint;
-        if (ep.starts_with("https://")) ep.remove_prefix(8);
-        else if (ep.starts_with("http://")) ep.remove_prefix(7);
+        if (ep.starts_with("https://"))
+            ep.remove_prefix(8);
+        else if (ep.starts_with("http://"))
+            ep.remove_prefix(7);
         auto slash = ep.find('/');
-        if (slash != std::string_view::npos) ep = ep.substr(0, slash);
+        if (slash != std::string_view::npos)
+            ep = ep.substr(0, slash);
         return std::string(ep);
     }
 
     std::string uri_path(const std::string& key) const {
-        if (path_style) return fmt::format("{}/{}", bucket, key);
+        if (path_style)
+            return fmt::format("{}/{}", bucket, key);
         return key;
     }
 
-    std::string build_authorization(
-        const std::string& method, const std::string& uri,
-        const std::string& query_string,
-        const std::map<std::string, std::string>& headers,
-        const std::string& payload_hash_val,
-        const std::string& date, const std::string& datetime) const {
-
+    std::string build_authorization(const std::string& method, const std::string& uri, const std::string& query_string,
+                                    const std::map<std::string, std::string>& headers,
+                                    const std::string& payload_hash_val, const std::string& date,
+                                    const std::string& datetime) const {
         // Canonical headers
         std::string canonical_headers;
         std::string signed_headers;
         for (auto& [k, v] : headers) {
             canonical_headers += fmt::format("{}:{}\n", k, v);
-            if (!signed_headers.empty()) signed_headers += ';';
+            if (!signed_headers.empty())
+                signed_headers += ';';
             signed_headers += k;
         }
 
@@ -227,26 +225,23 @@ struct S3StorageBackend::Impl {
         }
         std::string canonical_qs;
         for (auto& [k, v] : sorted_params) {
-            if (!canonical_qs.empty()) canonical_qs += '&';
+            if (!canonical_qs.empty())
+                canonical_qs += '&';
             canonical_qs += k + "=" + v;
         }
 
-        auto canonical_request = fmt::format("{}\n{}\n{}\n{}\n{}\n{}",
-            method, canonical_uri, canonical_qs,
-            canonical_headers, signed_headers, payload_hash_val);
+        auto canonical_request = fmt::format("{}\n{}\n{}\n{}\n{}\n{}", method, canonical_uri, canonical_qs,
+                                             canonical_headers, signed_headers, payload_hash_val);
 
-        auto canonical_hash = crypto::sha256_hex(
-            std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(canonical_request.data()),
-                                     canonical_request.size()));
+        auto canonical_hash = crypto::sha256_hex(std::span<const uint8_t>(
+            reinterpret_cast<const uint8_t*>(canonical_request.data()), canonical_request.size()));
 
         std::string credential_scope = fmt::format("{}/{}/s3/aws4_request", date, region);
-        std::string string_to_sign = fmt::format("AWS4-HMAC-SHA256\n{}\n{}\n{}",
-            datetime, credential_scope, canonical_hash);
+        std::string string_to_sign =
+            fmt::format("AWS4-HMAC-SHA256\n{}\n{}\n{}", datetime, credential_scope, canonical_hash);
 
         // Derive signing key
-        auto key_bytes = [](const std::string& s) -> std::vector<uint8_t> {
-            return {s.begin(), s.end()};
-        };
+        auto key_bytes = [](const std::string& s) -> std::vector<uint8_t> { return {s.begin(), s.end()}; };
         auto k_secret = key_bytes("AWS4" + secret_key);
         auto k_date = crypto::hmac_sha256(k_secret, std::vector<uint8_t>(date.begin(), date.end()));
         auto k_region = crypto::hmac_sha256(k_date, std::vector<uint8_t>(region.begin(), region.end()));
@@ -255,17 +250,16 @@ struct S3StorageBackend::Impl {
         std::string req = "aws4_request";
         auto signing_key = crypto::hmac_sha256(k_service, std::vector<uint8_t>(req.begin(), req.end()));
 
-        auto signature = crypto::hmac_sha256_hex(signing_key,
-            std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(string_to_sign.data()),
-                                     string_to_sign.size()));
+        auto signature = crypto::hmac_sha256_hex(
+            signing_key,
+            std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(string_to_sign.data()), string_to_sign.size()));
 
-        return fmt::format("AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={}, Signature={}",
-                           access_key, credential_scope, signed_headers, signature);
+        return fmt::format("AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={}, Signature={}", access_key,
+                           credential_scope, signed_headers, signature);
     }
 };
 
-S3StorageBackend::S3StorageBackend(const StorageConfig& config)
-    : impl_(std::make_unique<Impl>()) {
+S3StorageBackend::S3StorageBackend(const StorageConfig& config) : impl_(std::make_unique<Impl>()) {
     impl_->bucket = config.bucket;
     impl_->region = config.region;
     impl_->access_key = config.access_key;
@@ -288,35 +282,37 @@ S3StorageBackend::S3StorageBackend(const StorageConfig& config)
             impl_->region = "us-east-1";
     }
     if (impl_->endpoint.empty()) {
-        impl_->endpoint = fmt::format("https://{}.s3.{}.amazonaws.com",
-                                       impl_->bucket, impl_->region);
+        impl_->endpoint = fmt::format("https://{}.s3.{}.amazonaws.com", impl_->bucket, impl_->region);
         impl_->path_style = false;
     } else {
         impl_->path_style = true;
     }
-    spdlog::debug("S3StorageBackend: endpoint={}, bucket={}, region={}",
-                   impl_->endpoint, impl_->bucket, impl_->region);
+    spdlog::debug("S3StorageBackend: endpoint={}, bucket={}, region={}", impl_->endpoint, impl_->bucket, impl_->region);
 }
 
 S3StorageBackend::~S3StorageBackend() = default;
 
 std::string S3StorageBackend::build_url(const std::string& key) const {
     if (impl_->path_style) {
-        if (key.empty()) return fmt::format("{}/{}", impl_->endpoint, impl_->bucket);
+        if (key.empty())
+            return fmt::format("{}/{}", impl_->endpoint, impl_->bucket);
         return fmt::format("{}/{}/{}", impl_->endpoint, impl_->bucket, key);
     }
-    if (key.empty()) return impl_->endpoint;
+    if (key.empty())
+        return impl_->endpoint;
     return fmt::format("{}/{}", impl_->endpoint, key);
 }
 
 std::string S3StorageBackend::prefixed_key(const std::string& key) const {
-    if (impl_->prefix.empty()) return key;
-    if (impl_->prefix.back() == '/') return impl_->prefix + key;
+    if (impl_->prefix.empty())
+        return key;
+    if (impl_->prefix.back() == '/')
+        return impl_->prefix + key;
     return impl_->prefix + "/" + key;
 }
 
 int32_t S3StorageBackend::put_object(const std::string& key, std::span<const uint8_t> data,
-                                      const std::string& content_type) {
+                                     const std::string& content_type) {
     auto full_key = prefixed_key(key);
     auto url = build_url(full_key);
     auto ph = crypto::sha256_hex(data);
@@ -334,15 +330,20 @@ int32_t S3StorageBackend::put_object(const std::string& key, std::span<const uin
     headers["authorization"] = auth;
 
     auto* curl = curl_easy_init();
-    if (!curl) return SURGE_ERROR;
+    if (!curl)
+        return SURGE_ERROR;
 
     struct curl_slist* hdr_list = nullptr;
     for (auto& [k, v] : headers) {
-        if (k == "host") continue;
+        if (k == "host")
+            continue;
         hdr_list = curl_slist_append(hdr_list, fmt::format("{}: {}", k, v).c_str());
     }
 
-    struct ReadState { const uint8_t* ptr; size_t remaining; };
+    struct ReadState {
+        const uint8_t* ptr;
+        size_t remaining;
+    };
     ReadState read_state{data.data(), data.size()};
     std::vector<uint8_t> response;
 
@@ -352,8 +353,8 @@ int32_t S3StorageBackend::put_object(const std::string& key, std::span<const uin
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdr_list);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-    curl_easy_setopt(curl, CURLOPT_READFUNCTION,
-        +[](char* ptr, size_t size, size_t nmemb, void* ud) -> size_t {
+    curl_easy_setopt(
+        curl, CURLOPT_READFUNCTION, +[](char* ptr, size_t size, size_t nmemb, void* ud) -> size_t {
             auto* state = static_cast<ReadState*>(ud);
             size_t to_copy = std::min(size * nmemb, state->remaining);
             std::memcpy(ptr, state->ptr, to_copy);
@@ -369,7 +370,8 @@ int32_t S3StorageBackend::put_object(const std::string& key, std::span<const uin
     curl_slist_free_all(hdr_list);
     curl_easy_cleanup(curl);
 
-    if (res != CURLE_OK || http_code < 200 || http_code >= 300) return SURGE_ERROR;
+    if (res != CURLE_OK || http_code < 200 || http_code >= 300)
+        return SURGE_ERROR;
     return SURGE_OK;
 }
 
@@ -389,11 +391,13 @@ int32_t S3StorageBackend::get_object(const std::string& key, std::vector<uint8_t
     headers["authorization"] = auth;
 
     auto* curl = curl_easy_init();
-    if (!curl) return SURGE_ERROR;
+    if (!curl)
+        return SURGE_ERROR;
 
     struct curl_slist* hdr_list = nullptr;
     for (auto& [k, v] : headers) {
-        if (k == "host") continue;
+        if (k == "host")
+            continue;
         hdr_list = curl_slist_append(hdr_list, fmt::format("{}: {}", k, v).c_str());
     }
 
@@ -409,9 +413,12 @@ int32_t S3StorageBackend::get_object(const std::string& key, std::vector<uint8_t
     curl_slist_free_all(hdr_list);
     curl_easy_cleanup(curl);
 
-    if (res != CURLE_OK) return SURGE_ERROR;
-    if (http_code == 404) return SURGE_NOT_FOUND;
-    if (http_code < 200 || http_code >= 300) return SURGE_ERROR;
+    if (res != CURLE_OK)
+        return SURGE_ERROR;
+    if (http_code == 404)
+        return SURGE_NOT_FOUND;
+    if (http_code < 200 || http_code >= 300)
+        return SURGE_ERROR;
     return SURGE_OK;
 }
 
@@ -427,15 +434,18 @@ int32_t S3StorageBackend::head_object(const std::string& key, ObjectInfo& out_in
     sign_headers["x-amz-content-sha256"] = ph;
     sign_headers["x-amz-date"] = datetime;
 
-    auto auth = impl_->build_authorization("HEAD", "/" + impl_->uri_path(full_key), "", sign_headers, ph, date, datetime);
+    auto auth =
+        impl_->build_authorization("HEAD", "/" + impl_->uri_path(full_key), "", sign_headers, ph, date, datetime);
     sign_headers["authorization"] = auth;
 
     auto* curl = curl_easy_init();
-    if (!curl) return SURGE_ERROR;
+    if (!curl)
+        return SURGE_ERROR;
 
     struct curl_slist* hdr_list = nullptr;
     for (auto& [k, v] : sign_headers) {
-        if (k == "host") continue;
+        if (k == "host")
+            continue;
         hdr_list = curl_slist_append(hdr_list, fmt::format("{}: {}", k, v).c_str());
     }
 
@@ -452,9 +462,12 @@ int32_t S3StorageBackend::head_object(const std::string& key, ObjectInfo& out_in
     curl_slist_free_all(hdr_list);
     curl_easy_cleanup(curl);
 
-    if (res != CURLE_OK) return SURGE_ERROR;
-    if (http_code == 404) return SURGE_NOT_FOUND;
-    if (http_code < 200 || http_code >= 300) return SURGE_ERROR;
+    if (res != CURLE_OK)
+        return SURGE_ERROR;
+    if (http_code == 404)
+        return SURGE_NOT_FOUND;
+    if (http_code < 200 || http_code >= 300)
+        return SURGE_ERROR;
 
     out_info.key = key;
     if (auto it = resp_headers.find("content-length"); it != resp_headers.end())
@@ -483,11 +496,13 @@ int32_t S3StorageBackend::delete_object(const std::string& key) {
     headers["authorization"] = auth;
 
     auto* curl = curl_easy_init();
-    if (!curl) return SURGE_ERROR;
+    if (!curl)
+        return SURGE_ERROR;
 
     struct curl_slist* hdr_list = nullptr;
     for (auto& [k, v] : headers) {
-        if (k == "host") continue;
+        if (k == "host")
+            continue;
         hdr_list = curl_slist_append(hdr_list, fmt::format("{}: {}", k, v).c_str());
     }
 
@@ -501,14 +516,17 @@ int32_t S3StorageBackend::delete_object(const std::string& key) {
     curl_slist_free_all(hdr_list);
     curl_easy_cleanup(curl);
 
-    if (res != CURLE_OK) return SURGE_ERROR;
-    if (http_code >= 200 && http_code < 300) return SURGE_OK;
-    if (http_code == 404) return SURGE_OK;
+    if (res != CURLE_OK)
+        return SURGE_ERROR;
+    if (http_code >= 200 && http_code < 300)
+        return SURGE_OK;
+    if (http_code == 404)
+        return SURGE_OK;
     return SURGE_ERROR;
 }
 
-int32_t S3StorageBackend::list_objects(const std::string& prefix, ListResult& out_result,
-                                        const std::string& marker, int max_keys) {
+int32_t S3StorageBackend::list_objects(const std::string& prefix, ListResult& out_result, const std::string& marker,
+                                       int max_keys) {
     // Simplified list implementation
     out_result.objects.clear();
     out_result.truncated = false;
@@ -535,11 +553,13 @@ int32_t S3StorageBackend::list_objects(const std::string& prefix, ListResult& ou
     headers["authorization"] = auth;
 
     auto* curl = curl_easy_init();
-    if (!curl) return SURGE_ERROR;
+    if (!curl)
+        return SURGE_ERROR;
 
     struct curl_slist* hdr_list = nullptr;
     for (auto& [k, v] : headers) {
-        if (k == "host") continue;
+        if (k == "host")
+            continue;
         hdr_list = curl_slist_append(hdr_list, fmt::format("{}: {}", k, v).c_str());
     }
 
@@ -555,7 +575,8 @@ int32_t S3StorageBackend::list_objects(const std::string& prefix, ListResult& ou
     curl_slist_free_all(hdr_list);
     curl_easy_cleanup(curl);
 
-    if (res != CURLE_OK || http_code < 200 || http_code >= 300) return SURGE_ERROR;
+    if (res != CURLE_OK || http_code < 200 || http_code >= 300)
+        return SURGE_ERROR;
 
     // Simple XML parsing
     std::string xml(response.begin(), response.end());
@@ -566,9 +587,11 @@ int32_t S3StorageBackend::list_objects(const std::string& prefix, ListResult& ou
     size_t search_from = 0;
     while (true) {
         auto cs = xml.find("<Contents>", search_from);
-        if (cs == std::string::npos) break;
+        if (cs == std::string::npos)
+            break;
         auto ce = xml.find("</Contents>", cs);
-        if (ce == std::string::npos) break;
+        if (ce == std::string::npos)
+            break;
         search_from = ce + 11;
 
         auto block = xml.substr(cs, ce - cs);
@@ -577,16 +600,19 @@ int32_t S3StorageBackend::list_objects(const std::string& prefix, ListResult& ou
             auto open = "<" + tag + ">";
             auto close = "</" + tag + ">";
             auto s = block.find(open);
-            if (s == std::string::npos) return {};
+            if (s == std::string::npos)
+                return {};
             s += open.size();
             auto e = block.find(close, s);
-            if (e == std::string::npos) return {};
+            if (e == std::string::npos)
+                return {};
             return block.substr(s, e - s);
         };
 
         info.key = extract("Key");
         auto size_str = extract("Size");
-        if (!size_str.empty()) info.size = std::stoll(size_str);
+        if (!size_str.empty())
+            info.size = std::stoll(size_str);
         info.etag = extract("ETag");
         info.last_modified = extract("LastModified");
         out_result.objects.push_back(std::move(info));
@@ -596,7 +622,7 @@ int32_t S3StorageBackend::list_objects(const std::string& prefix, ListResult& ou
 }
 
 int32_t S3StorageBackend::download_to_file(const std::string& key, const std::filesystem::path& dest,
-                                            std::function<void(int64_t, int64_t)> progress) {
+                                           std::function<void(int64_t, int64_t)> progress) {
     auto full_key = prefixed_key(key);
     auto url = build_url(full_key);
     auto ph = crypto::sha256_hex(std::span<const uint8_t>{});
@@ -612,11 +638,13 @@ int32_t S3StorageBackend::download_to_file(const std::string& key, const std::fi
     headers["authorization"] = auth;
 
     auto* curl = curl_easy_init();
-    if (!curl) return SURGE_ERROR;
+    if (!curl)
+        return SURGE_ERROR;
 
     struct curl_slist* hdr_list = nullptr;
     for (auto& [k, v] : headers) {
-        if (k == "host") continue;
+        if (k == "host")
+            continue;
         hdr_list = curl_slist_append(hdr_list, fmt::format("{}: {}", k, v).c_str());
     }
 
@@ -654,7 +682,7 @@ int32_t S3StorageBackend::download_to_file(const std::string& key, const std::fi
 }
 
 int32_t S3StorageBackend::upload_from_file(const std::string& key, const std::filesystem::path& src,
-                                            std::function<void(int64_t, int64_t)> progress) {
+                                           std::function<void(int64_t, int64_t)> progress) {
     auto full_key = prefixed_key(key);
     auto url = build_url(full_key);
     auto file_size = std::filesystem::file_size(src);
@@ -673,11 +701,13 @@ int32_t S3StorageBackend::upload_from_file(const std::string& key, const std::fi
     headers["authorization"] = auth;
 
     auto* curl = curl_easy_init();
-    if (!curl) return SURGE_ERROR;
+    if (!curl)
+        return SURGE_ERROR;
 
     struct curl_slist* hdr_list = nullptr;
     for (auto& [k, v] : headers) {
-        if (k == "host") continue;
+        if (k == "host")
+            continue;
         hdr_list = curl_slist_append(hdr_list, fmt::format("{}: {}", k, v).c_str());
     }
 
@@ -707,8 +737,9 @@ int32_t S3StorageBackend::upload_from_file(const std::string& key, const std::fi
     curl_slist_free_all(hdr_list);
     curl_easy_cleanup(curl);
 
-    if (res != CURLE_OK || http_code < 200 || http_code >= 300) return SURGE_ERROR;
+    if (res != CURLE_OK || http_code < 200 || http_code >= 300)
+        return SURGE_ERROR;
     return SURGE_OK;
 }
 
-} // namespace surge::storage
+}  // namespace surge::storage

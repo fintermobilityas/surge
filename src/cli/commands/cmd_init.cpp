@@ -3,14 +3,15 @@
  * @brief `surge init` - Initialize a new surge project.
  */
 
+#include "config/constants.hpp"
+
 #include <cxxopts.hpp>
-#include <spdlog/spdlog.h>
-#include <fmt/format.h>
 #include <filesystem>
+#include <fmt/format.h>
 #include <fstream>
 #include <iostream>
+#include <spdlog/spdlog.h>
 #include <string>
-#include "config/constants.hpp"
 
 namespace fs = std::filesystem;
 
@@ -37,10 +38,8 @@ std::string detect_rid() {
 #endif
 }
 
-std::string generate_template_manifest(const std::string& app_id,
-                                        const std::string& main_exe,
-                                        const std::string& os,
-                                        const std::string& rid) {
+std::string generate_template_manifest(const std::string& app_id, const std::string& main_exe, const std::string& os,
+                                       const std::string& rid) {
     return fmt::format(R"(# Surge manifest - https://github.com/user/surge
 schema: {schema}
 
@@ -82,24 +81,19 @@ apps:
       description: ""
       authors: ""
 )",
-        fmt::arg("schema", surge::constants::MANIFEST_SCHEMA_VERSION),
-        fmt::arg("app_id", app_id),
-        fmt::arg("main", main_exe),
-        fmt::arg("os", os),
-        fmt::arg("rid", rid));
+                       fmt::arg("schema", surge::constants::MANIFEST_SCHEMA_VERSION), fmt::arg("app_id", app_id),
+                       fmt::arg("main", main_exe), fmt::arg("os", os), fmt::arg("rid", rid));
 }
 
-} // anonymous namespace
+}  // anonymous namespace
 
 int cmd_init(int argc, char* argv[]) {
     cxxopts::Options options("surge init", "Initialize a new surge project");
 
-    options.add_options()
-        ("app-id", "Application identifier", cxxopts::value<std::string>()->default_value("myapp"))
-        ("main", "Main executable name", cxxopts::value<std::string>()->default_value("myapp"))
-        ("path", "Project directory (default: current directory)", cxxopts::value<std::string>()->default_value("."))
-        ("h,help", "Show help")
-    ;
+    options.add_options()("app-id", "Application identifier", cxxopts::value<std::string>()->default_value("myapp"))(
+        "main", "Main executable name", cxxopts::value<std::string>()->default_value("myapp"))(
+        "path", "Project directory (default: current directory)", cxxopts::value<std::string>()->default_value("."))(
+        "h,help", "Show help");
 
     auto result = options.parse(argc, argv);
 
@@ -108,7 +102,7 @@ int cmd_init(int argc, char* argv[]) {
         return 0;
     }
 
-    const auto app_id  = result["app-id"].as<std::string>();
+    const auto app_id = result["app-id"].as<std::string>();
     const auto main_exe = result["main"].as<std::string>();
     const auto project_dir = fs::path(result["path"].as<std::string>());
     const auto surge_dir = project_dir / surge::constants::SURGE_DIR;
@@ -122,7 +116,7 @@ int cmd_init(int argc, char* argv[]) {
     }
 
     // Detect platform
-    const auto os  = detect_os();
+    const auto os = detect_os();
     const auto rid = detect_rid();
 
     spdlog::info("Initializing surge project...");

@@ -3,15 +3,16 @@
  * @brief `surge pack` - Build full and delta packages from artifacts.
  */
 
-#include <cxxopts.hpp>
-#include <spdlog/spdlog.h>
-#include <fmt/format.h>
-#include <yaml-cpp/yaml.h>
-#include <filesystem>
-#include <iostream>
-#include <chrono>
 #include "config/constants.hpp"
 #include "config/manifest.hpp"
+
+#include <chrono>
+#include <cxxopts.hpp>
+#include <filesystem>
+#include <fmt/format.h>
+#include <iostream>
+#include <spdlog/spdlog.h>
+#include <yaml-cpp/yaml.h>
 
 namespace fs = std::filesystem;
 
@@ -29,26 +30,27 @@ fs::path find_manifest(const std::string& path_override) {
 }
 
 std::string format_size(int64_t bytes) {
-    if (bytes < 1024) return fmt::format("{} B", bytes);
-    if (bytes < 1024 * 1024) return fmt::format("{:.1f} KB", bytes / 1024.0);
-    if (bytes < 1024 * 1024 * 1024) return fmt::format("{:.1f} MB", bytes / (1024.0 * 1024.0));
+    if (bytes < 1024)
+        return fmt::format("{} B", bytes);
+    if (bytes < 1024 * 1024)
+        return fmt::format("{:.1f} KB", bytes / 1024.0);
+    if (bytes < 1024 * 1024 * 1024)
+        return fmt::format("{:.1f} MB", bytes / (1024.0 * 1024.0));
     return fmt::format("{:.2f} GB", bytes / (1024.0 * 1024.0 * 1024.0));
 }
 
-} // anonymous namespace
+}  // anonymous namespace
 
 int cmd_pack(int argc, char* argv[]) {
     cxxopts::Options options("surge pack", "Build full and delta packages from artifacts");
 
-    options.add_options()
-        ("app", "Application ID (overrides manifest)", cxxopts::value<std::string>()->default_value(""))
-        ("rid", "Runtime identifier (overrides manifest)", cxxopts::value<std::string>()->default_value(""))
-        ("version", "Semantic version for this release (required)", cxxopts::value<std::string>())
-        ("artifacts", "Path to artifacts directory", cxxopts::value<std::string>()->default_value(""))
-        ("manifest", "Path to surge.yml", cxxopts::value<std::string>()->default_value(""))
-        ("max-memory", "Maximum memory budget in MB", cxxopts::value<int>()->default_value("0"))
-        ("h,help", "Show help")
-    ;
+    options.add_options()("app", "Application ID (overrides manifest)",
+                          cxxopts::value<std::string>()->default_value(""))(
+        "rid", "Runtime identifier (overrides manifest)", cxxopts::value<std::string>()->default_value(""))(
+        "version", "Semantic version for this release (required)", cxxopts::value<std::string>())(
+        "artifacts", "Path to artifacts directory", cxxopts::value<std::string>()->default_value(""))(
+        "manifest", "Path to surge.yml", cxxopts::value<std::string>()->default_value(""))(
+        "max-memory", "Maximum memory budget in MB", cxxopts::value<int>()->default_value("0"))("h,help", "Show help");
 
     auto result = options.parse(argc, argv);
 
@@ -67,8 +69,7 @@ int cmd_pack(int argc, char* argv[]) {
     // Locate manifest
     auto manifest_path = find_manifest(result["manifest"].as<std::string>());
     if (manifest_path.empty() || !fs::exists(manifest_path)) {
-        spdlog::error("Cannot find {}. Run 'surge init' first or specify --manifest",
-                       surge::constants::MANIFEST_FILE);
+        spdlog::error("Cannot find {}. Run 'surge init' first or specify --manifest", surge::constants::MANIFEST_FILE);
         return 1;
     }
 
@@ -126,9 +127,8 @@ int cmd_pack(int argc, char* argv[]) {
     auto artifacts_dir_str = result["artifacts"].as<std::string>();
     fs::path artifacts_dir;
     if (artifacts_dir_str.empty()) {
-        artifacts_dir = manifest.generic.artifacts.empty()
-            ? fs::path(surge::constants::ARTIFACTS_DIR)
-            : fs::path(manifest.generic.artifacts);
+        artifacts_dir = manifest.generic.artifacts.empty() ? fs::path(surge::constants::ARTIFACTS_DIR)
+                                                           : fs::path(manifest.generic.artifacts);
     } else {
         artifacts_dir = fs::path(artifacts_dir_str);
     }
@@ -160,9 +160,8 @@ int cmd_pack(int argc, char* argv[]) {
     }
 
     // Resolve packages output directory
-    fs::path packages_dir = manifest.generic.packages.empty()
-        ? fs::path(surge::constants::PACKAGES_DIR)
-        : fs::path(manifest.generic.packages);
+    fs::path packages_dir = manifest.generic.packages.empty() ? fs::path(surge::constants::PACKAGES_DIR)
+                                                              : fs::path(manifest.generic.packages);
     fs::create_directories(packages_dir);
 
     auto start_time = std::chrono::steady_clock::now();

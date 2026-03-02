@@ -20,8 +20,7 @@ struct ExtractorOptions {
      * Progress callback: (files_done, files_total, bytes_done, bytes_total).
      * bytes_total may be 0 if the total is not known up-front.
      */
-    std::function<void(int64_t files_done, int64_t files_total,
-                       int64_t bytes_done, int64_t bytes_total)> progress;
+    std::function<void(int64_t files_done, int64_t files_total, int64_t bytes_done, int64_t bytes_total)> progress;
 
     /** If true, read and verify the embedded manifest.yml checksums. */
     bool verify_manifest = false;
@@ -43,8 +42,7 @@ public:
      * @param archive_path Path to the .tar.zst file.
      * @param options      Extraction options.
      */
-    explicit ArchiveExtractor(const std::filesystem::path& archive_path,
-                              const ExtractorOptions& options = {});
+    explicit ArchiveExtractor(const std::filesystem::path& archive_path, const ExtractorOptions& options = {});
     ~ArchiveExtractor();
 
     ArchiveExtractor(const ArchiveExtractor&) = delete;
@@ -75,4 +73,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-} // namespace surge::archive
+}  // namespace surge::archive

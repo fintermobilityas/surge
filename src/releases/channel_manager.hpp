@@ -5,12 +5,12 @@
 
 #pragma once
 
+#include "release_manifest.hpp"
+
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
-
-#include "release_manifest.hpp"
 
 namespace surge {
 class Context;
@@ -43,9 +43,7 @@ public:
      * @param target_channel  Channel to promote to.
      * @return 0 on success, negative error code on failure.
      */
-    int32_t promote(const std::string& version,
-                    const std::string& source_channel,
-                    const std::string& target_channel);
+    int32_t promote(const std::string& version, const std::string& source_channel, const std::string& target_channel);
 
     /**
      * Remove a release from a channel.
@@ -53,8 +51,7 @@ public:
      * @param channel Channel to remove the release from.
      * @return 0 on success, negative error code on failure.
      */
-    int32_t demote(const std::string& version,
-                   const std::string& channel);
+    int32_t demote(const std::string& version, const std::string& channel);
 
     /**
      * List all distinct channels present in the release index.
@@ -76,4 +73,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-} // namespace surge::releases
+}  // namespace surge::releases

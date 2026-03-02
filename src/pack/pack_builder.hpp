@@ -5,14 +5,14 @@
 
 #pragma once
 
+#include "surge/surge_api.h"
+
 #include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <memory>
 #include <string>
 #include <vector>
-
-#include "surge/surge_api.h"
 
 namespace surge {
 class Context;
@@ -21,18 +21,18 @@ class Context;
 namespace surge::releases {
 struct ReleaseEntry;
 struct ReleaseIndex;
-}
+}  // namespace surge::releases
 
 namespace surge::pack {
 
 /** Metadata about a built package. */
 struct PackageArtifact {
     std::filesystem::path path;
-    std::string           filename;
-    int64_t               size = 0;
-    std::string           sha256;
-    bool                  is_delta = false;
-    std::string           from_version;  // only for delta packages
+    std::string filename;
+    int64_t size = 0;
+    std::string sha256;
+    bool is_delta = false;
+    std::string from_version;  // only for delta packages
 };
 
 /** Progress callback for pack operations. */
@@ -61,12 +61,8 @@ public:
      * @param version       Version string for this release.
      * @param artifacts_dir Directory containing build artifacts.
      */
-    PackBuilder(Context& ctx,
-                std::filesystem::path manifest_path,
-                std::string app_id,
-                std::string rid,
-                std::string version,
-                std::filesystem::path artifacts_dir);
+    PackBuilder(Context& ctx, std::filesystem::path manifest_path, std::string app_id, std::string rid,
+                std::string version, std::filesystem::path artifacts_dir);
     ~PackBuilder();
 
     PackBuilder(const PackBuilder&) = delete;
@@ -95,8 +91,7 @@ public:
      * @param progress Optional progress callback.
      * @return 0 on success, negative error code on failure.
      */
-    int32_t push(const std::string& channel,
-                 ProgressCallback progress = nullptr);
+    int32_t push(const std::string& channel, ProgressCallback progress = nullptr);
 
     /** Return the list of packages produced by the last build(). */
     const std::vector<PackageArtifact>& artifacts() const;
@@ -115,4 +110,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-} // namespace surge::pack
+}  // namespace surge::pack

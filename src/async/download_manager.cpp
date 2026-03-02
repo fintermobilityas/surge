@@ -1,12 +1,14 @@
 #include "async/download_manager.hpp"
+
 #include "core/context.hpp"
 #include "crypto/sha256.hpp"
+
+#include <chrono>
 #include <curl/curl.h>
-#include <spdlog/spdlog.h>
 #include <fmt/format.h>
 #include <fstream>
 #include <mutex>
-#include <chrono>
+#include <spdlog/spdlog.h>
 
 namespace surge::async {
 
@@ -21,22 +23,24 @@ struct TransferData {
 
 size_t write_cb(char* ptr, size_t size, size_t nmemb, void* userdata) {
     auto* td = static_cast<TransferData*>(userdata);
-    if (td->cancelled || td->stop.stop_requested()) return 0;
+    if (td->cancelled || td->stop.stop_requested())
+        return 0;
     size_t total = size * nmemb;
     td->file.write(ptr, static_cast<std::streamsize>(total));
-    if (td->file.fail()) return 0;
+    if (td->file.fail())
+        return 0;
     td->bytes_downloaded += static_cast<int64_t>(total);
     return total;
 }
 
 [[maybe_unused]]
-int curl_progress_cb(void* userdata, curl_off_t /*dltotal*/, curl_off_t /*dlnow*/,
-                     curl_off_t /*ultotal*/, curl_off_t /*ulnow*/) {
+int curl_progress_cb(void* userdata, curl_off_t /*dltotal*/, curl_off_t /*dlnow*/, curl_off_t /*ultotal*/,
+                     curl_off_t /*ulnow*/) {
     auto* td = static_cast<TransferData*>(userdata);
     return (td->cancelled || td->stop.stop_requested()) ? 1 : 0;
 }
 
-} // anonymous namespace
+}  // anonymous namespace
 
 struct DownloadManager::Impl {
     Context& ctx;
@@ -53,17 +57,15 @@ struct DownloadManager::Impl {
         }
     }
 
-    std::vector<DownloadResult> do_download(
-        std::span<const DownloadRequest> requests,
-        std::stop_token stop,
-        DownloadProgressCallback progress_cb) {
-
+    std::vector<DownloadResult> do_download(std::span<const DownloadRequest> requests, std::stop_token stop,
+                                            DownloadProgressCallback progress_cb) {
         std::vector<DownloadResult> results(requests.size());
         for (size_t i = 0; i < requests.size(); ++i) {
             results[i].index = static_cast<int32_t>(i);
         }
 
-        if (requests.empty()) return results;
+        if (requests.empty())
+            return results;
 
         CURLM* multi = curl_multi_init();
         if (!multi) {
@@ -95,7 +97,8 @@ struct DownloadManager::Impl {
         }
 
         auto report_progress = [&] {
-            if (!progress_cb) return;
+            if (!progress_cb)
+                return;
             DownloadProgress dp;
             dp.files_done = files_done;
             dp.files_total = static_cast<int32_t>(requests.size());
@@ -115,12 +118,10 @@ struct DownloadManager::Impl {
             std::error_code ec;
             std::filesystem::create_directories(req.dest_path.parent_path(), ec);
 
-            transfer->data.file.open(req.dest_path,
-                                     std::ios::binary | std::ios::trunc);
+            transfer->data.file.open(req.dest_path, std::ios::binary | std::ios::trunc);
             if (!transfer->data.file.is_open()) {
                 results[idx].status = -1;
-                results[idx].error_message = fmt::format(
-                    "Failed to open '{}' for writing", req.dest_path.string());
+                results[idx].error_message = fmt::format("Failed to open '{}' for writing", req.dest_path.string());
                 return false;
             }
 
@@ -142,14 +143,11 @@ struct DownloadManager::Impl {
             curl_easy_setopt(easy, CURLOPT_FOLLOWLOCATION, 1L);
             curl_easy_setopt(easy, CURLOPT_MAXREDIRS, 5L);
             curl_easy_setopt(easy, CURLOPT_FAILONERROR, 1L);
-            curl_easy_setopt(easy, CURLOPT_PRIVATE,
-                             reinterpret_cast<void*>(transfer.get()));
+            curl_easy_setopt(easy, CURLOPT_PRIVATE, reinterpret_cast<void*>(transfer.get()));
 
             if (max_speed_bps > 0) {
-                auto per_transfer = max_speed_bps /
-                    static_cast<int64_t>(max_concurrent);
-                curl_easy_setopt(easy, CURLOPT_MAX_RECV_SPEED_LARGE,
-                                 static_cast<curl_off_t>(per_transfer));
+                auto per_transfer = max_speed_bps / static_cast<int64_t>(max_concurrent);
+                curl_easy_setopt(easy, CURLOPT_MAX_RECV_SPEED_LARGE, static_cast<curl_off_t>(per_transfer));
             }
 
             curl_multi_add_handle(multi, easy);
@@ -158,8 +156,7 @@ struct DownloadManager::Impl {
         };
 
         // Start initial batch
-        while (next_to_start < requests.size() &&
-               static_cast<int32_t>(active.size()) < max_concurrent) {
+        while (next_to_start < requests.size() && static_cast<int32_t>(active.size()) < max_concurrent) {
             start_transfer(next_to_start++);
         }
 
@@ -172,7 +169,8 @@ struct DownloadManager::Impl {
             CURLMsg* msg;
             int msgs_in_queue;
             while ((msg = curl_multi_info_read(multi, &msgs_in_queue))) {
-                if (msg->msg != CURLMSG_DONE) continue;
+                if (msg->msg != CURLMSG_DONE)
+                    continue;
 
                 CURL* easy = msg->easy_handle;
                 CURLcode curl_result = msg->data.result;
@@ -194,23 +192,19 @@ struct DownloadManager::Impl {
                 results[idx].bytes_downloaded = transfer->data.bytes_downloaded;
                 total_bytes_done += transfer->data.bytes_downloaded;
 
-                if (curl_result == CURLE_OK && !transfer->data.cancelled &&
-                    !stop.stop_requested()) {
+                if (curl_result == CURLE_OK && !transfer->data.cancelled && !stop.stop_requested()) {
                     results[idx].status = 0;
 
                     // Verify checksum if expected
                     if (!requests[idx].expected_sha256.empty()) {
                         try {
-                            auto hash = crypto::sha256_hex_file(
-                                requests[idx].dest_path);
+                            auto hash = crypto::sha256_hex_file(requests[idx].dest_path);
                             results[idx].sha256 = hash;
                             if (hash != requests[idx].expected_sha256) {
                                 results[idx].status = -1;
-                                results[idx].error_message =
-                                    "Checksum mismatch";
+                                results[idx].error_message = "Checksum mismatch";
                                 std::error_code ec;
-                                std::filesystem::remove(
-                                    requests[idx].dest_path, ec);
+                                std::filesystem::remove(requests[idx].dest_path, ec);
                             }
                         } catch (const std::exception& e) {
                             results[idx].status = -1;
@@ -218,33 +212,27 @@ struct DownloadManager::Impl {
                         }
                     }
 
-                    spdlog::debug("Download #{} completed: {} bytes",
-                                  idx, results[idx].bytes_downloaded);
+                    spdlog::debug("Download #{} completed: {} bytes", idx, results[idx].bytes_downloaded);
                 } else {
                     results[idx].status = -1;
                     if (stop.stop_requested() || transfer->data.cancelled) {
                         results[idx].error_message = "Cancelled";
                     } else {
-                        results[idx].error_message =
-                            curl_easy_strerror(curl_result);
+                        results[idx].error_message = curl_easy_strerror(curl_result);
                     }
                     std::error_code ec;
                     std::filesystem::remove(requests[idx].dest_path, ec);
-                    spdlog::warn("Download #{} failed: {}",
-                                 idx, results[idx].error_message);
+                    spdlog::warn("Download #{} failed: {}", idx, results[idx].error_message);
                 }
 
                 files_done++;
                 report_progress();
 
                 // Remove from active list
-                std::erase_if(active, [transfer](const auto& t) {
-                    return t.get() == transfer;
-                });
+                std::erase_if(active, [transfer](const auto& t) { return t.get() == transfer; });
 
                 // Start next if available
-                if (next_to_start < requests.size() &&
-                    !stop.stop_requested()) {
+                if (next_to_start < requests.size() && !stop.stop_requested()) {
                     start_transfer(next_to_start++);
                 }
             }
@@ -267,21 +255,17 @@ struct DownloadManager::Impl {
     }
 };
 
-DownloadManager::DownloadManager(Context& ctx)
-    : impl_(std::make_unique<Impl>(ctx)) {}
+DownloadManager::DownloadManager(Context& ctx) : impl_(std::make_unique<Impl>(ctx)) {}
 
 DownloadManager::~DownloadManager() = default;
 
-std::vector<DownloadResult> DownloadManager::download(
-    std::span<const DownloadRequest> requests,
-    DownloadProgressCallback progress) {
+std::vector<DownloadResult> DownloadManager::download(std::span<const DownloadRequest> requests,
+                                                      DownloadProgressCallback progress) {
     return impl_->do_download(requests, impl_->ctx.stop_token(), std::move(progress));
 }
 
-std::vector<DownloadResult> DownloadManager::download(
-    std::span<const DownloadRequest> requests,
-    std::stop_token stop_token,
-    DownloadProgressCallback progress) {
+std::vector<DownloadResult> DownloadManager::download(std::span<const DownloadRequest> requests,
+                                                      std::stop_token stop_token, DownloadProgressCallback progress) {
     return impl_->do_download(requests, stop_token, std::move(progress));
 }
 
@@ -295,4 +279,4 @@ void DownloadManager::set_max_speed(int64_t bytes_per_sec) {
     impl_->max_speed_bps = bytes_per_sec;
 }
 
-} // namespace surge::async
+}  // namespace surge::async

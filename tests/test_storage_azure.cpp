@@ -3,6 +3,9 @@
  * @brief Azure SharedKey signing test vectors.
  */
 
+#include "crypto/hmac.hpp"
+#include "crypto/sha256.hpp"
+
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -12,9 +15,6 @@
 #include <utility>
 #include <vector>
 
-#include "crypto/hmac.hpp"
-#include "crypto/sha256.hpp"
-
 namespace {
 
 std::vector<uint8_t> to_bytes(const std::string& s) {
@@ -23,8 +23,7 @@ std::vector<uint8_t> to_bytes(const std::string& s) {
 
 // Base64 decode (minimal implementation for test vectors)
 std::vector<uint8_t> base64_decode(const std::string& input) {
-    static const std::string chars =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    static const std::string chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
     std::vector<uint8_t> result;
     std::vector<int> T(256, -1);
@@ -49,8 +48,7 @@ std::vector<uint8_t> base64_decode(const std::string& input) {
 
 // Base64 encode
 std::string base64_encode(const std::vector<uint8_t>& data) {
-    static const char chars[] =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    static const char chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
     std::string result;
     int val = 0, valb = -6;
@@ -62,8 +60,10 @@ std::string base64_encode(const std::vector<uint8_t>& data) {
             valb -= 6;
         }
     }
-    if (valb > -6) result += chars[((val << 8) >> (valb + 8)) & 0x3F];
-    while (result.size() % 4) result += '=';
+    if (valb > -6)
+        result += chars[((val << 8) >> (valb + 8)) & 0x3F];
+    while (result.size() % 4)
+        result += '=';
     return result;
 }
 
@@ -86,29 +86,24 @@ std::string base64_encode(const std::vector<uint8_t>& data) {
  *   CanonicalizedHeaders\n
  *   CanonicalizedResource
  */
-std::string make_azure_string_to_sign(
-    const std::string& verb,
-    const std::string& content_type,
-    const std::string& content_length,
-    const std::string& x_ms_date,
-    const std::string& x_ms_version,
-    const std::string& account_name,
-    const std::string& resource_path)
-{
+std::string make_azure_string_to_sign(const std::string& verb, const std::string& content_type,
+                                      const std::string& content_length, const std::string& x_ms_date,
+                                      const std::string& x_ms_version, const std::string& account_name,
+                                      const std::string& resource_path) {
     // Standard headers (most empty for simple GET/PUT)
     std::string sts;
-    sts += verb + "\n";          // VERB
-    sts += "\n";                 // Content-Encoding
-    sts += "\n";                 // Content-Language
-    sts += content_length + "\n"; // Content-Length (empty if 0 for GET)
-    sts += "\n";                 // Content-MD5
-    sts += content_type + "\n";  // Content-Type
-    sts += "\n";                 // Date (using x-ms-date instead)
-    sts += "\n";                 // If-Modified-Since
-    sts += "\n";                 // If-Match
-    sts += "\n";                 // If-None-Match
-    sts += "\n";                 // If-Unmodified-Since
-    sts += "\n";                 // Range
+    sts += verb + "\n";            // VERB
+    sts += "\n";                   // Content-Encoding
+    sts += "\n";                   // Content-Language
+    sts += content_length + "\n";  // Content-Length (empty if 0 for GET)
+    sts += "\n";                   // Content-MD5
+    sts += content_type + "\n";    // Content-Type
+    sts += "\n";                   // Date (using x-ms-date instead)
+    sts += "\n";                   // If-Modified-Since
+    sts += "\n";                   // If-Match
+    sts += "\n";                   // If-None-Match
+    sts += "\n";                   // If-Unmodified-Since
+    sts += "\n";                   // Range
 
     // Canonicalized headers
     sts += "x-ms-date:" + x_ms_date + "\n";
@@ -120,10 +115,7 @@ std::string make_azure_string_to_sign(
     return sts;
 }
 
-std::string sign_azure_request(
-    const std::string& account_key_base64,
-    const std::string& string_to_sign)
-{
+std::string sign_azure_request(const std::string& account_key_base64, const std::string& string_to_sign) {
     auto key_bytes = base64_decode(account_key_base64);
     auto sts_bytes = to_bytes(string_to_sign);
     auto signature = surge::crypto::hmac_sha256(key_bytes, sts_bytes);
@@ -135,14 +127,13 @@ std::string sign_azure_request(
 // --------------------------------------------------------------------------
 
 TEST(AzureSharedKey, StringToSign_GetBlob) {
-    auto sts = make_azure_string_to_sign(
-        "GET",                                // verb
-        "",                                   // content_type
-        "",                                   // content_length (empty for GET)
-        "Sun, 11 Oct 2009 21:49:13 GMT",      // x-ms-date
-        "2009-09-19",                         // x-ms-version
-        "myaccount",                          // account_name
-        "/mycontainer/myblob"                 // resource_path
+    auto sts = make_azure_string_to_sign("GET",                            // verb
+                                         "",                               // content_type
+                                         "",                               // content_length (empty for GET)
+                                         "Sun, 11 Oct 2009 21:49:13 GMT",  // x-ms-date
+                                         "2009-09-19",                     // x-ms-version
+                                         "myaccount",                      // account_name
+                                         "/mycontainer/myblob"             // resource_path
     );
 
     // Verify structure
@@ -154,20 +145,14 @@ TEST(AzureSharedKey, StringToSign_GetBlob) {
     // Count newlines: should have at least 14 (12 standard headers + canonicalized headers)
     int newline_count = 0;
     for (char c : sts)
-        if (c == '\n') newline_count++;
+        if (c == '\n')
+            newline_count++;
     EXPECT_GE(newline_count, 13);
 }
 
 TEST(AzureSharedKey, StringToSign_PutBlob) {
-    auto sts = make_azure_string_to_sign(
-        "PUT",
-        "application/octet-stream",
-        "1024",
-        "Mon, 12 Oct 2009 10:00:00 GMT",
-        "2009-09-19",
-        "myaccount",
-        "/mycontainer/myblob"
-    );
+    auto sts = make_azure_string_to_sign("PUT", "application/octet-stream", "1024", "Mon, 12 Oct 2009 10:00:00 GMT",
+                                         "2009-09-19", "myaccount", "/mycontainer/myblob");
 
     EXPECT_EQ(sts.substr(0, 4), "PUT\n");
     EXPECT_TRUE(sts.find("application/octet-stream") != std::string::npos);
@@ -176,11 +161,10 @@ TEST(AzureSharedKey, StringToSign_PutBlob) {
 
 TEST(AzureSharedKey, SignatureGeneration) {
     // Use a known Base64-encoded key
-    std::string account_key_base64 = "dGVzdGtleWZvcmF6dXJlc3RvcmFnZXNpZ25pbmc="; // "testkeyforazurestoragesigning"
+    std::string account_key_base64 = "dGVzdGtleWZvcmF6dXJlc3RvcmFnZXNpZ25pbmc=";  // "testkeyforazurestoragesigning"
 
-    auto sts = make_azure_string_to_sign(
-        "GET", "", "", "Mon, 01 Jan 2024 00:00:00 GMT", "2023-11-03",
-        "testaccount", "/testcontainer/testblob");
+    auto sts = make_azure_string_to_sign("GET", "", "", "Mon, 01 Jan 2024 00:00:00 GMT", "2023-11-03", "testaccount",
+                                         "/testcontainer/testblob");
 
     auto signature = sign_azure_request(account_key_base64, sts);
 
@@ -196,9 +180,8 @@ TEST(AzureSharedKey, DifferentKeysDifferentSignatures) {
     std::string key1 = base64_encode(to_bytes("key-one-for-azure"));
     std::string key2 = base64_encode(to_bytes("key-two-for-azure"));
 
-    auto sts = make_azure_string_to_sign(
-        "GET", "", "", "Mon, 01 Jan 2024 00:00:00 GMT", "2023-11-03",
-        "account", "/container/blob");
+    auto sts = make_azure_string_to_sign("GET", "", "", "Mon, 01 Jan 2024 00:00:00 GMT", "2023-11-03", "account",
+                                         "/container/blob");
 
     auto sig1 = sign_azure_request(key1, sts);
     auto sig2 = sign_azure_request(key2, sts);
@@ -208,7 +191,7 @@ TEST(AzureSharedKey, DifferentKeysDifferentSignatures) {
 
 TEST(AzureSharedKey, AuthorizationHeaderFormat) {
     std::string account_name = "myaccount";
-    std::string signature = "c2lnbmF0dXJlLWhlcmU="; // placeholder
+    std::string signature = "c2lnbmF0dXJlLWhlcmU=";  // placeholder
 
     auto auth = "SharedKey " + account_name + ":" + signature;
 
@@ -224,13 +207,11 @@ TEST(AzureSharedKey, Base64_RoundTrip) {
 }
 
 TEST(AzureSharedKey, ListBlobs_StringToSign) {
-    auto sts = make_azure_string_to_sign(
-        "GET", "", "",
-        "Tue, 02 Jan 2024 12:00:00 GMT", "2023-11-03",
-        "storageaccount", "/mycontainer\ncomp:list\nrestype:container");
+    auto sts = make_azure_string_to_sign("GET", "", "", "Tue, 02 Jan 2024 12:00:00 GMT", "2023-11-03", "storageaccount",
+                                         "/mycontainer\ncomp:list\nrestype:container");
 
     EXPECT_TRUE(sts.find("/storageaccount/mycontainer") != std::string::npos);
     EXPECT_TRUE(sts.find("comp:list") != std::string::npos);
 }
 
-} // anonymous namespace
+}  // anonymous namespace

@@ -4,16 +4,17 @@
  */
 
 #include "supervisor/supervisor.hpp"
+
 #include "platform/pal_process.hpp"
-#include <spdlog/spdlog.h>
-#include <fmt/format.h>
 
 #include <atomic>
 #include <chrono>
 #include <csignal>
 #include <cstring>
 #include <filesystem>
+#include <fmt/format.h>
 #include <fstream>
+#include <spdlog/spdlog.h>
 #include <string>
 #include <thread>
 #include <vector>
@@ -37,10 +38,7 @@ struct Supervisor::Impl {
     bool running = false;
 };
 
-Supervisor::Supervisor(std::string supervisor_id,
-                       std::filesystem::path install_dir)
-    : impl_(std::make_unique<Impl>())
-{
+Supervisor::Supervisor(std::string supervisor_id, std::filesystem::path install_dir) : impl_(std::make_unique<Impl>()) {
     impl_->supervisor_id = std::move(supervisor_id);
     impl_->install_dir = std::move(install_dir);
     impl_->info.state = ProcessState::Stopped;
@@ -52,9 +50,8 @@ Supervisor::~Supervisor() {
     }
 }
 
-int32_t Supervisor::start(const std::filesystem::path& exe_path,
-                           const std::filesystem::path& working_dir,
-                           const std::vector<std::string>& args) {
+int32_t Supervisor::start(const std::filesystem::path& exe_path, const std::filesystem::path& working_dir,
+                          const std::vector<std::string>& args) {
     if (impl_->running) {
         spdlog::warn("Supervisor: process already running, stopping first");
         stop();
@@ -87,10 +84,10 @@ int32_t Supervisor::start(const std::filesystem::path& exe_path,
 }
 
 int32_t Supervisor::stop(int timeout_ms) {
-    if (!impl_->running) return 0;
+    if (!impl_->running)
+        return 0;
 
-    spdlog::info("Stopping supervised process (PID {}, timeout {}ms)",
-                  impl_->info.pid, timeout_ms);
+    spdlog::info("Stopping supervised process (PID {}, timeout {}ms)", impl_->info.pid, timeout_ms);
 
     impl_->info.state = ProcessState::Stopping;
 
@@ -118,8 +115,7 @@ int32_t Supervisor::stop(int timeout_ms) {
     return 0;
 }
 
-int32_t Supervisor::restart(const std::filesystem::path& new_exe_path,
-                             const std::vector<std::string>& new_args) {
+int32_t Supervisor::restart(const std::filesystem::path& new_exe_path, const std::vector<std::string>& new_args) {
     spdlog::info("Restarting supervised process");
 
     // Stop current process
@@ -135,7 +131,8 @@ int32_t Supervisor::restart(const std::filesystem::path& new_exe_path,
 }
 
 bool Supervisor::is_running() const {
-    if (!impl_->running) return false;
+    if (!impl_->running)
+        return false;
     return platform::is_process_running(impl_->process_handle);
 }
 
@@ -151,4 +148,4 @@ const std::string& Supervisor::supervisor_id() const {
     return impl_->supervisor_id;
 }
 
-} // namespace surge::supervisor
+}  // namespace surge::supervisor

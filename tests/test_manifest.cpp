@@ -3,14 +3,14 @@
  * @brief Tests for surge.yml manifest parsing and validation.
  */
 
+#include "config/manifest.hpp"
+
 #include <gtest/gtest.h>
 
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <string>
-
-#include "config/manifest.hpp"
 
 namespace fs = std::filesystem;
 
@@ -278,9 +278,7 @@ apps:
 }
 
 TEST_F(ManifestTest, ParseNonExistentFile_Throws) {
-    EXPECT_THROW(
-        surge::config::parse_manifest(temp_dir_ / "nonexistent.yml"),
-        std::runtime_error);
+    EXPECT_THROW(surge::config::parse_manifest(temp_dir_ / "nonexistent.yml"), std::runtime_error);
 }
 
 TEST_F(ManifestTest, ParseInvalidYaml_Throws) {
@@ -288,9 +286,7 @@ TEST_F(ManifestTest, ParseInvalidYaml_Throws) {
     // Use content that either yaml-cpp rejects or our parser rejects
     // (not a mapping -> our parser throws).
     auto path = write_yaml("invalid.yml", "just a plain string, not a mapping");
-    EXPECT_THROW(
-        surge::config::parse_manifest(path),
-        std::runtime_error);
+    EXPECT_THROW(surge::config::parse_manifest(path), std::runtime_error);
 }
 
 TEST_F(ManifestTest, ValidManifest_NoIssues) {
@@ -309,8 +305,7 @@ TEST_F(ManifestTest, ValidManifest_NoIssues) {
     manifest.apps.push_back(app);
 
     auto issues = surge::config::validate_manifest(manifest);
-    EXPECT_TRUE(issues.empty()) << "Valid manifest should have no issues, got: "
-                                 << (issues.empty() ? "" : issues[0]);
+    EXPECT_TRUE(issues.empty()) << "Valid manifest should have no issues, got: " << (issues.empty() ? "" : issues[0]);
 }
 
-} // anonymous namespace
+}  // anonymous namespace

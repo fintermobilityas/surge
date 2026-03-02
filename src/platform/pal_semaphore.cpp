@@ -1,16 +1,17 @@
 #include "platform/pal_semaphore.hpp"
-#include <spdlog/spdlog.h>
+
 #include <fmt/format.h>
+#include <spdlog/spdlog.h>
 #include <stdexcept>
 
 #ifdef _WIN32
 #include <windows.h>
 #else
-#include <fcntl.h>
-#include <semaphore.h>
 #include <cerrno>
 #include <cstring>
 #include <ctime>
+#include <fcntl.h>
+#include <semaphore.h>
 #endif
 
 namespace surge::platform {
@@ -25,40 +26,31 @@ struct NamedSemaphore::Impl {
 #endif
 };
 
-NamedSemaphore::NamedSemaphore(std::string_view name, int32_t initial_count)
-    : impl_(std::make_unique<Impl>()) {
+NamedSemaphore::NamedSemaphore(std::string_view name, int32_t initial_count) : impl_(std::make_unique<Impl>()) {
     impl_->name_ = std::string(name);
 
 #ifdef _WIN32
     std::string win_name = "Global\\" + impl_->name_;
-    impl_->handle = CreateSemaphoreA(
-        nullptr,
-        static_cast<LONG>(initial_count),
-        static_cast<LONG>(initial_count),
-        win_name.c_str()
-    );
+    impl_->handle =
+        CreateSemaphoreA(nullptr, static_cast<LONG>(initial_count), static_cast<LONG>(initial_count), win_name.c_str());
     if (!impl_->handle) {
-        throw std::runtime_error(
-            fmt::format("Failed to create semaphore '{}': error {}",
-                        name, GetLastError()));
+        throw std::runtime_error(fmt::format("Failed to create semaphore '{}': error {}", name, GetLastError()));
     }
     spdlog::debug("Created Windows semaphore '{}' (count={})", name, initial_count);
 
 #else
     std::string posix_name = "/" + impl_->name_;
-    impl_->handle = sem_open(posix_name.c_str(), O_CREAT, 0644,
-                             static_cast<unsigned int>(initial_count));
+    impl_->handle = sem_open(posix_name.c_str(), O_CREAT, 0644, static_cast<unsigned int>(initial_count));
     if (impl_->handle == SEM_FAILED) {
-        throw std::runtime_error(
-            fmt::format("Failed to create semaphore '{}': {}",
-                        name, strerror(errno)));
+        throw std::runtime_error(fmt::format("Failed to create semaphore '{}': {}", name, strerror(errno)));
     }
     spdlog::debug("Created POSIX semaphore '{}' (count={})", name, initial_count);
 #endif
 }
 
 NamedSemaphore::~NamedSemaphore() {
-    if (!impl_) return;
+    if (!impl_)
+        return;
 
     if (impl_->held_) {
         release();
@@ -109,8 +101,7 @@ bool NamedSemaphore::acquire(int32_t timeout_ms) {
         spdlog::debug("Semaphore '{}' acquire timed out", impl_->name_);
         return false;
     }
-    spdlog::error("WaitForSingleObject failed for '{}': error {}",
-                  impl_->name_, GetLastError());
+    spdlog::error("WaitForSingleObject failed for '{}': error {}", impl_->name_, GetLastError());
     return false;
 
 #else
@@ -118,8 +109,7 @@ bool NamedSemaphore::acquire(int32_t timeout_ms) {
         // Wait indefinitely
         while (sem_wait(impl_->handle) != 0) {
             if (errno != EINTR) {
-                spdlog::error("sem_wait failed for '{}': {}",
-                              impl_->name_, strerror(errno));
+                spdlog::error("sem_wait failed for '{}': {}", impl_->name_, strerror(errno));
                 return false;
             }
         }
@@ -133,7 +123,7 @@ bool NamedSemaphore::acquire(int32_t timeout_ms) {
     }
 
     // Timed wait
-    struct timespec ts {};
+    struct timespec ts{};
     clock_gettime(CLOCK_REALTIME, &ts);
     ts.tv_sec += timeout_ms / 1000;
     ts.tv_nsec += (timeout_ms % 1000) * 1000000L;
@@ -148,8 +138,7 @@ bool NamedSemaphore::acquire(int32_t timeout_ms) {
             return false;
         }
         if (errno != EINTR) {
-            spdlog::error("sem_timedwait failed for '{}': {}",
-                          impl_->name_, strerror(errno));
+            spdlog::error("sem_timedwait failed for '{}': {}", impl_->name_, strerror(errno));
             return false;
         }
     }
@@ -163,8 +152,7 @@ bool NamedSemaphore::acquire(int32_t timeout_ms) {
 bool NamedSemaphore::release() {
 #ifdef _WIN32
     if (!ReleaseSemaphore(impl_->handle, 1, nullptr)) {
-        spdlog::error("ReleaseSemaphore failed for '{}': error {}",
-                      impl_->name_, GetLastError());
+        spdlog::error("ReleaseSemaphore failed for '{}': error {}", impl_->name_, GetLastError());
         return false;
     }
     impl_->held_ = false;
@@ -203,4 +191,4 @@ void NamedSemaphore::unlink(std::string_view name) {
 #endif
 }
 
-} // namespace surge::platform
+}  // namespace surge::platform

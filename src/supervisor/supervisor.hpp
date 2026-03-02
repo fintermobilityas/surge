@@ -27,9 +27,9 @@ enum class ProcessState {
 /** Information about the supervised process. */
 struct ProcessInfo {
     ProcessState state = ProcessState::Stopped;
-    int          pid   = -1;
-    int          exit_code = 0;
-    std::string  version;
+    int pid = -1;
+    int exit_code = 0;
+    std::string version;
     std::filesystem::path exe_path;
     std::filesystem::path working_dir;
 };
@@ -51,8 +51,7 @@ public:
      * @param supervisor_id Unique identifier for this supervisor instance.
      * @param install_dir   Root installation directory (contains app-* dirs).
      */
-    Supervisor(std::string supervisor_id,
-               std::filesystem::path install_dir);
+    Supervisor(std::string supervisor_id, std::filesystem::path install_dir);
     ~Supervisor();
 
     Supervisor(const Supervisor&) = delete;
@@ -65,8 +64,7 @@ public:
      * @param args        Command-line arguments.
      * @return 0 on success, negative error code on failure.
      */
-    int32_t start(const std::filesystem::path& exe_path,
-                  const std::filesystem::path& working_dir,
+    int32_t start(const std::filesystem::path& exe_path, const std::filesystem::path& working_dir,
                   const std::vector<std::string>& args = {});
 
     /**
@@ -82,8 +80,7 @@ public:
      * @param new_args     If non-empty, use these arguments.
      * @return 0 on success, negative error code on failure.
      */
-    int32_t restart(const std::filesystem::path& new_exe_path = {},
-                    const std::vector<std::string>& new_args = {});
+    int32_t restart(const std::filesystem::path& new_exe_path = {}, const std::vector<std::string>& new_args = {});
 
     /** Return true if the supervised process is currently running. */
     bool is_running() const;
@@ -102,4 +99,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-} // namespace surge::supervisor
+}  // namespace surge::supervisor

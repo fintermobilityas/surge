@@ -3,18 +3,19 @@
  * @brief `surge migrate` - Migrate configuration from snapx to surge.
  */
 
-#include <cxxopts.hpp>
-#include <spdlog/spdlog.h>
-#include <fmt/format.h>
-#include <yaml-cpp/yaml.h>
-#include <filesystem>
-#include <fstream>
-#include <iostream>
-#include <string>
-#include <vector>
-#include <set>
 #include "config/constants.hpp"
 #include "config/manifest.hpp"
+
+#include <cxxopts.hpp>
+#include <filesystem>
+#include <fmt/format.h>
+#include <fstream>
+#include <iostream>
+#include <set>
+#include <spdlog/spdlog.h>
+#include <string>
+#include <vector>
+#include <yaml-cpp/yaml.h>
 
 namespace fs = std::filesystem;
 
@@ -22,13 +23,7 @@ namespace {
 
 // Fields from snapx that are dropped during migration (NuGet-specific)
 const std::set<std::string> DROPPED_FIELDS = {
-    "nuspec",
-    "pushFeed",
-    "updateFeed",
-    "framework",
-    "icon",
-    "shortcuts",
-    "installers",
+    "nuspec", "pushFeed", "updateFeed", "framework", "icon", "shortcuts", "installers",
 };
 
 struct MigrationSummary {
@@ -38,10 +33,7 @@ struct MigrationSummary {
     std::vector<std::string> warnings;
 };
 
-surge::config::SurgeManifest migrate_snapx_manifest(
-    const YAML::Node& snapx,
-    MigrationSummary& summary)
-{
+surge::config::SurgeManifest migrate_snapx_manifest(const YAML::Node& snapx, MigrationSummary& summary) {
     surge::config::SurgeManifest surge_manifest;
     surge_manifest.schema = surge::constants::MANIFEST_SCHEMA_VERSION;
 
@@ -129,8 +121,7 @@ surge::config::SurgeManifest migrate_snapx_manifest(
 
                 if (target["environment"]) {
                     for (const auto& env : target["environment"]) {
-                        app.target.environment[env.first.as<std::string>()] =
-                            env.second.as<std::string>("");
+                        app.target.environment[env.first.as<std::string>()] = env.second.as<std::string>("");
                     }
                 }
             }
@@ -146,8 +137,7 @@ surge::config::SurgeManifest migrate_snapx_manifest(
             // Track dropped NuGet-specific fields
             for (const auto& field : DROPPED_FIELDS) {
                 if (app_node[field]) {
-                    summary.dropped_fields.push_back(
-                        fmt::format("apps[{}].{}", app.id, field));
+                    summary.dropped_fields.push_back(fmt::format("apps[{}].{}", app.id, field));
                 }
             }
 
@@ -168,16 +158,13 @@ surge::config::SurgeManifest migrate_snapx_manifest(
     return surge_manifest;
 }
 
-} // anonymous namespace
+}  // anonymous namespace
 
 int cmd_migrate(int argc, char* argv[]) {
     cxxopts::Options options("surge migrate", "Migrate configuration from snapx to surge");
 
-    options.add_options()
-        ("from-snapx", "Path to snapx.yml file (required)", cxxopts::value<std::string>())
-        ("output", "Output path for surge.yml", cxxopts::value<std::string>()->default_value(""))
-        ("h,help", "Show help")
-    ;
+    options.add_options()("from-snapx", "Path to snapx.yml file (required)", cxxopts::value<std::string>())(
+        "output", "Output path for surge.yml", cxxopts::value<std::string>()->default_value(""))("h,help", "Show help");
 
     auto result = options.parse(argc, argv);
 

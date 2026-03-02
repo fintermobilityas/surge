@@ -3,9 +3,9 @@
  * @brief C API contract tests: create/destroy context, set config, verify error handling.
  */
 
-#include <gtest/gtest.h>
-
 #include "surge/surge_api.h"
+
+#include <gtest/gtest.h>
 
 namespace {
 
@@ -47,14 +47,11 @@ TEST(CApi, ConfigSetStorage_ValidParams) {
     surge_context* ctx = surge_context_create();
     ASSERT_NE(ctx, nullptr);
 
-    surge_result result = surge_config_set_storage(
-        ctx,
-        SURGE_STORAGE_FILESYSTEM,
-        "/tmp/test-releases",
-        nullptr,    // region
-        nullptr,    // access_key
-        nullptr,    // secret_key
-        nullptr     // endpoint
+    surge_result result = surge_config_set_storage(ctx, SURGE_STORAGE_FILESYSTEM, "/tmp/test-releases",
+                                                   nullptr,  // region
+                                                   nullptr,  // access_key
+                                                   nullptr,  // secret_key
+                                                   nullptr   // endpoint
     );
     EXPECT_EQ(result, SURGE_OK);
 
@@ -65,27 +62,16 @@ TEST(CApi, ConfigSetStorage_S3Provider) {
     surge_context* ctx = surge_context_create();
     ASSERT_NE(ctx, nullptr);
 
-    surge_result result = surge_config_set_storage(
-        ctx,
-        SURGE_STORAGE_S3,
-        "my-bucket",
-        "us-east-1",
-        "AKIAEXAMPLE",
-        "secret-key",
-        nullptr
-    );
+    surge_result result =
+        surge_config_set_storage(ctx, SURGE_STORAGE_S3, "my-bucket", "us-east-1", "AKIAEXAMPLE", "secret-key", nullptr);
     EXPECT_EQ(result, SURGE_OK);
 
     surge_context_destroy(ctx);
 }
 
 TEST(CApi, ConfigSetStorage_NullCtx_ReturnsError) {
-    surge_result result = surge_config_set_storage(
-        nullptr,
-        SURGE_STORAGE_FILESYSTEM,
-        "/tmp/test",
-        nullptr, nullptr, nullptr, nullptr
-    );
+    surge_result result =
+        surge_config_set_storage(nullptr, SURGE_STORAGE_FILESYSTEM, "/tmp/test", nullptr, nullptr, nullptr, nullptr);
     EXPECT_EQ(result, SURGE_ERROR);
 }
 
@@ -138,8 +124,7 @@ TEST(CApi, UpdateManagerCreate_WithValidParams) {
     // Configure storage first
     surge_config_set_storage(ctx, SURGE_STORAGE_FILESYSTEM, "/tmp/test", nullptr, nullptr, nullptr, nullptr);
 
-    surge_update_manager* mgr = surge_update_manager_create(
-        ctx, "testapp", "1.0.0", "stable", "/opt/testapp");
+    surge_update_manager* mgr = surge_update_manager_create(ctx, "testapp", "1.0.0", "stable", "/opt/testapp");
     EXPECT_NE(mgr, nullptr);
 
     surge_update_manager_destroy(mgr);
@@ -147,8 +132,7 @@ TEST(CApi, UpdateManagerCreate_WithValidParams) {
 }
 
 TEST(CApi, UpdateManagerCreate_NullCtx_ReturnsNull) {
-    surge_update_manager* mgr = surge_update_manager_create(
-        nullptr, "testapp", "1.0.0", "stable", "/opt/testapp");
+    surge_update_manager* mgr = surge_update_manager_create(nullptr, "testapp", "1.0.0", "stable", "/opt/testapp");
     EXPECT_EQ(mgr, nullptr);
 }
 
@@ -253,4 +237,4 @@ TEST(CApi, BspatchFree_ZeroedCtx_NoOp) {
     surge_bspatch_free(&ctx);
 }
 
-} // anonymous namespace
+}  // anonymous namespace

@@ -81,26 +81,23 @@ public:
      */
     template <typename F>
         requires std::invocable<F, std::stop_token>
-    auto submit_cancellable(F&& task)
-        -> std::future<std::invoke_result_t<F, std::stop_token>> {
+    auto submit_cancellable(F&& task) -> std::future<std::invoke_result_t<F, std::stop_token>> {
         using R = std::invoke_result_t<F, std::stop_token>;
         auto promise = std::make_shared<std::promise<R>>();
         auto future = promise->get_future();
 
-        enqueue_cancellable(
-            [p = std::move(promise), t = std::forward<F>(task)](
-                std::stop_token st) mutable {
-                try {
-                    if constexpr (std::is_void_v<R>) {
-                        t(st);
-                        p->set_value();
-                    } else {
-                        p->set_value(t(st));
-                    }
-                } catch (...) {
-                    p->set_exception(std::current_exception());
+        enqueue_cancellable([p = std::move(promise), t = std::forward<F>(task)](std::stop_token st) mutable {
+            try {
+                if constexpr (std::is_void_v<R>) {
+                    t(st);
+                    p->set_value();
+                } else {
+                    p->set_value(t(st));
                 }
-            });
+            } catch (...) {
+                p->set_exception(std::current_exception());
+            }
+        });
 
         return future;
     }
@@ -128,4 +125,4 @@ private:
     void enqueue_cancellable(std::function<void(std::stop_token)> task);
 };
 
-} // namespace surge::async
+}  // namespace surge::async

@@ -14,28 +14,28 @@ namespace surge {
 
 /** Strongly-typed error codes used throughout the library. */
 enum class ErrorCode : int32_t {
-    Ok               =  0,
-    Unknown          = -1,
-    Cancelled        = -2,
-    NotFound         = -3,
-    InvalidArgument  = -10,
-    InvalidManifest  = -11,
-    IoError          = -20,
-    NetworkError     = -21,
-    Timeout          = -22,
-    AuthError        = -23,
-    StorageError     = -30,
-    UploadFailed     = -31,
-    DownloadFailed   = -32,
+    Ok = 0,
+    Unknown = -1,
+    Cancelled = -2,
+    NotFound = -3,
+    InvalidArgument = -10,
+    InvalidManifest = -11,
+    IoError = -20,
+    NetworkError = -21,
+    Timeout = -22,
+    AuthError = -23,
+    StorageError = -30,
+    UploadFailed = -31,
+    DownloadFailed = -32,
     ChecksumMismatch = -40,
     DecompressionErr = -41,
-    DiffError        = -50,
-    PatchError       = -51,
-    LockFailed       = -60,
-    LockConflict     = -61,
-    SupervisorError  = -70,
-    VersionError     = -80,
-    AlreadyUpToDate  = -81,
+    DiffError = -50,
+    PatchError = -51,
+    LockFailed = -60,
+    LockConflict = -61,
+    SupervisorError = -70,
+    VersionError = -80,
+    AlreadyUpToDate = -81,
 };
 
 /** Convert an ErrorCode to a human-readable string. */
@@ -61,7 +61,7 @@ const std::error_category& surge_error_category() noexcept;
 /** Create a std::error_code from an ErrorCode. */
 std::error_code make_error_code(ErrorCode code) noexcept;
 
-} // namespace surge
+}  // namespace surge
 
 /** Register ErrorCode as an error-code enum so implicit conversion works. */
 template <>

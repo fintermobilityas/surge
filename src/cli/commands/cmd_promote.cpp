@@ -3,17 +3,18 @@
  * @brief `surge promote` - Promote a release to an additional channel.
  */
 
-#include <cxxopts.hpp>
-#include <spdlog/spdlog.h>
-#include <fmt/format.h>
-#include <yaml-cpp/yaml.h>
-#include <nlohmann/json.hpp>
-#include <filesystem>
-#include <fstream>
-#include <iostream>
-#include <algorithm>
 #include "config/constants.hpp"
 #include "config/manifest.hpp"
+
+#include <algorithm>
+#include <cxxopts.hpp>
+#include <filesystem>
+#include <fmt/format.h>
+#include <fstream>
+#include <iostream>
+#include <nlohmann/json.hpp>
+#include <spdlog/spdlog.h>
+#include <yaml-cpp/yaml.h>
 
 namespace fs = std::filesystem;
 
@@ -30,18 +31,15 @@ fs::path find_manifest(const std::string& path_override) {
     return {};
 }
 
-} // anonymous namespace
+}  // anonymous namespace
 
 int cmd_promote(int argc, char* argv[]) {
     cxxopts::Options options("surge promote", "Promote a release to an additional channel");
 
-    options.add_options()
-        ("app", "Application ID", cxxopts::value<std::string>()->default_value(""))
-        ("version", "Release version to promote (required)", cxxopts::value<std::string>())
-        ("channel", "Target channel to promote to (required)", cxxopts::value<std::string>())
-        ("manifest", "Path to surge.yml", cxxopts::value<std::string>()->default_value(""))
-        ("h,help", "Show help")
-    ;
+    options.add_options()("app", "Application ID", cxxopts::value<std::string>()->default_value(""))(
+        "version", "Release version to promote (required)", cxxopts::value<std::string>())(
+        "channel", "Target channel to promote to (required)", cxxopts::value<std::string>())(
+        "manifest", "Path to surge.yml", cxxopts::value<std::string>()->default_value(""))("h,help", "Show help");
 
     auto result = options.parse(argc, argv);
 
@@ -65,8 +63,7 @@ int cmd_promote(int argc, char* argv[]) {
     // Locate manifest
     auto manifest_path = find_manifest(result["manifest"].as<std::string>());
     if (manifest_path.empty() || !fs::exists(manifest_path)) {
-        spdlog::error("Cannot find {}. Run 'surge init' first or specify --manifest",
-                       surge::constants::MANIFEST_FILE);
+        spdlog::error("Cannot find {}. Run 'surge init' first or specify --manifest", surge::constants::MANIFEST_FILE);
         return 1;
     }
 

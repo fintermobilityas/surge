@@ -17,13 +17,13 @@ namespace surge::platform {
 struct ProcessHandle {
     int64_t pid = -1;
 #ifdef _WIN32
-    void*   handle = nullptr;
+    void* handle = nullptr;
 #endif
 };
 
 /** Result of a completed process. */
 struct ProcessResult {
-    int  exit_code = -1;
+    int exit_code = -1;
     bool timed_out = false;
 };
 
@@ -35,11 +35,10 @@ struct ProcessResult {
  * @param env         Additional environment variables (key=value pairs).
  * @return Process handle, or std::nullopt on failure.
  */
-std::optional<ProcessHandle> spawn_process(
-    const std::filesystem::path& exe_path,
-    const std::vector<std::string>& args = {},
-    const std::filesystem::path& working_dir = {},
-    const std::vector<std::string>& env = {});
+std::optional<ProcessHandle> spawn_process(const std::filesystem::path& exe_path,
+                                           const std::vector<std::string>& args = {},
+                                           const std::filesystem::path& working_dir = {},
+                                           const std::vector<std::string>& env = {});
 
 /**
  * Wait for a process to exit.
@@ -47,8 +46,7 @@ std::optional<ProcessHandle> spawn_process(
  * @param timeout_ms Maximum time to wait (-1 = infinite).
  * @return Process result.
  */
-ProcessResult wait_for_process(const ProcessHandle& handle,
-                                int timeout_ms = -1);
+ProcessResult wait_for_process(const ProcessHandle& handle, int timeout_ms = -1);
 
 /**
  * Send a graceful termination signal (SIGTERM / TerminateProcess).
@@ -79,7 +77,6 @@ int64_t current_pid();
  * @param args     Arguments for the new process.
  * @return Only returns on failure; exit code in that case.
  */
-int exec_replace(const std::filesystem::path& exe_path,
-                 const std::vector<std::string>& args);
+int exec_replace(const std::filesystem::path& exe_path, const std::vector<std::string>& args);
 
-} // namespace surge::platform
+}  // namespace surge::platform

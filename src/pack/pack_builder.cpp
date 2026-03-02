@@ -4,18 +4,20 @@
  */
 
 #include "pack/pack_builder.hpp"
-#include "core/context.hpp"
+
 #include "archive/packer.hpp"
+#include "config/constants.hpp"
+#include "core/context.hpp"
 #include "crypto/sha256.hpp"
 #include "diff/bsdiff_wrapper.hpp"
 #include "releases/release_manifest.hpp"
 #include "storage/storage_backend.hpp"
-#include "config/constants.hpp"
-#include <spdlog/spdlog.h>
-#include <fmt/format.h>
-#include <yaml-cpp/yaml.h>
+
 #include <filesystem>
+#include <fmt/format.h>
 #include <fstream>
+#include <spdlog/spdlog.h>
+#include <yaml-cpp/yaml.h>
 
 namespace surge::pack {
 
@@ -37,26 +39,19 @@ struct PackBuilder::Impl {
     explicit Impl(Context& c) : ctx(c) {}
 };
 
-PackBuilder::PackBuilder(Context& ctx,
-                          std::filesystem::path manifest_path,
-                          std::string app_id,
-                          std::string rid,
-                          std::string version,
-                          std::filesystem::path artifacts_dir)
-    : impl_(std::make_unique<Impl>(ctx))
-{
+PackBuilder::PackBuilder(Context& ctx, std::filesystem::path manifest_path, std::string app_id, std::string rid,
+                         std::string version, std::filesystem::path artifacts_dir)
+    : impl_(std::make_unique<Impl>(ctx)) {
     impl_->manifest_path = std::move(manifest_path);
     impl_->app_id = std::move(app_id);
     impl_->rid = std::move(rid);
     impl_->version = std::move(version);
     impl_->artifacts_dir = std::move(artifacts_dir);
     impl_->output_dir = impl_->artifacts_dir.parent_path() / "packages";
-    impl_->storage = std::shared_ptr<storage::IStorageBackend>(
-        storage::create_storage_backend(ctx.storage_config()));
+    impl_->storage = std::shared_ptr<storage::IStorageBackend>(storage::create_storage_backend(ctx.storage_config()));
 
     fs::create_directories(impl_->output_dir);
-    spdlog::debug("PackBuilder: app_id={}, version={}, rid={}",
-                   impl_->app_id, impl_->version, impl_->rid);
+    spdlog::debug("PackBuilder: app_id={}, version={}, rid={}", impl_->app_id, impl_->version, impl_->rid);
 }
 
 PackBuilder::~PackBuilder() = default;
@@ -76,7 +71,8 @@ int32_t PackBuilder::build(ProgressCallback progress) {
     int64_t total_files = 0;
     std::error_code ec;
     for (auto& entry : fs::recursive_directory_iterator(impl_->artifacts_dir, ec)) {
-        if (entry.is_regular_file()) total_files++;
+        if (entry.is_regular_file())
+            total_files++;
     }
 
     if (total_files == 0) {
@@ -86,8 +82,7 @@ int32_t PackBuilder::build(ProgressCallback progress) {
     spdlog::info("Found {} files in artifacts", total_files);
 
     // Build the tar.zst archive
-    auto package_name = fmt::format("{}-{}-{}-full.tar.zst",
-                                     impl_->app_id, impl_->version, impl_->rid);
+    auto package_name = fmt::format("{}-{}-{}-full.tar.zst", impl_->app_id, impl_->version, impl_->rid);
     auto full_package_path = impl_->output_dir / package_name;
 
     archive::PackerOptions opts;
@@ -126,15 +121,12 @@ int32_t PackBuilder::build(ProgressCallback progress) {
     artifact.is_delta = false;
     impl_->artifacts.push_back(std::move(artifact));
 
-    spdlog::info("Full package built: {} ({} bytes, sha256={})",
-                  package_name, package_size, package_sha256);
+    spdlog::info("Full package built: {} ({} bytes, sha256={})", package_name, package_size, package_sha256);
     return SURGE_OK;
 }
 
-int32_t PackBuilder::push(const std::string& channel,
-                           ProgressCallback progress) {
-    spdlog::info("Pushing packages for {} v{} to channel '{}'",
-                  impl_->app_id, impl_->version, channel);
+int32_t PackBuilder::push(const std::string& channel, ProgressCallback progress) {
+    spdlog::info("Pushing packages for {} v{} to channel '{}'", impl_->app_id, impl_->version, channel);
 
     if (impl_->artifacts.empty()) {
         spdlog::error("No packages to push. Call build() first.");
@@ -164,9 +156,13 @@ int32_t PackBuilder::push(const std::string& channel,
     bool is_genesis = true;
     for (auto& rel : index.releases) {
         for (auto& ch : rel.channels) {
-            if (ch == channel) { is_genesis = false; break; }
+            if (ch == channel) {
+                is_genesis = false;
+                break;
+            }
         }
-        if (!is_genesis) break;
+        if (!is_genesis)
+            break;
     }
 
     // Upload packages
@@ -176,7 +172,7 @@ int32_t PackBuilder::push(const std::string& channel,
             if (progress) {
                 int pct = (total > 0) ? static_cast<int>(done * 100 / total) : 0;
                 surge_progress p{};
-                p.phase = SURGE_PHASE_DOWNLOAD; // reuse for upload indication
+                p.phase = SURGE_PHASE_DOWNLOAD;  // reuse for upload indication
                 p.phase_percent = pct;
                 p.total_percent = pct / 2;
                 p.bytes_done = done;
@@ -240,8 +236,7 @@ int32_t PackBuilder::push(const std::string& channel,
         progress(p);
     }
 
-    spdlog::info("Successfully pushed {} v{} to channel '{}'",
-                  impl_->app_id, impl_->version, channel);
+    spdlog::info("Successfully pushed {} v{} to channel '{}'", impl_->app_id, impl_->version, channel);
     return SURGE_OK;
 }
 
@@ -261,4 +256,4 @@ const std::string& PackBuilder::rid() const {
     return impl_->rid;
 }
 
-} // namespace surge::pack
+}  // namespace surge::pack

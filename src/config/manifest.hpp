@@ -36,8 +36,8 @@ struct ChannelConfig {
 };
 
 struct TargetConfig {
-    std::string              os;
-    std::string              rid;
+    std::string os;
+    std::string rid;
     std::vector<std::string> persistent_assets;
     std::map<std::string, std::string> environment;
 };
@@ -48,22 +48,22 @@ struct MetadataConfig {
 };
 
 struct AppConfig {
-    std::string              id;
-    std::string              main;
-    std::string              supervisor_id;
-    std::string              install_directory;
+    std::string id;
+    std::string main;
+    std::string supervisor_id;
+    std::string install_directory;
     std::vector<std::string> channels;
-    TargetConfig             target;
-    MetadataConfig           metadata;
+    TargetConfig target;
+    MetadataConfig metadata;
 };
 
 struct SurgeManifest {
-    int                       schema = 1;
-    GenericConfig             generic;
-    StorageManifestConfig     storage;
-    LockManifestConfig        lock;
+    int schema = 1;
+    GenericConfig generic;
+    StorageManifestConfig storage;
+    LockManifestConfig lock;
     std::vector<ChannelConfig> channels;
-    std::vector<AppConfig>    apps;
+    std::vector<AppConfig> apps;
 };
 
 /**
@@ -76,8 +76,7 @@ SurgeManifest parse_manifest(const std::filesystem::path& path);
  * Serialize and write a manifest to disk.
  * @throws std::runtime_error on I/O failure.
  */
-void write_manifest(const SurgeManifest& manifest,
-                    const std::filesystem::path& path);
+void write_manifest(const SurgeManifest& manifest, const std::filesystem::path& path);
 
 /**
  * Validate a manifest and return a list of human-readable issues.
@@ -85,4 +84,4 @@ void write_manifest(const SurgeManifest& manifest,
  */
 std::vector<std::string> validate_manifest(const SurgeManifest& manifest);
 
-} // namespace surge::config
+}  // namespace surge::config

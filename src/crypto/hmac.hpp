@@ -17,15 +17,13 @@ namespace surge::crypto {
  * @param key  Secret key bytes.
  * @param data Message bytes.
  */
-std::vector<uint8_t> hmac_sha256(std::span<const uint8_t> key,
-                                  std::span<const uint8_t> data);
+std::vector<uint8_t> hmac_sha256(std::span<const uint8_t> key, std::span<const uint8_t> data);
 
 /**
  * Compute HMAC-SHA256 and return the result as a lowercase hex string.
  * @param key  Secret key bytes.
  * @param data Message bytes.
  */
-std::string hmac_sha256_hex(std::span<const uint8_t> key,
-                             std::span<const uint8_t> data);
+std::string hmac_sha256_hex(std::span<const uint8_t> key, std::span<const uint8_t> data);
 
-} // namespace surge::crypto
+}  // namespace surge::crypto

@@ -6,14 +6,15 @@
  * restore, lock, unlock, migrate.
  */
 
+#include "config/constants.hpp"
+
 #include <cxxopts.hpp>
-#include <spdlog/spdlog.h>
-#include <spdlog/sinks/stdout_color_sinks.h>
+#include <functional>
 #include <iostream>
+#include <spdlog/sinks/stdout_color_sinks.h>
+#include <spdlog/spdlog.h>
 #include <string>
 #include <unordered_map>
-#include <functional>
-#include "config/constants.hpp"
 
 // Forward declarations for command handlers
 int cmd_init(int argc, char* argv[]);
@@ -30,28 +31,27 @@ int cmd_migrate(int argc, char* argv[]);
 namespace {
 
 void print_usage() {
-    std::cout
-        << "surge " << surge::constants::VERSION << " - binary delta update framework\n"
-        << "\n"
-        << "Usage: surge <command> [options]\n"
-        << "\n"
-        << "Commands:\n"
-        << "  init       Initialize a new surge project\n"
-        << "  pack       Build full and delta packages from artifacts\n"
-        << "  push       Upload packages to cloud storage\n"
-        << "  promote    Add a release to a channel\n"
-        << "  demote     Remove a release from a channel\n"
-        << "  list       List releases and their channels\n"
-        << "  restore    Reconstruct a full package from delta chain\n"
-        << "  lock       Acquire a distributed lock\n"
-        << "  unlock     Release a distributed lock\n"
-        << "  migrate    Migrate configuration from snapx\n"
-        << "\n"
-        << "Options:\n"
-        << "  --version  Show version information\n"
-        << "  --help     Show this help message\n"
-        << "\n"
-        << "Run 'surge <command> --help' for command-specific options.\n";
+    std::cout << "surge " << surge::constants::VERSION << " - binary delta update framework\n"
+              << "\n"
+              << "Usage: surge <command> [options]\n"
+              << "\n"
+              << "Commands:\n"
+              << "  init       Initialize a new surge project\n"
+              << "  pack       Build full and delta packages from artifacts\n"
+              << "  push       Upload packages to cloud storage\n"
+              << "  promote    Add a release to a channel\n"
+              << "  demote     Remove a release from a channel\n"
+              << "  list       List releases and their channels\n"
+              << "  restore    Reconstruct a full package from delta chain\n"
+              << "  lock       Acquire a distributed lock\n"
+              << "  unlock     Release a distributed lock\n"
+              << "  migrate    Migrate configuration from snapx\n"
+              << "\n"
+              << "Options:\n"
+              << "  --version  Show version information\n"
+              << "  --help     Show this help message\n"
+              << "\n"
+              << "Run 'surge <command> --help' for command-specific options.\n";
 }
 
 void setup_logging(bool verbose) {
@@ -68,7 +68,7 @@ void setup_logging(bool verbose) {
     spdlog::set_default_logger(logger);
 }
 
-} // anonymous namespace
+}  // anonymous namespace
 
 int main(int argc, char* argv[]) {
     // Handle no-argument case
@@ -103,16 +103,9 @@ int main(int argc, char* argv[]) {
 
     // Build dispatch table
     static const std::unordered_map<std::string, std::function<int(int, char*[])>> commands = {
-        {"init",    cmd_init},
-        {"pack",    cmd_pack},
-        {"push",    cmd_push},
-        {"promote", cmd_promote},
-        {"demote",  cmd_demote},
-        {"list",    cmd_list},
-        {"restore", cmd_restore},
-        {"lock",    cmd_lock},
-        {"unlock",  cmd_unlock},
-        {"migrate", cmd_migrate},
+        {"init", cmd_init},     {"pack", cmd_pack},       {"push", cmd_push},       {"promote", cmd_promote},
+        {"demote", cmd_demote}, {"list", cmd_list},       {"restore", cmd_restore}, {"lock", cmd_lock},
+        {"unlock", cmd_unlock}, {"migrate", cmd_migrate},
     };
 
     auto it = commands.find(first_arg);

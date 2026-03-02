@@ -58,11 +58,11 @@ struct DownloadResult {
 
 /** Aggregate progress for all downloads. */
 struct DownloadProgress {
-    int64_t total_bytes_done  = 0;
+    int64_t total_bytes_done = 0;
     int64_t total_bytes_total = 0;
-    int32_t files_done        = 0;
-    int32_t files_total       = 0;
-    double  speed_bytes_per_sec = 0.0;
+    int32_t files_done = 0;
+    int32_t files_total = 0;
+    double speed_bytes_per_sec = 0.0;
 };
 
 /** Progress callback type. */
@@ -104,9 +104,8 @@ public:
      * @param progress Optional progress callback.
      * @return One DownloadResult per request, in the same order.
      */
-    std::vector<DownloadResult> download(
-        std::span<const DownloadRequest> requests,
-        DownloadProgressCallback progress = nullptr);
+    std::vector<DownloadResult> download(std::span<const DownloadRequest> requests,
+                                         DownloadProgressCallback progress = nullptr);
 
     /**
      * Download all files with explicit cancellation support.
@@ -115,10 +114,8 @@ public:
      * @param progress   Optional progress callback.
      * @return One DownloadResult per request.
      */
-    std::vector<DownloadResult> download(
-        std::span<const DownloadRequest> requests,
-        std::stop_token stop_token,
-        DownloadProgressCallback progress = nullptr);
+    std::vector<DownloadResult> download(std::span<const DownloadRequest> requests, std::stop_token stop_token,
+                                         DownloadProgressCallback progress = nullptr);
 
     /** Set the maximum number of concurrent downloads. */
     void set_max_concurrent(int32_t max_concurrent);
@@ -131,4 +128,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-} // namespace surge::async
+}  // namespace surge::async

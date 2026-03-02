@@ -33,8 +33,10 @@ struct SemVer {
     }
 
     bool operator<(const SemVer& o) const {
-        if (major != o.major) return major < o.major;
-        if (minor != o.minor) return minor < o.minor;
+        if (major != o.major)
+            return major < o.major;
+        if (minor != o.minor)
+            return minor < o.minor;
         return patch < o.patch;
     }
 
@@ -42,10 +44,18 @@ struct SemVer {
         return major == o.major && minor == o.minor && patch == o.patch;
     }
 
-    bool operator>(const SemVer& o) const { return o < *this; }
-    bool operator<=(const SemVer& o) const { return !(o < *this); }
-    bool operator>=(const SemVer& o) const { return !(*this < o); }
-    bool operator!=(const SemVer& o) const { return !(*this == o); }
+    bool operator>(const SemVer& o) const {
+        return o < *this;
+    }
+    bool operator<=(const SemVer& o) const {
+        return !(o < *this);
+    }
+    bool operator>=(const SemVer& o) const {
+        return !(*this < o);
+    }
+    bool operator!=(const SemVer& o) const {
+        return !(*this == o);
+    }
 };
 
 struct ReleaseEntry {
@@ -54,17 +64,16 @@ struct ReleaseEntry {
     int64_t full_size = 0;
     int64_t delta_size = 0;
     bool is_genesis = false;
-    std::string base_version; // for delta chain
+    std::string base_version;  // for delta chain
 };
 
 struct ReleaseIndex {
     std::vector<ReleaseEntry> releases;
 
     void sort_by_version_desc() {
-        std::sort(releases.begin(), releases.end(),
-                  [](const ReleaseEntry& a, const ReleaseEntry& b) {
-                      return SemVer::parse(b.version) < SemVer::parse(a.version);
-                  });
+        std::sort(releases.begin(), releases.end(), [](const ReleaseEntry& a, const ReleaseEntry& b) {
+            return SemVer::parse(b.version) < SemVer::parse(a.version);
+        });
     }
 
     std::vector<ReleaseEntry> filter_by_channel(const std::string& channel) const {
@@ -78,10 +87,8 @@ struct ReleaseIndex {
 
     // Build delta chain from current_version to target_version.
     // Returns versions in apply order, or empty if no chain exists.
-    std::vector<std::string> resolve_delta_chain(
-        const std::string& current_version,
-        const std::string& target_version) const
-    {
+    std::vector<std::string> resolve_delta_chain(const std::string& current_version,
+                                                 const std::string& target_version) const {
         // Build a map from version -> base_version
         std::unordered_map<std::string, std::string> base_map;
         for (const auto& r : releases) {
@@ -98,7 +105,7 @@ struct ReleaseIndex {
             chain.push_back(v);
             auto it = base_map.find(v);
             if (it == base_map.end())
-                return {}; // broken chain
+                return {};  // broken chain
             v = it->second;
             // Safety: prevent infinite loops
             if (chain.size() > releases.size())
@@ -258,4 +265,4 @@ TEST(ReleaseEntry, DeltaRelease) {
     EXPECT_LT(delta.delta_size, delta.full_size);
 }
 
-} // anonymous namespace
+}  // anonymous namespace

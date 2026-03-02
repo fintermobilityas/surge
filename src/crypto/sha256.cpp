@@ -1,25 +1,28 @@
 #include "crypto/sha256.hpp"
-#include <openssl/evp.h>
+
+#include <array>
 #include <fmt/format.h>
 #include <fstream>
 #include <iomanip>
+#include <memory>
+#include <openssl/evp.h>
 #include <sstream>
 #include <stdexcept>
-#include <array>
-#include <memory>
 
 namespace surge::crypto {
 
 namespace {
 
 struct EvpMdCtxDeleter {
-    void operator()(EVP_MD_CTX* ctx) const { EVP_MD_CTX_free(ctx); }
+    void operator()(EVP_MD_CTX* ctx) const {
+        EVP_MD_CTX_free(ctx);
+    }
 };
 
 using EvpMdCtxPtr = std::unique_ptr<EVP_MD_CTX, EvpMdCtxDeleter>;
 
 constexpr size_t SHA256_DIGEST_SIZE = 32;
-constexpr size_t FILE_READ_BUFFER_SIZE = 65536; // 64KB
+constexpr size_t FILE_READ_BUFFER_SIZE = 65536;  // 64KB
 
 std::string bytes_to_hex(const uint8_t* data, size_t len) {
     std::string result;
@@ -56,19 +59,17 @@ std::vector<uint8_t> compute_sha256(const uint8_t* data, size_t len) {
     return hash;
 }
 
-} // anonymous namespace
+}  // anonymous namespace
 
 std::string sha256_hex(std::span<const uint8_t> data) {
     auto hash = compute_sha256(data.data(), data.size());
     return bytes_to_hex(hash.data(), hash.size());
 }
 
-std::string sha256_hex_file(const std::filesystem::path& path,
-                            std::function<void(int64_t, int64_t)> progress) {
+std::string sha256_hex_file(const std::filesystem::path& path, std::function<void(int64_t, int64_t)> progress) {
     std::ifstream file(path, std::ios::binary);
     if (!file.is_open()) {
-        throw std::runtime_error(
-            fmt::format("Failed to open file for hashing: '{}'", path.string()));
+        throw std::runtime_error(fmt::format("Failed to open file for hashing: '{}'", path.string()));
     }
 
     // Get file size for progress reporting
@@ -92,8 +93,7 @@ std::string sha256_hex_file(const std::filesystem::path& path,
         file.read(buffer.data(), buffer.size());
         auto bytes_read = file.gcount();
         if (bytes_read > 0) {
-            if (EVP_DigestUpdate(ctx.get(), buffer.data(),
-                                 static_cast<size_t>(bytes_read)) != 1) {
+            if (EVP_DigestUpdate(ctx.get(), buffer.data(), static_cast<size_t>(bytes_read)) != 1) {
                 throw std::runtime_error("Failed to update SHA-256 digest");
             }
             bytes_read_total += bytes_read;
@@ -116,4 +116,4 @@ std::vector<uint8_t> sha256_raw(std::span<const uint8_t> data) {
     return compute_sha256(data.data(), data.size());
 }
 
-} // namespace surge::crypto
+}  // namespace surge::crypto

@@ -31,8 +31,7 @@ public:
      * @param app_main     Relative path to the main executable within an app dir
      *                     (e.g. "bin/myapp").
      */
-    StubExecutable(std::filesystem::path install_dir,
-                   std::string app_main);
+    StubExecutable(std::filesystem::path install_dir, std::string app_main);
     ~StubExecutable();
 
     StubExecutable(const StubExecutable&) = delete;
@@ -66,12 +65,11 @@ public:
      * @param dir_name Directory name (e.g. "app-1.2.3").
      * @return Version string, or std::nullopt if the name is not valid.
      */
-    static std::optional<std::string> version_from_dir_name(
-        const std::string& dir_name);
+    static std::optional<std::string> version_from_dir_name(const std::string& dir_name);
 
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
 
-} // namespace surge::supervisor
+}  // namespace surge::supervisor

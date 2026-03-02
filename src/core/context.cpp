@@ -1,4 +1,5 @@
 #include "core/context.hpp"
+
 #include <mutex>
 #include <string>
 
@@ -28,7 +29,8 @@ void Context::set_last_error(int32_t code, std::string message) {
 
 const surge_error* Context::last_error() const {
     std::lock_guard lock(impl_->mutex);
-    if (impl_->last_error.code == 0) return nullptr;
+    if (impl_->last_error.code == 0)
+        return nullptr;
     return &impl_->last_error;
 }
 
@@ -85,4 +87,4 @@ bool Context::is_cancelled() const {
     return impl_->stop_src.get_token().stop_requested();
 }
 
-} // namespace surge
+}  // namespace surge

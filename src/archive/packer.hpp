@@ -42,8 +42,7 @@ public:
      * @param output_path Destination file (will be created / overwritten).
      * @param options     Compression and progress options.
      */
-    explicit ArchivePacker(const std::filesystem::path& output_path,
-                           const PackerOptions& options = {});
+    explicit ArchivePacker(const std::filesystem::path& output_path, const PackerOptions& options = {});
     ~ArchivePacker();
 
     ArchivePacker(const ArchivePacker&) = delete;
@@ -54,16 +53,14 @@ public:
      * @param source       Path to the file on disk.
      * @param archive_path Relative path inside the archive.
      */
-    void add_file(const std::filesystem::path& source,
-                  const std::string& archive_path);
+    void add_file(const std::filesystem::path& source, const std::string& archive_path);
 
     /**
      * Recursively add a directory to the archive.
      * @param source_dir     Directory to walk.
      * @param archive_prefix Optional prefix prepended to all entries.
      */
-    void add_directory(const std::filesystem::path& source_dir,
-                       const std::string& archive_prefix = "");
+    void add_directory(const std::filesystem::path& source_dir, const std::string& archive_prefix = "");
 
     /**
      * Add an in-memory buffer as a file entry.
@@ -71,9 +68,7 @@ public:
      * @param data         Buffer contents.
      * @param permissions  POSIX permissions (default 0644).
      */
-    void add_buffer(const std::string& archive_path,
-                    std::span<const uint8_t> data,
-                    mode_t permissions = 0644);
+    void add_buffer(const std::string& archive_path, std::span<const uint8_t> data, mode_t permissions = 0644);
 
     /**
      * Flush and close the archive. Must be called before the file is usable.
@@ -86,4 +81,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-} // namespace surge::archive
+}  // namespace surge::archive

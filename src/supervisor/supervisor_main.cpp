@@ -1,16 +1,17 @@
-#include "supervisor/supervisor.hpp"
 #include "platform/pal.hpp"
-#include "platform/pal_process.hpp"
 #include "platform/pal_fs.hpp"
-#include <spdlog/spdlog.h>
+#include "platform/pal_process.hpp"
+#include "supervisor/supervisor.hpp"
+
+#include <atomic>
+#include <chrono>
+#include <csignal>
+#include <fstream>
+#include <iostream>
 #include <spdlog/sinks/basic_file_sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
-#include <csignal>
-#include <atomic>
+#include <spdlog/spdlog.h>
 #include <thread>
-#include <chrono>
-#include <iostream>
-#include <fstream>
 
 namespace {
 
@@ -35,12 +36,10 @@ void setup_logging(const std::filesystem::path& log_dir) {
         std::filesystem::create_directories(log_dir, ec);
 
         auto console_sink = std::make_shared<spdlog::sinks::stderr_color_sink_mt>();
-        auto file_sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(
-            (log_dir / "supervisor.log").string(), false);
+        auto file_sink =
+            std::make_shared<spdlog::sinks::basic_file_sink_mt>((log_dir / "supervisor.log").string(), false);
 
-        auto logger = std::make_shared<spdlog::logger>(
-            "supervisor",
-            spdlog::sinks_init_list{console_sink, file_sink});
+        auto logger = std::make_shared<spdlog::logger>("supervisor", spdlog::sinks_init_list{console_sink, file_sink});
 
         logger->set_level(spdlog::level::debug);
         logger->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] [%t] %v");
@@ -112,7 +111,8 @@ SupervisorConfig parse_args(int argc, char* argv[]) {
 }
 
 void write_pid_file(const std::filesystem::path& path) {
-    if (path.empty()) return;
+    if (path.empty())
+        return;
     try {
         std::ofstream f(path);
         f << surge::platform::current_pid();
@@ -122,12 +122,13 @@ void write_pid_file(const std::filesystem::path& path) {
 }
 
 void remove_pid_file(const std::filesystem::path& path) {
-    if (path.empty()) return;
+    if (path.empty())
+        return;
     std::error_code ec;
     std::filesystem::remove(path, ec);
 }
 
-} // anonymous namespace
+}  // anonymous namespace
 
 int main(int argc, char* argv[]) {
     auto config = parse_args(argc, argv);
@@ -136,7 +137,8 @@ int main(int argc, char* argv[]) {
         std::cerr << "Usage: surge_supervisor --exe <path> [--install-dir <dir>] "
                      "[--working-dir <dir>] [--id <name>] "
                      "[--max-restarts N] [--restart-delay N] [--log-dir <dir>] "
-                     "[--pid-file <path>] [-- child-args...]" << std::endl;
+                     "[--pid-file <path>] [-- child-args...]"
+                  << std::endl;
         return 1;
     }
 
@@ -154,8 +156,7 @@ int main(int argc, char* argv[]) {
     spdlog::info("  Max restarts: {}", config.max_restarts);
     spdlog::info("  Restart delay: {}s", config.restart_delay_seconds);
 
-    surge::supervisor::Supervisor supervisor(
-        config.supervisor_id, config.install_dir);
+    surge::supervisor::Supervisor supervisor(config.supervisor_id, config.install_dir);
 
     int restart_count = 0;
     auto window_start = std::chrono::steady_clock::now();
@@ -163,31 +164,27 @@ int main(int argc, char* argv[]) {
     while (!g_shutdown_requested.load()) {
         // Reset restart count if outside the window
         auto now = std::chrono::steady_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-            now - window_start).count();
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - window_start).count();
         if (elapsed >= config.restart_window_seconds) {
             restart_count = 0;
             window_start = now;
         }
 
         if (restart_count >= config.max_restarts) {
-            spdlog::error("Max restarts ({}) exceeded within {} seconds, giving up",
-                          config.max_restarts, config.restart_window_seconds);
+            spdlog::error("Max restarts ({}) exceeded within {} seconds, giving up", config.max_restarts,
+                          config.restart_window_seconds);
             remove_pid_file(config.pid_file);
             return 1;
         }
 
         // Start the supervised process
         // Supervisor::start(path, path, vector<string>)
-        int32_t rc = supervisor.start(
-            config.executable, config.working_dir, config.args);
+        int32_t rc = supervisor.start(config.executable, config.working_dir, config.args);
 
         if (rc != 0) {
-            spdlog::error("Failed to start child process '{}'",
-                          config.executable.string());
+            spdlog::error("Failed to start child process '{}'", config.executable.string());
             restart_count++;
-            std::this_thread::sleep_for(
-                std::chrono::seconds(config.restart_delay_seconds));
+            std::this_thread::sleep_for(std::chrono::seconds(config.restart_delay_seconds));
             continue;
         }
 
@@ -213,12 +210,10 @@ int main(int argc, char* argv[]) {
         }
 
         restart_count++;
-        spdlog::info("Restarting child ({}/{} in current window)",
-                     restart_count, config.max_restarts);
+        spdlog::info("Restarting child ({}/{} in current window)", restart_count, config.max_restarts);
 
         // Delay before restart
-        for (int i = 0; i < config.restart_delay_seconds &&
-             !g_shutdown_requested.load(); ++i) {
+        for (int i = 0; i < config.restart_delay_seconds && !g_shutdown_requested.load(); ++i) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
     }

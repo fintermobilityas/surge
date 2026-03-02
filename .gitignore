@@ -1,0 +1,43 @@
+# Build directories
+build/
+out/
+cmake-build-*/
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Compiled objects
+*.o
+*.obj
+*.so
+*.so.*
+*.dll
+*.exe
+*.lib
+*.a
+*.dylib
+
+# vcpkg
+vcpkg_installed/
+
+# .NET
+dotnet/**/bin/
+dotnet/**/obj/
+
+# Testing
+Testing/
+
+# CMake generated
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,29 @@
+schema: 1
+
+generic:
+  token: demo-token
+  artifacts: .surge/artifacts
+  packages: .surge/packages
+
+storage:
+  provider: filesystem
+  bucket: /tmp/surge-demo-releases
+
+channels:
+  - name: test
+  - name: production
+
+apps:
+  - id: demoapp
+    main: demoapp
+    supervisorId: demo-supervisor
+    installDirectory: demoapp
+    target:
+      os: linux
+      rid: linux-x64
+      persistentAssets:
+        - config
+        - logs
+    metadata:
+      description: Surge demo application
+      authors: Surge Team

@@ -1,0 +1,16 @@
+{
+  "name": "surge",
+  "version-string": "0.1.0",
+  "dependencies": [
+    "curl",
+    "openssl",
+    "zstd",
+    "libarchive",
+    "yaml-cpp",
+    "nlohmann-json",
+    "fmt",
+    "spdlog",
+    "cxxopts",
+    "gtest"
+  ]
+}

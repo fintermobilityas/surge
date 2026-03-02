@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="Surge.NET.Tests/Surge.NET.Tests.csproj" />
+  <Project Path="Surge.NET/Surge.NET.csproj" />
+</Solution>

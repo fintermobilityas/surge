@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::config::constants::RELEASES_FILE_COMPRESSED;
 use crate::context::Context;
@@ -389,6 +389,31 @@ impl UpdateManager {
             crate::platform::fs::atomic_rename(&extract_dir, &app_dir)?;
         }
 
+        let latest = info
+            .apply_releases
+            .last()
+            .ok_or_else(|| SurgeError::Update("No latest release".to_string()))?;
+        if !latest.shortcuts.is_empty() {
+            match crate::platform::shortcuts::install_shortcuts(
+                &self.app_id,
+                &app_dir,
+                &latest.main_exe,
+                &latest.icon,
+                &latest.shortcuts,
+            ) {
+                Ok(()) => {
+                    debug!(version = %latest.version, "Installed shortcuts");
+                }
+                Err(e) => {
+                    warn!(
+                        version = %latest.version,
+                        error = %e,
+                        "Failed to install shortcuts (continuing)"
+                    );
+                }
+            }
+        }
+
         // Clean up staging directory
         if staging_dir.exists() {
             let _ = tokio::fs::remove_dir_all(&staging_dir).await;
@@ -426,6 +451,7 @@ fn normalize_os_label(raw: &str) -> String {
 mod tests {
     use super::*;
     use crate::archive::packer::ArchivePacker;
+    use crate::config::manifest::ShortcutLocation;
     use crate::crypto::sha256::sha256_hex_file;
     use crate::releases::manifest::{ReleaseEntry, ReleaseIndex, compress_release_index};
 
@@ -444,6 +470,9 @@ mod tests {
             delta_sha256: String::new(),
             created_utc: String::new(),
             release_notes: String::new(),
+            main_exe: "test-app".to_string(),
+            icon: String::new(),
+            shortcuts: Vec::new(),
         }
     }
 
@@ -604,6 +633,9 @@ mod tests {
                 delta_sha256: String::new(),
                 created_utc: chrono::Utc::now().to_rfc3339(),
                 release_notes: String::new(),
+                main_exe: "test-app".to_string(),
+                icon: String::new(),
+                shortcuts: Vec::new(),
             }],
             ..ReleaseIndex::default()
         };
@@ -639,5 +671,107 @@ mod tests {
         let installed_file = install_root.join("app-1.1.0").join("payload.txt");
         assert!(installed_file.exists());
         assert_eq!(std::fs::read_to_string(installed_file).unwrap(), "installed payload");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_download_and_apply_full_installs_shortcuts() {
+        struct ShortcutPathsOverrideGuard;
+
+        impl Drop for ShortcutPathsOverrideGuard {
+            fn drop(&mut self) {
+                crate::platform::shortcuts::clear_test_shortcut_paths_override();
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let applications_dir = tmp
+            .path()
+            .join("shortcut-home")
+            .join(".local")
+            .join("share")
+            .join("applications");
+        let autostart_dir = tmp.path().join("shortcut-home").join(".config").join("autostart");
+        crate::platform::shortcuts::set_test_shortcut_paths_override(applications_dir.clone(), autostart_dir.clone());
+        let _override_guard = ShortcutPathsOverrideGuard;
+
+        let store_root = tmp.path().join("store");
+        let install_root = tmp.path().join("install");
+        std::fs::create_dir_all(&store_root).unwrap();
+        std::fs::create_dir_all(&install_root).unwrap();
+
+        let rid = crate::platform::detect::current_rid();
+        let full_filename = format!("test-app-1.1.0-{rid}-full.tar.zst");
+        let full_path = store_root.join(&full_filename);
+
+        let mut packer = ArchivePacker::new(3).unwrap();
+        packer.add_buffer("demoapp", b"#!/bin/sh\necho demo\n", 0o755).unwrap();
+        packer.add_buffer("icon.png", b"png", 0o644).unwrap();
+        packer.add_buffer("payload.txt", b"installed payload", 0o644).unwrap();
+        packer.finalize_to_file(&full_path).unwrap();
+
+        let full_size = std::fs::metadata(&full_path).unwrap().len() as i64;
+        let full_sha256 = sha256_hex_file(&full_path).unwrap();
+
+        let index = ReleaseIndex {
+            app_id: "test-app".to_string(),
+            releases: vec![ReleaseEntry {
+                version: "1.1.0".to_string(),
+                channels: vec!["stable".to_string()],
+                os: "linux".to_string(),
+                rid: rid.clone(),
+                is_genesis: true,
+                full_filename: full_filename.clone(),
+                full_size,
+                full_sha256,
+                delta_filename: String::new(),
+                delta_size: 0,
+                delta_sha256: String::new(),
+                created_utc: chrono::Utc::now().to_rfc3339(),
+                release_notes: String::new(),
+                main_exe: "demoapp".to_string(),
+                icon: "icon.png".to_string(),
+                shortcuts: vec![ShortcutLocation::Desktop, ShortcutLocation::Startup],
+            }],
+            ..ReleaseIndex::default()
+        };
+
+        let compressed = compress_release_index(&index, crate::config::constants::DEFAULT_ZSTD_LEVEL).unwrap();
+        std::fs::write(
+            store_root.join(crate::config::constants::RELEASES_FILE_COMPRESSED),
+            compressed,
+        )
+        .unwrap();
+
+        let ctx = Arc::new(Context::new());
+        ctx.set_storage(
+            crate::context::StorageProvider::Filesystem,
+            store_root.to_str().unwrap(),
+            "",
+            "",
+            "",
+            "",
+        );
+
+        let mut manager =
+            UpdateManager::new(ctx, "test-app", "1.0.0", "stable", install_root.to_str().unwrap()).unwrap();
+        let info = manager.check_for_updates().await.unwrap().unwrap();
+        assert_eq!(info.apply_strategy, ApplyStrategy::Full);
+        manager
+            .download_and_apply(&info, None::<fn(ProgressInfo)>)
+            .await
+            .unwrap();
+
+        let installed_file = install_root.join("app-1.1.0").join("payload.txt");
+        assert!(installed_file.exists());
+
+        let desktop_file = applications_dir.join("test-app.desktop");
+        let startup_file = autostart_dir.join("test-app.desktop");
+        assert!(desktop_file.exists());
+        assert!(startup_file.exists());
+
+        let desktop_content = std::fs::read_to_string(desktop_file).unwrap();
+        assert!(desktop_content.contains("Icon="));
+        assert!(desktop_content.contains("demoapp"));
     }
 }

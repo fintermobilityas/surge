@@ -246,17 +246,13 @@ storage:
 channels:
   - name: stable
 
-_defaults: &defaults
-  os: linux
-  rid: linux-x64
-  persistentAssets: []
-
 apps:
   - id: app1
     main: app1
     installDirectory: app1
     target:
-      <<: *defaults
+      os: linux
+      rid: linux-x64
     metadata:
       description: App 1
       authors: Team
@@ -264,7 +260,7 @@ apps:
     main: app2
     installDirectory: app2
     target:
-      <<: *defaults
+      os: linux
       rid: linux-arm64
     metadata:
       description: App 2

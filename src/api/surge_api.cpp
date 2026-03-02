@@ -502,6 +502,12 @@ SURGE_API surge_result SURGE_CALL surge_supervisor_start(
     if (!exe_path || !working_dir || !supervisor_id) return SURGE_ERROR;
 
     try {
+        // Verify executable exists before attempting to start
+        if (!std::filesystem::exists(exe_path)) {
+            spdlog::error("surge_supervisor_start: executable not found: {}", exe_path);
+            return SURGE_ERROR;
+        }
+
         std::vector<std::string> args;
         if (argv) {
             for (int i = 0; i < argc; ++i) {
@@ -509,7 +515,7 @@ SURGE_API surge_result SURGE_CALL surge_supervisor_start(
             }
         }
 
-        std::filesystem::path install_dir = working_dir ? working_dir : ".";
+        std::filesystem::path install_dir = working_dir;
 
         surge::supervisor::Supervisor sup(supervisor_id, install_dir);
         int32_t rc = sup.start(

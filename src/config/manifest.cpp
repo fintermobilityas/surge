@@ -155,6 +155,11 @@ SurgeManifest parse_manifest(const std::filesystem::path& path) {
             fmt::format("Failed to parse manifest YAML '{}': {}", path.string(), e.what()));
     }
 
+    if (!root.IsMap()) {
+        throw std::runtime_error(
+            fmt::format("Manifest '{}' is not a valid YAML mapping", path.string()));
+    }
+
     SurgeManifest manifest;
 
     // Schema version

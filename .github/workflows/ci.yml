@@ -7,6 +7,62 @@ on:
     branches: [main, develop]
 
 jobs:
+  native:
+    name: ${{ matrix.os }} (${{ matrix.compiler }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            compiler: gcc-13
+            preset: linux-x64-release
+            cc: gcc-13
+            cxx: g++-13
+          - os: windows-latest
+            compiler: msvc
+            preset: win-x64-release
+            cc: cl
+            cxx: cl
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install GCC 13 (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-13 g++-13 ninja-build
+
+      - name: Setup MSVC (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install Ninja (Windows)
+        if: runner.os == 'Windows'
+        run: choco install ninja
+
+      - name: Setup vcpkg
+        run: |
+          git clone https://github.com/microsoft/vcpkg.git ${{ runner.temp }}/vcpkg
+          ${{ runner.temp }}/vcpkg/bootstrap-vcpkg.sh || ${{ runner.temp }}/vcpkg/bootstrap-vcpkg.bat
+        shell: bash
+
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }}
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+          VCPKG_ROOT: ${{ runner.temp }}/vcpkg
+
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }}
+
+      - name: Test
+        run: ctest --preset ${{ matrix.preset }}
+
   dotnet:
     name: .NET Build and Test
     runs-on: ubuntu-latest

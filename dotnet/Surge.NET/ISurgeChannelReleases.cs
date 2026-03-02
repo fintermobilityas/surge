@@ -14,7 +14,7 @@ namespace Surge
         string Channel { get; }
 
         /// <summary>
-        /// All available releases in this channel, ordered newest to oldest.
+        /// All available releases in this channel, ordered oldest to newest.
         /// </summary>
         IReadOnlyList<SurgeRelease> Releases { get; }
 
@@ -38,7 +38,7 @@ namespace Surge
 
         public string Channel { get; }
         public IReadOnlyList<SurgeRelease> Releases => _releases;
-        public SurgeRelease? Latest => _releases.Count > 0 ? _releases[0] : null;
+        public SurgeRelease? Latest => _releases.Count > 0 ? _releases[_releases.Count - 1] : null;
         public int Count => _releases.Count;
 
         internal SurgeChannelReleases(string channel, List<SurgeRelease> releases)

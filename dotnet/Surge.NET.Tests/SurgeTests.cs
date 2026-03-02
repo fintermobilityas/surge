@@ -64,6 +64,10 @@ namespace Surge.Tests
             Assert.Equal("", info.Version);
             Assert.Equal("", info.Channel);
             Assert.Equal("", info.InstallDirectory);
+            Assert.Equal("", info.StorageProvider);
+            Assert.Equal("", info.StorageBucket);
+            Assert.Equal("", info.StorageRegion);
+            Assert.Equal("", info.StorageEndpoint);
             Assert.False(info.IsSupervisorRunning);
         }
 
@@ -75,13 +79,21 @@ namespace Surge.Tests
                 Id = "myapp",
                 Version = "1.2.3",
                 Channel = "stable",
-                InstallDirectory = "/opt/myapp"
+                InstallDirectory = "/opt/myapp",
+                StorageProvider = "filesystem",
+                StorageBucket = "/tmp/releases",
+                StorageRegion = "us-east-1",
+                StorageEndpoint = "http://localhost:9000"
             };
 
             Assert.Equal("myapp", info.Id);
             Assert.Equal("1.2.3", info.Version);
             Assert.Equal("stable", info.Channel);
             Assert.Equal("/opt/myapp", info.InstallDirectory);
+            Assert.Equal("filesystem", info.StorageProvider);
+            Assert.Equal("/tmp/releases", info.StorageBucket);
+            Assert.Equal("us-east-1", info.StorageRegion);
+            Assert.Equal("http://localhost:9000", info.StorageEndpoint);
         }
     }
 
@@ -283,8 +295,8 @@ namespace Surge.Tests
         {
             var list = new System.Collections.Generic.List<SurgeRelease>
             {
-                new SurgeRelease { Version = "2.0.0", Channel = "stable" },
-                new SurgeRelease { Version = "1.0.0", Channel = "stable" }
+                new SurgeRelease { Version = "1.0.0", Channel = "stable" },
+                new SurgeRelease { Version = "2.0.0", Channel = "stable" }
             };
 
             var releases = new SurgeChannelReleases("stable", list);

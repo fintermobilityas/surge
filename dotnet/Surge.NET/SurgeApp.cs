@@ -239,6 +239,10 @@ namespace Surge
                 string? version = null;
                 string? channel = null;
                 string? installDir = null;
+                string? storageProvider = null;
+                string? storageBucket = null;
+                string? storageRegion = null;
+                string? storageEndpoint = null;
 
                 foreach (var line in File.ReadLines(manifestPath))
                 {
@@ -255,6 +259,14 @@ namespace Surge
                         channel = trimmed.Substring(8).Trim().Trim('"');
                     else if (trimmed.StartsWith("installDirectory:", StringComparison.Ordinal))
                         installDir = trimmed.Substring(17).Trim().Trim('"');
+                    else if (trimmed.StartsWith("provider:", StringComparison.Ordinal))
+                        storageProvider = trimmed.Substring(9).Trim().Trim('"');
+                    else if (trimmed.StartsWith("bucket:", StringComparison.Ordinal))
+                        storageBucket = trimmed.Substring(7).Trim().Trim('"');
+                    else if (trimmed.StartsWith("region:", StringComparison.Ordinal))
+                        storageRegion = trimmed.Substring(7).Trim().Trim('"');
+                    else if (trimmed.StartsWith("endpoint:", StringComparison.Ordinal))
+                        storageEndpoint = trimmed.Substring(9).Trim().Trim('"');
                 }
 
                 if (appId == null)
@@ -265,7 +277,11 @@ namespace Surge
                     Id = appId,
                     Version = version ?? "0.0.0",
                     Channel = channel ?? "stable",
-                    InstallDirectory = installDir ?? assemblyDir
+                    InstallDirectory = installDir ?? assemblyDir,
+                    StorageProvider = storageProvider ?? "filesystem",
+                    StorageBucket = storageBucket ?? "",
+                    StorageRegion = storageRegion ?? "",
+                    StorageEndpoint = storageEndpoint ?? ""
                 };
             }
             catch

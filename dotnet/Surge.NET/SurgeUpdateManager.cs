@@ -37,6 +37,24 @@ namespace Surge
             if (_nativeCtx == IntPtr.Zero)
                 throw new InvalidOperationException("Failed to create native Surge context.");
 
+            int provider = ParseStorageProvider(appInfo.StorageProvider);
+            int storageResult = NativeMethods.ConfigSetStorage(
+                _nativeCtx,
+                provider,
+                appInfo.StorageBucket,
+                NullIfEmpty(appInfo.StorageRegion),
+                null,
+                null,
+                NullIfEmpty(appInfo.StorageEndpoint));
+            if (storageResult != 0)
+            {
+                string? error = GetContextLastError(_nativeCtx);
+                NativeMethods.ContextDestroy(_nativeCtx);
+                _nativeCtx = IntPtr.Zero;
+                throw new InvalidOperationException(
+                    "Failed to configure native storage." + (string.IsNullOrWhiteSpace(error) ? "" : $" {error}"));
+            }
+
             _nativeMgr = NativeMethods.UpdateManagerCreate(
                 _nativeCtx,
                 appInfo.Id,
@@ -142,8 +160,8 @@ namespace Surge
 
                         cancellationToken.ThrowIfCancellationRequested();
 
-                        // Get the latest release
-                        var latestRelease = releases[0];
+                        // Native releases are ordered oldest -> newest.
+                        var latestRelease = releases[releases.Count - 1];
 
                         // Before apply callback
                         onBeforeApplyUpdate?.Invoke(latestRelease);
@@ -228,6 +246,47 @@ namespace Surge
                     registration.Dispose();
                 }
             }, cancellationToken);
+        }
+
+        private static int ParseStorageProvider(string provider)
+        {
+            switch ((provider ?? "").Trim().ToLowerInvariant())
+            {
+                case "s3":
+                    return 0;
+                case "azure":
+                case "azureblob":
+                case "azure_blob":
+                    return 1;
+                case "gcs":
+                    return 2;
+                case "filesystem":
+                case "":
+                    return 3;
+                default:
+                    throw new InvalidOperationException($"Unsupported storage provider: {provider}");
+            }
+        }
+
+        private static string? NullIfEmpty(string value)
+        {
+            return string.IsNullOrWhiteSpace(value) ? null : value;
+        }
+
+        private static string? GetContextLastError(IntPtr nativeCtx)
+        {
+            if (nativeCtx == IntPtr.Zero)
+                return null;
+
+            IntPtr errorPtr = NativeMethods.ContextLastError(nativeCtx);
+            if (errorPtr == IntPtr.Zero)
+                return null;
+
+            var error = Marshal.PtrToStructure<SurgeErrorNative>(errorPtr);
+            if (error.Message == IntPtr.Zero)
+                return null;
+
+            return MarshalUtf8(error.Message);
         }
 
         private static void DispatchProgress(ISurgeProgressSource source, SurgeProgress progress)

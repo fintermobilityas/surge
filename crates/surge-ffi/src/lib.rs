@@ -12,10 +12,14 @@ use std::sync::Arc;
 
 use surge_core::context::{Context, ResourceBudget, StorageProvider};
 use surge_core::diff::wrapper::{bsdiff_buffers, bspatch_buffers};
-use surge_core::platform::process::spawn_process;
+use surge_core::lock::mutex::DistributedMutex;
+use surge_core::pack::builder::PackBuilder;
+use surge_core::supervisor::supervisor::Supervisor;
+use surge_core::update::manager::{ProgressInfo, UpdateManager};
 
 use crate::handles::{
-    SurgeContextHandle, SurgeErrorFfi, SurgePackContextHandle, SurgeReleasesInfoHandle, SurgeUpdateManagerHandle,
+    ReleaseEntryFfi, SurgeContextHandle, SurgeErrorFfi, SurgePackContextHandle, SurgeReleasesInfoHandle,
+    SurgeUpdateManagerHandle,
 };
 
 // ---------------------------------------------------------------------------
@@ -39,6 +43,7 @@ const SURGE_PHASE_VERIFY: i32 = 2;
 const SURGE_PHASE_EXTRACT: i32 = 3;
 #[allow(dead_code)]
 const SURGE_PHASE_APPLY_DELTA: i32 = 4;
+#[allow(dead_code)]
 const SURGE_PHASE_FINALIZE: i32 = 5;
 
 // ---------------------------------------------------------------------------
@@ -101,6 +106,60 @@ type SurgeEventCallback = Option<unsafe extern "C" fn(*const c_char, *mut c_void
 // ---------------------------------------------------------------------------
 //  Helpers
 // ---------------------------------------------------------------------------
+
+/// Bridges a C progress callback + user_data pointer so that it satisfies
+/// the `Send + Sync` bounds required by `UpdateManager::download_and_apply`.
+///
+/// # Safety
+///
+/// Only safe when the pointer is valid for the duration of the async call
+/// and only accessed from the calling thread (via `Runtime::block_on`).
+struct ProgressBridge {
+    cb: unsafe extern "C" fn(*const SurgeProgressFfi, *mut c_void),
+    user_data: *mut c_void,
+}
+
+// SAFETY: The C API contract guarantees single-threaded access per context,
+// and we only use this with Runtime::block_on (same thread).
+unsafe impl Send for ProgressBridge {}
+unsafe impl Sync for ProgressBridge {}
+
+impl ProgressBridge {
+    /// Convert a core `ProgressInfo` to its FFI representation and invoke
+    /// the C callback.  Core phases are 1-indexed; FFI phases are 0-indexed.
+    fn invoke(&self, pi: &ProgressInfo) {
+        let ffi = SurgeProgressFfi {
+            phase: pi.phase.saturating_sub(1),
+            phase_percent: pi.phase_percent,
+            total_percent: pi.total_percent,
+            bytes_done: pi.bytes_done,
+            bytes_total: pi.bytes_total,
+            items_done: pi.items_done,
+            items_total: pi.items_total,
+            speed_bytes_per_sec: pi.speed_bytes_per_sec,
+        };
+        unsafe { (self.cb)(&ffi, self.user_data) };
+    }
+}
+
+/// Build a `SurgeProgressFfi` from pack-style `(items_done, items_total)` counters.
+fn make_pack_progress(phase: i32, items_done: i32, items_total: i32) -> SurgeProgressFfi {
+    let pct = if items_total > 0 {
+        items_done * 100 / items_total
+    } else {
+        0
+    };
+    SurgeProgressFfi {
+        phase,
+        phase_percent: pct,
+        total_percent: pct,
+        bytes_done: 0,
+        bytes_total: 0,
+        items_done: i64::from(items_done),
+        items_total: i64::from(items_total),
+        speed_bytes_per_sec: 0.0,
+    }
+}
 
 /// Convert a nullable C string pointer to a Rust `&str`, defaulting to `""`.
 ///
@@ -357,24 +416,57 @@ pub unsafe extern "C" fn surge_update_check(
         let handle = unsafe { &*ctx_handle };
         unsafe { handle.clear_last_error() };
 
-        // Check cancellation.
         if handle.ctx.is_cancelled() {
             return SURGE_CANCELLED;
         }
 
-        // TODO: When surge_core::releases and surge_core::update modules are
-        // implemented, perform the actual update check here via:
-        //   handle.runtime.block_on(async { ... })
-        //
-        // For now, return SURGE_NOT_FOUND (no updates available) as a stub.
-        // This allows the FFI layer to compile and export all symbols.
-        let releases_handle = Box::new(SurgeReleasesInfoHandle {
-            releases: Vec::new(),
-            cached_strings: Vec::new(),
-        });
+        let mut update_mgr = match UpdateManager::new(
+            handle.ctx.clone(),
+            &mgr_ref.app_id,
+            &mgr_ref.current_version,
+            &mgr_ref.channel,
+            &mgr_ref.install_dir,
+        ) {
+            Ok(m) => m,
+            Err(e) => return unsafe { set_ctx_error(ctx_handle, &e) },
+        };
 
-        unsafe { *info = Box::into_raw(releases_handle) };
-        SURGE_NOT_FOUND
+        let result = handle.runtime.block_on(update_mgr.check_for_updates());
+
+        match result {
+            Ok(Some(update_info)) => {
+                let ffi_releases: Vec<ReleaseEntryFfi> = update_info
+                    .available_releases
+                    .iter()
+                    .map(|r| ReleaseEntryFfi {
+                        version: r.version.clone(),
+                        channel: r.channels.first().cloned().unwrap_or_default(),
+                        full_size: r.full_size,
+                        is_genesis: r.is_genesis,
+                    })
+                    .collect();
+
+                let mut releases_handle = Box::new(SurgeReleasesInfoHandle {
+                    releases: ffi_releases,
+                    cached_strings: Vec::new(),
+                    update_info: Some(update_info),
+                });
+                releases_handle.cache_strings();
+
+                unsafe { *info = Box::into_raw(releases_handle) };
+                SURGE_OK
+            }
+            Ok(None) => {
+                let releases_handle = Box::new(SurgeReleasesInfoHandle {
+                    releases: Vec::new(),
+                    cached_strings: Vec::new(),
+                    update_info: None,
+                });
+                unsafe { *info = Box::into_raw(releases_handle) };
+                SURGE_NOT_FOUND
+            }
+            Err(e) => unsafe { set_ctx_error(ctx_handle, &e) },
+        }
     }))
 }
 
@@ -404,45 +496,52 @@ pub unsafe extern "C" fn surge_update_download_and_apply(
         }
 
         let info_ref = unsafe { &*info };
-        if info_ref.releases.is_empty() {
+
+        let update_info = match info_ref.update_info.as_ref() {
+            Some(ui) => ui,
+            None => {
+                let e = surge_core::error::SurgeError::Update("No update info available".into());
+                return unsafe { set_ctx_error(ctx_handle, &e) };
+            }
+        };
+
+        if update_info.available_releases.is_empty() {
             let e = surge_core::error::SurgeError::Update("No releases to apply".into());
             return unsafe { set_ctx_error(ctx_handle, &e) };
         }
 
-        // Report initial progress if callback is provided.
-        if let Some(cb) = progress_cb {
-            let progress = SurgeProgressFfi {
-                phase: SURGE_PHASE_DOWNLOAD,
-                phase_percent: 0,
-                total_percent: 0,
-                bytes_done: 0,
-                bytes_total: 0,
-                items_done: 0,
-                items_total: info_ref.releases.len() as i64,
-                speed_bytes_per_sec: 0.0,
-            };
-            unsafe { cb(&progress, user_data) };
-        }
+        let update_mgr = match UpdateManager::new(
+            handle.ctx.clone(),
+            &mgr_ref.app_id,
+            &mgr_ref.current_version,
+            &mgr_ref.channel,
+            &mgr_ref.install_dir,
+        ) {
+            Ok(m) => m,
+            Err(e) => return unsafe { set_ctx_error(ctx_handle, &e) },
+        };
 
-        // TODO: When surge_core::update is implemented, perform the actual
-        // download and apply via handle.runtime.block_on(async { ... }).
-        //
-        // For now, stub: report completion and return OK.
-        if let Some(cb) = progress_cb {
-            let progress = SurgeProgressFfi {
-                phase: SURGE_PHASE_FINALIZE,
-                phase_percent: 100,
-                total_percent: 100,
-                bytes_done: 0,
-                bytes_total: 0,
-                items_done: info_ref.releases.len() as i64,
-                items_total: info_ref.releases.len() as i64,
-                speed_bytes_per_sec: 0.0,
+        // Map core ProgressInfo → SurgeProgressFfi via the C callback.
+        // Handle Some/None explicitly to give the compiler a concrete type
+        // for the generic F in download_and_apply<F: Send + Sync>.
+        let result = if let Some(cb) = progress_cb {
+            let bridge = ProgressBridge { cb, user_data };
+            let progress_fn = move |pi: ProgressInfo| {
+                bridge.invoke(&pi);
             };
-            unsafe { cb(&progress, user_data) };
-        }
+            handle
+                .runtime
+                .block_on(update_mgr.download_and_apply(update_info, Some(progress_fn)))
+        } else {
+            handle
+                .runtime
+                .block_on(update_mgr.download_and_apply(update_info, None::<fn(ProgressInfo)>))
+        };
 
-        SURGE_OK
+        match result {
+            Ok(()) => SURGE_OK,
+            Err(e) => unsafe { set_ctx_error(ctx_handle, &e) },
+        }
     }))
 }
 
@@ -723,6 +822,7 @@ pub unsafe extern "C" fn surge_pack_create(
             rid: rid_s,
             version: version_s,
             artifacts_dir: artifacts_s,
+            builder: std::cell::UnsafeCell::new(None),
         });
 
         Box::into_raw(pack)
@@ -755,40 +855,40 @@ pub unsafe extern "C" fn surge_pack_build(
             return SURGE_CANCELLED;
         }
 
-        // Report initial progress if callback is provided.
-        if let Some(cb) = progress_cb {
-            let progress = SurgeProgressFfi {
-                phase: SURGE_PHASE_CHECK,
-                phase_percent: 0,
-                total_percent: 0,
-                bytes_done: 0,
-                bytes_total: 0,
-                items_done: 0,
-                items_total: 0,
-                speed_bytes_per_sec: 0.0,
-            };
-            unsafe { cb(&progress, user_data) };
-        }
+        let mut builder = match PackBuilder::new(
+            handle.ctx.clone(),
+            &pack.manifest_path,
+            &pack.app_id,
+            &pack.rid,
+            &pack.version,
+            &pack.artifacts_dir,
+        ) {
+            Ok(b) => b,
+            Err(e) => return unsafe { set_ctx_error(ctx_handle, &e) },
+        };
 
-        // TODO: When surge_core::pack is implemented, perform the actual
-        // pack build via handle.runtime.block_on(async { ... }).
-        //
-        // For now, stub: report completion and return OK.
-        if let Some(cb) = progress_cb {
-            let progress = SurgeProgressFfi {
-                phase: SURGE_PHASE_FINALIZE,
-                phase_percent: 100,
-                total_percent: 100,
-                bytes_done: 0,
-                bytes_total: 0,
-                items_done: 0,
-                items_total: 0,
-                speed_bytes_per_sec: 0.0,
-            };
-            unsafe { cb(&progress, user_data) };
-        }
+        let progress_fn = progress_cb.map(|cb| {
+            move |done: i32, total: i32| {
+                let ffi = make_pack_progress(SURGE_PHASE_CHECK, done, total);
+                unsafe { cb(&ffi, user_data) };
+            }
+        });
 
-        SURGE_OK
+        let result = handle
+            .runtime
+            .block_on(builder.build(progress_fn.as_ref().map(|f| f as &dyn Fn(i32, i32))));
+
+        match result {
+            Ok(()) => {
+                // Store the builder so surge_pack_push can use it.
+                unsafe {
+                    let slot = &mut *pack.builder.get();
+                    *slot = Some(builder);
+                }
+                SURGE_OK
+            }
+            Err(e) => unsafe { set_ctx_error(ctx_handle, &e) },
+        }
     }))
 }
 
@@ -817,40 +917,38 @@ pub unsafe extern "C" fn surge_pack_push(
             return SURGE_CANCELLED;
         }
 
-        let _channel_s = unsafe { cstr_to_str(channel) };
+        let channel_s = unsafe { cstr_to_str(channel) };
 
-        // Report initial progress.
-        if let Some(cb) = progress_cb {
-            let progress = SurgeProgressFfi {
-                phase: SURGE_PHASE_CHECK,
-                phase_percent: 0,
-                total_percent: 0,
-                bytes_done: 0,
-                bytes_total: 0,
-                items_done: 0,
-                items_total: 0,
-                speed_bytes_per_sec: 0.0,
-            };
-            unsafe { cb(&progress, user_data) };
+        // Take the builder that was stored by surge_pack_build.
+        let builder = unsafe {
+            let slot = &mut *pack.builder.get();
+            slot.take()
+        };
+
+        let builder = match builder {
+            Some(b) => b,
+            None => {
+                let e =
+                    surge_core::error::SurgeError::Pack("No builder available. Call surge_pack_build first.".into());
+                return unsafe { set_ctx_error(ctx_handle, &e) };
+            }
+        };
+
+        let progress_fn = progress_cb.map(|cb| {
+            move |done: i32, total: i32| {
+                let ffi = make_pack_progress(SURGE_PHASE_DOWNLOAD, done, total);
+                unsafe { cb(&ffi, user_data) };
+            }
+        });
+
+        let result = handle
+            .runtime
+            .block_on(builder.push(channel_s, progress_fn.as_ref().map(|f| f as &dyn Fn(i32, i32))));
+
+        match result {
+            Ok(()) => SURGE_OK,
+            Err(e) => unsafe { set_ctx_error(ctx_handle, &e) },
         }
-
-        // TODO: When surge_core::pack and surge_core::storage are implemented,
-        // perform the actual push via handle.runtime.block_on(async { ... }).
-        if let Some(cb) = progress_cb {
-            let progress = SurgeProgressFfi {
-                phase: SURGE_PHASE_FINALIZE,
-                phase_percent: 100,
-                total_percent: 100,
-                bytes_done: 0,
-                bytes_total: 0,
-                items_done: 0,
-                items_total: 0,
-                speed_bytes_per_sec: 0.0,
-            };
-            unsafe { cb(&progress, user_data) };
-        }
-
-        SURGE_OK
     }))
 }
 
@@ -891,27 +989,33 @@ pub unsafe extern "C" fn surge_lock_acquire(
             return SURGE_CANCELLED;
         }
 
-        let _name_s = unsafe { cstr_to_str(name) };
-        let _ = timeout_seconds;
+        let name_s = unsafe { cstr_to_str(name) };
 
-        // TODO: When surge_core::lock is implemented, perform the actual
-        // lock acquisition via handle.runtime.block_on(async { ... }).
-        //
-        // For now, return a stub challenge string via malloc so the caller
-        // can free it with free() as documented.
-        let challenge = CString::new("stub-challenge-token").unwrap();
-        let len = challenge.as_bytes_with_nul().len();
-        let buf = unsafe { libc_malloc(len) }.cast::<c_char>();
-        if buf.is_null() {
-            let e = surge_core::error::SurgeError::Other("malloc failed".into());
-            return unsafe { set_ctx_error(ctx, &e) };
-        }
-        unsafe {
-            ptr::copy_nonoverlapping(challenge.as_ptr(), buf, len);
-            *challenge_out = buf;
-        }
+        let mut mutex = DistributedMutex::new(handle.ctx.clone(), name_s);
+        let result = handle.runtime.block_on(mutex.try_acquire(timeout_seconds));
 
-        SURGE_OK
+        match result {
+            Ok(true) => {
+                let token = mutex.challenge().unwrap_or("");
+                let c_challenge = CString::new(token).unwrap_or_default();
+                let len = c_challenge.as_bytes_with_nul().len();
+                let buf = unsafe { libc_malloc(len) }.cast::<c_char>();
+                if buf.is_null() {
+                    let e = surge_core::error::SurgeError::Other("malloc failed".into());
+                    return unsafe { set_ctx_error(ctx, &e) };
+                }
+                unsafe {
+                    ptr::copy_nonoverlapping(c_challenge.as_ptr(), buf, len);
+                    *challenge_out = buf;
+                }
+                SURGE_OK
+            }
+            Ok(false) => {
+                let e = surge_core::error::SurgeError::Lock("Lock is held by another process".into());
+                unsafe { set_ctx_error(ctx, &e) }
+            }
+            Err(e) => unsafe { set_ctx_error(ctx, &e) },
+        }
     }))
 }
 
@@ -930,13 +1034,18 @@ pub unsafe extern "C" fn surge_lock_release(
         let handle = unsafe { &*ctx };
         unsafe { handle.clear_last_error() };
 
-        let _name_s = unsafe { cstr_to_str(name) };
-        let _challenge_s = unsafe { cstr_to_str(challenge) };
+        let name_s = unsafe { cstr_to_str(name) };
+        let challenge_s = unsafe { cstr_to_str(challenge) };
 
-        // TODO: When surge_core::lock is implemented, perform the actual
-        // lock release via handle.runtime.block_on(async { ... }).
+        let mut mutex = DistributedMutex::new(handle.ctx.clone(), name_s);
+        mutex.set_challenge(challenge_s.to_string());
 
-        SURGE_OK
+        let result = handle.runtime.block_on(mutex.try_release());
+
+        match result {
+            Ok(()) => SURGE_OK,
+            Err(e) => unsafe { set_ctx_error(ctx, &e) },
+        }
     }))
 }
 
@@ -960,7 +1069,7 @@ pub unsafe extern "C" fn surge_supervisor_start(
 
         let exe_s = unsafe { cstr_to_str(exe_path) };
         let wd_s = unsafe { cstr_to_str(working_dir) };
-        let _sup_id = unsafe { cstr_to_str(supervisor_id) };
+        let sup_id = unsafe { cstr_to_str(supervisor_id) };
 
         // Collect argv into a Vec<&str>.
         let mut args: Vec<&str> = Vec::new();
@@ -973,16 +1082,10 @@ pub unsafe extern "C" fn surge_supervisor_start(
             }
         }
 
-        let exe = std::path::Path::new(exe_s);
-        let wd = std::path::Path::new(wd_s);
+        let mut supervisor = Supervisor::new(sup_id, wd_s);
 
-        match spawn_process(exe, &args, Some(wd)) {
-            Ok(_handle) => {
-                // The process is running.  In the full implementation the
-                // supervisor would monitor it, restart on crash, etc.
-                // TODO: Wire up surge_core::supervisor when implemented.
-                SURGE_OK
-            }
+        match supervisor.start(exe_s, wd_s, &args) {
+            Ok(()) => SURGE_OK,
             Err(e) => {
                 tracing::error!("supervisor_start failed: {e}");
                 SURGE_ERROR

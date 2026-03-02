@@ -161,6 +161,15 @@ impl DistributedMutex {
         Ok(())
     }
 
+    /// Set the challenge token externally.
+    ///
+    /// Used by the FFI layer for `surge_lock_release`, where the challenge
+    /// string is passed in from the C caller rather than obtained from a
+    /// prior `try_acquire` call on this instance.
+    pub fn set_challenge(&mut self, challenge: String) {
+        self.challenge = Some(challenge);
+    }
+
     /// Check if the lock is currently held by this instance.
     #[must_use]
     pub fn is_locked(&self) -> bool {

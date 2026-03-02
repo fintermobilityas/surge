@@ -7,6 +7,8 @@ use std::ffi::{CString, c_char};
 use std::sync::Arc;
 
 use surge_core::context::Context;
+use surge_core::pack::builder::PackBuilder;
+use surge_core::update::manager::UpdateInfo;
 
 // ---------------------------------------------------------------------------
 //  FFI error struct (matches `surge_error` in surge_api.h)
@@ -137,6 +139,10 @@ pub struct SurgeReleasesInfoHandle {
     /// Cached `CString`s for version/channel accessors so that the returned
     /// `*const c_char` pointers remain valid for the lifetime of the handle.
     pub cached_strings: Vec<(CString, CString)>,
+    /// Full update info from the core library, preserved so that
+    /// `surge_update_download_and_apply` can pass the complete
+    /// `ReleaseEntry` data (filenames, hashes, etc.) back to the core.
+    pub update_info: Option<UpdateInfo>,
 }
 
 impl SurgeReleasesInfoHandle {
@@ -166,6 +172,8 @@ pub struct SurgePackContextHandle {
     pub rid: String,
     pub version: String,
     pub artifacts_dir: String,
+    /// Persisted `PackBuilder` between `surge_pack_build` and `surge_pack_push`.
+    pub builder: std::cell::UnsafeCell<Option<PackBuilder>>,
 }
 
 // SAFETY: Same reasoning as SurgeUpdateManagerHandle.

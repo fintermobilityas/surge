@@ -14,9 +14,11 @@ add_library(bzip2 STATIC
     3rdparty/bzip2/randtable.c
 )
 set_property(TARGET bzip2 PROPERTY POSITION_INDEPENDENT_CODE ON)
-# Vendored code: disable warnings-as-errors
-if(NOT MSVC)
-    target_compile_options(bzip2 PRIVATE -Wno-error)
+# Vendored code: suppress all warnings
+if(MSVC)
+    target_compile_options(bzip2 PRIVATE /w)
+else()
+    target_compile_options(bzip2 PRIVATE -w)
 endif()
 
 # --- libdivsufsort (static) ------------------------------------------------
@@ -31,14 +33,12 @@ endfunction()
 
 add_libdivsufsort()
 
-# Vendored code: disable warnings-as-errors for libdivsufsort
-if(NOT MSVC)
-    if(TARGET divsufsort)
-        target_compile_options(divsufsort PRIVATE -Wno-error)
-    endif()
-    if(TARGET divsufsort64)
-        target_compile_options(divsufsort64 PRIVATE -Wno-error)
-    endif()
+# Vendored code: suppress all warnings for libdivsufsort
+if(TARGET divsufsort)
+    target_compile_options(divsufsort PRIVATE $<IF:$<CXX_COMPILER_ID:MSVC>,/w,-w>)
+endif()
+if(TARGET divsufsort64)
+    target_compile_options(divsufsort64 PRIVATE $<IF:$<CXX_COMPILER_ID:MSVC>,/w,-w>)
 endif()
 
 # --- bsdiff (static) -------------------------------------------------------
@@ -71,7 +71,9 @@ target_link_libraries(bsdiff
 )
 
 set_property(TARGET bsdiff PROPERTY POSITION_INDEPENDENT_CODE ON)
-# Vendored code: disable warnings-as-errors
-if(NOT MSVC)
-    target_compile_options(bsdiff PRIVATE -Wno-error)
+# Vendored code: suppress all warnings
+if(MSVC)
+    target_compile_options(bsdiff PRIVATE /w)
+else()
+    target_compile_options(bsdiff PRIVATE -w)
 endif()

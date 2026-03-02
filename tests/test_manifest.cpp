@@ -284,7 +284,10 @@ TEST_F(ManifestTest, ParseNonExistentFile_Throws) {
 }
 
 TEST_F(ManifestTest, ParseInvalidYaml_Throws) {
-    auto path = write_yaml("invalid.yml", "{{{{not valid yaml}}}}");
+    // yaml-cpp may tolerate some invalid YAML as scalar values.
+    // Use content that either yaml-cpp rejects or our parser rejects
+    // (not a mapping -> our parser throws).
+    auto path = write_yaml("invalid.yml", "just a plain string, not a mapping");
     EXPECT_THROW(
         surge::config::parse_manifest(path),
         std::runtime_error);

@@ -56,7 +56,7 @@ TEST_F(ArchiveTest, CreateAndExtract_VerifyContents) {
 
     // Pack
     {
-        surge::archive::ArchivePacker packer(archive_path, {.zstd_level = 3});
+        surge::archive::ArchivePacker packer(archive_path, {.zstd_level = 3, .progress = nullptr});
         packer.add_directory(source_dir);
         packer.finalize();
     }

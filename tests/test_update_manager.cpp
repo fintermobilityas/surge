@@ -69,6 +69,11 @@ public:
         return 0;
     }
 
+    // Convenience overload for tests (avoids implicit vector->span conversion issues)
+    int32_t put_object(const std::string& key, const std::vector<uint8_t>& data) {
+        return put_object(key, std::span<const uint8_t>(data), "application/octet-stream");
+    }
+
     int32_t get_object(
         const std::string& key,
         std::vector<uint8_t>& out_data) override

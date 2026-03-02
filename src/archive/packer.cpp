@@ -40,10 +40,14 @@ ArchivePacker::ArchivePacker(const std::filesystem::path& output_path, const Pac
         throw std::runtime_error("Failed to create archive writer");
     }
 
-    // Set zstd compression
-    if (archive_write_add_filter_zstd(impl_->archive) != ARCHIVE_OK) {
+    // Set zstd compression (ARCHIVE_WARN is acceptable — libarchive returns it
+    // when using its built-in zstd support rather than an external program)
+    int zstd_ret = archive_write_add_filter_zstd(impl_->archive);
+    if (zstd_ret != ARCHIVE_OK && zstd_ret != ARCHIVE_WARN) {
+        auto err = archive_error_string(impl_->archive);
         archive_write_free(impl_->archive);
-        throw std::runtime_error("Failed to set zstd compression filter");
+        throw std::runtime_error(
+            fmt::format("Failed to set zstd compression filter: {}", err ? err : "unknown error"));
     }
 
     // Use PAX restricted (POSIX tar) format
@@ -52,9 +56,10 @@ ArchivePacker::ArchivePacker(const std::filesystem::path& output_path, const Pac
         throw std::runtime_error("Failed to set archive format");
     }
 
-    // Set compression level
+    // Set compression level — use NULL for filter name to let libarchive
+    // route to the correct filter regardless of internal naming
     auto level_str = std::to_string(options.zstd_level);
-    archive_write_set_filter_option(impl_->archive, "zstd", "compression-level", level_str.c_str());
+    archive_write_set_filter_option(impl_->archive, NULL, "compression-level", level_str.c_str());
 
     if (archive_write_open_filename(impl_->archive, output_path.string().c_str()) != ARCHIVE_OK) {
         auto err = archive_error_string(impl_->archive);

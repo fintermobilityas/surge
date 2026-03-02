@@ -8,6 +8,25 @@ namespace surge::config {
 
 namespace {
 
+// Helper: read a YAML node by trying camelCase first, then snake_case.
+template<typename T>
+T yaml_get(const YAML::Node& node,
+           const std::string& camel_key,
+           const std::string& snake_key,
+           const T& default_val) {
+    if (node[camel_key]) return node[camel_key].as<T>(default_val);
+    if (node[snake_key]) return node[snake_key].as<T>(default_val);
+    return default_val;
+}
+
+// Helper: return the first present YAML node for the given keys.
+YAML::Node yaml_node(const YAML::Node& parent,
+                     const std::string& camel_key,
+                     const std::string& snake_key) {
+    if (parent[camel_key]) return parent[camel_key];
+    return parent[snake_key];
+}
+
 TargetConfig parse_target(const YAML::Node& node) {
     TargetConfig target;
     if (!node) return target;
@@ -15,7 +34,9 @@ TargetConfig parse_target(const YAML::Node& node) {
     target.os = node["os"].as<std::string>("");
     target.rid = node["rid"].as<std::string>("");
 
-    if (auto assets = node["persistent_assets"]) {
+    // Accept both camelCase (persistentAssets) and snake_case (persistent_assets)
+    auto assets = yaml_node(node, "persistentAssets", "persistent_assets");
+    if (assets) {
         for (const auto& a : assets) {
             target.persistent_assets.push_back(a.as<std::string>());
         }
@@ -43,8 +64,10 @@ AppConfig parse_app(const YAML::Node& node) {
     AppConfig app;
     app.id = node["id"].as<std::string>("");
     app.main = node["main"].as<std::string>("");
-    app.supervisor_id = node["supervisor_id"].as<std::string>("");
-    app.install_directory = node["install_directory"].as<std::string>("");
+    // Accept both camelCase (supervisorId) and snake_case (supervisor_id)
+    app.supervisor_id = yaml_get<std::string>(node, "supervisorId", "supervisor_id", "");
+    // Accept both camelCase (installDirectory) and snake_case (install_directory)
+    app.install_directory = yaml_get<std::string>(node, "installDirectory", "install_directory", "");
 
     if (auto channels = node["channels"]) {
         for (const auto& ch : channels) {
@@ -267,10 +290,7 @@ std::vector<std::string> validate_manifest(const SurgeManifest& manifest) {
             "Unsupported schema version: {} (expected 1)", manifest.schema));
     }
 
-    // Generic section
-    if (manifest.generic.token.empty()) {
-        errors.push_back("generic.token is required");
-    }
+    // Generic section — token is optional (e.g. filesystem provider needs no auth)
 
     // Storage
     if (manifest.storage.provider.empty()) {

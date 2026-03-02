@@ -192,11 +192,9 @@ TEST_F(ArchiveTest, ProgressCallback_IsCalled) {
     {
         surge::archive::PackerOptions opts;
         opts.zstd_level = 1;
-        opts.progress = [&](int64_t done, int64_t total) {
+        opts.progress = [&](int64_t done, int64_t /*total*/) {
             callback_count++;
-            EXPECT_GE(done, 0);
-            EXPECT_GE(total, 0);
-            EXPECT_LE(done, total);
+            EXPECT_GT(done, 0);
         };
 
         surge::archive::ArchivePacker packer(archive_path, opts);

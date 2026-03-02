@@ -499,7 +499,7 @@ SURGE_API surge_result SURGE_CALL surge_supervisor_start(
     const char* supervisor_id,
     int argc,
     const char** argv) {
-    if (!exe_path || !supervisor_id) return SURGE_ERROR;
+    if (!exe_path || !working_dir || !supervisor_id) return SURGE_ERROR;
 
     try {
         std::vector<std::string> args;

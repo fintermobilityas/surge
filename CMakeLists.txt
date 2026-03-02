@@ -57,8 +57,13 @@ find_package(cxxopts CONFIG REQUIRED)
 file(GLOB_RECURSE SURGE_CORE_SOURCES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
 )
-list(FILTER SURGE_CORE_SOURCES EXCLUDE REGEX "src/cli/main\\.cpp$")
+list(FILTER SURGE_CORE_SOURCES EXCLUDE REGEX "src/cli/.*\\.cpp$")
 list(FILTER SURGE_CORE_SOURCES EXCLUDE REGEX "src/supervisor/supervisor_main\\.cpp$")
+
+# Collect CLI command sources (built into surge executable, not the shared library)
+file(GLOB SURGE_CLI_SOURCES CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/cli/commands/*.cpp"
+)
 
 # Build vendor/bsdiff as a static library (includes bzip2 + libdivsufsort)
 add_subdirectory(vendor/bsdiff)
@@ -108,6 +113,7 @@ endif()
 # surge CLI executable
 add_executable(surge
     src/cli/main.cpp
+    ${SURGE_CLI_SOURCES}
 )
 
 target_link_libraries(surge PRIVATE surge_core)

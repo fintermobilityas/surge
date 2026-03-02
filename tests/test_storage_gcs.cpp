@@ -22,7 +22,7 @@ std::vector<uint8_t> to_bytes(const std::string& s) {
     return {s.begin(), s.end()};
 }
 
-std::string bytes_to_hex(const std::vector<uint8_t>& data) {
+[[maybe_unused]] std::string bytes_to_hex(const std::vector<uint8_t>& data) {
     std::string result;
     result.reserve(data.size() * 2);
     for (uint8_t b : data) {

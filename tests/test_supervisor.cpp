@@ -146,9 +146,9 @@ TEST(ProcessEvents, NullCallbacks_NoOp) {
 }
 
 TEST(ProcessEvents, WithCallbacks) {
-    static bool first_run_called = false;
-    static bool installed_called = false;
-    static bool updated_called = false;
+    [[maybe_unused]] static bool first_run_called = false;
+    [[maybe_unused]] static bool installed_called = false;
+    [[maybe_unused]] static bool updated_called = false;
 
     surge_event_callback on_first_run = [](const char*, void*) {
         first_run_called = true;

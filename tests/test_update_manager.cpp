@@ -334,7 +334,7 @@ TEST(MockStorage, ListObjects) {
     storage.put_object("app2/releases.yml", d3);
 
     surge::storage::ListResult result;
-    storage.list_objects("app1/", result);
+    storage.list_objects("app1/", result, "", 1000);
     EXPECT_EQ(result.objects.size(), 2u);
 }
 

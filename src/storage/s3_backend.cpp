@@ -36,7 +36,7 @@ std::string url_encode(std::string_view input) {
     return result;
 }
 
-std::string to_hex(std::span<const uint8_t> data) {
+[[maybe_unused]] std::string to_hex(std::span<const uint8_t> data) {
     std::string result;
     result.reserve(data.size() * 2);
     for (auto b : data) {

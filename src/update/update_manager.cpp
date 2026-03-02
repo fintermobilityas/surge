@@ -141,7 +141,7 @@ int32_t UpdateManager::download_and_apply(const UpdateInfo& info,
 
     std::string package_filename = target.full_filename;
     std::string expected_sha256 = target.full_sha256;
-    int64_t expected_size = target.full_size;
+    [[maybe_unused]] int64_t expected_size = target.full_size;
 
     std::string package_key = fmt::format("{}/{}", impl_->app_id, package_filename);
     auto dest_path = packages_dir / package_filename;

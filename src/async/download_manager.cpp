@@ -29,8 +29,9 @@ size_t write_cb(char* ptr, size_t size, size_t nmemb, void* userdata) {
     return total;
 }
 
-int progress_cb(void* userdata, curl_off_t /*dltotal*/, curl_off_t /*dlnow*/,
-                curl_off_t /*ultotal*/, curl_off_t /*ulnow*/) {
+[[maybe_unused]]
+int curl_progress_cb(void* userdata, curl_off_t /*dltotal*/, curl_off_t /*dlnow*/,
+                     curl_off_t /*ultotal*/, curl_off_t /*ulnow*/) {
     auto* td = static_cast<TransferData*>(userdata);
     return (td->cancelled || td->stop.stop_requested()) ? 1 : 0;
 }

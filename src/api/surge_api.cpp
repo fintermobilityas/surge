@@ -39,10 +39,6 @@ struct surge_update_manager_wrapper {
     surge::Context* ctx;
 };
 
-static surge::update::UpdateManager* to_mgr(surge_update_manager* m) {
-    return reinterpret_cast<surge_update_manager_wrapper*>(m)->mgr.get();
-}
-
 // ----- Releases info wrapper -----
 
 struct surge_releases_info_wrapper {
@@ -52,10 +48,6 @@ struct surge_releases_info_wrapper {
 
 static surge_releases_info_wrapper* to_info(surge_releases_info* i) {
     return reinterpret_cast<surge_releases_info_wrapper*>(i);
-}
-
-static const surge_releases_info_wrapper* to_info(const surge_releases_info* i) {
-    return reinterpret_cast<const surge_releases_info_wrapper*>(i);
 }
 
 // ----- Pack context wrapper -----

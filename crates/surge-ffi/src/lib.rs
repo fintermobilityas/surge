@@ -440,7 +440,7 @@ pub unsafe extern "C" fn surge_update_check(
                     .iter()
                     .map(|r| ReleaseEntryFfi {
                         version: r.version.clone(),
-                        channel: r.channels.first().cloned().unwrap_or_default(),
+                        channel: mgr_ref.channel.clone(),
                         full_size: r.full_size,
                         is_genesis: r.is_genesis,
                     })
@@ -982,6 +982,7 @@ pub unsafe extern "C" fn surge_lock_acquire(
     }
 
     catch_ffi(std::panic::AssertUnwindSafe(|| {
+        unsafe { *challenge_out = ptr::null_mut() };
         let handle = unsafe { &*ctx };
         unsafe { handle.clear_last_error() };
 

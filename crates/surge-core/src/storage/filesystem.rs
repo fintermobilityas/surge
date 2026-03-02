@@ -27,6 +27,14 @@ impl FilesystemBackend {
             self.root.join(&self.prefix).join(key)
         }
     }
+
+    fn base_dir(&self) -> PathBuf {
+        if self.prefix.is_empty() {
+            self.root.clone()
+        } else {
+            self.root.join(&self.prefix)
+        }
+    }
 }
 
 #[async_trait]
@@ -70,36 +78,39 @@ impl StorageBackend for FilesystemBackend {
     }
 
     async fn list_objects(&self, prefix: &str, _marker: Option<&str>, max_keys: i32) -> Result<ListResult> {
-        let dir = self.resolve_key(prefix);
-        let mut entries = Vec::new();
+        let marker = _marker;
+        let base = self.base_dir();
+        let prefix_path = if prefix.is_empty() {
+            base.clone()
+        } else {
+            base.join(prefix)
+        };
 
-        if !dir.exists() {
+        if !prefix_path.exists() {
             return Ok(ListResult::default());
         }
 
-        let mut read_dir = tokio::fs::read_dir(&dir).await?;
-        while let Some(entry) = read_dir.next_entry().await? {
-            if entries.len() >= max_keys as usize {
-                return Ok(ListResult {
-                    entries,
-                    next_marker: None,
-                    is_truncated: true,
-                });
-            }
-            let meta = entry.metadata().await?;
-            if meta.is_file() {
-                let key = format!("{}/{}", prefix, entry.file_name().to_string_lossy());
-                entries.push(ListEntry {
-                    key,
-                    size: meta.len() as i64,
-                });
-            }
-        }
+        let mut all_entries = Vec::new();
+        collect_entries_recursive(&base, &prefix_path, &mut all_entries)?;
+        all_entries.sort_by(|a, b| a.key.cmp(&b.key));
+
+        let start_idx = marker
+            .and_then(|m| all_entries.iter().position(|entry| entry.key.as_str() > m))
+            .unwrap_or_else(|| if marker.is_some() { all_entries.len() } else { 0 });
+
+        let max = max_keys.max(0) as usize;
+        let entries: Vec<ListEntry> = all_entries.iter().skip(start_idx).take(max).cloned().collect();
+        let is_truncated = start_idx + entries.len() < all_entries.len();
+        let next_marker = if is_truncated {
+            entries.last().map(|entry| entry.key.clone())
+        } else {
+            None
+        };
 
         Ok(ListResult {
             entries,
-            next_marker: None,
-            is_truncated: false,
+            next_marker,
+            is_truncated,
         })
     }
 
@@ -124,5 +135,97 @@ impl StorageBackend for FilesystemBackend {
             cb(total, total);
         }
         Ok(())
+    }
+}
+
+fn collect_entries_recursive(base: &Path, path: &Path, out: &mut Vec<ListEntry>) -> Result<()> {
+    let metadata = std::fs::metadata(path)?;
+    if metadata.is_file() {
+        let rel = path
+            .strip_prefix(base)
+            .map_err(|e| SurgeError::Storage(format!("Failed to relativize key path: {e}")))?;
+        let key = rel.to_string_lossy().replace('\\', "/");
+        out.push(ListEntry {
+            key,
+            size: metadata.len() as i64,
+        });
+        return Ok(());
+    }
+
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        collect_entries_recursive(base, &entry.path(), out)?;
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_list_objects_recursive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = FilesystemBackend::new(tmp.path().to_str().unwrap(), "");
+        backend
+            .put_object(
+                "app/linux-x64/stable/1.0.0/full.tar.zst",
+                b"full",
+                "application/octet-stream",
+            )
+            .await
+            .unwrap();
+        backend
+            .put_object(
+                "app/linux-x64/stable/1.0.0/delta.tar.zst",
+                b"delta",
+                "application/octet-stream",
+            )
+            .await
+            .unwrap();
+
+        let listed = backend.list_objects("app/linux-x64/", None, 100).await.unwrap();
+        assert_eq!(listed.entries.len(), 2);
+        assert_eq!(listed.entries[0].key, "app/linux-x64/stable/1.0.0/delta.tar.zst");
+        assert_eq!(listed.entries[1].key, "app/linux-x64/stable/1.0.0/full.tar.zst");
+        assert!(!listed.is_truncated);
+    }
+
+    #[tokio::test]
+    async fn test_list_objects_marker_pagination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = FilesystemBackend::new(tmp.path().to_str().unwrap(), "");
+        backend
+            .put_object("a/1.bin", b"1", "application/octet-stream")
+            .await
+            .unwrap();
+        backend
+            .put_object("a/2.bin", b"2", "application/octet-stream")
+            .await
+            .unwrap();
+        backend
+            .put_object("a/3.bin", b"3", "application/octet-stream")
+            .await
+            .unwrap();
+
+        let first = backend.list_objects("a/", None, 2).await.unwrap();
+        assert_eq!(first.entries.len(), 2);
+        assert!(first.is_truncated);
+        let marker = first.next_marker.clone().unwrap();
+        assert_eq!(marker, "a/2.bin");
+
+        let second = backend.list_objects("a/", Some(&marker), 2).await.unwrap();
+        assert_eq!(second.entries.len(), 1);
+        assert_eq!(second.entries[0].key, "a/3.bin");
+        assert!(!second.is_truncated);
+    }
+
+    #[tokio::test]
+    async fn test_list_objects_missing_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = FilesystemBackend::new(tmp.path().to_str().unwrap(), "");
+        let listed = backend.list_objects("missing/", None, 10).await.unwrap();
+        assert!(listed.entries.is_empty());
     }
 }

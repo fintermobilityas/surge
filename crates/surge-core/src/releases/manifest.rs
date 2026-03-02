@@ -158,8 +158,8 @@ pub fn get_delta_chain<'a>(
         return None;
     }
 
-    // Verify all entries in the chain have delta files (except genesis releases)
-    let all_have_deltas = chain.iter().all(|r| r.is_genesis || !r.delta_filename.is_empty());
+    // Delta chains require an actual delta file for each step.
+    let all_have_deltas = chain.iter().all(|r| !r.delta_filename.is_empty());
     if !all_have_deltas {
         return None;
     }
@@ -311,5 +311,15 @@ mod tests {
         let chain = chain.unwrap();
         assert_eq!(chain.len(), 1);
         assert_eq!(chain[0].version, "1.2.0");
+    }
+
+    #[test]
+    fn test_get_delta_chain_genesis_without_delta_is_invalid() {
+        let mut genesis = make_entry("1.1.0", &["stable"], false);
+        genesis.is_genesis = true;
+
+        let index = make_index(vec![genesis]);
+        let chain = get_delta_chain(&index, "1.0.0", "1.1.0", "stable");
+        assert!(chain.is_none());
     }
 }

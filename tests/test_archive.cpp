@@ -72,7 +72,7 @@ TEST_F(ArchiveTest, AddBuffer_CreatesEntry) {
     std::vector<uint8_t> data(content.begin(), content.end());
 
     {
-        surge::archive::ArchivePacker packer(archive_path, {.zstd_level = 1});
+        surge::archive::ArchivePacker packer(archive_path, {.zstd_level = 1, .progress = nullptr});
         packer.add_buffer("manifest.yml", data, 0644);
         packer.finalize();
     }
@@ -126,7 +126,7 @@ TEST_F(ArchiveTest, DirectoryStructurePreservation) {
     auto archive_path = temp_dir_ / "structure.tar.zst";
 
     {
-        surge::archive::ArchivePacker packer(archive_path, {.zstd_level = 1});
+        surge::archive::ArchivePacker packer(archive_path, {.zstd_level = 1, .progress = nullptr});
         packer.add_directory(source_dir, "app/");
         packer.finalize();
     }

@@ -1,9 +1,12 @@
 use std::path::Path;
 
+use surge_core::config::constants::RELEASES_FILE_COMPRESSED;
 use surge_core::config::manifest::SurgeManifest;
 use surge_core::context::{Context, StorageConfig, StorageProvider};
 use surge_core::error::{Result, SurgeError};
-use surge_core::storage;
+use surge_core::releases::manifest::decompress_release_index;
+use surge_core::releases::version::compare_versions;
+use surge_core::storage::{self, StorageBackend};
 
 /// List releases and channels for an application.
 pub async fn execute(manifest_path: &Path, app_id: &str, rid: &str, channel: Option<&str>) -> Result<()> {
@@ -11,45 +14,56 @@ pub async fn execute(manifest_path: &Path, app_id: &str, rid: &str, channel: Opt
     let storage_config = build_storage_config(&manifest)?;
     let backend = storage::create_storage_backend(&storage_config)?;
 
-    let prefix = match channel {
-        Some(ch) => format!("{app_id}/{rid}/{ch}/"),
-        None => format!("{app_id}/{rid}/"),
-    };
-
     tracing::info!("Listing releases for {app_id}/{rid}");
 
-    let mut marker: Option<String> = None;
-    let mut total_entries = 0;
-
-    loop {
-        let listing = backend.list_objects(&prefix, marker.as_deref(), 1000).await?;
-
-        for entry in &listing.entries {
-            // Parse version from key path: {app_id}/{rid}/{channel}/{version}/...
-            let parts: Vec<&str> = entry.key.split('/').collect();
-            if parts.len() >= 4 {
-                let ch = parts.get(2).unwrap_or(&"");
-                let ver = parts.get(3).unwrap_or(&"");
-                let file = parts.last().unwrap_or(&"");
-                println!("{ch:<16} {ver:<16} {file:<32} {size:>12} bytes", size = entry.size);
-            }
-            total_entries += 1;
-        }
-
-        if listing.is_truncated {
-            marker = listing.next_marker;
-        } else {
-            break;
-        }
+    let index = fetch_release_index(&*backend).await?;
+    if !index.app_id.is_empty() && index.app_id != app_id {
+        return Err(SurgeError::NotFound(format!(
+            "Release index belongs to app '{}' not '{}'",
+            index.app_id, app_id
+        )));
     }
 
-    if total_entries == 0 {
+    let mut releases: Vec<&surge_core::releases::manifest::ReleaseEntry> = index
+        .releases
+        .iter()
+        .filter(|release| release.rid.is_empty() || release.rid == rid)
+        .filter(|release| {
+            channel.is_none_or(|requested_channel| release.channels.iter().any(|c| c == requested_channel))
+        })
+        .collect();
+
+    releases.sort_by(|a, b| compare_versions(&a.version, &b.version));
+
+    if releases.is_empty() {
         println!("No releases found.");
-    } else {
-        println!("\n{total_entries} object(s) found.");
+        return Ok(());
+    }
+
+    for release in releases {
+        let channels = if release.channels.is_empty() {
+            "-".to_string()
+        } else {
+            release.channels.join(",")
+        };
+        println!(
+            "{version:<16} {channels:<20} {full_size:>12} {delta_size:>12} {kind}",
+            version = release.version,
+            full_size = release.full_size,
+            delta_size = release.delta_size,
+            kind = if release.is_genesis { "genesis" } else { "" },
+        );
     }
 
     Ok(())
+}
+
+async fn fetch_release_index(backend: &dyn StorageBackend) -> Result<surge_core::releases::manifest::ReleaseIndex> {
+    match backend.get_object(RELEASES_FILE_COMPRESSED).await {
+        Ok(data) => decompress_release_index(&data),
+        Err(SurgeError::NotFound(_)) => Ok(surge_core::releases::manifest::ReleaseIndex::default()),
+        Err(e) => Err(e),
+    }
 }
 
 fn build_storage_config(manifest: &SurgeManifest) -> Result<StorageConfig> {
@@ -70,5 +84,7 @@ fn build_storage_config(manifest: &SurgeManifest) -> Result<StorageConfig> {
         "",
         &manifest.storage.endpoint,
     );
-    Ok(ctx.storage_config())
+    let mut cfg = ctx.storage_config();
+    cfg.prefix.clone_from(&manifest.storage.prefix);
+    Ok(cfg)
 }

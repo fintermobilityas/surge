@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use surge_core::config::constants::RELEASES_FILE_COMPRESSED;
 use surge_core::config::manifest::SurgeManifest;
 use surge_core::context::{Context, StorageConfig, StorageProvider};
 use surge_core::error::{Result, SurgeError};
@@ -46,6 +47,13 @@ pub async fn execute(manifest_path: &Path, app_id: &str, rid: &str, dest_manifes
         }
     }
 
+    if let Ok(releases_data) = src_backend.get_object(RELEASES_FILE_COMPRESSED).await {
+        dest_backend
+            .put_object(RELEASES_FILE_COMPRESSED, &releases_data, "application/octet-stream")
+            .await?;
+        tracing::debug!("Migrated {}", RELEASES_FILE_COMPRESSED);
+    }
+
     tracing::info!("Migration complete: {migrated} object(s) migrated");
     Ok(())
 }
@@ -68,5 +76,7 @@ fn build_storage_config(manifest: &SurgeManifest) -> Result<StorageConfig> {
         "",
         &manifest.storage.endpoint,
     );
-    Ok(ctx.storage_config())
+    let mut cfg = ctx.storage_config();
+    cfg.prefix.clone_from(&manifest.storage.prefix);
+    Ok(cfg)
 }

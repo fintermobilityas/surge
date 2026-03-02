@@ -1,7 +1,10 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use surge_core::config::manifest::SurgeManifest;
+use surge_core::context::Context;
 use surge_core::error::{Result, SurgeError};
+use surge_core::lock::mutex::DistributedMutex;
 
 /// Acquire a distributed lock.
 pub async fn acquire(manifest_path: &Path, name: &str, timeout: u32) -> Result<()> {
@@ -16,30 +19,16 @@ pub async fn acquire(manifest_path: &Path, name: &str, timeout: u32) -> Result<(
         return Err(SurgeError::Config("Lock server URL is empty in manifest".to_string()));
     }
 
-    tracing::info!("Acquiring lock '{name}' (timeout: {timeout}s) via {}", lock_config.url);
+    let ctx = Arc::new(Context::new());
+    ctx.set_lock_server(&lock_config.url);
 
-    let client = reqwest::Client::new();
-    let response = client
-        .post(format!("{}/locks/{name}/acquire", lock_config.url))
-        .json(&serde_json::json!({ "timeout_seconds": timeout }))
-        .send()
-        .await
-        .map_err(|e| SurgeError::Lock(format!("Failed to contact lock server: {e}")))?;
-
-    if !response.status().is_success() {
-        return Err(SurgeError::Lock(format!(
-            "Lock acquire failed with status: {}",
-            response.status()
-        )));
+    let mut mutex = DistributedMutex::new(ctx, name);
+    let acquired = mutex.try_acquire(timeout as i32).await?;
+    if !acquired {
+        return Err(SurgeError::Lock(format!("Lock '{name}' is held by another process")));
     }
 
-    let body: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| SurgeError::Lock(format!("Failed to parse lock response: {e}")))?;
-
-    let challenge = body.get("challenge").and_then(|v| v.as_str()).unwrap_or("");
-
+    let challenge = mutex.challenge().unwrap_or("");
     println!("{challenge}");
     tracing::info!("Lock '{name}' acquired");
 
@@ -59,22 +48,12 @@ pub async fn release(manifest_path: &Path, name: &str, challenge: &str) -> Resul
         return Err(SurgeError::Config("Lock server URL is empty in manifest".to_string()));
     }
 
-    tracing::info!("Releasing lock '{name}' via {}", lock_config.url);
+    let ctx = Arc::new(Context::new());
+    ctx.set_lock_server(&lock_config.url);
 
-    let client = reqwest::Client::new();
-    let response = client
-        .post(format!("{}/locks/{name}/release", lock_config.url))
-        .json(&serde_json::json!({ "challenge": challenge }))
-        .send()
-        .await
-        .map_err(|e| SurgeError::Lock(format!("Failed to contact lock server: {e}")))?;
-
-    if !response.status().is_success() {
-        return Err(SurgeError::Lock(format!(
-            "Lock release failed with status: {}",
-            response.status()
-        )));
-    }
+    let mut mutex = DistributedMutex::new(ctx, name);
+    mutex.set_challenge(challenge.to_string());
+    mutex.try_release().await?;
 
     tracing::info!("Lock '{name}' released");
     Ok(())

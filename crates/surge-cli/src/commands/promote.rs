@@ -1,9 +1,11 @@
 use std::path::Path;
 
+use surge_core::config::constants::{DEFAULT_ZSTD_LEVEL, RELEASES_FILE_COMPRESSED};
 use surge_core::config::manifest::SurgeManifest;
 use surge_core::context::{Context, StorageConfig, StorageProvider};
 use surge_core::error::{Result, SurgeError};
-use surge_core::storage;
+use surge_core::releases::manifest::{compress_release_index, decompress_release_index};
+use surge_core::storage::{self, StorageBackend};
 
 /// Promote a release version to a target channel.
 pub async fn execute(manifest_path: &Path, app_id: &str, version: &str, rid: &str, channel: &str) -> Result<()> {
@@ -13,41 +15,39 @@ pub async fn execute(manifest_path: &Path, app_id: &str, version: &str, rid: &st
 
     tracing::info!("Promoting {app_id} v{version} ({rid}) to channel '{channel}'");
 
-    // Verify the release exists in storage
-    let source_prefix = format!("{app_id}/{rid}/");
-    let listing = backend.list_objects(&source_prefix, None, 1000).await?;
-
-    let version_exists = listing.entries.iter().any(|e| e.key.contains(&format!("/{version}/")));
-
-    if !version_exists {
+    let mut index = fetch_release_index(&*backend).await?;
+    if !index.app_id.is_empty() && index.app_id != app_id {
         return Err(SurgeError::NotFound(format!(
-            "Release {version} not found for {app_id}/{rid}"
+            "Release index belongs to app '{}' not '{}'",
+            index.app_id, app_id
         )));
     }
 
-    // Copy/link the release to the target channel
-    let full_key = format!("{app_id}/{rid}/{channel}/{version}/full.tar.zst");
-    let source_data = find_and_download_release(&*backend, &listing.entries, version, "full.tar.zst").await?;
-    backend.put_object(&full_key, &source_data, "application/zstd").await?;
+    let release = index
+        .releases
+        .iter_mut()
+        .find(|release| release.version == version && release.rid == rid)
+        .ok_or_else(|| SurgeError::NotFound(format!("Release {version} not found for {app_id}/{rid}")))?;
+
+    if !release.channels.iter().any(|existing| existing == channel) {
+        release.channels.push(channel.to_string());
+        release.channels.sort();
+        release.channels.dedup();
+    }
+
+    index.last_write_utc = chrono::Utc::now().to_rfc3339();
+    let compressed = compress_release_index(&index, DEFAULT_ZSTD_LEVEL)?;
+    backend
+        .put_object(RELEASES_FILE_COMPRESSED, &compressed, "application/octet-stream")
+        .await?;
 
     tracing::info!("Promoted {app_id} v{version} ({rid}) -> {channel}");
     Ok(())
 }
 
-async fn find_and_download_release(
-    backend: &dyn storage::StorageBackend,
-    entries: &[storage::ListEntry],
-    version: &str,
-    filename: &str,
-) -> Result<Vec<u8>> {
-    for entry in entries {
-        if entry.key.contains(&format!("/{version}/")) && entry.key.ends_with(filename) {
-            return backend.get_object(&entry.key).await;
-        }
-    }
-    Err(SurgeError::NotFound(format!(
-        "Release artifact {filename} not found for version {version}"
-    )))
+async fn fetch_release_index(backend: &dyn StorageBackend) -> Result<surge_core::releases::manifest::ReleaseIndex> {
+    let data = backend.get_object(RELEASES_FILE_COMPRESSED).await?;
+    decompress_release_index(&data)
 }
 
 fn build_storage_config(manifest: &SurgeManifest) -> Result<StorageConfig> {
@@ -68,5 +68,7 @@ fn build_storage_config(manifest: &SurgeManifest) -> Result<StorageConfig> {
         "",
         &manifest.storage.endpoint,
     );
-    Ok(ctx.storage_config())
+    let mut cfg = ctx.storage_config();
+    cfg.prefix.clone_from(&manifest.storage.prefix);
+    Ok(cfg)
 }

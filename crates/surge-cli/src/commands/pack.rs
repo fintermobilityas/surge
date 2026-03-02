@@ -1,9 +1,10 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use surge_core::config::manifest::SurgeManifest;
 use surge_core::context::Context;
 use surge_core::error::{Result, SurgeError};
-use surge_core::storage;
+use surge_core::pack::builder::PackBuilder;
 
 /// Build release packages (full + delta) for a given app version and RID.
 pub async fn execute(
@@ -15,13 +16,9 @@ pub async fn execute(
     output_dir: &Path,
 ) -> Result<()> {
     let manifest = SurgeManifest::from_file(manifest_path)?;
-    let _target = manifest
+    manifest
         .find_target(app_id, rid)
         .ok_or_else(|| SurgeError::Config(format!("No target {rid} found for app {app_id}")))?;
-
-    let ctx = Context::new();
-    let storage_config = configure_storage(&manifest, &ctx)?;
-    let backend = storage::create_storage_backend(&storage_config)?;
 
     if !artifacts_dir.is_dir() {
         return Err(SurgeError::Pack(format!(
@@ -34,36 +31,33 @@ pub async fn execute(
 
     tracing::info!("Packing {app_id} v{version} ({rid}) from {}", artifacts_dir.display());
 
-    // Build the full release archive
-    let full_archive_name = format!("{app_id}-{version}-{rid}-full.tar.zst");
-    let full_archive_path = output_dir.join(&full_archive_name);
+    let ctx = Arc::new(configure_context(&manifest)?);
+    let manifest_path_s = manifest_path
+        .to_str()
+        .ok_or_else(|| SurgeError::Config(format!("Manifest path is not valid UTF-8: {}", manifest_path.display())))?;
+    let artifacts_dir_s = artifacts_dir.to_str().ok_or_else(|| {
+        SurgeError::Config(format!(
+            "Artifacts directory is not valid UTF-8: {}",
+            artifacts_dir.display()
+        ))
+    })?;
 
-    {
-        let compression = ctx.resource_budget().zstd_compression_level;
-        let mut packer = surge_core::archive::packer::ArchivePacker::new(compression)?;
-        packer.add_directory(artifacts_dir, "")?;
-        packer.finalize_to_file(&full_archive_path)?;
-    }
-    tracing::info!("Created full archive: {}", full_archive_path.display());
+    let mut builder = PackBuilder::new(ctx, manifest_path_s, app_id, rid, version, artifacts_dir_s)?;
+    builder.build(None).await?;
 
-    // Attempt to build delta if a previous release exists
-    let prefix = format!("{app_id}/{rid}/");
-    let list_result = backend.list_objects(&prefix, None, 100).await;
-
-    if let Ok(listing) = list_result
-        && !listing.entries.is_empty()
-    {
-        tracing::info!(
-            "Found {} existing objects, delta generation would apply here",
-            listing.entries.len()
-        );
+    for artifact in builder.artifacts() {
+        let dest = output_dir.join(&artifact.filename);
+        if artifact.path != dest {
+            std::fs::copy(&artifact.path, &dest)?;
+        }
+        tracing::info!("Created {}", dest.display());
     }
 
     tracing::info!("Pack complete. Output: {}", output_dir.display());
     Ok(())
 }
 
-fn configure_storage(manifest: &SurgeManifest, ctx: &Context) -> Result<surge_core::context::StorageConfig> {
+fn configure_context(manifest: &SurgeManifest) -> Result<Context> {
     let provider = match manifest.storage.provider.to_lowercase().as_str() {
         "s3" => surge_core::context::StorageProvider::S3,
         "azure" => surge_core::context::StorageProvider::AzureBlob,
@@ -72,6 +66,7 @@ fn configure_storage(manifest: &SurgeManifest, ctx: &Context) -> Result<surge_co
         other => return Err(SurgeError::Config(format!("Unknown storage provider: {other}"))),
     };
 
+    let ctx = Context::new();
     ctx.set_storage(
         provider,
         &manifest.storage.bucket,
@@ -80,6 +75,10 @@ fn configure_storage(manifest: &SurgeManifest, ctx: &Context) -> Result<surge_co
         "", // secret_key from env
         &manifest.storage.endpoint,
     );
+    {
+        let mut cfg = ctx.storage.lock().unwrap();
+        cfg.prefix.clone_from(&manifest.storage.prefix);
+    }
 
-    Ok(ctx.storage_config())
+    Ok(ctx)
 }

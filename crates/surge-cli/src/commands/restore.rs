@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use surge_core::config::constants::RELEASES_FILE_COMPRESSED;
 use surge_core::config::manifest::SurgeManifest;
 use surge_core::context::{Context, StorageConfig, StorageProvider};
 use surge_core::error::{Result, SurgeError};
@@ -32,15 +33,18 @@ pub async fn execute(
 
     let mut restored = 0u64;
 
-    // Walk the backup directory and upload matching files
     for entry in walkdir(backup_dir)? {
         let rel_path = entry
             .strip_prefix(backup_dir)
             .map_err(|e| SurgeError::Io(std::io::Error::other(e)))?;
 
-        let key = format!("{app_id}/{rid}/{}", rel_path.display());
+        let rel_str = rel_path.to_string_lossy().replace('\\', "/");
+        let key = if rel_str == RELEASES_FILE_COMPRESSED {
+            RELEASES_FILE_COMPRESSED.to_string()
+        } else {
+            format!("{app_id}/{rid}/{rel_str}")
+        };
 
-        // If a specific version was requested, only restore matching files
         if let Some(ver) = version
             && !key.contains(&format!("/{ver}/"))
         {
@@ -99,5 +103,7 @@ fn build_storage_config(manifest: &SurgeManifest) -> Result<StorageConfig> {
         "",
         &manifest.storage.endpoint,
     );
-    Ok(ctx.storage_config())
+    let mut cfg = ctx.storage_config();
+    cfg.prefix.clone_from(&manifest.storage.prefix);
+    Ok(cfg)
 }

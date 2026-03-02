@@ -84,7 +84,7 @@ jobs:
         shell: bash
 
       - name: Cache vcpkg packages
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: .vcpkg-cache
           key: vcpkg-${{ matrix.triplet }}-${{ hashFiles('vcpkg.json') }}

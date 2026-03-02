@@ -1,0 +1,75 @@
+[workspace]
+members = ["crates/surge-core", "crates/surge-ffi", "crates/surge-cli", "crates/surge-supervisor"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/fintermobilityas/surge"
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1.0"
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+tokio = { version = "1", features = ["full"] }
+zstd = "0.13"
+tar = "0.4"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+thiserror = "2.0"
+cc = "1.2"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+percent-encoding = "2.3"
+quick-xml = "0.39"
+async-trait = "0.1"
+tempfile = "3"
+uuid = { version = "1", features = ["v4"] }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+cast_precision_loss = "allow"
+similar_names = "allow"
+doc_markdown = "allow"
+wildcard_imports = "allow"
+borrow_as_ptr = "allow"
+struct_excessive_bools = "allow"
+unused_self = "allow"
+unnecessary_wraps = "allow"
+needless_pass_by_value = "allow"
+items_after_statements = "allow"
+too_many_lines = "allow"
+too_many_arguments = "allow"
+let_and_return = "allow"
+redundant_else = "allow"
+single_match_else = "allow"
+struct_field_names = "allow"
+float_cmp = "allow"
+module_inception = "allow"
+manual_let_else = "allow"
+format_push_string = "allow"
+needless_continue = "allow"
+unused_async = "allow"
+missing_safety_doc = "allow"
+undocumented_unsafe_blocks = "allow"
+
+[profile.release]
+lto = true
+strip = true

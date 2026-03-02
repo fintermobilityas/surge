@@ -1,0 +1,113 @@
+use std::path::Path;
+use std::process::{Child, Command, Stdio};
+
+use crate::error::{Result, SurgeError};
+
+/// Handle to a spawned child process.
+pub struct ProcessHandle {
+    child: Child,
+}
+
+/// Result of waiting for a process.
+pub struct ProcessResult {
+    pub exit_code: i32,
+    pub timed_out: bool,
+}
+
+impl ProcessHandle {
+    /// Get the PID.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Check if the process is still running.
+    pub fn is_running(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+
+    /// Wait for the process to exit. Returns the exit code.
+    pub fn wait(&mut self) -> Result<ProcessResult> {
+        let status = self.child.wait()?;
+        Ok(ProcessResult {
+            exit_code: status.code().unwrap_or(-1),
+            timed_out: false,
+        })
+    }
+
+    /// Terminate the process gracefully.
+    #[cfg(unix)]
+    pub fn terminate(&self) -> Result<()> {
+        use nix::sys::signal::{Signal, kill};
+        use nix::unistd::Pid;
+        kill(Pid::from_raw(self.child.id() as i32), Signal::SIGTERM)
+            .map_err(|e| SurgeError::Platform(format!("Failed to send SIGTERM: {e}")))?;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    pub fn terminate(&mut self) -> Result<()> {
+        self.child
+            .kill()
+            .map_err(|e| SurgeError::Platform(format!("Failed to terminate process: {e}")))?;
+        Ok(())
+    }
+
+    /// Force-kill the process.
+    pub fn kill(&mut self) -> Result<()> {
+        self.child
+            .kill()
+            .map_err(|e| SurgeError::Platform(format!("Failed to kill process: {e}")))?;
+        Ok(())
+    }
+}
+
+/// Spawn a new child process.
+pub fn spawn_process(exe: &Path, args: &[&str], working_dir: Option<&Path>) -> Result<ProcessHandle> {
+    let mut cmd = Command::new(exe);
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+
+    if let Some(wd) = working_dir {
+        cmd.current_dir(wd);
+    }
+
+    let child = cmd
+        .spawn()
+        .map_err(|e| SurgeError::Platform(format!("Failed to spawn {}: {e}", exe.display())))?;
+
+    Ok(ProcessHandle { child })
+}
+
+/// Get the current process ID.
+#[must_use]
+pub fn current_pid() -> u32 {
+    std::process::id()
+}
+
+/// Replace the current process with a new executable (Unix: exec, Windows: spawn+exit).
+#[cfg(unix)]
+pub fn exec_replace(exe: &Path, args: &[&str]) -> Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let exe_c =
+        CString::new(exe.as_os_str().as_bytes()).map_err(|e| SurgeError::Platform(format!("Invalid exe path: {e}")))?;
+
+    let args_c: std::result::Result<Vec<CString>, _> = std::iter::once(Ok(exe_c.clone()))
+        .chain(args.iter().map(|a| CString::new(*a)))
+        .collect();
+    let args_c = args_c.map_err(|e| SurgeError::Platform(format!("Invalid argument: {e}")))?;
+
+    nix::unistd::execv(&exe_c, &args_c).map_err(|e| SurgeError::Platform(format!("execv failed: {e}")))?;
+
+    unreachable!()
+}
+
+#[cfg(not(unix))]
+pub fn exec_replace(exe: &Path, args: &[&str]) -> Result<()> {
+    let mut handle = spawn_process(exe, args, None)?;
+    let result = handle.wait()?;
+    std::process::exit(result.exit_code);
+}

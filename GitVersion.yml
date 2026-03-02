@@ -1,0 +1,13 @@
+next-version: 0.2.0
+mode: ContinuousDeployment
+branches:
+  main:
+    regex: ^main$
+    increment: Patch
+    label: ''
+    prevent-increment:
+      when-current-commit-tagged: true
+  develop:
+    regex: ^develop$
+    increment: Patch
+    label: preview

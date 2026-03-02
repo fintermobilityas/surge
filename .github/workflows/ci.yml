@@ -1,0 +1,228 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  version:
+    name: Version
+    runs-on: ubuntu-latest
+    outputs:
+      semver: ${{ steps.gitversion.outputs.semVer }}
+      major: ${{ steps.gitversion.outputs.major }}
+      minor: ${{ steps.gitversion.outputs.minor }}
+      patch: ${{ steps.gitversion.outputs.patch }}
+      prerelease: ${{ steps.gitversion.outputs.preReleaseLabel }}
+      nuget: ${{ steps.gitversion.outputs.semVer }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: gittools/actions/gitversion/setup@v4.3.3
+        with:
+          versionSpec: '6.x'
+      - id: gitversion
+        uses: gittools/actions/gitversion/execute@v4.3.3
+
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v6
+      - run: rustup component add rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+      - uses: Swatinem/rust-cache@v2
+      - run: rustup component add clippy
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  linux:
+    name: Linux x64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-release
+      - run: cargo build --release
+      - run: cargo test --release
+      - name: Upload artifacts
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-x64
+          path: |
+            target/release/libsurge.so
+            target/release/surge
+            target/release/surge-supervisor
+
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-release
+      - run: cargo build --release
+      - run: cargo test --release
+      - name: Upload artifacts
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v7
+        with:
+          name: win-x64
+          path: |
+            target/release/surge.dll
+            target/release/surge.dll.lib
+            target/release/surge.exe
+            target/release/surge-supervisor.exe
+
+  macos:
+    name: macOS
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-release
+      - run: cargo build --release
+      - run: cargo test --release
+      - name: Upload artifacts
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v7
+        with:
+          name: osx-x64
+          path: |
+            target/release/libsurge.dylib
+            target/release/surge
+            target/release/surge-supervisor
+
+  dotnet:
+    name: .NET
+    runs-on: ubuntu-latest
+    needs: [version]
+    defaults:
+      run:
+        working-directory: dotnet
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '10.0.x'
+      - uses: actions/cache@v5
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ hashFiles('dotnet/Directory.Packages.props') }}
+          restore-keys: nuget-
+      - run: dotnet restore
+      - run: dotnet format --verify-no-changes --verbosity diagnostic
+      - run: dotnet build --no-restore --configuration Release -p:Version=${{ needs.version.outputs.semver }}
+      - run: dotnet test --no-build --configuration Release --verbosity normal
+
+  nuget:
+    name: Publish NuGet
+    runs-on: ubuntu-latest
+    needs: [version, clippy, linux, windows, macos, dotnet]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
+    defaults:
+      run:
+        working-directory: dotnet
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '10.0.x'
+      - uses: actions/cache@v5
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ hashFiles('dotnet/Directory.Packages.props') }}
+          restore-keys: nuget-
+      - name: Pack
+        run: dotnet pack Surge.NET/Surge.NET.csproj --configuration Release -p:Version=${{ needs.version.outputs.nuget }} --output ../nupkgs
+      - name: Push to NuGet
+        run: dotnet nuget push ../nupkgs/*.nupkg --source nuget.org --api-key ${{ secrets.PETERSUNDE_NUGET_ORG_API_KEY }} --skip-duplicate
+
+  cargo-publish:
+    name: Publish Crates
+    runs-on: ubuntu-latest
+    needs: [version, clippy, linux, windows, macos, dotnet]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+      - uses: Swatinem/rust-cache@v2
+      - name: Set version
+        run: |
+          sed -i 's/^version = ".*"/version = "${{ needs.version.outputs.semver }}"/' Cargo.toml
+          cargo generate-lockfile
+      - name: Publish surge-core
+        run: cargo publish -p surge-core --allow-dirty
+      - name: Publish surge-cli
+        run: cargo publish -p surge-cli --allow-dirty
+
+  release:
+    name: Draft Release
+    runs-on: ubuntu-latest
+    needs: [version, clippy, linux, windows, macos, dotnet]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Package release assets
+        run: |
+          cd artifacts
+          tar czf ../surge-linux-x64.tar.gz -C linux-x64 .
+          tar czf ../surge-osx-x64.tar.gz -C osx-x64 .
+          cd win-x64 && zip -r ../../surge-win-x64.zip . && cd ..
+
+      - name: Create draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.version.outputs.semver }}
+          name: v${{ needs.version.outputs.semver }}
+          draft: true
+          generate_release_notes: true
+          files: |
+            surge-linux-x64.tar.gz
+            surge-osx-x64.tar.gz
+            surge-win-x64.zip
+            include/surge/surge_api.h

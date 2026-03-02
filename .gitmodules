@@ -1,0 +1,3 @@
+[submodule "vendor/bsdiff"]
+	path = vendor/bsdiff
+	url = https://github.com/fintermobilityas/bsdiff.git

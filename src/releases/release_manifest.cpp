@@ -64,7 +64,7 @@ ReleaseIndex parse_release_index(const std::vector<uint8_t>& yaml_data) {
     if (doc["last_write_utc"]) index.last_write_utc = doc["last_write_utc"].as<std::string>();
 
     if (doc["releases"] && doc["releases"].IsSequence()) {
-        for (auto& rel_node : doc["releases"]) {
+        for (const auto& rel_node : doc["releases"]) {
             ReleaseEntry entry;
             if (rel_node["version"]) entry.version = rel_node["version"].as<std::string>();
             if (rel_node["os"]) entry.os = rel_node["os"].as<std::string>();
@@ -74,7 +74,7 @@ ReleaseIndex parse_release_index(const std::vector<uint8_t>& yaml_data) {
             if (rel_node["release_notes"]) entry.release_notes = rel_node["release_notes"].as<std::string>();
 
             if (rel_node["channels"] && rel_node["channels"].IsSequence()) {
-                for (auto& ch : rel_node["channels"]) {
+                for (const auto& ch : rel_node["channels"]) {
                     entry.channels.push_back(ch.as<std::string>());
                 }
             }

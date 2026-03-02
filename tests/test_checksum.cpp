@@ -6,6 +6,8 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <span>
 #include <string>
 #include <vector>
@@ -53,7 +55,7 @@ TEST(SHA256, EmptyString) {
 TEST(SHA256, Abc) {
     auto data = to_bytes("abc");
     auto hash = surge::crypto::sha256_hex(data);
-    EXPECT_EQ(hash, "ba7816bf8f01cfea414140de5dae2223b0361a396177a9cb410ff61f20015ad");
+    EXPECT_EQ(hash, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
 }
 
 TEST(SHA256, LongerMessage) {

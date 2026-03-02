@@ -6,7 +6,10 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cstdint>
+#include <cstdio>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace {

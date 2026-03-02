@@ -6,7 +6,9 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <functional>
 #include <map>
 #include <span>
@@ -319,9 +321,12 @@ TEST(MockStorage, Delete) {
 TEST(MockStorage, ListObjects) {
     MockStorageBackend storage;
 
-    storage.put_object("app1/releases.yml", {1});
-    storage.put_object("app1/packages/1.0.0.tar.zst", {2, 3});
-    storage.put_object("app2/releases.yml", {4});
+    std::vector<uint8_t> d1 = {1};
+    std::vector<uint8_t> d2 = {2, 3};
+    std::vector<uint8_t> d3 = {4};
+    storage.put_object("app1/releases.yml", d1);
+    storage.put_object("app1/packages/1.0.0.tar.zst", d2);
+    storage.put_object("app2/releases.yml", d3);
 
     surge::storage::ListResult result;
     storage.list_objects("app1/", result);
@@ -332,7 +337,8 @@ TEST(MockStorage, ListObjects_WithMaxKeys) {
     MockStorageBackend storage;
 
     for (int i = 0; i < 10; ++i) {
-        storage.put_object("prefix/key" + std::to_string(i), {static_cast<uint8_t>(i)});
+        std::vector<uint8_t> val = {static_cast<uint8_t>(i)};
+        storage.put_object("prefix/key" + std::to_string(i), val);
     }
 
     surge::storage::ListResult result;

@@ -50,6 +50,10 @@ static surge_releases_info_wrapper* to_info(surge_releases_info* i) {
     return reinterpret_cast<surge_releases_info_wrapper*>(i);
 }
 
+static const surge_releases_info_wrapper* to_info(const surge_releases_info* i) {
+    return reinterpret_cast<const surge_releases_info_wrapper*>(i);
+}
+
 // ----- Pack context wrapper -----
 
 struct surge_pack_context_wrapper {

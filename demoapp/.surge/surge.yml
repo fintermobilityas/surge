@@ -1,0 +1,15 @@
+schema: 1
+
+storage:
+  provider: filesystem
+  bucket: /tmp/surge-demo-releases
+
+apps:
+  - id: demoapp
+    name: Surge Demo App
+    version: "1.0.0"
+    channel: test
+    installDirectory: demoapp
+    targets:
+      - rid: linux-x64
+        artifacts_dir: artifacts

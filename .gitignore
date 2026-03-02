@@ -1,0 +1,29 @@
+# Rust
+target/
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Compiled objects
+*.o
+*.obj
+*.so
+*.so.*
+*.dll
+*.exe
+*.lib
+*.a
+*.dylib
+
+# .NET
+**/bin/
+**/obj/
+
+# OS
+.DS_Store
+Thumbs.db

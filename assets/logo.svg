@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200">
+  <defs>
+    <linearGradient id="bolt-gradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#3B82F6;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#2563EB;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+  <polygon
+    points="110,10 60,95 95,95 80,190 140,105 105,105"
+    fill="url(#bolt-gradient)"
+    stroke="none"
+  />
+  <polygon
+    points="110,10 60,95 95,95 80,190 140,105 105,105"
+    fill="none"
+    stroke="#1D4ED8"
+    stroke-width="2"
+    stroke-linejoin="round"
+  />
+</svg>

@@ -6,6 +6,7 @@ Surge is a Rust application update framework. It uses direct cloud storage (S3, 
 
 ## Repository Structure
 
+- `README.md` - Project README (keep in sync when adding features or changing the API)
 - `include/surge/` - Public C API header (`surge_api.h`)
 - `crates/surge-core/` - Core library: config, crypto, storage, archive, diff, releases, update, pack, supervisor, platform
 - `crates/surge-ffi/` - C API cdylib (`libsurge.so` / `surge.dll` / `libsurge.dylib`)

@@ -42,11 +42,11 @@ DiffResult bsdiff(std::span<const uint8_t> old_data,
                   std::span<const uint8_t> new_data) {
     DiffResult result;
 
-    struct bsdiff_stream oldfile = {nullptr};
-    struct bsdiff_stream newfile = {nullptr};
-    struct bsdiff_stream patchfile = {nullptr};
-    struct bsdiff_ctx ctx = {nullptr};
-    struct bsdiff_patch_packer packer = {nullptr};
+    struct bsdiff_stream oldfile = {};
+    struct bsdiff_stream newfile = {};
+    struct bsdiff_stream patchfile = {};
+    struct bsdiff_ctx ctx = {};
+    struct bsdiff_patch_packer packer = {};
 
     StreamGuard guard;
 
@@ -108,11 +108,11 @@ PatchResult bspatch(std::span<const uint8_t> old_data,
                     std::span<const uint8_t> patch_data) {
     PatchResult result;
 
-    struct bsdiff_stream oldfile = {nullptr};
-    struct bsdiff_stream newfile = {nullptr};
-    struct bsdiff_stream patchfile = {nullptr};
-    struct bsdiff_ctx ctx = {nullptr};
-    struct bsdiff_patch_packer packer = {nullptr};
+    struct bsdiff_stream oldfile = {};
+    struct bsdiff_stream newfile = {};
+    struct bsdiff_stream patchfile = {};
+    struct bsdiff_ctx ctx = {};
+    struct bsdiff_patch_packer packer = {};
 
     StreamGuard guard;
 

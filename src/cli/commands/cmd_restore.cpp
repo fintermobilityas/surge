@@ -29,7 +29,7 @@ fs::path find_manifest(const std::string& path_override) {
     return {};
 }
 
-std::string format_size(int64_t bytes) {
+[[maybe_unused]] std::string format_size(int64_t bytes) {
     if (bytes < 1024) return fmt::format("{} B", bytes);
     if (bytes < 1024 * 1024) return fmt::format("{:.1f} KB", bytes / 1024.0);
     if (bytes < 1024 * 1024 * 1024) return fmt::format("{:.1f} MB", bytes / (1024.0 * 1024.0));

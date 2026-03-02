@@ -74,7 +74,7 @@ int32_t Supervisor::start(const std::filesystem::path& exe_path,
     if (!handle) {
         spdlog::error("Failed to spawn child process: {}", exe_path.string());
         impl_->info.state = ProcessState::Crashed;
-        return SURGE_ERROR;
+        return -1;
     }
 
     impl_->process_handle = *handle;
@@ -83,11 +83,11 @@ int32_t Supervisor::start(const std::filesystem::path& exe_path,
     impl_->running = true;
 
     spdlog::info("Launched child process with PID {}", handle->pid);
-    return SURGE_OK;
+    return 0;
 }
 
 int32_t Supervisor::stop(int timeout_ms) {
-    if (!impl_->running) return SURGE_OK;
+    if (!impl_->running) return 0;
 
     spdlog::info("Stopping supervised process (PID {}, timeout {}ms)",
                   impl_->info.pid, timeout_ms);
@@ -115,7 +115,7 @@ int32_t Supervisor::stop(int timeout_ms) {
     }
 
     spdlog::info("Child process stopped with exit code {}", result.exit_code);
-    return SURGE_OK;
+    return 0;
 }
 
 int32_t Supervisor::restart(const std::filesystem::path& new_exe_path,

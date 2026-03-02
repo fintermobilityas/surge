@@ -9,8 +9,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-set(CMAKE_CXX_VISIBILITY_PRESET hidden)
-set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
+# Note: visibility is set per-target, not globally, so the CLI can link to surge_core
 
 # Warnings as errors - enforce high code quality
 if(MSVC)
@@ -57,13 +56,8 @@ find_package(cxxopts CONFIG REQUIRED)
 file(GLOB_RECURSE SURGE_CORE_SOURCES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
 )
-list(FILTER SURGE_CORE_SOURCES EXCLUDE REGEX "src/cli/.*\\.cpp$")
+list(FILTER SURGE_CORE_SOURCES EXCLUDE REGEX "src/cli/main\\.cpp$")
 list(FILTER SURGE_CORE_SOURCES EXCLUDE REGEX "src/supervisor/supervisor_main\\.cpp$")
-
-# Collect CLI command sources (built into surge executable, not the shared library)
-file(GLOB SURGE_CLI_SOURCES CONFIGURE_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/cli/commands/*.cpp"
-)
 
 # Build vendor/bsdiff as a static library (includes bzip2 + libdivsufsort)
 add_subdirectory(vendor/bsdiff)
@@ -113,7 +107,6 @@ endif()
 # surge CLI executable
 add_executable(surge
     src/cli/main.cpp
-    ${SURGE_CLI_SOURCES}
 )
 
 target_link_libraries(surge PRIVATE surge_core)

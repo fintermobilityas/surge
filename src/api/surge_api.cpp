@@ -238,7 +238,8 @@ SURGE_API surge_result SURGE_CALL surge_update_download_and_apply(
             };
         }
 
-        int32_t rc = wrapper->mgr->download_and_apply(*wrapper->last_check, cb);
+        int32_t rc = wrapper->mgr->download_and_apply(
+            *wrapper->last_check, cb);
         return static_cast<surge_result>(rc);
     } catch (const std::exception& e) {
         return set_error(wrapper->ctx, surge::ErrorCode::DownloadFailed, e.what());
@@ -270,9 +271,9 @@ SURGE_API const char* SURGE_CALL surge_release_channel(
     if (!info) return nullptr;
     auto* w = to_info(info);
     if (index < 0 || static_cast<size_t>(index) >= w->releases.size()) return nullptr;
-    const auto& channels = w->releases[static_cast<size_t>(index)].channels;
-    if (channels.empty()) return nullptr;
-    return channels.front().c_str();
+    auto& rel = w->releases[static_cast<size_t>(index)];
+    if (rel.channels.empty()) return nullptr;
+    return rel.channels.front().c_str();
 }
 
 SURGE_API int64_t SURGE_CALL surge_release_full_size(
@@ -280,7 +281,7 @@ SURGE_API int64_t SURGE_CALL surge_release_full_size(
     if (!info) return 0;
     auto* w = to_info(info);
     if (index < 0 || static_cast<size_t>(index) >= w->releases.size()) return 0;
-    return w->releases[static_cast<size_t>(index)].full_size;
+    return w->releases[static_cast<size_t>(index)].full_size;  // matches ReleaseEntry::full_size
 }
 
 SURGE_API int32_t SURGE_CALL surge_release_is_genesis(
@@ -519,9 +520,10 @@ SURGE_API surge_result SURGE_CALL surge_supervisor_start(
         std::filesystem::path install_dir = working_dir ? working_dir : ".";
 
         surge::supervisor::Supervisor sup(supervisor_id, install_dir);
-        int32_t rc = sup.start(exe_path,
-                               working_dir ? working_dir : "",
-                               args);
+        int32_t rc = sup.start(
+            std::filesystem::path(exe_path),
+            working_dir ? std::filesystem::path(working_dir) : std::filesystem::path("."),
+            args);
         return static_cast<surge_result>(rc);
     } catch (const std::exception& e) {
         spdlog::error("surge_supervisor_start failed: {}", e.what());

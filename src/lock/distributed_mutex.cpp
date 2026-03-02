@@ -4,6 +4,7 @@
  */
 
 #include "lock/distributed_mutex.hpp"
+#include "core/context.hpp"
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -25,15 +26,11 @@ size_t write_string_callback(char* ptr, size_t size, size_t nmemb, void* userdat
 
 } // anonymous namespace
 
-class DistributedMutex::Impl {
-public:
+struct DistributedMutex::Impl {
     std::string server_url;
     std::string name;
-    std::string challenge;
+    std::string challenge_token;
     bool acquired = false;
-    bool disposed = false;
-    bool release_on_destroy = true;
-    std::stop_token stop_token;
 
     int32_t http_post_json(const std::string& url, const nlohmann::json& body,
                             std::string& response) {
@@ -103,49 +100,31 @@ public:
     }
 };
 
-DistributedMutex::DistributedMutex(const std::string& server_url,
-                                   const std::string& name,
-                                   bool release_on_destroy,
-                                   std::stop_token stop_token)
+DistributedMutex::DistributedMutex(Context& ctx, std::string name)
     : impl_(std::make_unique<Impl>())
 {
-    impl_->server_url = server_url;
-    impl_->name = name;
-    impl_->release_on_destroy = release_on_destroy;
-    impl_->stop_token = std::move(stop_token);
+    impl_->server_url = ctx.lock_config().server_url;
+    impl_->name = std::move(name);
 }
 
 DistributedMutex::~DistributedMutex() {
-    if (impl_ && impl_->acquired && impl_->release_on_destroy && !impl_->disposed) {
-        spdlog::info("Disposing mutex: {}", impl_->name);
+    if (impl_ && impl_->acquired) {
         // Best-effort release on destruction
         try_release();
     }
 }
 
-DistributedMutex::DistributedMutex(DistributedMutex&&) noexcept = default;
-DistributedMutex& DistributedMutex::operator=(DistributedMutex&&) noexcept = default;
-
-bool DistributedMutex::try_acquire(std::chrono::milliseconds retry_delay, int retries) {
-    if (impl_->disposed) {
-        spdlog::error("Cannot acquire disposed mutex: {}", impl_->name);
-        return false;
-    }
+bool DistributedMutex::try_acquire(int32_t timeout_seconds) {
     if (impl_->acquired) {
         spdlog::error("Mutex already acquired: {}", impl_->name);
         return false;
     }
 
-    retries = std::max(0, retries);
-    int attempt = 0;
+    auto deadline = std::chrono::steady_clock::now() +
+                    std::chrono::seconds(timeout_seconds);
 
-    while (true) {
-        if (impl_->stop_token.stop_requested()) {
-            spdlog::info("Lock acquisition cancelled: {}", impl_->name);
-            return false;
-        }
-
-        spdlog::info("Attempting to acquire mutex: {} (attempt {})", impl_->name, attempt + 1);
+    while (std::chrono::steady_clock::now() < deadline) {
+        spdlog::info("Attempting to acquire mutex: {}", impl_->name);
 
         nlohmann::json body;
         body["name"] = impl_->name;
@@ -156,35 +135,32 @@ bool DistributedMutex::try_acquire(std::chrono::milliseconds retry_delay, int re
         auto rc = impl_->http_post_json(lock_url, body, response);
 
         if (rc == SURGE_OK && !response.empty()) {
-            impl_->challenge = response;
+            impl_->challenge_token = response;
             // Strip quotes if JSON-encoded string
-            if (impl_->challenge.front() == '"' && impl_->challenge.back() == '"') {
-                impl_->challenge = impl_->challenge.substr(1, impl_->challenge.size() - 2);
+            if (impl_->challenge_token.front() == '"' && impl_->challenge_token.back() == '"') {
+                impl_->challenge_token = impl_->challenge_token.substr(1, impl_->challenge_token.size() - 2);
             }
             impl_->acquired = true;
             spdlog::info("Successfully acquired mutex: {}", impl_->name);
             return true;
         }
 
-        attempt++;
-        if (attempt > retries) {
-            spdlog::error("Failed to acquire mutex after {} attempts: {}", attempt, impl_->name);
-            return false;
-        }
-
-        spdlog::info("Retrying lock acquisition in {}ms", retry_delay.count());
-        std::this_thread::sleep_for(retry_delay);
+        // Wait before retry
+        std::this_thread::sleep_for(std::chrono::seconds(1));
     }
+
+    spdlog::error("Failed to acquire mutex within {} seconds: {}", timeout_seconds, impl_->name);
+    return false;
 }
 
 bool DistributedMutex::try_release() {
-    if (impl_->disposed || !impl_->acquired) return false;
+    if (!impl_->acquired) return false;
 
     spdlog::info("Attempting to release mutex: {}", impl_->name);
 
     nlohmann::json body;
     body["name"] = impl_->name;
-    body["challenge"] = impl_->challenge;
+    body["challenge"] = impl_->challenge_token;
     body["breakPeriod"] = "00:00:00"; // immediate
 
     std::string response;
@@ -201,7 +177,7 @@ bool DistributedMutex::try_release() {
     return false;
 }
 
-bool DistributedMutex::is_acquired() const {
+bool DistributedMutex::is_locked() const {
     return impl_->acquired;
 }
 
@@ -209,22 +185,30 @@ const std::string& DistributedMutex::name() const {
     return impl_->name;
 }
 
-const std::string& DistributedMutex::challenge() const {
-    return impl_->challenge;
+std::optional<std::string> DistributedMutex::challenge() const {
+    if (impl_->acquired) {
+        return impl_->challenge_token;
+    }
+    return std::nullopt;
 }
 
-void DistributedMutex::dispose() {
-    if (impl_->disposed) return;
+// ----- DistributedLockGuard -----
 
-    if (impl_->acquired && impl_->release_on_destroy) {
-        // Retry release up to 3 times
-        for (int i = 0; i < 3; ++i) {
-            if (try_release()) break;
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        }
+DistributedLockGuard::DistributedLockGuard(DistributedMutex& mutex,
+                                            int32_t timeout_seconds)
+    : mutex_(mutex)
+{
+    locked_ = mutex_.try_acquire(timeout_seconds);
+}
+
+DistributedLockGuard::~DistributedLockGuard() {
+    if (locked_) {
+        mutex_.try_release();
     }
+}
 
-    impl_->disposed = true;
+bool DistributedLockGuard::owns_lock() const {
+    return locked_;
 }
 
 } // namespace surge::lock

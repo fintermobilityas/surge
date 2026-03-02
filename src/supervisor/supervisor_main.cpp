@@ -178,6 +178,7 @@ int main(int argc, char* argv[]) {
         }
 
         // Start the supervised process
+        // Supervisor::start(path, path, vector<string>)
         int32_t rc = supervisor.start(
             config.executable, config.working_dir, config.args);
 
@@ -199,14 +200,14 @@ int main(int argc, char* argv[]) {
 
         if (g_shutdown_requested.load()) {
             spdlog::info("Shutdown requested, stopping child");
-            supervisor.stop(5000);
+            supervisor.stop(5000);  // Supervisor::stop(int timeout_ms = 5000)
             break;
         }
 
-        auto info = supervisor.process_info();
-        spdlog::warn("Child process exited with code {}", info.exit_code);
+        auto pinfo = supervisor.process_info();  // Supervisor::process_info() const
+        spdlog::warn("Child process exited with code {}", pinfo.exit_code);
 
-        if (info.exit_code == 0) {
+        if (pinfo.exit_code == 0) {
             spdlog::info("Child exited cleanly, supervisor shutting down");
             break;
         }

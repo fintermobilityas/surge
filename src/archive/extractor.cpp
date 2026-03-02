@@ -20,13 +20,16 @@ namespace fs = std::filesystem;
 struct ArchiveExtractor::Impl {
     struct archive* archive = nullptr;
     fs::path archive_path;
+    ExtractorOptions options;
     bool opened = false;
 };
 
-ArchiveExtractor::ArchiveExtractor(const std::filesystem::path& archive_path)
+ArchiveExtractor::ArchiveExtractor(const std::filesystem::path& archive_path,
+                                    const ExtractorOptions& options)
     : impl_(std::make_unique<Impl>())
 {
     impl_->archive_path = archive_path;
+    impl_->options = options;
     impl_->archive = archive_read_new();
     if (!impl_->archive) {
         throw std::runtime_error("Failed to create archive reader");
@@ -57,19 +60,16 @@ ArchiveExtractor::~ArchiveExtractor() {
     }
 }
 
-ArchiveExtractor::ArchiveExtractor(ArchiveExtractor&&) noexcept = default;
-ArchiveExtractor& ArchiveExtractor::operator=(ArchiveExtractor&&) noexcept = default;
-
-int32_t ArchiveExtractor::extract_all(
-    const std::filesystem::path& dest_dir,
-    std::function<void(int64_t items_done, int64_t items_total, const std::string& current_file)> progress)
-{
-    if (!impl_->opened) return SURGE_ERROR;
+void ArchiveExtractor::extract_to(const std::filesystem::path& dest_dir) {
+    if (!impl_->opened) {
+        throw std::runtime_error("Archive is not open");
+    }
 
     fs::create_directories(dest_dir);
 
     // First pass: count entries (for progress)
     int64_t total_entries = 0;
+    int64_t total_bytes = 0;
     {
         struct archive* count_archive = archive_read_new();
         archive_read_support_filter_all(count_archive);
@@ -78,6 +78,7 @@ int32_t ArchiveExtractor::extract_all(
             struct archive_entry* entry;
             while (archive_read_next_header(count_archive, &entry) == ARCHIVE_OK) {
                 total_entries++;
+                total_bytes += archive_entry_size(entry);
                 archive_read_data_skip(count_archive);
             }
             archive_read_close(count_archive);
@@ -92,13 +93,14 @@ int32_t ArchiveExtractor::extract_all(
     archive_read_support_filter_all(impl_->archive);
     archive_read_support_format_all(impl_->archive);
     if (archive_read_open_filename(impl_->archive, impl_->archive_path.string().c_str(), 65536) != ARCHIVE_OK) {
-        return SURGE_ERROR;
+        throw std::runtime_error("Failed to reopen archive for extraction");
     }
     impl_->opened = true;
 
     // Extract entries
     struct archive_entry* entry;
-    int64_t items_done = 0;
+    int64_t files_done = 0;
+    int64_t bytes_done = 0;
 
     while (archive_read_next_header(impl_->archive, &entry) == ARCHIVE_OK) {
         const char* pathname = archive_entry_pathname(entry);
@@ -127,8 +129,8 @@ int32_t ArchiveExtractor::extract_all(
 
             std::ofstream file(dest_path, std::ios::binary | std::ios::trunc);
             if (!file) {
-                spdlog::error("Failed to create file: {}", dest_path.string());
-                return SURGE_ERROR;
+                throw std::runtime_error(
+                    fmt::format("Failed to create file: {}", dest_path.string()));
             }
 
             constexpr size_t BUFFER_SIZE = 65536;
@@ -137,14 +139,15 @@ int32_t ArchiveExtractor::extract_all(
             while ((bytes_read = archive_read_data(impl_->archive, buffer, BUFFER_SIZE)) > 0) {
                 file.write(buffer, bytes_read);
                 if (!file) {
-                    spdlog::error("Write failed for: {}", dest_path.string());
-                    return SURGE_ERROR;
+                    throw std::runtime_error(
+                        fmt::format("Write failed for: {}", dest_path.string()));
                 }
+                bytes_done += bytes_read;
             }
             if (bytes_read < 0) {
-                spdlog::error("Error reading archive data for {}: {}",
-                               pathname, archive_error_string(impl_->archive));
-                return SURGE_ERROR;
+                throw std::runtime_error(
+                    fmt::format("Error reading archive data for {}: {}",
+                                 pathname, archive_error_string(impl_->archive)));
             }
             file.close();
 
@@ -159,18 +162,16 @@ int32_t ArchiveExtractor::extract_all(
             archive_read_data_skip(impl_->archive);
         }
 
-        items_done++;
-        if (progress) {
-            progress(items_done, total_entries, pathname);
+        files_done++;
+        if (impl_->options.progress) {
+            impl_->options.progress(files_done, total_entries, bytes_done, total_bytes);
         }
     }
 
-    spdlog::info("Extracted {} entries to {}", items_done, dest_dir.string());
-    return SURGE_OK;
+    spdlog::info("Extracted {} entries to {}", files_done, dest_dir.string());
 }
 
-int32_t ArchiveExtractor::read_entry(const std::string& entry_path,
-                                      std::vector<uint8_t>& out_data) {
+std::vector<uint8_t> ArchiveExtractor::read_entry(const std::string& entry_path) {
     // Reopen archive to search from beginning
     archive_read_close(impl_->archive);
     archive_read_free(impl_->archive);
@@ -179,7 +180,7 @@ int32_t ArchiveExtractor::read_entry(const std::string& entry_path,
     archive_read_support_format_all(impl_->archive);
     if (archive_read_open_filename(impl_->archive, impl_->archive_path.string().c_str(), 65536) != ARCHIVE_OK) {
         impl_->opened = false;
-        return SURGE_ERROR;
+        return {};
     }
     impl_->opened = true;
 
@@ -189,8 +190,8 @@ int32_t ArchiveExtractor::read_entry(const std::string& entry_path,
         if (!pathname) continue;
 
         if (entry_path == pathname) {
+            std::vector<uint8_t> out_data;
             auto entry_size = archive_entry_size(entry);
-            out_data.clear();
             if (entry_size > 0) {
                 out_data.resize(static_cast<size_t>(entry_size));
                 la_ssize_t total_read = 0;
@@ -202,7 +203,7 @@ int32_t ArchiveExtractor::read_entry(const std::string& entry_path,
                     if (bytes_read < 0) {
                         spdlog::error("Error reading entry {}: {}",
                                        entry_path, archive_error_string(impl_->archive));
-                        return SURGE_ERROR;
+                        return {};
                     }
                     if (bytes_read == 0) break;
                     total_read += bytes_read;
@@ -216,14 +217,13 @@ int32_t ArchiveExtractor::read_entry(const std::string& entry_path,
                 while ((bytes_read = archive_read_data(impl_->archive, buffer, BUFFER_SIZE)) > 0) {
                     out_data.insert(out_data.end(), buffer, buffer + bytes_read);
                 }
-                if (bytes_read < 0) return SURGE_ERROR;
             }
-            return SURGE_OK;
+            return out_data;
         }
         archive_read_data_skip(impl_->archive);
     }
 
-    return SURGE_NOT_FOUND;
+    return {};
 }
 
 std::vector<std::string> ArchiveExtractor::list_entries() {
@@ -250,6 +250,7 @@ std::vector<std::string> ArchiveExtractor::list_entries() {
         archive_read_data_skip(impl_->archive);
     }
 
+    std::sort(entries.begin(), entries.end());
     return entries;
 }
 

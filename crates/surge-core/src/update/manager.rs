@@ -476,6 +476,12 @@ mod tests {
         }
     }
 
+    fn current_os_label_for_tests() -> String {
+        let rid = crate::platform::detect::current_rid();
+        let raw = rid.split('-').next().unwrap_or_default();
+        normalize_os_label(raw)
+    }
+
     #[test]
     fn test_progress_info_default() {
         let p = ProgressInfo::default();
@@ -560,7 +566,12 @@ mod tests {
         let store_root = tmp.path().join("store");
         std::fs::create_dir_all(&store_root).unwrap();
 
-        let mut release = make_entry("1.1.0", "stable", "linux", &crate::platform::detect::current_rid());
+        let mut release = make_entry(
+            "1.1.0",
+            "stable",
+            &current_os_label_for_tests(),
+            &crate::platform::detect::current_rid(),
+        );
         release.is_genesis = true;
         release.delta_filename.clear();
         release.delta_size = 0;
@@ -622,7 +633,7 @@ mod tests {
             releases: vec![ReleaseEntry {
                 version: "1.1.0".to_string(),
                 channels: vec!["stable".to_string()],
-                os: "linux".to_string(),
+                os: current_os_label_for_tests(),
                 rid: rid.clone(),
                 is_genesis: true,
                 full_filename: full_filename.clone(),

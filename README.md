@@ -83,11 +83,15 @@ Point Surge at your build output:
 surge pack \
   --app-id my-app \
   --rid linux-x64 \
-  --version 1.0.0 \
-  --artifacts-dir ./publish
+  --version 1.0.0
 ```
 
-Surge compresses everything into a `tar.zst` package. If a previous version exists in storage, it also generates a binary delta patch automatically.
+By default, `surge pack` reads artifacts from `.surge/artifacts/<app-id>/<rid>/<version>`, writes packages to
+`.surge/packages`, and writes installers to `.surge/installers/<app-id>/<rid>`. Use `--artifacts-dir`/`--output-dir`
+to override.
+
+Surge compresses everything into a `tar.zst` package. If a previous version exists in storage, it also generates a
+binary delta patch automatically.
 
 ### 3. Push to storage
 
@@ -108,6 +112,7 @@ If your devices are on a tailnet, Surge can pick a matching package for a remote
 ```bash
 surge tailscale install \
   --node my-node \
+  --ssh-user operator \
   --channel stable
 ```
 
@@ -116,7 +121,8 @@ This command:
 - resolves the newest matching release on the selected channel,
 - downloads it locally and sends it with `tailscale file cp`.
 
-Use `--plan-only` to preview selection without transfer, or `--rid` to force a specific RID.
+Use `--plan-only` to preview selection without transfer, or `--rid` to force a specific RID. If your tailnet
+requires explicit SSH identity, pass `--ssh-user <account>` (or set `--node <account>@<node>` directly).
 
 ### 4. Add update checking to your app
 
@@ -162,7 +168,7 @@ jobs:
       - uses: actions/checkout@v6
       - run: cargo build --release
 
-      - run: surge pack --version ${{ env.VERSION }} --artifacts-dir target/release
+      - run: surge pack --version ${{ env.VERSION }}
       - run: surge push --version ${{ env.VERSION }} --channel stable
 ```
 
@@ -187,7 +193,7 @@ jobs:
       - uses: actions/checkout@v6
       - run: dotnet publish -c Release -r ${{ matrix.rid }}
 
-      - run: surge pack --rid ${{ matrix.rid }} --version ${{ env.VERSION }} --artifacts-dir publish
+      - run: surge pack --rid ${{ matrix.rid }} --version ${{ env.VERSION }}
       - run: surge push --rid ${{ matrix.rid }} --version ${{ env.VERSION }} --channel stable
 ```
 
@@ -450,6 +456,26 @@ surge tailscale     Resolve and transfer packages to a Tailscale node
 ```
 
 If the manifest has one app, `--app-id` is optional. If the app has one target, `--rid` is optional.
+
+`surge restore` also supports installer-only generation (snapx-style `restore -i`) from existing full packages:
+
+```bash
+surge restore -i
+```
+
+By default this resolves the latest release for the manifest app/target and default channel, restores missing full
+packages from storage into `.surge/packages`, and builds installers using artifacts from
+`.surge/artifacts/<app-id>/<rid>/<version>`. The generated installers are written to
+`.surge/installers/<app-id>/<rid>`.
+
+Explicit override example:
+
+```bash
+surge restore -i \
+  --version 1.2.3 \
+  --artifacts-dir ./publish \
+  --packages-dir .surge/packages
+```
 
 ### C API function groups
 

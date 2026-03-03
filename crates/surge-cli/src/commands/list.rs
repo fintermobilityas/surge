@@ -126,9 +126,7 @@ fn build_overview_row(
 
     let latest_release = relevant.iter().max_by(|a, b| compare_versions(&a.version, &b.version));
 
-    let latest = latest_release
-        .map(|release| release.version.clone())
-        .unwrap_or_else(|| "-".to_string());
+    let latest = latest_release.map_or_else(|| "-".to_string(), |release| release.version.clone());
 
     let published_raw = latest_release
         .and_then(|release| {
@@ -147,17 +145,13 @@ fn build_overview_row(
                 Some(last_write.to_string())
             }
         })
-        .unwrap_or_else(|| "-".to_string());
+        .unwrap_or("-".to_string());
     let published = humanize_publish_timestamp(&published_raw);
 
     let mut channel_statuses = Vec::with_capacity(channel_headers.len());
     for channel in channel_headers {
         let latest_for_channel = latest_release_for_channel(&relevant, channel);
-        channel_statuses.push(
-            latest_for_channel
-                .map(format_release_cell)
-                .unwrap_or_else(|| "-".to_string()),
-        );
+        channel_statuses.push(latest_for_channel.map_or("-".to_string(), format_release_cell));
     }
 
     OverviewRow {
@@ -374,7 +368,7 @@ fn style_data_cell(idx: usize, value: &str, padded: &str, theme: UiTheme) -> Str
                 padded.to_string()
             }
         }
-        2 => theme.dim(padded),
+        2 | 4 => theme.dim(padded),
         3 => {
             if value == "-" {
                 theme.dim(padded)
@@ -382,7 +376,6 @@ fn style_data_cell(idx: usize, value: &str, padded: &str, theme: UiTheme) -> Str
                 theme.green(padded)
             }
         }
-        4 => theme.dim(padded),
         _ => style_channel_cell(value, padded, theme),
     }
 }

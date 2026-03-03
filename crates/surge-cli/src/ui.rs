@@ -78,10 +78,10 @@ fn should_colorize_output() -> bool {
         return false;
     }
 
-    if let Some(force) = std::env::var("CLICOLOR_FORCE").ok() {
-        if force != "0" {
-            return true;
-        }
+    if let Ok(force) = std::env::var("CLICOLOR_FORCE")
+        && force != "0"
+    {
+        return true;
     }
 
     if !std::io::stdout().is_terminal() {

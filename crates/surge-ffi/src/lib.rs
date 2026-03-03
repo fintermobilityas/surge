@@ -1472,4 +1472,77 @@ mod tests {
         assert!(ctx.patch.is_null());
         assert_eq!(ctx.patch_size, 0);
     }
+
+    #[test]
+    fn pack_push_without_build_sets_context_error() {
+        let ctx = unsafe { surge_context_create() };
+        assert!(!ctx.is_null());
+
+        let manifest = CString::new("placeholder.yml").unwrap();
+        let app_id = CString::new("demo").unwrap();
+        let rid = CString::new("linux-x64").unwrap();
+        let version = CString::new("1.0.0").unwrap();
+        let artifacts = CString::new("artifacts").unwrap();
+
+        let pack = unsafe {
+            surge_pack_create(
+                ctx,
+                manifest.as_ptr(),
+                app_id.as_ptr(),
+                rid.as_ptr(),
+                version.as_ptr(),
+                artifacts.as_ptr(),
+            )
+        };
+        assert!(!pack.is_null());
+
+        let channel = CString::new("stable").unwrap();
+        let rc = unsafe { surge_pack_push(pack, channel.as_ptr(), None, std::ptr::null_mut()) };
+        assert_ne!(rc, SURGE_OK);
+
+        let last = unsafe { surge_context_last_error(ctx) };
+        assert!(!last.is_null());
+        let msg = unsafe { CStr::from_ptr((*last).message) }
+            .to_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(msg.contains("Call surge_pack_build first"));
+
+        unsafe {
+            surge_pack_destroy(pack);
+            surge_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn pack_handle_survives_context_destroy() {
+        let ctx = unsafe { surge_context_create() };
+        assert!(!ctx.is_null());
+
+        let manifest = CString::new("placeholder.yml").unwrap();
+        let app_id = CString::new("demo").unwrap();
+        let rid = CString::new("linux-x64").unwrap();
+        let version = CString::new("1.0.0").unwrap();
+        let artifacts = CString::new("artifacts").unwrap();
+
+        let pack = unsafe {
+            surge_pack_create(
+                ctx,
+                manifest.as_ptr(),
+                app_id.as_ptr(),
+                rid.as_ptr(),
+                version.as_ptr(),
+                artifacts.as_ptr(),
+            )
+        };
+        assert!(!pack.is_null());
+
+        unsafe { surge_context_destroy(ctx) };
+
+        let channel = CString::new("stable").unwrap();
+        let rc = unsafe { surge_pack_push(pack, channel.as_ptr(), None, std::ptr::null_mut()) };
+        assert_ne!(rc, SURGE_OK);
+
+        unsafe { surge_pack_destroy(pack) };
+    }
 }

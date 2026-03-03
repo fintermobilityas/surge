@@ -418,7 +418,7 @@ fn build_installers(
                 bucket: manifest.storage.bucket.clone(),
                 region: manifest.storage.region.clone(),
                 endpoint: manifest.storage.endpoint.clone(),
-                prefix: manifest.storage.prefix.clone(),
+                prefix: installer_storage_prefix(manifest, app_id),
             },
             release: InstallerRelease {
                 full_filename: full_filename.clone(),
@@ -515,6 +515,14 @@ fn default_channel_for_app(manifest: &SurgeManifest, app: &AppConfig) -> String 
         .unwrap_or_else(|| "stable".to_string())
 }
 
+fn installer_storage_prefix(manifest: &SurgeManifest, app_id: &str) -> String {
+    if manifest.apps.len() > 1 {
+        super::append_prefix(&manifest.storage.prefix, app_id)
+    } else {
+        manifest.storage.prefix.clone()
+    }
+}
+
 fn default_artifacts_dir(manifest_path: &Path, app_id: &str, rid: &str, version: &str) -> PathBuf {
     manifest_path
         .parent()
@@ -542,7 +550,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use surge_core::archive::extractor::list_entries_from_bytes;
+    use surge_core::archive::extractor::{list_entries_from_bytes, read_entry};
     use surge_core::config::constants::DEFAULT_ZSTD_LEVEL;
     use surge_core::platform::detect::current_rid;
     use surge_core::platform::fs::make_executable;
@@ -762,6 +770,77 @@ apps:
                 .join(&rid)
                 .join(format!("Setup-{rid}-{app_id}-stable-web.surge-installer.tar.zst"))
                 .exists()
+        );
+    }
+
+    #[test]
+    fn build_installers_uses_app_scoped_prefix_in_multi_app_manifest() {
+        let tmp = tempfile::tempdir().expect("temp dir should be created");
+        let store_dir = tmp.path().join("store");
+        let artifacts_dir = tmp.path().join("artifacts");
+        let output_dir = tmp.path().join("packages");
+        let app_id = "app-a";
+        let rid = "linux-x64";
+        let version = "1.2.3";
+
+        std::fs::create_dir_all(&store_dir).expect("store dir should be created");
+        std::fs::create_dir_all(&artifacts_dir).expect("artifacts dir should be created");
+        std::fs::create_dir_all(&output_dir).expect("packages dir should be created");
+        std::fs::write(artifacts_dir.join("icon.png"), b"icon").expect("icon should be written");
+
+        let full_package = output_dir.join(format!("{app_id}-{version}-{rid}-full.tar.zst"));
+        std::fs::write(&full_package, b"full package bytes").expect("full package should be written");
+
+        let yaml = format!(
+            r"schema: 1
+storage:
+  provider: filesystem
+  bucket: {}
+  prefix: releases
+apps:
+  - id: app-a
+    main_exe: demoapp
+    channels: [stable]
+    target:
+      rid: linux-x64
+      icon: icon.png
+      installers: [web]
+  - id: app-b
+    main_exe: demoapp
+    channels: [stable]
+    target:
+      rid: linux-x64
+      icon: icon.png
+      installers: [web]
+",
+            store_dir.display()
+        );
+        let manifest = SurgeManifest::parse(yaml.as_bytes()).expect("manifest should parse");
+        let (app, target) = manifest
+            .find_app_with_target(app_id, rid)
+            .expect("app/target should exist in manifest");
+
+        let installers = build_installers(
+            &manifest,
+            app,
+            &target,
+            app_id,
+            rid,
+            version,
+            &artifacts_dir,
+            &output_dir,
+            &full_package,
+        )
+        .expect("installer build should succeed");
+        assert_eq!(installers.len(), 1);
+
+        let installer_data = std::fs::read(&installers[0]).expect("installer archive should be readable");
+        let installer_manifest =
+            String::from_utf8(read_entry(&installer_data, "installer.yml").expect("installer.yml should be present"))
+                .expect("installer.yml should be UTF-8");
+        assert!(
+            installer_manifest.contains("prefix: releases/app-a"),
+            "installer manifest should use app-scoped prefix in multi-app manifests"
         );
     }
 }

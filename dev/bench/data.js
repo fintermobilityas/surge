@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1772543353864,
+  "lastUpdate": 1772543357342,
   "repoUrl": "https://github.com/fintermobilityas/surge",
   "entries": {
     "Surge (small)": [
@@ -229,6 +229,122 @@ window.BENCHMARK_DATA = {
           {
             "name": "Installer (offline)",
             "value": 161.64731700000002,
+            "unit": "ms"
+          }
+        ]
+      }
+    ],
+    "Surge (medium)": [
+      {
+        "commit": {
+          "author": {
+            "email": "peter.sunde@gmail.com",
+            "name": "Peter Rekdal Khan-Sunde",
+            "username": "peters"
+          },
+          "committer": {
+            "email": "peter.sunde@gmail.com",
+            "name": "Peter Rekdal Khan-Sunde",
+            "username": "peters"
+          },
+          "distinct": true,
+          "id": "fe9fc0cb66567dd35bd1e7f84d03121b720f0cc5",
+          "message": "Fix benchmark workflow: add write permissions for gh-pages push",
+          "timestamp": "2026-03-03T14:07:26+01:00",
+          "tree_id": "0cee25658616c3b055acfee73ddc2678c7728042",
+          "url": "https://github.com/fintermobilityas/surge/commit/fe9fc0cb66567dd35bd1e7f84d03121b720f0cc5"
+        },
+        "date": 1772543357069,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "Archive create (zstd=1)",
+            "value": 45.833845,
+            "unit": "ms"
+          },
+          {
+            "name": "Archive create (zstd=3)",
+            "value": 62.86008999999999,
+            "unit": "ms"
+          },
+          {
+            "name": "Archive extract",
+            "value": 93.230518,
+            "unit": "ms"
+          },
+          {
+            "name": "SHA-256 (in-memory)",
+            "value": 39.242958,
+            "unit": "ms"
+          },
+          {
+            "name": "SHA-256 (file)",
+            "value": 43.80215,
+            "unit": "ms"
+          },
+          {
+            "name": "Zstd compress (level=1)",
+            "value": 25.050552,
+            "unit": "ms"
+          },
+          {
+            "name": "Zstd compress (level=3)",
+            "value": 27.231675,
+            "unit": "ms"
+          },
+          {
+            "name": "Zstd decompress",
+            "value": 12.142297,
+            "unit": "ms"
+          },
+          {
+            "name": "bsdiff",
+            "value": 4308.793753,
+            "unit": "ms"
+          },
+          {
+            "name": "bspatch",
+            "value": 243.333508,
+            "unit": "ms"
+          },
+          {
+            "name": "chunked bsdiff",
+            "value": 4309.716533,
+            "unit": "ms"
+          },
+          {
+            "name": "chunked bspatch",
+            "value": 245.58282,
+            "unit": "ms"
+          },
+          {
+            "name": "Full package build",
+            "value": 65.18926,
+            "unit": "ms"
+          },
+          {
+            "name": "Delta package build",
+            "value": 4312.251296,
+            "unit": "ms"
+          },
+          {
+            "name": "Apply 1 delta",
+            "value": 247.668486,
+            "unit": "ms"
+          },
+          {
+            "name": "Apply 5x deltas",
+            "value": 1229.726646,
+            "unit": "ms"
+          },
+          {
+            "name": "Installer (web)",
+            "value": 0.084838,
+            "unit": "ms"
+          },
+          {
+            "name": "Installer (offline)",
+            "value": 90.527795,
             "unit": "ms"
           }
         ]

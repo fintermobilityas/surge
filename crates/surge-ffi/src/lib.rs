@@ -1,3 +1,5 @@
+#![deny(unsafe_op_in_unsafe_fn)]
+
 //! C API (`cdylib`) for the Surge update framework.
 //!
 //! This crate produces `libsurge.so` / `surge.dll` / `libsurge.dylib` and

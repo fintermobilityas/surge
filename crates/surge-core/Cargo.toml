@@ -5,6 +5,16 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Core library for the Surge update framework"
+include = [
+    "src/**/*",
+    "tests/**/*",
+    "build.rs",
+    "Cargo.toml",
+    "LICENSE*",
+    "vendor/**/*.c",
+    "vendor/**/*.h",
+    "vendor/**/*.cmake",
+]
 
 [dependencies]
 serde = { workspace = true }

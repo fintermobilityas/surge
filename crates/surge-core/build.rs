@@ -1,7 +1,8 @@
 use std::path::PathBuf;
 
 fn main() {
-    let vendor = PathBuf::from("../../vendor/bsdiff");
+    let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    let vendor = manifest_dir.join("vendor");
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
 
     // --- bzip2 ---
@@ -78,7 +79,7 @@ fn main() {
         .warnings(false)
         .compile("bsdiff");
 
-    println!("cargo:rerun-if-changed=../../vendor/bsdiff");
+    println!("cargo:rerun-if-changed={}", vendor.display());
 }
 
 fn generate_headers(template_dir: &std::path::Path, out_dir: &std::path::Path) {

@@ -6,14 +6,22 @@ use std::time::Duration;
 
 use tracing::{debug, info, warn};
 
+use crate::archive::extractor::extract_file_to;
+use crate::config::constants::RELEASES_FILE_COMPRESSED;
 use crate::context::Context;
+use crate::crypto::sha256::{sha256_hex, sha256_hex_file};
+use crate::diff::wrapper::bspatch_buffers;
 use crate::error::{Result, SurgeError};
+use crate::platform::detect::current_rid;
+use crate::platform::fs::{atomic_rename, copy_directory};
+use crate::platform::shortcuts::install_shortcuts;
 use crate::releases::manifest::{
     ReleaseEntry, ReleaseIndex, decompress_release_index, get_delta_chain, get_releases_newer_than,
 };
+use crate::releases::restore::restore_full_archive_for_version;
 use crate::releases::version::compare_versions;
 use crate::storage::{StorageBackend, create_storage_backend};
-use crate::config::constants::RELEASES_FILE_COMPRESSED;
+use crate::supervisor::stub::find_latest_app_dir;
 
 /// Progress information for update operations.
 #[derive(Debug, Clone)]
@@ -176,7 +184,7 @@ impl UpdateManager {
         // Download release index
         let data = self.storage.get_object(RELEASES_FILE_COMPRESSED).await?;
         let index = decompress_release_index(&data)?;
-        let current_rid = crate::platform::detect::current_rid();
+        let current_rid = current_rid();
         let current_os = normalize_os_label(current_rid.split('-').next().unwrap_or_default());
 
         if !index.app_id.is_empty() && index.app_id != self.app_id {
@@ -340,7 +348,7 @@ impl UpdateManager {
                 }
 
                 let path = staging_dir.join(&release.delta_filename);
-                let hash = crate::crypto::sha256::sha256_hex_file(&path)?;
+                let hash = sha256_hex_file(&path)?;
                 if !release.delta_sha256.is_empty() && hash != release.delta_sha256 {
                     return Err(SurgeError::Update(format!(
                         "SHA-256 mismatch for {}: expected {}, got {hash}",
@@ -354,7 +362,7 @@ impl UpdateManager {
                 .last()
                 .ok_or_else(|| SurgeError::Update("No latest release".to_string()))?;
             let path = staging_dir.join(&latest.full_filename);
-            let hash = crate::crypto::sha256::sha256_hex_file(&path)?;
+            let hash = sha256_hex_file(&path)?;
             if !latest.full_sha256.is_empty() && hash != latest.full_sha256 {
                 return Err(SurgeError::Update(format!(
                     "SHA-256 mismatch for {}: expected {}, got {hash}",
@@ -380,20 +388,16 @@ impl UpdateManager {
                 let data = self.storage.get_object(RELEASES_FILE_COMPRESSED).await?;
                 decompress_release_index(&data)?
             };
-            let rid = crate::platform::detect::current_rid();
-            let mut rebuilt_archive = crate::releases::restore::restore_full_archive_for_version(
-                self.storage.as_ref(),
-                &index,
-                &rid,
-                &self.current_version,
-            )
-            .await
-            .map_err(|e| {
-                SurgeError::Update(format!(
-                    "Failed to restore base full archive for {}: {e}",
-                    self.current_version
-                ))
-            })?;
+            let rid = current_rid();
+            let mut rebuilt_archive =
+                restore_full_archive_for_version(self.storage.as_ref(), &index, &rid, &self.current_version)
+                    .await
+                    .map_err(|e| {
+                        SurgeError::Update(format!(
+                            "Failed to restore base full archive for {}: {e}",
+                            self.current_version
+                        ))
+                    })?;
 
             for release in &info.apply_releases {
                 self.ctx.check_cancelled()?;
@@ -410,12 +414,12 @@ impl UpdateManager {
                 let patch = zstd::decode_all(delta_compressed.as_slice()).map_err(|e| {
                     SurgeError::Archive(format!("Failed to decompress delta {}: {e}", release.delta_filename))
                 })?;
-                rebuilt_archive = crate::diff::wrapper::bspatch_buffers(&rebuilt_archive, &patch).map_err(|e| {
+                rebuilt_archive = bspatch_buffers(&rebuilt_archive, &patch).map_err(|e| {
                     SurgeError::Update(format!("Failed to apply delta {}: {e}", release.delta_filename))
                 })?;
 
                 if !release.full_sha256.is_empty() {
-                    let hash = crate::crypto::sha256::sha256_hex(&rebuilt_archive);
+                    let hash = sha256_hex(&rebuilt_archive);
                     if hash != release.full_sha256 {
                         return Err(SurgeError::Update(format!(
                             "SHA-256 mismatch for rebuilt full archive {}: expected {}, got {hash}",
@@ -427,14 +431,14 @@ impl UpdateManager {
 
             let rebuilt_archive_path = staging_dir.join("rebuilt-full.tar.zst");
             tokio::fs::write(&rebuilt_archive_path, &rebuilt_archive).await?;
-            crate::archive::extractor::extract_file_to(&rebuilt_archive_path, &extract_dir)?;
+            extract_file_to(&rebuilt_archive_path, &extract_dir)?;
         } else {
             let latest = info
                 .apply_releases
                 .last()
                 .ok_or_else(|| SurgeError::Update("No latest release".to_string()))?;
             let archive_path = staging_dir.join(&latest.full_filename);
-            crate::archive::extractor::extract_file_to(&archive_path, &extract_dir)?;
+            extract_file_to(&archive_path, &extract_dir)?;
         }
 
         report(4, 100, 75);
@@ -480,15 +484,15 @@ impl UpdateManager {
         } else {
             extract_dir.clone()
         };
-        crate::platform::fs::atomic_rename(&extracted_final_dir, &next_app_dir)?;
+        atomic_rename(&extracted_final_dir, &next_app_dir)?;
 
         if active_app_dir.is_dir() {
-            crate::platform::fs::atomic_rename(&active_app_dir, &previous_swap_dir)?;
+            atomic_rename(&active_app_dir, &previous_swap_dir)?;
         }
-        if let Err(err) = crate::platform::fs::atomic_rename(&next_app_dir, &active_app_dir) {
+        if let Err(err) = atomic_rename(&next_app_dir, &active_app_dir) {
             // Best effort rollback to previous active content.
             if previous_swap_dir.is_dir() && !active_app_dir.exists() {
-                let _ = crate::platform::fs::atomic_rename(&previous_swap_dir, &active_app_dir);
+                let _ = atomic_rename(&previous_swap_dir, &active_app_dir);
             }
             return Err(err);
         }
@@ -511,7 +515,7 @@ impl UpdateManager {
         }
 
         if !latest.shortcuts.is_empty() {
-            match crate::platform::shortcuts::install_shortcuts(
+            match install_shortcuts(
                 &self.app_id,
                 &active_app_dir,
                 &latest.main_exe,
@@ -537,7 +541,7 @@ impl UpdateManager {
                 && previous_version_dir != active_app_dir
                 && !previous_version_dir.exists()
             {
-                if let Err(e) = crate::platform::fs::atomic_rename(&previous_swap_dir, &previous_version_dir) {
+                if let Err(e) = atomic_rename(&previous_swap_dir, &previous_version_dir) {
                     warn!(
                         previous = %previous_swap_dir.display(),
                         target = %previous_version_dir.display(),
@@ -595,7 +599,7 @@ fn find_previous_app_dir(install_dir: &Path, current_version: &str) -> Option<Pa
         return Some(explicit);
     }
 
-    crate::supervisor::stub::find_latest_app_dir(install_dir).ok()
+    find_latest_app_dir(install_dir).ok()
 }
 
 async fn request_supervisor_shutdown(install_dir: &Path, supervisor_id: &str) -> Result<()> {
@@ -658,7 +662,7 @@ fn copy_persistent_assets(previous_app_dir: &Path, new_app_dir: &Path, assets: &
                     std::fs::remove_file(&destination)?;
                 }
             }
-            crate::platform::fs::copy_directory(&source, &destination)?;
+            copy_directory(&source, &destination)?;
         } else {
             if let Some(parent) = destination.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -720,7 +724,10 @@ mod tests {
     use crate::config::constants::DEFAULT_ZSTD_LEVEL;
     #[cfg(target_os = "linux")]
     use crate::config::manifest::ShortcutLocation;
-    use crate::crypto::sha256::sha256_hex_file;
+    use crate::context::StorageProvider;
+    use crate::diff::wrapper::bsdiff_buffers;
+    #[cfg(target_os = "linux")]
+    use crate::platform::shortcuts::{clear_test_shortcut_paths_override, set_test_shortcut_paths_override};
     use crate::releases::manifest::{ReleaseEntry, ReleaseIndex, compress_release_index};
 
     fn make_entry(version: &str, channel: &str, os: &str, rid: &str) -> ReleaseEntry {
@@ -750,7 +757,7 @@ mod tests {
     }
 
     fn current_os_label_for_tests() -> String {
-        let rid = crate::platform::detect::current_rid();
+        let rid = current_rid();
         let raw = rid.split('-').next().unwrap_or_default();
         normalize_os_label(raw)
     }
@@ -788,7 +795,7 @@ mod tests {
     fn test_update_manager_rejects_embedded_credentials() {
         let ctx = Arc::new(Context::new());
         ctx.set_storage(
-            crate::context::StorageProvider::S3,
+            StorageProvider::S3,
             "bucket",
             "region",
             "embedded-key",
@@ -810,7 +817,7 @@ mod tests {
 
         let ctx = Arc::new(Context::new());
         ctx.set_storage(
-            crate::context::StorageProvider::Filesystem,
+            StorageProvider::Filesystem,
             store_root.to_str().unwrap(),
             "",
             "",
@@ -928,7 +935,7 @@ mod tests {
 
         let ctx = Arc::new(Context::new());
         ctx.set_storage(
-            crate::context::StorageProvider::Filesystem,
+            StorageProvider::Filesystem,
             store_root.to_str().unwrap(),
             "",
             "",
@@ -947,12 +954,7 @@ mod tests {
         let store_root = tmp.path().join("store");
         std::fs::create_dir_all(&store_root).unwrap();
 
-        let mut release = make_entry(
-            "1.1.0",
-            "stable",
-            &current_os_label_for_tests(),
-            &crate::platform::detect::current_rid(),
-        );
+        let mut release = make_entry("1.1.0", "stable", &current_os_label_for_tests(), &current_rid());
         release.is_genesis = true;
         release.delta_filename.clear();
         release.delta_size = 0;
@@ -969,7 +971,7 @@ mod tests {
 
         let ctx = Arc::new(Context::new());
         ctx.set_storage(
-            crate::context::StorageProvider::Filesystem,
+            StorageProvider::Filesystem,
             store_root.to_str().unwrap(),
             "",
             "",
@@ -991,7 +993,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store_root = tmp.path().join("store");
         std::fs::create_dir_all(&store_root).unwrap();
-        let rid = crate::platform::detect::current_rid();
+        let rid = current_rid();
         let os = current_os_label_for_tests();
 
         let index = ReleaseIndex {
@@ -1007,7 +1009,7 @@ mod tests {
 
         let ctx = Arc::new(Context::new());
         ctx.set_storage(
-            crate::context::StorageProvider::Filesystem,
+            StorageProvider::Filesystem,
             store_root.to_str().unwrap(),
             "",
             "",
@@ -1032,7 +1034,7 @@ mod tests {
         std::fs::create_dir_all(&store_root).unwrap();
         std::fs::create_dir_all(&install_root).unwrap();
 
-        let rid = crate::platform::detect::current_rid();
+        let rid = current_rid();
         let full_filename = format!("test-app-1.1.0-{rid}-full.tar.zst");
         let full_path = store_root.join(&full_filename);
 
@@ -1076,7 +1078,7 @@ mod tests {
 
         let ctx = Arc::new(Context::new());
         ctx.set_storage(
-            crate::context::StorageProvider::Filesystem,
+            StorageProvider::Filesystem,
             store_root.to_str().unwrap(),
             "",
             "",
@@ -1108,7 +1110,7 @@ mod tests {
         std::fs::create_dir_all(&store_root).unwrap();
         std::fs::create_dir_all(&install_root).unwrap();
 
-        let rid = crate::platform::detect::current_rid();
+        let rid = current_rid();
         let os = current_os_label_for_tests();
 
         let mut packer_v1 = ArchivePacker::new(3).unwrap();
@@ -1123,9 +1125,9 @@ mod tests {
         packer_v3.add_buffer("payload.txt", b"v3 payload", 0o644).unwrap();
         let full_v3 = packer_v3.finalize().unwrap();
 
-        let patch_v2 = crate::diff::wrapper::bsdiff_buffers(&full_v1, &full_v2).unwrap();
+        let patch_v2 = bsdiff_buffers(&full_v1, &full_v2).unwrap();
         let delta_v2 = zstd::encode_all(patch_v2.as_slice(), 3).unwrap();
-        let patch_v3 = crate::diff::wrapper::bsdiff_buffers(&full_v2, &full_v3).unwrap();
+        let patch_v3 = bsdiff_buffers(&full_v2, &full_v3).unwrap();
         let delta_v3 = zstd::encode_all(patch_v3.as_slice(), 3).unwrap();
 
         let full_v1_name = format!("test-app-1.0.0-{rid}-full.tar.zst");
@@ -1149,7 +1151,7 @@ mod tests {
                     is_genesis: true,
                     full_filename: full_v1_name.clone(),
                     full_size: full_v1.len() as i64,
-                    full_sha256: crate::crypto::sha256::sha256_hex(&full_v1),
+                    full_sha256: sha256_hex(&full_v1),
                     delta_filename: String::new(),
                     delta_size: 0,
                     delta_sha256: String::new(),
@@ -1172,10 +1174,10 @@ mod tests {
                     is_genesis: false,
                     full_filename: full_v2_name.clone(),
                     full_size: full_v2.len() as i64,
-                    full_sha256: crate::crypto::sha256::sha256_hex(&full_v2),
+                    full_sha256: sha256_hex(&full_v2),
                     delta_filename: delta_v2_name.clone(),
                     delta_size: delta_v2.len() as i64,
-                    delta_sha256: crate::crypto::sha256::sha256_hex(&delta_v2),
+                    delta_sha256: sha256_hex(&delta_v2),
                     created_utc: chrono::Utc::now().to_rfc3339(),
                     release_notes: String::new(),
                     main_exe: "test-app".to_string(),
@@ -1195,10 +1197,10 @@ mod tests {
                     is_genesis: false,
                     full_filename: full_v3_name,
                     full_size: full_v3.len() as i64,
-                    full_sha256: crate::crypto::sha256::sha256_hex(&full_v3),
+                    full_sha256: sha256_hex(&full_v3),
                     delta_filename: delta_v3_name,
                     delta_size: delta_v3.len() as i64,
-                    delta_sha256: crate::crypto::sha256::sha256_hex(&delta_v3),
+                    delta_sha256: sha256_hex(&delta_v3),
                     created_utc: chrono::Utc::now().to_rfc3339(),
                     release_notes: String::new(),
                     main_exe: "test-app".to_string(),
@@ -1219,7 +1221,7 @@ mod tests {
 
         let ctx = Arc::new(Context::new());
         ctx.set_storage(
-            crate::context::StorageProvider::Filesystem,
+            StorageProvider::Filesystem,
             store_root.to_str().unwrap(),
             "",
             "",
@@ -1252,7 +1254,7 @@ mod tests {
         std::fs::create_dir_all(&current_app_dir).unwrap();
         std::fs::write(current_app_dir.join("payload.txt"), "old payload").unwrap();
 
-        let rid = crate::platform::detect::current_rid();
+        let rid = current_rid();
         let full_filename = format!("test-app-1.1.0-{rid}-full.tar.zst");
         let full_path = store_root.join(&full_filename);
 
@@ -1296,7 +1298,7 @@ mod tests {
 
         let ctx = Arc::new(Context::new());
         ctx.set_storage(
-            crate::context::StorageProvider::Filesystem,
+            StorageProvider::Filesystem,
             store_root.to_str().unwrap(),
             "",
             "",
@@ -1329,7 +1331,7 @@ mod tests {
 
         impl Drop for ShortcutPathsOverrideGuard {
             fn drop(&mut self) {
-                crate::platform::shortcuts::clear_test_shortcut_paths_override();
+                clear_test_shortcut_paths_override();
             }
         }
 
@@ -1341,7 +1343,7 @@ mod tests {
             .join("share")
             .join("applications");
         let autostart_dir = tmp.path().join("shortcut-home").join(".config").join("autostart");
-        crate::platform::shortcuts::set_test_shortcut_paths_override(applications_dir.clone(), autostart_dir.clone());
+        set_test_shortcut_paths_override(applications_dir.clone(), autostart_dir.clone());
         let _override_guard = ShortcutPathsOverrideGuard;
 
         let store_root = tmp.path().join("store");
@@ -1349,7 +1351,7 @@ mod tests {
         std::fs::create_dir_all(&store_root).unwrap();
         std::fs::create_dir_all(&install_root).unwrap();
 
-        let rid = crate::platform::detect::current_rid();
+        let rid = current_rid();
         let full_filename = format!("test-app-1.1.0-{rid}-full.tar.zst");
         let full_path = store_root.join(&full_filename);
 
@@ -1395,7 +1397,7 @@ mod tests {
 
         let ctx = Arc::new(Context::new());
         ctx.set_storage(
-            crate::context::StorageProvider::Filesystem,
+            StorageProvider::Filesystem,
             store_root.to_str().unwrap(),
             "",
             "",

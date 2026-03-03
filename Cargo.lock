@@ -1467,6 +1467,7 @@ dependencies = [
  "clap",
  "nix",
  "surge-core",
+ "thiserror",
  "tracing",
  "tracing-subscriber",
 ]

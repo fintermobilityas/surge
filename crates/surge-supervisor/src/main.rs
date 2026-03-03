@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode};
 
 use clap::Parser;
+use thiserror::Error;
 
 #[derive(Parser)]
 #[command(
@@ -33,6 +34,15 @@ struct Cli {
     verbose: bool,
 }
 
+#[derive(Debug, Error)]
+enum SupervisorError {
+    #[error("Executable not found: {0}")]
+    ExecutableNotFound(String),
+
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
 fn init_tracing(verbose: bool) {
     let filter = if verbose { "debug" } else { "info" };
     tracing_subscriber::fmt()
@@ -56,7 +66,7 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+fn run(cli: &Cli) -> Result<(), SupervisorError> {
     tracing::info!(
         "Surge supervisor '{}' starting, exe: {}",
         cli.supervisor_id,
@@ -64,7 +74,7 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     );
 
     if !cli.exe_path.is_file() {
-        return Err(format!("Executable not found: {}", cli.exe_path.display()).into());
+        return Err(SupervisorError::ExecutableNotFound(cli.exe_path.display().to_string()));
     }
 
     // Write PID file
@@ -133,7 +143,7 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn write_pid_file(path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+fn write_pid_file(path: &Path) -> Result<(), SupervisorError> {
     let pid = std::process::id();
     std::fs::write(path, pid.to_string())?;
     tracing::debug!("Wrote PID file: {} (pid={})", path.display(), pid);
@@ -144,7 +154,7 @@ fn wait_for_child_or_stop(
     child: &mut Child,
     shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     stop_file: &Path,
-) -> Result<Option<std::process::ExitStatus>, Box<dyn std::error::Error>> {
+) -> Result<Option<std::process::ExitStatus>, SupervisorError> {
     loop {
         if shutdown.load(std::sync::atomic::Ordering::Acquire) || stop_file.exists() {
             terminate_child_process(child)?;
@@ -159,7 +169,7 @@ fn wait_for_child_or_stop(
     }
 }
 
-fn terminate_child_process(child: &mut Child) -> Result<(), Box<dyn std::error::Error>> {
+fn terminate_child_process(child: &mut Child) -> Result<(), SupervisorError> {
     if child.try_wait()?.is_some() {
         return Ok(());
     }
@@ -220,14 +230,14 @@ fn install_signal_handlers() -> std::sync::Arc<std::sync::atomic::AtomicBool> {
     #[cfg(windows)]
     {
         let shutdown_clone = shutdown.clone();
-        let _ = ctrlc_handler(shutdown_clone);
+        ctrlc_handler(shutdown_clone);
     }
 
     shutdown
 }
 
 #[cfg(windows)]
-fn ctrlc_handler(shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Result<(), Box<dyn std::error::Error>> {
+fn ctrlc_handler(shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>) {
     // On Windows, use a simple thread-based approach for Ctrl-C
     std::thread::spawn(move || {
         // This is a simplified handler; production code would use SetConsoleCtrlHandler
@@ -238,5 +248,4 @@ fn ctrlc_handler(shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Res
             }
         }
     });
-    Ok(())
 }

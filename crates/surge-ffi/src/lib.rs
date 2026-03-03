@@ -158,16 +158,24 @@ fn make_pack_progress(phase: i32, items_done: i32, items_total: i32) -> SurgePro
     }
 }
 
-/// Convert a nullable C string pointer to a Rust `&str`, defaulting to `""`.
+fn to_lossy_cstring(value: &str) -> CString {
+    let mut bytes = value.as_bytes().to_vec();
+    bytes.retain(|b| *b != 0);
+    CString::new(bytes).unwrap_or_default()
+}
+
+/// Convert a nullable C string pointer to an owned UTF-8 string.
 ///
 /// # Safety
 ///
 /// `p` must be null or point to a valid NUL-terminated C string.
-unsafe fn cstr_to_str<'a>(p: *const c_char) -> &'a str {
+unsafe fn cstr_to_string(p: *const c_char) -> String {
     if p.is_null() {
-        ""
+        String::new()
     } else {
-        unsafe { CStr::from_ptr(p) }.to_str().unwrap_or("")
+        // SAFETY: Caller guarantees `p` is either null (handled above) or
+        // a valid NUL-terminated C string.
+        unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
     }
 }
 
@@ -250,7 +258,7 @@ unsafe fn collect_argv(argc: c_int, argv: *const *const c_char) -> Vec<String> {
         if arg_ptr.is_null() {
             continue;
         }
-        args.push(unsafe { cstr_to_str(arg_ptr) }.to_string());
+        args.push(unsafe { cstr_to_string(arg_ptr) });
     }
     args
 }
@@ -337,15 +345,15 @@ pub unsafe extern "C" fn surge_config_set_storage(
             return set_ctx_error(ctx, &e);
         };
 
-        let bucket_s = unsafe { cstr_to_str(bucket) };
-        let region_s = unsafe { cstr_to_str(region) };
-        let access_s = unsafe { cstr_to_str(access_key) };
-        let secret_s = unsafe { cstr_to_str(secret_key) };
-        let endpoint_s = unsafe { cstr_to_str(endpoint) };
+        let bucket_s = unsafe { cstr_to_string(bucket) };
+        let region_s = unsafe { cstr_to_string(region) };
+        let access_s = unsafe { cstr_to_string(access_key) };
+        let secret_s = unsafe { cstr_to_string(secret_key) };
+        let endpoint_s = unsafe { cstr_to_string(endpoint) };
 
         handle
             .ctx
-            .set_storage(prov, bucket_s, region_s, access_s, secret_s, endpoint_s);
+            .set_storage(prov, &bucket_s, &region_s, &access_s, &secret_s, &endpoint_s);
         SURGE_OK
     }))
 }
@@ -361,8 +369,8 @@ pub unsafe extern "C" fn surge_config_set_lock_server(ctx: *mut SurgeContextHand
         let handle = unsafe { &*ctx };
         handle.clear_last_error();
 
-        let url_s = unsafe { cstr_to_str(url) };
-        handle.ctx.set_lock_server(url_s);
+        let url_s = unsafe { cstr_to_string(url) };
+        handle.ctx.set_lock_server(&url_s);
         SURGE_OK
     }))
 }
@@ -415,10 +423,10 @@ pub unsafe extern "C" fn surge_update_manager_create(
         let handle = unsafe { &*ctx };
         handle.clear_last_error();
 
-        let app_id_s = unsafe { cstr_to_str(app_id) }.to_string();
-        let version_s = unsafe { cstr_to_str(current_version) }.to_string();
-        let channel_s = unsafe { cstr_to_str(channel) }.to_string();
-        let install_s = unsafe { cstr_to_str(install_dir) }.to_string();
+        let app_id_s = unsafe { cstr_to_string(app_id) };
+        let version_s = unsafe { cstr_to_string(current_version) };
+        let channel_s = unsafe { cstr_to_string(channel) };
+        let install_s = unsafe { cstr_to_string(install_dir) };
 
         if app_id_s.is_empty() || version_s.is_empty() || channel_s.is_empty() || install_s.is_empty() {
             let e =
@@ -467,7 +475,8 @@ pub unsafe extern "C" fn surge_update_manager_set_channel(
         let mgr_ref = unsafe { &mut *mgr };
         clear_shared_error(&mgr_ref.ctx, &mgr_ref.last_error);
 
-        let channel_s = unsafe { cstr_to_str(channel) }.trim().to_string();
+        let channel_s = unsafe { cstr_to_string(channel) };
+        let channel_s = channel_s.trim().to_string();
         if channel_s.is_empty() {
             let e = surge_core::error::SurgeError::Config("channel is required".into());
             return set_shared_error(&mgr_ref.ctx, &mgr_ref.last_error, &e);
@@ -492,7 +501,8 @@ pub unsafe extern "C" fn surge_update_manager_set_current_version(
         let mgr_ref = unsafe { &mut *mgr };
         clear_shared_error(&mgr_ref.ctx, &mgr_ref.last_error);
 
-        let version_s = unsafe { cstr_to_str(current_version) }.trim().to_string();
+        let version_s = unsafe { cstr_to_string(current_version) };
+        let version_s = version_s.trim().to_string();
         if version_s.is_empty() {
             let e = surge_core::error::SurgeError::Config("current_version is required".into());
             return set_shared_error(&mgr_ref.ctx, &mgr_ref.last_error, &e);
@@ -660,7 +670,7 @@ pub unsafe extern "C" fn surge_releases_count(info: *const SurgeReleasesInfoHand
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let h = unsafe { &*info };
-        h.releases.len() as i32
+        i32::try_from(h.releases.len()).unwrap_or(i32::MAX)
     }));
 
     result.unwrap_or(0)
@@ -791,7 +801,13 @@ pub unsafe extern "C" fn surge_bsdiff(ctx: *mut SurgeBsdiffCtxFfi) -> i32 {
                 let boxed = patch.into_boxed_slice();
                 let ptr = Box::into_raw(boxed).cast::<u8>();
                 c.patch = ptr;
-                c.patch_size = len as i64;
+                let Some(patch_size) = i64::try_from(len).ok() else {
+                    c.patch = ptr::null_mut();
+                    c.patch_size = 0;
+                    c.status = SURGE_ERROR;
+                    return SURGE_ERROR;
+                };
+                c.patch_size = patch_size;
                 c.status = SURGE_OK;
                 SURGE_OK
             }
@@ -841,7 +857,13 @@ pub unsafe extern "C" fn surge_bspatch(ctx: *mut SurgeBspatchCtxFfi) -> i32 {
                 let boxed = newer.into_boxed_slice();
                 let ptr = Box::into_raw(boxed).cast::<u8>();
                 c.newer = ptr;
-                c.newer_size = len as i64;
+                let Some(newer_size) = i64::try_from(len).ok() else {
+                    c.newer = ptr::null_mut();
+                    c.newer_size = 0;
+                    c.status = SURGE_ERROR;
+                    return SURGE_ERROR;
+                };
+                c.newer_size = newer_size;
                 c.status = SURGE_OK;
                 SURGE_OK
             }
@@ -925,11 +947,11 @@ pub unsafe extern "C" fn surge_pack_create(
         let handle = unsafe { &*ctx };
         handle.clear_last_error();
 
-        let manifest_s = unsafe { cstr_to_str(manifest_path) }.to_string();
-        let app_id_s = unsafe { cstr_to_str(app_id) }.to_string();
-        let rid_s = unsafe { cstr_to_str(rid) }.to_string();
-        let version_s = unsafe { cstr_to_str(version) }.to_string();
-        let artifacts_s = unsafe { cstr_to_str(artifacts_dir) }.to_string();
+        let manifest_s = unsafe { cstr_to_string(manifest_path) };
+        let app_id_s = unsafe { cstr_to_string(app_id) };
+        let rid_s = unsafe { cstr_to_string(rid) };
+        let version_s = unsafe { cstr_to_string(version) };
+        let artifacts_s = unsafe { cstr_to_string(artifacts_dir) };
 
         if manifest_s.is_empty() || app_id_s.is_empty() || version_s.is_empty() || artifacts_s.is_empty() {
             let e = surge_core::error::SurgeError::Config(
@@ -1031,7 +1053,7 @@ pub unsafe extern "C" fn surge_pack_push(
             return SURGE_CANCELLED;
         }
 
-        let channel_s = unsafe { cstr_to_str(channel) };
+        let channel_s = unsafe { cstr_to_string(channel) };
 
         // Take the builder that was stored by surge_pack_build.
         let builder = {
@@ -1057,7 +1079,7 @@ pub unsafe extern "C" fn surge_pack_push(
 
         let result = pack
             .runtime
-            .block_on(builder.push(channel_s, progress_fn.as_ref().map(|f| f as &dyn Fn(i32, i32))));
+            .block_on(builder.push(&channel_s, progress_fn.as_ref().map(|f| f as &dyn Fn(i32, i32))));
 
         match result {
             Ok(()) => SURGE_OK,
@@ -1104,15 +1126,15 @@ pub unsafe extern "C" fn surge_lock_acquire(
             return SURGE_CANCELLED;
         }
 
-        let name_s = unsafe { cstr_to_str(name) };
+        let name_s = unsafe { cstr_to_string(name) };
 
-        let mut mutex = DistributedMutex::new(handle.ctx.clone(), name_s);
+        let mut mutex = DistributedMutex::new(handle.ctx.clone(), &name_s);
         let result = handle.runtime.block_on(mutex.try_acquire(timeout_seconds));
 
         match result {
             Ok(true) => {
                 let token = mutex.challenge().unwrap_or("");
-                let c_challenge = CString::new(token).unwrap_or_default();
+                let c_challenge = to_lossy_cstring(token);
                 let len = c_challenge.as_bytes_with_nul().len();
                 let buf = unsafe { libc_malloc(len) }.cast::<c_char>();
                 if buf.is_null() {
@@ -1149,11 +1171,11 @@ pub unsafe extern "C" fn surge_lock_release(
         let handle = unsafe { &*ctx };
         handle.clear_last_error();
 
-        let name_s = unsafe { cstr_to_str(name) };
-        let challenge_s = unsafe { cstr_to_str(challenge) };
+        let name_s = unsafe { cstr_to_string(name) };
+        let challenge_s = unsafe { cstr_to_string(challenge) };
 
-        let mut mutex = DistributedMutex::new(handle.ctx.clone(), name_s);
-        mutex.set_challenge(challenge_s.to_string());
+        let mut mutex = DistributedMutex::new(handle.ctx.clone(), &name_s);
+        mutex.set_challenge(challenge_s);
 
         let result = handle.runtime.block_on(mutex.try_release());
 
@@ -1182,17 +1204,17 @@ pub unsafe extern "C" fn surge_supervisor_start(
             return SURGE_ERROR;
         }
 
-        let exe_s = unsafe { cstr_to_str(exe_path) };
-        let wd_s = unsafe { cstr_to_str(working_dir) };
-        let sup_id = unsafe { cstr_to_str(supervisor_id) };
+        let exe_s = unsafe { cstr_to_string(exe_path) };
+        let wd_s = unsafe { cstr_to_string(working_dir) };
+        let sup_id = unsafe { cstr_to_string(supervisor_id) };
 
         // Collect argv into a Vec<&str>.
         let args_owned = unsafe { collect_argv(argc, argv) };
         let args: Vec<&str> = args_owned.iter().map(String::as_str).collect();
 
-        let mut supervisor = Supervisor::new(sup_id, wd_s);
+        let mut supervisor = Supervisor::new(&sup_id, &wd_s);
 
-        match supervisor.start(exe_s, wd_s, &args) {
+        match supervisor.start(&exe_s, &wd_s, &args) {
             Ok(()) => SURGE_OK,
             Err(e) => {
                 tracing::error!("supervisor_start failed: {e}");
@@ -1249,7 +1271,7 @@ pub unsafe extern "C" fn surge_process_events(
                         && let Some(cb) = on_updated
                     {
                         let ver = &arg["--surge-updated=".len()..];
-                        let version = CString::new(ver).unwrap_or_default();
+                        let version = to_lossy_cstring(ver);
                         unsafe { cb(version.as_ptr(), user_data) };
                     }
                 }

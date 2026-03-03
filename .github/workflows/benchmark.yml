@@ -36,8 +36,6 @@ jobs:
           submodules: true
 
       - uses: Swatinem/rust-cache@v2
-        with:
-          key: bench-${{ matrix.profile }}
 
       - name: Build benchmark
         run: cargo build --release -p surge-bench

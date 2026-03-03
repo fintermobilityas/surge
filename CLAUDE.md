@@ -12,7 +12,7 @@ Surge is a Rust application update framework. It uses direct cloud storage (S3, 
 - `crates/surge-ffi/` - C API cdylib (`libsurge.so` / `surge.dll` / `libsurge.dylib`)
 - `crates/surge-cli/` - CLI tool (`surge` binary)
 - `crates/surge-supervisor/` - Process supervisor binary
-- `vendor/bsdiff/` - Vendored bsdiff library (do not modify)
+- `vendor/bsdiff/` - bsdiff library (git submodule from `fintermobilityas/bsdiff`; do not modify)
 - `dotnet/Surge.NET/` - .NET wrapper (netstandard2.0 + net10.0)
 - `dotnet/Surge.NET.Tests/` - .NET xUnit tests
 - `demoapp/` - .NET demo application
@@ -73,7 +73,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 - Use `tokio` for async runtime
 - Use `serde` for serialization (YAML manifests, JSON APIs)
 - Use `reqwest` with `rustls-tls` for HTTP (no OpenSSL dependency)
-- Vendored bsdiff compiled via `cc` crate in `build.rs`
+- bsdiff via git submodule, compiled via `cc` crate in `build.rs`
 - All strings are UTF-8
 
 ### C API (`surge_api.h`)

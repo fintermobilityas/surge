@@ -456,6 +456,8 @@ surge tailscale     Resolve and transfer packages to a Tailscale node
 ```
 
 If the manifest has one app, `--app-id` is optional. If the app has one target, `--rid` is optional.
+`surge list` now defaults to a status overview table. For multi-app manifests it shows one row per app/rid by default;
+use `--app-id` (and optionally `--rid`) to scope down.
 
 `surge restore` also supports installer-only generation (snapx-style `restore -i`) from existing full packages:
 

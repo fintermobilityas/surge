@@ -38,6 +38,19 @@ impl SurgeErrorFfi {
     }
 }
 
+/// Thread-safe owned error state shared between related FFI handles.
+pub struct SurgeErrorOwned {
+    pub code: i32,
+    pub message: CString,
+}
+
+impl SurgeErrorOwned {
+    pub fn new(code: i32, msg: &str) -> Self {
+        let message = CString::new(msg).unwrap_or_else(|_| CString::new("(invalid utf-8 in error message)").unwrap());
+        Self { code, message }
+    }
+}
+
 // ---------------------------------------------------------------------------
 //  Context handle
 // ---------------------------------------------------------------------------
@@ -47,30 +60,53 @@ impl SurgeErrorFfi {
 /// Returned by `surge_context_create`, destroyed by `surge_context_destroy`.
 pub struct SurgeContextHandle {
     pub ctx: Arc<Context>,
-    pub runtime: tokio::runtime::Runtime,
+    pub runtime: Arc<tokio::runtime::Runtime>,
+    /// Cached FFI shape used by `surge_context_last_error`.
+    pub last_error: Mutex<Option<SurgeErrorFfi>>,
     /// Cached last-error for FFI return.
     ///
     /// The returned pointer from `surge_context_last_error` remains valid
     /// until the next API call mutates this slot.
-    pub last_error: Mutex<Option<SurgeErrorFfi>>,
+    pub shared_last_error: Arc<Mutex<Option<SurgeErrorOwned>>>,
 }
 
 impl SurgeContextHandle {
     /// Store an error so that `surge_context_last_error` can return it.
     pub fn set_last_error(&self, code: i32, msg: &str) {
+        {
+            let mut shared = self.shared_last_error.lock().unwrap();
+            *shared = Some(SurgeErrorOwned::new(code, msg));
+        }
         let mut slot = self.last_error.lock().unwrap();
         *slot = Some(SurgeErrorFfi::new(code, msg));
     }
 
     /// Clear any previously stored error.
     pub fn clear_last_error(&self) {
+        {
+            let mut shared = self.shared_last_error.lock().unwrap();
+            *shared = None;
+        }
         let mut slot = self.last_error.lock().unwrap();
         *slot = None;
     }
 
     /// Return a pointer to the cached error, or null if none.
     pub fn get_last_error(&self) -> *const SurgeErrorFfi {
-        let slot = self.last_error.lock().unwrap();
+        let snapshot = {
+            let shared = self.shared_last_error.lock().unwrap();
+            shared.as_ref().map(|e| (e.code, e.message.clone()))
+        };
+
+        let mut slot = self.last_error.lock().unwrap();
+        *slot = snapshot.map(|(code, message)| {
+            let ptr = message.as_ptr();
+            SurgeErrorFfi {
+                code,
+                message: ptr,
+                _message_owned: message,
+            }
+        });
         match slot.as_ref() {
             Some(e) => std::ptr::from_ref::<SurgeErrorFfi>(e),
             None => std::ptr::null(),
@@ -84,10 +120,11 @@ impl SurgeContextHandle {
 
 /// Opaque handle for the update manager.
 ///
-/// Holds a raw pointer back to its parent `SurgeContextHandle` so that async
-/// operations can use the tokio runtime and the `Context`.
+/// Clones shared context/runtime/error state from `surge_context_create`.
 pub struct SurgeUpdateManagerHandle {
-    pub ctx_handle: *const SurgeContextHandle,
+    pub ctx: Arc<Context>,
+    pub runtime: Arc<tokio::runtime::Runtime>,
+    pub last_error: Arc<Mutex<Option<SurgeErrorOwned>>>,
     pub app_id: String,
     pub current_version: String,
     pub channel: String,
@@ -139,7 +176,9 @@ impl SurgeReleasesInfoHandle {
 
 /// Opaque handle for the pack builder.
 pub struct SurgePackContextHandle {
-    pub ctx_handle: *const SurgeContextHandle,
+    pub ctx: Arc<Context>,
+    pub runtime: Arc<tokio::runtime::Runtime>,
+    pub last_error: Arc<Mutex<Option<SurgeErrorOwned>>>,
     pub manifest_path: String,
     pub app_id: String,
     pub rid: String,

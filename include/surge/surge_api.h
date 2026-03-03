@@ -62,7 +62,8 @@ typedef enum surge_storage_provider {
     SURGE_STORAGE_S3 = 0,
     SURGE_STORAGE_AZURE_BLOB = 1,
     SURGE_STORAGE_GCS = 2,
-    SURGE_STORAGE_FILESYSTEM = 3
+    SURGE_STORAGE_FILESYSTEM = 3,
+    SURGE_STORAGE_GITHUB_RELEASES = 4
 } surge_storage_provider;
 
 /* -------------------------------------------------------------------------- */

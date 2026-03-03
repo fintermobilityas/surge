@@ -110,7 +110,17 @@ impl SurgeManifest {
         }
 
         let provider = self.storage.provider.to_lowercase();
-        if !["s3", "azure", "gcs", "filesystem"].contains(&provider.as_str()) {
+        if ![
+            "s3",
+            "azure",
+            "gcs",
+            "filesystem",
+            "github",
+            "github_releases",
+            "github-releases",
+        ]
+        .contains(&provider.as_str())
+        {
             return Err(SurgeError::Config(format!(
                 "Unknown storage provider: {}",
                 self.storage.provider

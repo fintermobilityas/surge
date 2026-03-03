@@ -31,7 +31,7 @@ enum Commands {
         #[arg(long)]
         name: Option<String>,
 
-        /// Storage provider (s3, azure, gcs, filesystem)
+        /// Storage provider (s3, azure, gcs, filesystem, github_releases)
         #[arg(long, default_value = "filesystem")]
         provider: String,
 

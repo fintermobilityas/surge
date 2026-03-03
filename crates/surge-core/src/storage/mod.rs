@@ -1,6 +1,7 @@
 pub mod azure;
 pub mod filesystem;
 pub mod gcs;
+pub mod github_releases;
 pub mod s3;
 
 use crate::context::{StorageConfig, StorageProvider};
@@ -78,6 +79,7 @@ pub fn create_storage_backend(config: &StorageConfig) -> Result<Box<dyn StorageB
         Some(StorageProvider::S3) => Ok(Box::new(s3::S3Backend::new(config)?)),
         Some(StorageProvider::AzureBlob) => Ok(Box::new(azure::AzureBlobBackend::new(config)?)),
         Some(StorageProvider::Gcs) => Ok(Box::new(gcs::GcsBackend::new(config)?)),
+        Some(StorageProvider::GitHubReleases) => Ok(Box::new(github_releases::GitHubReleasesBackend::new(config)?)),
         None => Err(SurgeError::Config("No storage provider configured".to_string())),
     }
 }

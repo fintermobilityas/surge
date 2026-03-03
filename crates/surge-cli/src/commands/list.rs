@@ -72,6 +72,7 @@ fn build_storage_config(manifest: &SurgeManifest) -> Result<StorageConfig> {
         "azure" => StorageProvider::AzureBlob,
         "gcs" => StorageProvider::Gcs,
         "filesystem" => StorageProvider::Filesystem,
+        "github" | "github_releases" | "github-releases" => StorageProvider::GitHubReleases,
         other => return Err(SurgeError::Config(format!("Unknown storage provider: {other}"))),
     };
 

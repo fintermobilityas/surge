@@ -63,6 +63,7 @@ fn configure_context(manifest: &SurgeManifest) -> Result<Context> {
         "azure" => surge_core::context::StorageProvider::AzureBlob,
         "gcs" => surge_core::context::StorageProvider::Gcs,
         "filesystem" => surge_core::context::StorageProvider::Filesystem,
+        "github" | "github_releases" | "github-releases" => surge_core::context::StorageProvider::GitHubReleases,
         other => return Err(SurgeError::Config(format!("Unknown storage provider: {other}"))),
     };
 

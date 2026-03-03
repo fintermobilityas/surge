@@ -26,7 +26,7 @@ namespace Surge
         public string InstallDirectory { get; init; } = "";
 
         /// <summary>
-        /// Storage provider used for updates (filesystem, s3, azure, gcs).
+        /// Storage provider used for updates (filesystem, s3, azure, gcs, github_releases).
         /// </summary>
         public string StorageProvider { get; init; } = "";
 

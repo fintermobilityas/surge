@@ -263,6 +263,11 @@ namespace Surge
                 case "filesystem":
                 case "":
                     return 3;
+                case "github":
+                case "github_releases":
+                case "github-releases":
+                case "githubreleases":
+                    return 4;
                 default:
                     throw new InvalidOperationException($"Unsupported storage provider: {provider}");
             }

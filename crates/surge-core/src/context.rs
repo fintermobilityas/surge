@@ -12,6 +12,7 @@ pub enum StorageProvider {
     AzureBlob = 1,
     Gcs = 2,
     Filesystem = 3,
+    GitHubReleases = 4,
 }
 
 impl StorageProvider {
@@ -21,6 +22,7 @@ impl StorageProvider {
             1 => Some(Self::AzureBlob),
             2 => Some(Self::Gcs),
             3 => Some(Self::Filesystem),
+            4 => Some(Self::GitHubReleases),
             _ => None,
         }
     }

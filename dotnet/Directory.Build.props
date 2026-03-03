@@ -3,6 +3,10 @@
     <Version>0.1.0</Version>
     <Authors>Finter As</Authors>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/fintermobilityas/surge</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/fintermobilityas/surge</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
     <LangVersion>latest</LangVersion>
     <Nullable>enable</Nullable>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>

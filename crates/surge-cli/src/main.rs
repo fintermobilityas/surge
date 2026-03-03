@@ -188,7 +188,7 @@ enum Commands {
         dest_manifest: PathBuf,
     },
 
-    /// Restore releases from backup or build installers from existing packages
+    /// Restore releases from local packages or build installers from existing packages
     Restore {
         /// Application ID (auto-selected when manifest has exactly one app)
         #[arg(long)]
@@ -209,10 +209,6 @@ enum Commands {
         /// Path to build artifacts directory (defaults to .surge/artifacts/<app>/<rid>/<version> with --installers)
         #[arg(long)]
         artifacts_dir: Option<PathBuf>,
-
-        /// Path to backup directory
-        #[arg(long, required_unless_present = "installers", conflicts_with = "installers")]
-        backup_dir: Option<PathBuf>,
 
         /// Directory containing built packages (used with --installers)
         #[arg(long, default_value = ".surge/packages", requires = "installers")]
@@ -475,7 +471,6 @@ async fn run(cli: Cli) -> surge_core::error::Result<()> {
             app_id,
             rid,
             version,
-            backup_dir,
             installers,
             artifacts_dir,
             packages_dir,
@@ -491,17 +486,13 @@ async fn run(cli: Cli) -> surge_core::error::Result<()> {
                 )
                 .await
             } else {
-                let backup_dir = backup_dir.as_deref().ok_or_else(|| {
-                    surge_core::error::SurgeError::Config(
-                        "--backup-dir is required unless --installers is used".to_string(),
-                    )
-                })?;
+                let packages_dir = PathBuf::from(".surge/packages");
                 commands::restore::execute(
                     &manifest_path,
                     app_id.as_deref(),
                     rid.as_deref(),
                     version.as_deref(),
-                    backup_dir,
+                    packages_dir.as_path(),
                 )
                 .await
             }

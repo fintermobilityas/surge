@@ -8,13 +8,13 @@ use surge_core::config::manifest::SurgeManifest;
 use surge_core::error::{Result, SurgeError};
 use surge_core::storage;
 
-/// Restore releases from a local backup directory to storage.
+/// Restore releases from a local packages directory to storage.
 pub async fn execute(
     manifest_path: &Path,
     app_id: Option<&str>,
     rid: Option<&str>,
     version: Option<&str>,
-    backup_dir: &Path,
+    packages_dir: &Path,
 ) -> Result<()> {
     const TOTAL_STAGES: usize = 5;
 
@@ -29,10 +29,10 @@ pub async fn execute(
     let storage_config = super::build_app_scoped_storage_config(&manifest, &app_id)?;
     let backend = storage::create_storage_backend(&storage_config)?;
 
-    if !backup_dir.is_dir() {
+    if !packages_dir.is_dir() {
         return Err(SurgeError::Storage(format!(
-            "Backup directory does not exist: {}",
-            backup_dir.display()
+            "Packages directory does not exist: {}",
+            packages_dir.display()
         )));
     }
 
@@ -50,9 +50,9 @@ pub async fn execute(
         theme,
         2,
         TOTAL_STAGES,
-        &format!("Scanning backup directory {}", backup_dir.display()),
+        &format!("Scanning packages directory {}", packages_dir.display()),
     );
-    let files = walkdir(backup_dir)?;
+    let files = walkdir(packages_dir)?;
     let mut summary = RestoreSummary {
         scanned: files.len(),
         ..RestoreSummary::default()
@@ -65,7 +65,7 @@ pub async fn execute(
     );
 
     print_stage(theme, 3, TOTAL_STAGES, "Filtering files for selected app/rid/version");
-    let candidates = collect_restore_candidates(&files, backup_dir, &app_id, &rid, requested_version)?;
+    let candidates = collect_restore_candidates(&files, packages_dir, &app_id, &rid, requested_version)?;
     summary.matched = candidates.len();
     summary.total_bytes = candidates.iter().map(|candidate| candidate.size_bytes).sum();
     let skipped = summary.skipped();
@@ -164,7 +164,7 @@ struct RestoreCandidate {
 
 fn collect_restore_candidates(
     entries: &[std::path::PathBuf],
-    backup_dir: &Path,
+    packages_dir: &Path,
     app_id: &str,
     rid: &str,
     version: Option<&str>,
@@ -172,7 +172,7 @@ fn collect_restore_candidates(
     let mut candidates = Vec::new();
     for entry in entries {
         let rel_path = entry
-            .strip_prefix(backup_dir)
+            .strip_prefix(packages_dir)
             .map_err(|e| SurgeError::Io(std::io::Error::other(e)))?;
         let key = normalize_key(rel_path);
         if !is_restore_match(&key, app_id, rid, version) {
@@ -302,14 +302,14 @@ apps:
     async fn execute_restores_only_matching_files_and_release_index() {
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
         let store_dir = temp_dir.path().join("store");
-        let backup_dir = temp_dir.path().join("backup");
+        let packages_dir = temp_dir.path().join("packages");
         let manifest_path = temp_dir.path().join("surge.yml");
         let app_id = "demo";
         let version = "1.0.0";
         let rid = current_rid();
 
         std::fs::create_dir_all(&store_dir).expect("store dir should be created");
-        std::fs::create_dir_all(&backup_dir).expect("backup dir should be created");
+        std::fs::create_dir_all(&packages_dir).expect("packages dir should be created");
         write_manifest(&manifest_path, &store_dir, app_id, &rid);
 
         let matching_full = format!("{app_id}-{version}-{rid}-full.tar.zst");
@@ -317,13 +317,13 @@ apps:
         let wrong_version = format!("{app_id}-2.0.0-{rid}-full.tar.zst");
         let wrong_app = format!("other-{version}-{rid}-full.tar.zst");
 
-        std::fs::write(backup_dir.join(RELEASES_FILE_COMPRESSED), b"index").expect("release index should be written");
-        std::fs::write(backup_dir.join(&matching_full), b"full").expect("matching full should be written");
-        std::fs::write(backup_dir.join(&matching_delta), b"delta").expect("matching delta should be written");
-        std::fs::write(backup_dir.join(&wrong_version), b"wrong version").expect("wrong version should be written");
-        std::fs::write(backup_dir.join(&wrong_app), b"wrong app").expect("wrong app should be written");
+        std::fs::write(packages_dir.join(RELEASES_FILE_COMPRESSED), b"index").expect("release index should be written");
+        std::fs::write(packages_dir.join(&matching_full), b"full").expect("matching full should be written");
+        std::fs::write(packages_dir.join(&matching_delta), b"delta").expect("matching delta should be written");
+        std::fs::write(packages_dir.join(&wrong_version), b"wrong version").expect("wrong version should be written");
+        std::fs::write(packages_dir.join(&wrong_app), b"wrong app").expect("wrong app should be written");
 
-        execute(&manifest_path, Some(app_id), Some(&rid), Some(version), &backup_dir)
+        execute(&manifest_path, Some(app_id), Some(&rid), Some(version), &packages_dir)
             .await
             .expect("restore should succeed");
 

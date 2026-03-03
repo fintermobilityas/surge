@@ -459,10 +459,7 @@ pub unsafe extern "C" fn surge_update_manager_set_channel(
 
     catch_ffi(std::panic::AssertUnwindSafe(|| {
         let mgr_ref = unsafe { &mut *mgr };
-        {
-            let mut slot = mgr_ref.last_error.lock().unwrap();
-            *slot = None;
-        }
+        clear_shared_error(&mgr_ref.ctx, &mgr_ref.last_error);
 
         let channel_s = unsafe { cstr_to_str(channel) }.trim().to_string();
         if channel_s.is_empty() {
@@ -487,10 +484,7 @@ pub unsafe extern "C" fn surge_update_manager_set_current_version(
 
     catch_ffi(std::panic::AssertUnwindSafe(|| {
         let mgr_ref = unsafe { &mut *mgr };
-        {
-            let mut slot = mgr_ref.last_error.lock().unwrap();
-            *slot = None;
-        }
+        clear_shared_error(&mgr_ref.ctx, &mgr_ref.last_error);
 
         let version_s = unsafe { cstr_to_str(current_version) }.trim().to_string();
         if version_s.is_empty() {

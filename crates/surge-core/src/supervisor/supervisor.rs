@@ -70,7 +70,7 @@ impl Supervisor {
     }
 
     pub fn start(&mut self, exe_path: &str, working_dir: &str, args: &[&str]) -> Result<()> {
-        if self.is_running() {
+        if self.refresh_running_state() {
             return Err(SurgeError::Supervisor("Process is already running".to_string()));
         }
 
@@ -106,7 +106,7 @@ impl Supervisor {
             return Ok(());
         };
 
-        if !handle.is_running() {
+        if !handle.poll_running() {
             self.info.state = ProcessState::Stopped;
             self.handle = None;
             return Ok(());
@@ -126,7 +126,7 @@ impl Supervisor {
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
         loop {
-            if !handle.is_running() {
+            if !handle.poll_running() {
                 break;
             }
             if std::time::Instant::now() >= deadline {
@@ -160,7 +160,7 @@ impl Supervisor {
             "Restarting supervised process"
         );
 
-        if self.is_running() {
+        if self.refresh_running_state() {
             self.stop(5000)?;
         }
 
@@ -168,9 +168,9 @@ impl Supervisor {
     }
 
     /// Also transitions state to `Crashed` if the process exited unexpectedly.
-    pub fn is_running(&mut self) -> bool {
+    pub fn refresh_running_state(&mut self) -> bool {
         if let Some(handle) = self.handle.as_mut() {
-            if handle.is_running() {
+            if handle.poll_running() {
                 return true;
             }
             if self.info.state == ProcessState::Running {
@@ -208,7 +208,7 @@ mod tests {
     #[test]
     fn test_supervisor_initial_state() {
         let mut sv = Supervisor::new("test-sv", "/tmp/install");
-        assert!(!sv.is_running());
+        assert!(!sv.refresh_running_state());
         assert_eq!(sv.process_info().state, ProcessState::Stopped);
         assert_eq!(sv.process_info().pid, 0);
     }

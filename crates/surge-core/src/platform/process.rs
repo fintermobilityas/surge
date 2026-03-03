@@ -17,7 +17,7 @@ impl ProcessHandle {
         self.child.id()
     }
 
-    pub fn is_running(&mut self) -> bool {
+    pub fn poll_running(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))
     }
 

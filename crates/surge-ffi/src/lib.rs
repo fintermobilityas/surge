@@ -1136,7 +1136,7 @@ pub unsafe extern "C" fn surge_lock_acquire(
                 let token = mutex.challenge().unwrap_or("");
                 let c_challenge = to_lossy_cstring(token);
                 let len = c_challenge.as_bytes_with_nul().len();
-                let buf = unsafe { libc_malloc(len) }.cast::<c_char>();
+                let buf = libc_malloc(len).cast::<c_char>();
                 if buf.is_null() {
                     let e = surge_core::error::SurgeError::Other("malloc failed".into());
                     return set_ctx_error(ctx, &e);
@@ -1309,13 +1309,13 @@ pub unsafe extern "C" fn surge_cancel(ctx: *mut SurgeContextHandle) -> i32 {
 /// Thin wrapper around platform `malloc` for allocating buffers that C callers
 /// will free with `free()`.
 ///
-/// # Safety
-///
 /// Returns a pointer to `size` bytes of uninitialized memory, or null on failure.
-unsafe fn libc_malloc(size: usize) -> *mut u8 {
+fn libc_malloc(size: usize) -> *mut u8 {
     unsafe extern "C" {
         fn malloc(size: usize) -> *mut c_void;
     }
+    // SAFETY: Calling C `malloc` with any `usize` is valid; failure is
+    // reported with a null pointer and handled by callers.
     unsafe { malloc(size).cast::<u8>() }
 }
 

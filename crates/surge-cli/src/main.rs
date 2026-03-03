@@ -80,9 +80,9 @@ enum Commands {
         #[arg(long)]
         rid: Option<String>,
 
-        /// Path to build artifacts directory
+        /// Path to build artifacts directory (defaults to .surge/artifacts/<app>/<rid>/<version>)
         #[arg(long)]
-        artifacts_dir: PathBuf,
+        artifacts_dir: Option<PathBuf>,
 
         /// Output directory for packages
         #[arg(long, short = 'o', default_value = ".surge/packages")]
@@ -186,7 +186,7 @@ enum Commands {
         dest_manifest: PathBuf,
     },
 
-    /// Restore releases from backup
+    /// Restore releases from backup or build installers from existing packages
     Restore {
         /// Application ID (auto-selected when manifest has exactly one app)
         #[arg(long)]
@@ -196,13 +196,25 @@ enum Commands {
         #[arg(long)]
         rid: Option<String>,
 
-        /// Specific version to restore (restores all if omitted)
+        /// Specific version to restore (defaults to latest when using --installers)
         #[arg(long)]
         version: Option<String>,
 
-        /// Path to backup directory
+        /// Build installers only (snapx-compatible restore mode)
+        #[arg(long, short = 'i')]
+        installers: bool,
+
+        /// Path to build artifacts directory (defaults to .surge/artifacts/<app>/<rid>/<version> with --installers)
         #[arg(long)]
-        backup_dir: PathBuf,
+        artifacts_dir: Option<PathBuf>,
+
+        /// Path to backup directory
+        #[arg(long, required_unless_present = "installers", conflicts_with = "installers")]
+        backup_dir: Option<PathBuf>,
+
+        /// Directory containing built packages (used with --installers)
+        #[arg(long, default_value = ".surge/packages", requires = "installers")]
+        packages_dir: PathBuf,
     },
 
     /// Tailscale-assisted install planning and package transfer
@@ -244,6 +256,10 @@ enum TailscaleAction {
         /// Target node (for example: my-node or user@my-node)
         #[arg(long)]
         node: String,
+
+        /// SSH user account used for remote profile detection (optional)
+        #[arg(long)]
+        ssh_user: Option<String>,
 
         /// Application ID (auto-selected when manifest has exactly one app)
         #[arg(long)]
@@ -365,7 +381,7 @@ async fn run(cli: Cli) -> surge_core::error::Result<()> {
                 app_id.as_deref(),
                 &version,
                 rid.as_deref(),
-                &artifacts_dir,
+                artifacts_dir.as_deref(),
                 &output_dir,
             )
             .await
@@ -423,20 +439,41 @@ async fn run(cli: Cli) -> surge_core::error::Result<()> {
             rid,
             version,
             backup_dir,
+            installers,
+            artifacts_dir,
+            packages_dir,
         } => {
-            commands::restore::execute(
-                &manifest_path,
-                app_id.as_deref(),
-                rid.as_deref(),
-                version.as_deref(),
-                &backup_dir,
-            )
-            .await
+            if installers {
+                commands::pack::execute_installers_only(
+                    &manifest_path,
+                    app_id.as_deref(),
+                    version.as_deref(),
+                    rid.as_deref(),
+                    artifacts_dir.as_deref(),
+                    &packages_dir,
+                )
+                .await
+            } else {
+                let backup_dir = backup_dir.as_deref().ok_or_else(|| {
+                    surge_core::error::SurgeError::Config(
+                        "--backup-dir is required unless --installers is used".to_string(),
+                    )
+                })?;
+                commands::restore::execute(
+                    &manifest_path,
+                    app_id.as_deref(),
+                    rid.as_deref(),
+                    version.as_deref(),
+                    backup_dir,
+                )
+                .await
+            }
         }
 
         Commands::Tailscale { action } => match action {
             TailscaleAction::Install {
                 node,
+                ssh_user,
                 app_id,
                 channel,
                 rid,
@@ -447,6 +484,7 @@ async fn run(cli: Cli) -> surge_core::error::Result<()> {
                 commands::tailscale::install_execute(
                     &manifest_path,
                     &node,
+                    ssh_user.as_deref(),
                     app_id.as_deref(),
                     &channel,
                     rid.as_deref(),

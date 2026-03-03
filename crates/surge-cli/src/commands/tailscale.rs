@@ -27,6 +27,7 @@ impl RemoteProfile {
 pub async fn install_execute(
     manifest_path: &Path,
     node: &str,
+    ssh_user: Option<&str>,
     app_id: Option<&str>,
     channel: &str,
     rid: Option<&str>,
@@ -36,11 +37,12 @@ pub async fn install_execute(
 ) -> Result<()> {
     let manifest = SurgeManifest::from_file(manifest_path)?;
     let app_id = super::resolve_app_id(&manifest, app_id)?;
+    let (ssh_target, file_target) = resolve_tailscale_targets(node, ssh_user)?;
 
     let (rid_candidates, profile) = if let Some(requested_rid) = rid.map(str::trim).filter(|r| !r.is_empty()) {
         (vec![requested_rid.to_string()], None)
     } else {
-        let detected = detect_remote_profile(node).await?;
+        let detected = detect_remote_profile(&ssh_target).await?;
         let base_rid = derive_base_rid(&detected).ok_or_else(|| {
             SurgeError::Platform(format!(
                 "Unable to map remote profile to a RID (os='{}', arch='{}'). Use --rid to override.",
@@ -79,7 +81,7 @@ pub async fn install_execute(
 
     if let Some(profile) = &profile {
         println!(
-            "Remote profile for {node}: os={}, arch={}, gpu={}",
+            "Remote profile for {ssh_target}: os={}, arch={}, gpu={}",
             profile.os, profile.arch, profile.gpu
         );
     }
@@ -106,7 +108,9 @@ pub async fn install_execute(
     }
 
     if plan_only {
-        println!("Plan only mode: no transfer performed. Remove --plan-only to download and copy package to {node}.");
+        println!(
+            "Plan only mode: no transfer performed. Remove --plan-only to download and copy package to {file_target}."
+        );
         return Ok(());
     }
 
@@ -119,20 +123,44 @@ pub async fn install_execute(
     );
     backend.download_to_file(full_filename, &local_package, None).await?;
 
-    copy_file_to_tailscale_node(node, &local_package).await?;
+    copy_file_to_tailscale_node(&file_target, &local_package).await?;
     println!(
         "Copied '{}' to node '{}' via tailscale file sharing.",
         local_package.display(),
-        node
+        file_target
     );
     println!(
         "Install hint on node {}: extract '{}' into the install directory for app '{}'.",
-        node,
+        file_target,
         Path::new(full_filename).display(),
         app_id
     );
 
     Ok(())
+}
+
+fn resolve_tailscale_targets(node: &str, ssh_user: Option<&str>) -> Result<(String, String)> {
+    let node = node.trim();
+    if node.is_empty() {
+        return Err(SurgeError::Config(
+            "Tailscale node cannot be empty. Provide --node <node>.".to_string(),
+        ));
+    }
+
+    if let Some((user_part, host_part)) = node.split_once('@') {
+        if user_part.trim().is_empty() || host_part.trim().is_empty() {
+            return Err(SurgeError::Config(format!(
+                "Invalid --node value '{node}'. Expected '<node>' or '<user>@<node>'."
+            )));
+        }
+        return Ok((node.to_string(), host_part.to_string()));
+    }
+
+    if let Some(user) = ssh_user.map(str::trim).filter(|value| !value.is_empty()) {
+        Ok((format!("{user}@{node}"), node.to_string()))
+    } else {
+        Ok((node.to_string(), node.to_string()))
+    }
 }
 
 async fn fetch_release_index(backend: &dyn StorageBackend) -> Result<ReleaseIndex> {
@@ -387,6 +415,27 @@ mod tests {
         assert_eq!(profile.os, "Linux");
         assert_eq!(profile.arch, "x86_64");
         assert!(profile.has_nvidia_gpu());
+    }
+
+    #[test]
+    fn resolve_targets_plain_node_without_user() {
+        let (ssh_target, file_target) = resolve_tailscale_targets("edge-node", None).expect("targets");
+        assert_eq!(ssh_target, "edge-node");
+        assert_eq!(file_target, "edge-node");
+    }
+
+    #[test]
+    fn resolve_targets_plain_node_with_ssh_user() {
+        let (ssh_target, file_target) = resolve_tailscale_targets("edge-node", Some("operator")).expect("targets");
+        assert_eq!(ssh_target, "operator@edge-node");
+        assert_eq!(file_target, "edge-node");
+    }
+
+    #[test]
+    fn resolve_targets_user_at_node_keeps_file_target_host_only() {
+        let (ssh_target, file_target) = resolve_tailscale_targets("alice@edge-node", Some("ignored")).expect("targets");
+        assert_eq!(ssh_target, "alice@edge-node");
+        assert_eq!(file_target, "edge-node");
     }
 
     fn load_reference_manifest_bytes() -> Vec<u8> {

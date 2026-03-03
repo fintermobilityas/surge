@@ -154,7 +154,7 @@ apps:
             Some(app_id),
             version,
             Some(&rid),
-            &artifacts_dir,
+            Some(&artifacts_dir),
             &packages_dir,
         )
         .await

@@ -69,14 +69,17 @@ jobs:
   clippy-pedantic:
     name: clippy pedantic (advisory)
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v6
         with:
           submodules: true
       - uses: Swatinem/rust-cache@v2
       - run: rustup component add clippy
-      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings -W clippy::pedantic
+      - name: Run pedantic audit (non-blocking)
+        run: |
+          cargo clippy --workspace --all-targets --all-features -- -D warnings -W clippy::pedantic || {
+            echo "::warning::Pedantic lint debt detected (non-blocking advisory job)."
+          }
 
   linux:
     name: Linux x64
@@ -209,6 +212,7 @@ jobs:
       - name: Set version
         run: |
           sed -i 's/^version = ".*"/version = "${{ needs.version.outputs.semver }}"/' Cargo.toml
+          sed -i -E 's/(surge-core = \{ path = "crates\/surge-core", version = ").*(" \})/\1${{ needs.version.outputs.semver }}\2/' Cargo.toml
           cargo generate-lockfile
       - name: Publish surge-core
         run: cargo publish -p surge-core --allow-dirty

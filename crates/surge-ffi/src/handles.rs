@@ -89,6 +89,7 @@ impl SurgeContextHandle {
         }
         let mut slot = self.last_error.lock().unwrap();
         *slot = None;
+        self.ctx.clear_error();
     }
 
     /// Return a pointer to the cached error, or null if none.

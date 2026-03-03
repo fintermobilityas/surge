@@ -206,8 +206,18 @@ fn set_shared_error(
     code
 }
 
+fn clear_shared_error(ctx: &Arc<Context>, last_error: &Arc<std::sync::Mutex<Option<SurgeErrorOwned>>>) {
+    let mut slot = last_error.lock().unwrap();
+    *slot = None;
+    ctx.clear_error();
+}
+
 fn try_len(size: i64) -> Option<usize> {
     usize::try_from(size).ok().filter(|len| *len > 0)
+}
+
+fn try_len_allow_zero(size: i64) -> Option<usize> {
+    usize::try_from(size).ok()
 }
 
 fn try_index(index: i32, len: usize) -> Option<usize> {
@@ -506,11 +516,9 @@ pub unsafe extern "C" fn surge_update_check(
     }
 
     catch_ffi(std::panic::AssertUnwindSafe(|| {
+        unsafe { *info = ptr::null_mut() };
         let mgr_ref = unsafe { &*mgr };
-        {
-            let mut slot = mgr_ref.last_error.lock().unwrap();
-            *slot = None;
-        }
+        clear_shared_error(&mgr_ref.ctx, &mgr_ref.last_error);
 
         if mgr_ref.ctx.is_cancelled() {
             return SURGE_CANCELLED;
@@ -580,10 +588,7 @@ pub unsafe extern "C" fn surge_update_download_and_apply(
 
     catch_ffi(std::panic::AssertUnwindSafe(|| {
         let mgr_ref = unsafe { &*mgr };
-        {
-            let mut slot = mgr_ref.last_error.lock().unwrap();
-            *slot = None;
-        }
+        clear_shared_error(&mgr_ref.ctx, &mgr_ref.last_error);
 
         if mgr_ref.ctx.is_cancelled() {
             return SURGE_CANCELLED;
@@ -860,8 +865,8 @@ pub unsafe extern "C" fn surge_bsdiff_free(ctx: *mut SurgeBsdiffCtxFfi) {
 
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let c = unsafe { &mut *ctx };
-        if !c.patch.is_null() && c.patch_size > 0 {
-            let Some(patch_size) = try_len(c.patch_size) else {
+        if !c.patch.is_null() {
+            let Some(patch_size) = try_len_allow_zero(c.patch_size) else {
                 c.patch = ptr::null_mut();
                 c.patch_size = 0;
                 return;
@@ -884,8 +889,8 @@ pub unsafe extern "C" fn surge_bspatch_free(ctx: *mut SurgeBspatchCtxFfi) {
 
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let c = unsafe { &mut *ctx };
-        if !c.newer.is_null() && c.newer_size > 0 {
-            let Some(newer_size) = try_len(c.newer_size) else {
+        if !c.newer.is_null() {
+            let Some(newer_size) = try_len_allow_zero(c.newer_size) else {
                 c.newer = ptr::null_mut();
                 c.newer_size = 0;
                 return;
@@ -965,10 +970,7 @@ pub unsafe extern "C" fn surge_pack_build(
 
     catch_ffi(std::panic::AssertUnwindSafe(|| {
         let pack = unsafe { &*pack_ctx };
-        {
-            let mut slot = pack.last_error.lock().unwrap();
-            *slot = None;
-        }
+        clear_shared_error(&pack.ctx, &pack.last_error);
 
         if pack.ctx.is_cancelled() {
             return SURGE_CANCELLED;
@@ -1023,10 +1025,7 @@ pub unsafe extern "C" fn surge_pack_push(
 
     catch_ffi(std::panic::AssertUnwindSafe(|| {
         let pack = unsafe { &*pack_ctx };
-        {
-            let mut slot = pack.last_error.lock().unwrap();
-            *slot = None;
-        }
+        clear_shared_error(&pack.ctx, &pack.last_error);
 
         if pack.ctx.is_cancelled() {
             return SURGE_CANCELLED;
@@ -1395,5 +1394,82 @@ mod tests {
         assert_eq!(rc, SURGE_OK);
 
         unsafe { surge_update_manager_destroy(mgr) };
+    }
+
+    #[test]
+    fn update_check_clears_output_pointer_on_failure() {
+        let ctx = unsafe { surge_context_create() };
+        assert!(!ctx.is_null());
+
+        let app_id = CString::new("demo").unwrap();
+        let version = CString::new("1.0.0").unwrap();
+        let channel = CString::new("stable").unwrap();
+        let install_dir = CString::new("/tmp/demo").unwrap();
+
+        let mgr = unsafe {
+            surge_update_manager_create(
+                ctx,
+                app_id.as_ptr(),
+                version.as_ptr(),
+                channel.as_ptr(),
+                install_dir.as_ptr(),
+            )
+        };
+        assert!(!mgr.is_null());
+
+        let stale = Box::new(SurgeReleasesInfoHandle {
+            releases: Vec::new(),
+            cached_strings: Vec::new(),
+            update_info: None,
+        });
+        let mut info_ptr = Box::into_raw(stale);
+        assert!(!info_ptr.is_null());
+
+        let rc = unsafe { surge_update_check(mgr, &mut info_ptr) };
+        assert_ne!(rc, SURGE_OK);
+        assert!(info_ptr.is_null());
+
+        unsafe {
+            surge_update_manager_destroy(mgr);
+            surge_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn bspatch_free_releases_zero_length_buffer() {
+        let empty: Box<[u8]> = Vec::new().into_boxed_slice();
+        let ptr = Box::into_raw(empty).cast::<u8>();
+        let mut ctx = SurgeBspatchCtxFfi {
+            older: std::ptr::null(),
+            older_size: 0,
+            newer: ptr,
+            newer_size: 0,
+            patch: std::ptr::null(),
+            patch_size: 0,
+            status: 0,
+        };
+
+        unsafe { surge_bspatch_free(&mut ctx) };
+        assert!(ctx.newer.is_null());
+        assert_eq!(ctx.newer_size, 0);
+    }
+
+    #[test]
+    fn bsdiff_free_releases_zero_length_buffer() {
+        let empty: Box<[u8]> = Vec::new().into_boxed_slice();
+        let ptr = Box::into_raw(empty).cast::<u8>();
+        let mut ctx = SurgeBsdiffCtxFfi {
+            older: std::ptr::null(),
+            older_size: 0,
+            newer: std::ptr::null(),
+            newer_size: 0,
+            patch: ptr,
+            patch_size: 0,
+            status: 0,
+        };
+
+        unsafe { surge_bsdiff_free(&mut ctx) };
+        assert!(ctx.patch.is_null());
+        assert_eq!(ctx.patch_size, 0);
     }
 }

@@ -53,22 +53,19 @@ impl AzureBlobBackend {
             config.secret_key.clone()
         };
 
-        if account_name.is_empty() || account_key.is_empty() {
-            return Err(SurgeError::Config(
-                "Azure Blob storage requires access_key (account name) and secret_key (account key). \
-                 Set AZURE_STORAGE_ACCOUNT_NAME and AZURE_STORAGE_ACCOUNT_KEY environment variables."
-                    .to_string(),
-            ));
-        }
         if config.bucket.is_empty() {
             return Err(SurgeError::Config(
                 "Azure Blob storage requires a container name (bucket)".to_string(),
             ));
         }
 
-        let key_bytes = BASE64
-            .decode(&account_key)
-            .map_err(|e| SurgeError::Config(format!("Azure account key is not valid base64: {e}")))?;
+        let key_bytes = if account_key.is_empty() {
+            Vec::new()
+        } else {
+            BASE64
+                .decode(&account_key)
+                .map_err(|e| SurgeError::Config(format!("Azure account key is not valid base64: {e}")))?
+        };
 
         let endpoint = if config.endpoint.is_empty() {
             format!("https://{account_name}.blob.core.windows.net")
@@ -95,6 +92,22 @@ impl AzureBlobBackend {
             endpoint,
             prefix: config.prefix.clone(),
         })
+    }
+
+    /// Returns `true` when credentials are available for signing requests.
+    fn has_credentials(&self) -> bool {
+        !self.key_bytes.is_empty()
+    }
+
+    /// Return an error when a write is attempted without credentials.
+    fn require_credentials(&self, operation: &str) -> Result<()> {
+        if self.has_credentials() {
+            Ok(())
+        } else {
+            Err(SurgeError::Config(format!(
+                "Azure Blob {operation} requires account credentials"
+            )))
+        }
     }
 
     /// Build the full blob name, prepending the configured prefix.
@@ -253,6 +266,7 @@ impl AzureBlobBackend {
 #[async_trait]
 impl StorageBackend for AzureBlobBackend {
     async fn put_object(&self, key: &str, data: &[u8], content_type: &str) -> Result<()> {
+        self.require_credentials("PUT")?;
         let full_key = self.full_key(key);
         let url = self.blob_url(&full_key);
         let resource_path = format!("/{}/{}", self.container, full_key);
@@ -286,13 +300,14 @@ impl StorageBackend for AzureBlobBackend {
     async fn get_object(&self, key: &str) -> Result<Vec<u8>> {
         let full_key = self.full_key(key);
         let url = self.blob_url(&full_key);
-        let resource_path = format!("/{}/{}", self.container, full_key);
-
-        let headers = self.sign_request("GET", &resource_path, &[], None, "", &[]);
 
         let mut req = self.client.get(&url);
-        for (name, value) in &headers {
-            req = req.header(name.as_str(), value.as_str());
+        if self.has_credentials() {
+            let resource_path = format!("/{}/{}", self.container, full_key);
+            let headers = self.sign_request("GET", &resource_path, &[], None, "", &[]);
+            for (name, value) in &headers {
+                req = req.header(name.as_str(), value.as_str());
+            }
         }
 
         let resp = req.send().await?;
@@ -310,13 +325,14 @@ impl StorageBackend for AzureBlobBackend {
     async fn head_object(&self, key: &str) -> Result<ObjectInfo> {
         let full_key = self.full_key(key);
         let url = self.blob_url(&full_key);
-        let resource_path = format!("/{}/{}", self.container, full_key);
-
-        let headers = self.sign_request("HEAD", &resource_path, &[], None, "", &[]);
 
         let mut req = self.client.head(&url);
-        for (name, value) in &headers {
-            req = req.header(name.as_str(), value.as_str());
+        if self.has_credentials() {
+            let resource_path = format!("/{}/{}", self.container, full_key);
+            let headers = self.sign_request("HEAD", &resource_path, &[], None, "", &[]);
+            for (name, value) in &headers {
+                req = req.header(name.as_str(), value.as_str());
+            }
         }
 
         let resp = req.send().await?;
@@ -359,6 +375,7 @@ impl StorageBackend for AzureBlobBackend {
     }
 
     async fn delete_object(&self, key: &str) -> Result<()> {
+        self.require_credentials("DELETE")?;
         let full_key = self.full_key(key);
         let url = self.blob_url(&full_key);
         let resource_path = format!("/{}/{}", self.container, full_key);
@@ -397,10 +414,6 @@ impl StorageBackend for AzureBlobBackend {
             query_params.push(("marker".to_string(), m.to_string()));
         }
 
-        let resource_path = format!("/{}", self.container);
-
-        let headers = self.sign_request("GET", &resource_path, &query_params, None, "", &[]);
-
         let querystring = query_params
             .iter()
             .map(|(k, v)| format!("{k}={v}"))
@@ -409,8 +422,12 @@ impl StorageBackend for AzureBlobBackend {
 
         let url = format!("{container_url}?{querystring}");
         let mut req = self.client.get(&url);
-        for (name, value) in &headers {
-            req = req.header(name.as_str(), value.as_str());
+        if self.has_credentials() {
+            let resource_path = format!("/{}", self.container);
+            let headers = self.sign_request("GET", &resource_path, &query_params, None, "", &[]);
+            for (name, value) in &headers {
+                req = req.header(name.as_str(), value.as_str());
+            }
         }
 
         let resp = req.send().await?;
@@ -424,13 +441,14 @@ impl StorageBackend for AzureBlobBackend {
     async fn download_to_file(&self, key: &str, dest: &Path, progress: Option<&TransferProgress>) -> Result<()> {
         let full_key = self.full_key(key);
         let url = self.blob_url(&full_key);
-        let resource_path = format!("/{}/{}", self.container, full_key);
-
-        let headers = self.sign_request("GET", &resource_path, &[], None, "", &[]);
 
         let mut req = self.client.get(&url);
-        for (name, value) in &headers {
-            req = req.header(name.as_str(), value.as_str());
+        if self.has_credentials() {
+            let resource_path = format!("/{}/{}", self.container, full_key);
+            let headers = self.sign_request("GET", &resource_path, &[], None, "", &[]);
+            for (name, value) in &headers {
+                req = req.header(name.as_str(), value.as_str());
+            }
         }
 
         let resp = req.send().await?;
@@ -456,6 +474,7 @@ impl StorageBackend for AzureBlobBackend {
     }
 
     async fn upload_from_file(&self, key: &str, src: &Path, progress: Option<&TransferProgress>) -> Result<()> {
+        self.require_credentials("upload")?;
         let data = tokio::fs::read(src).await?;
         let total = data.len() as u64;
         let full_key = self.full_key(key);

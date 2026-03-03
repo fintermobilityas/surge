@@ -190,18 +190,11 @@ fn catch_ffi<F: FnOnce() -> i32 + std::panic::UnwindSafe>(f: F) -> i32 {
 
 /// Store an error on the context handle and return the appropriate error code.
 ///
-fn set_ctx_error(handle: *const SurgeContextHandle, e: &surge_core::error::SurgeError) -> i32 {
-    if handle.is_null() {
-        SURGE_ERROR
-    } else {
-        // SAFETY: `handle` is checked non-null above and is an FFI-owned
-        // `SurgeContextHandle` pointer managed by this API.
-        let h = unsafe { &*handle };
-        let code = e.error_code() as i32;
-        h.set_last_error(code, &e.to_string());
-        h.ctx.set_error(e);
-        code
-    }
+fn set_ctx_error(handle: &SurgeContextHandle, e: &surge_core::error::SurgeError) -> i32 {
+    let code = e.error_code() as i32;
+    handle.set_last_error(code, &e.to_string());
+    handle.ctx.set_error(e);
+    code
 }
 
 fn set_shared_error(
@@ -347,7 +340,7 @@ pub unsafe extern "C" fn surge_config_set_storage(
             p
         } else {
             let e = surge_core::error::SurgeError::Config(format!("Invalid storage provider: {provider}"));
-            return set_ctx_error(ctx, &e);
+            return set_ctx_error(handle, &e);
         };
 
         // SAFETY: C string pointers are nullable by API contract and each
@@ -457,7 +450,7 @@ pub unsafe extern "C" fn surge_update_manager_create(
         if app_id_s.is_empty() || version_s.is_empty() || channel_s.is_empty() || install_s.is_empty() {
             let e =
                 surge_core::error::SurgeError::Config("app_id, version, channel, and install_dir are required".into());
-            set_ctx_error(ctx, &e);
+            set_ctx_error(handle, &e);
             return ptr::null_mut();
         }
 
@@ -1000,7 +993,7 @@ pub unsafe extern "C" fn surge_pack_create(
             let e = surge_core::error::SurgeError::Config(
                 "manifest_path, app_id, version, and artifacts_dir are required".into(),
             );
-            set_ctx_error(ctx, &e);
+            set_ctx_error(handle, &e);
             return ptr::null_mut();
         }
 
@@ -1189,7 +1182,7 @@ pub unsafe extern "C" fn surge_lock_acquire(
                 let buf = libc_malloc(len).cast::<c_char>();
                 if buf.is_null() {
                     let e = surge_core::error::SurgeError::Other("malloc failed".into());
-                    return set_ctx_error(ctx, &e);
+                    return set_ctx_error(handle, &e);
                 }
                 // SAFETY: `buf` points to `len` writable bytes allocated by
                 // malloc above and `c_challenge` contains exactly `len`
@@ -1202,9 +1195,9 @@ pub unsafe extern "C" fn surge_lock_acquire(
             }
             Ok(false) => {
                 let e = surge_core::error::SurgeError::Lock("Lock is held by another process".into());
-                set_ctx_error(ctx, &e)
+                set_ctx_error(handle, &e)
             }
-            Err(e) => set_ctx_error(ctx, &e),
+            Err(e) => set_ctx_error(handle, &e),
         }
     }))
 }
@@ -1236,7 +1229,7 @@ pub unsafe extern "C" fn surge_lock_release(
 
         match result {
             Ok(()) => SURGE_OK,
-            Err(e) => set_ctx_error(ctx, &e),
+            Err(e) => set_ctx_error(handle, &e),
         }
     }))
 }

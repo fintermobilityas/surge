@@ -6,7 +6,6 @@ use std::time::Duration;
 
 use tracing::{debug, info, warn};
 
-use crate::config::constants::RELEASES_FILE_COMPRESSED;
 use crate::context::Context;
 use crate::error::{Result, SurgeError};
 use crate::releases::manifest::{
@@ -14,6 +13,7 @@ use crate::releases::manifest::{
 };
 use crate::releases::version::compare_versions;
 use crate::storage::{StorageBackend, create_storage_backend};
+use crate::config::constants::RELEASES_FILE_COMPRESSED;
 
 /// Progress information for update operations.
 #[derive(Debug, Clone)]
@@ -717,6 +717,7 @@ fn validate_relative_persistent_asset_path(raw: &str) -> Result<PathBuf> {
 mod tests {
     use super::*;
     use crate::archive::packer::ArchivePacker;
+    use crate::config::constants::DEFAULT_ZSTD_LEVEL;
     #[cfg(target_os = "linux")]
     use crate::config::manifest::ShortcutLocation;
     use crate::crypto::sha256::sha256_hex_file;
@@ -922,12 +923,8 @@ mod tests {
             ..ReleaseIndex::default()
         };
 
-        let compressed = compress_release_index(&index, crate::config::constants::DEFAULT_ZSTD_LEVEL).unwrap();
-        std::fs::write(
-            store_root.join(crate::config::constants::RELEASES_FILE_COMPRESSED),
-            compressed,
-        )
-        .unwrap();
+        let compressed = compress_release_index(&index, DEFAULT_ZSTD_LEVEL).unwrap();
+        std::fs::write(store_root.join(RELEASES_FILE_COMPRESSED), compressed).unwrap();
 
         let ctx = Arc::new(Context::new());
         ctx.set_storage(
@@ -967,12 +964,8 @@ mod tests {
             ..ReleaseIndex::default()
         };
 
-        let compressed = compress_release_index(&index, crate::config::constants::DEFAULT_ZSTD_LEVEL).unwrap();
-        std::fs::write(
-            store_root.join(crate::config::constants::RELEASES_FILE_COMPRESSED),
-            compressed,
-        )
-        .unwrap();
+        let compressed = compress_release_index(&index, DEFAULT_ZSTD_LEVEL).unwrap();
+        std::fs::write(store_root.join(RELEASES_FILE_COMPRESSED), compressed).unwrap();
 
         let ctx = Arc::new(Context::new());
         ctx.set_storage(
@@ -1009,12 +1002,8 @@ mod tests {
             ],
             ..ReleaseIndex::default()
         };
-        let compressed = compress_release_index(&index, crate::config::constants::DEFAULT_ZSTD_LEVEL).unwrap();
-        std::fs::write(
-            store_root.join(crate::config::constants::RELEASES_FILE_COMPRESSED),
-            compressed,
-        )
-        .unwrap();
+        let compressed = compress_release_index(&index, DEFAULT_ZSTD_LEVEL).unwrap();
+        std::fs::write(store_root.join(RELEASES_FILE_COMPRESSED), compressed).unwrap();
 
         let ctx = Arc::new(Context::new());
         ctx.set_storage(
@@ -1082,12 +1071,8 @@ mod tests {
             ..ReleaseIndex::default()
         };
 
-        let compressed = compress_release_index(&index, crate::config::constants::DEFAULT_ZSTD_LEVEL).unwrap();
-        std::fs::write(
-            store_root.join(crate::config::constants::RELEASES_FILE_COMPRESSED),
-            compressed,
-        )
-        .unwrap();
+        let compressed = compress_release_index(&index, DEFAULT_ZSTD_LEVEL).unwrap();
+        std::fs::write(store_root.join(RELEASES_FILE_COMPRESSED), compressed).unwrap();
 
         let ctx = Arc::new(Context::new());
         ctx.set_storage(
@@ -1229,12 +1214,8 @@ mod tests {
             ..ReleaseIndex::default()
         };
 
-        let compressed = compress_release_index(&index, crate::config::constants::DEFAULT_ZSTD_LEVEL).unwrap();
-        std::fs::write(
-            store_root.join(crate::config::constants::RELEASES_FILE_COMPRESSED),
-            compressed,
-        )
-        .unwrap();
+        let compressed = compress_release_index(&index, DEFAULT_ZSTD_LEVEL).unwrap();
+        std::fs::write(store_root.join(RELEASES_FILE_COMPRESSED), compressed).unwrap();
 
         let ctx = Arc::new(Context::new());
         ctx.set_storage(
@@ -1310,12 +1291,8 @@ mod tests {
             ..ReleaseIndex::default()
         };
 
-        let compressed = compress_release_index(&index, crate::config::constants::DEFAULT_ZSTD_LEVEL).unwrap();
-        std::fs::write(
-            store_root.join(crate::config::constants::RELEASES_FILE_COMPRESSED),
-            compressed,
-        )
-        .unwrap();
+        let compressed = compress_release_index(&index, DEFAULT_ZSTD_LEVEL).unwrap();
+        std::fs::write(store_root.join(RELEASES_FILE_COMPRESSED), compressed).unwrap();
 
         let ctx = Arc::new(Context::new());
         ctx.set_storage(
@@ -1413,12 +1390,8 @@ mod tests {
             ..ReleaseIndex::default()
         };
 
-        let compressed = compress_release_index(&index, crate::config::constants::DEFAULT_ZSTD_LEVEL).unwrap();
-        std::fs::write(
-            store_root.join(crate::config::constants::RELEASES_FILE_COMPRESSED),
-            compressed,
-        )
-        .unwrap();
+        let compressed = compress_release_index(&index, DEFAULT_ZSTD_LEVEL).unwrap();
+        std::fs::write(store_root.join(RELEASES_FILE_COMPRESSED), compressed).unwrap();
 
         let ctx = Arc::new(Context::new());
         ctx.set_storage(

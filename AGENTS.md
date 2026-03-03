@@ -28,6 +28,21 @@ dotnet build dotnet/Surge.slnx --configuration Release
 dotnet test dotnet/Surge.slnx --configuration Release
 ```
 
+## Mandatory Pre-Push Validation
+Before any push, run the same quality gates CI uses. Do not push if any command fails.
+
+```bash
+cargo fmt --all -- --check
+RUSTFLAGS="-D warnings" cargo test --workspace
+cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --workspace --lib --bins --examples -- -D warnings -D clippy::unwrap_used -D clippy::expect_used
+cargo clippy --workspace --all-targets --all-features -- -D warnings -W clippy::pedantic
+dotnet format dotnet/Surge.slnx --verify-no-changes
+dotnet test dotnet/Surge.slnx --configuration Release
+```
+
+If the local environment cannot run a listed command, document the exact gap in the PR and run it in CI before merge.
+
 ## Rust Quality Bar (Best Practices)
 - Prefer self-documenting code: clear types, names, and small functions over explanatory comments.
 - Use comments sparingly; add them only for invariants, non-obvious tradeoffs, or safety contracts.

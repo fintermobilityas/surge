@@ -11,6 +11,7 @@ use crate::config::constants::{RELEASES_FILE_COMPRESSED, SCHEMA_VERSION};
 use crate::config::manifest::{ShortcutLocation, SurgeManifest};
 use crate::context::Context;
 use crate::crypto::sha256::sha256_hex_file;
+use crate::diff::wrapper::bsdiff_buffers;
 use crate::error::{Result, SurgeError};
 use crate::releases::manifest::{ReleaseEntry, ReleaseIndex, compress_release_index, decompress_release_index};
 use crate::releases::restore::{find_previous_release_for_rid, restore_full_archive_for_version};
@@ -276,7 +277,7 @@ impl PackBuilder {
         let new_data = std::fs::read(&full_artifact.path)?;
 
         // Compute bsdiff
-        let patch = crate::diff::wrapper::bsdiff_buffers(&prev_data, &new_data)?;
+        let patch = bsdiff_buffers(&prev_data, &new_data)?;
 
         let delta_filename = format!("{}-{}-{}-delta.tar.zst", self.app_id, self.version, self.rid);
         let output_dir = self.artifacts_dir.parent().unwrap_or(Path::new("."));
@@ -374,6 +375,7 @@ mod tests {
     use crate::config::constants::{DEFAULT_ZSTD_LEVEL, RELEASES_FILE_COMPRESSED};
     use crate::context::StorageProvider;
     use crate::crypto::sha256::sha256_hex;
+    use crate::platform::detect::current_rid;
     use crate::releases::manifest::{ReleaseEntry, ReleaseIndex, compress_release_index};
 
     #[test]
@@ -408,7 +410,7 @@ mod tests {
         std::fs::write(artifacts_root.join("payload.txt"), b"v3 payload").unwrap();
 
         let app_id = "demo";
-        let rid = crate::platform::detect::current_rid();
+        let rid = current_rid();
         let manifest_path = tmp.path().join("surge.yml");
         let manifest_yaml = format!(
             r"schema: 1
@@ -432,7 +434,7 @@ apps:
         packer_v2.add_buffer("payload.txt", b"v2 payload", 0o644).unwrap();
         let full_v2 = packer_v2.finalize().unwrap();
 
-        let patch_v2 = crate::diff::wrapper::bsdiff_buffers(&full_v1, &full_v2).unwrap();
+        let patch_v2 = bsdiff_buffers(&full_v1, &full_v2).unwrap();
         let delta_v2 = zstd::encode_all(patch_v2.as_slice(), 3).unwrap();
 
         let full_v1_name = format!("{app_id}-1.0.0-{rid}-full.tar.zst");

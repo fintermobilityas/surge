@@ -13,6 +13,11 @@ use surge_core::config::manifest::SurgeManifest;
 use surge_core::context::{Context, StorageConfig, StorageProvider};
 use surge_core::error::{Result, SurgeError};
 
+pub(crate) struct StorageCredentials {
+    pub access_key: String,
+    pub secret_key: String,
+}
+
 pub(crate) fn resolve_app_id(manifest: &SurgeManifest, requested_app_id: Option<&str>) -> Result<String> {
     if let Some(app_id) = requested_app_id.map(str::trim).filter(|value| !value.is_empty()) {
         return Ok(app_id.to_string());
@@ -51,15 +56,15 @@ pub(crate) fn resolve_rid(manifest: &SurgeManifest, app_id: &str, requested_rid:
 
 pub(crate) fn build_storage_context(manifest: &SurgeManifest) -> Result<Context> {
     let provider = parse_storage_provider(&manifest.storage.provider)?;
-    let (access_key, secret_key) = storage_credentials_from_env(provider);
+    let creds = storage_credentials_from_env(provider);
 
     let ctx = Context::new();
     ctx.set_storage(
         provider,
         &manifest.storage.bucket,
         &manifest.storage.region,
-        &access_key,
-        &secret_key,
+        &creds.access_key,
+        &creds.secret_key,
         &manifest.storage.endpoint,
     );
     ctx.set_storage_prefix(&manifest.storage.prefix);
@@ -122,35 +127,38 @@ pub(crate) fn parse_storage_provider(raw: &str) -> Result<StorageProvider> {
     Ok(provider)
 }
 
-pub(crate) fn storage_credentials_from_env(provider: StorageProvider) -> (String, String) {
+pub(crate) fn storage_credentials_from_env(provider: StorageProvider) -> StorageCredentials {
     storage_credentials_from_lookup(provider, |name| std::env::var(name).ok())
 }
 
-pub(crate) fn storage_credentials_from_lookup<F>(provider: StorageProvider, mut lookup: F) -> (String, String)
+pub(crate) fn storage_credentials_from_lookup<F>(provider: StorageProvider, mut lookup: F) -> StorageCredentials
 where
     F: FnMut(&str) -> Option<String>,
 {
     match provider {
-        StorageProvider::S3 => (
-            first_non_empty_env(&mut lookup, &["AWS_ACCESS_KEY_ID", "AWS_ACCESS_KEY"]),
-            first_non_empty_env(&mut lookup, &["AWS_SECRET_ACCESS_KEY", "AWS_SECRET_KEY"]),
-        ),
-        StorageProvider::AzureBlob => (
-            first_non_empty_env(&mut lookup, &["AZURE_STORAGE_ACCOUNT_NAME", "AZURE_STORAGE_ACCOUNT"]),
-            first_non_empty_env(&mut lookup, &["AZURE_STORAGE_ACCOUNT_KEY"]),
-        ),
-        StorageProvider::Gcs => (
-            first_non_empty_env(&mut lookup, &["GCS_ACCESS_KEY_ID", "GCS_ACCESS_KEY"]),
-            first_non_empty_env(
+        StorageProvider::S3 => StorageCredentials {
+            access_key: first_non_empty_env(&mut lookup, &["AWS_ACCESS_KEY_ID", "AWS_ACCESS_KEY"]),
+            secret_key: first_non_empty_env(&mut lookup, &["AWS_SECRET_ACCESS_KEY", "AWS_SECRET_KEY"]),
+        },
+        StorageProvider::AzureBlob => StorageCredentials {
+            access_key: first_non_empty_env(&mut lookup, &["AZURE_STORAGE_ACCOUNT_NAME", "AZURE_STORAGE_ACCOUNT"]),
+            secret_key: first_non_empty_env(&mut lookup, &["AZURE_STORAGE_ACCOUNT_KEY"]),
+        },
+        StorageProvider::Gcs => StorageCredentials {
+            access_key: first_non_empty_env(&mut lookup, &["GCS_ACCESS_KEY_ID", "GCS_ACCESS_KEY"]),
+            secret_key: first_non_empty_env(
                 &mut lookup,
                 &["GCS_SECRET_ACCESS_KEY", "GCS_SECRET_KEY", "GOOGLE_ACCESS_TOKEN"],
             ),
-        ),
-        StorageProvider::GitHubReleases => (
-            String::new(),
-            first_non_empty_env(&mut lookup, &["GITHUB_TOKEN", "GH_TOKEN"]),
-        ),
-        StorageProvider::Filesystem => (String::new(), String::new()),
+        },
+        StorageProvider::GitHubReleases => StorageCredentials {
+            access_key: String::new(),
+            secret_key: first_non_empty_env(&mut lookup, &["GITHUB_TOKEN", "GH_TOKEN"]),
+        },
+        StorageProvider::Filesystem => StorageCredentials {
+            access_key: String::new(),
+            secret_key: String::new(),
+        },
     }
 }
 
@@ -293,10 +301,9 @@ apps:
         let mut env = BTreeMap::new();
         env.insert("AWS_ACCESS_KEY_ID".to_string(), "access".to_string());
         env.insert("AWS_SECRET_ACCESS_KEY".to_string(), "secret".to_string());
-        let (access, secret) =
-            super::storage_credentials_from_lookup(super::StorageProvider::S3, |key| env.get(key).cloned());
-        assert_eq!(access, "access");
-        assert_eq!(secret, "secret");
+        let creds = super::storage_credentials_from_lookup(super::StorageProvider::S3, |key| env.get(key).cloned());
+        assert_eq!(creds.access_key, "access");
+        assert_eq!(creds.secret_key, "secret");
     }
 
     #[test]
@@ -304,20 +311,20 @@ apps:
         let mut env = BTreeMap::new();
         env.insert("AZURE_STORAGE_ACCOUNT_NAME".to_string(), "account".to_string());
         env.insert("AZURE_STORAGE_ACCOUNT_KEY".to_string(), "key".to_string());
-        let (access, secret) =
+        let creds =
             super::storage_credentials_from_lookup(super::StorageProvider::AzureBlob, |key| env.get(key).cloned());
-        assert_eq!(access, "account");
-        assert_eq!(secret, "key");
+        assert_eq!(creds.access_key, "account");
+        assert_eq!(creds.secret_key, "key");
     }
 
     #[test]
     fn test_storage_credentials_resolve_github_token_to_secret_key() {
         let mut env = BTreeMap::new();
         env.insert("GITHUB_TOKEN".to_string(), "ghp_test".to_string());
-        let (access, secret) =
+        let creds =
             super::storage_credentials_from_lookup(super::StorageProvider::GitHubReleases, |key| env.get(key).cloned());
-        assert!(access.is_empty());
-        assert_eq!(secret, "ghp_test");
+        assert!(creds.access_key.is_empty());
+        assert_eq!(creds.secret_key, "ghp_test");
     }
 
     #[test]

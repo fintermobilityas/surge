@@ -17,6 +17,10 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
 
+permissions:
+  contents: write
+  pull-requests: write
+
 jobs:
   benchmark:
     name: Performance (${{ matrix.profile }})

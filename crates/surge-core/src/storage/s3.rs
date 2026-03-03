@@ -42,11 +42,6 @@ pub struct S3Backend {
 impl S3Backend {
     /// Create a new S3 backend from configuration.
     pub fn new(config: &StorageConfig) -> Result<Self> {
-        if config.access_key.is_empty() || config.secret_key.is_empty() {
-            return Err(SurgeError::Config(
-                "S3 storage requires access_key and secret_key".to_string(),
-            ));
-        }
         if config.bucket.is_empty() {
             return Err(SurgeError::Config("S3 storage requires a bucket name".to_string()));
         }
@@ -88,6 +83,22 @@ impl S3Backend {
             prefix: config.prefix.clone(),
             path_style,
         })
+    }
+
+    /// Returns `true` when credentials are available for signing requests.
+    fn has_credentials(&self) -> bool {
+        !self.access_key.is_empty() && !self.secret_key.is_empty()
+    }
+
+    /// Return an error when a write is attempted without credentials.
+    fn require_credentials(&self, operation: &str) -> Result<()> {
+        if self.has_credentials() {
+            Ok(())
+        } else {
+            Err(SurgeError::Config(format!(
+                "S3 {operation} requires access_key and secret_key"
+            )))
+        }
     }
 
     /// Build the full object key, prepending the configured prefix.
@@ -234,6 +245,7 @@ impl S3Backend {
 #[async_trait]
 impl StorageBackend for S3Backend {
     async fn put_object(&self, key: &str, data: &[u8], content_type: &str) -> Result<()> {
+        self.require_credentials("PUT")?;
         let full_key = self.full_key(key);
         let url = self.object_url(&full_key);
         let payload_hash = sha256_hex(data);
@@ -265,20 +277,22 @@ impl StorageBackend for S3Backend {
     async fn get_object(&self, key: &str) -> Result<Vec<u8>> {
         let full_key = self.full_key(key);
         let url = self.object_url(&full_key);
-        let payload_hash = sha256_hex(b""); // empty payload for GET
-        let now = Utc::now();
-
-        let canonical_uri = if self.path_style {
-            format!("/{}/{}", self.bucket, Self::encode_uri_path(&full_key))
-        } else {
-            format!("/{}", Self::encode_uri_path(&full_key))
-        };
-
-        let headers = self.sign_request("GET", &canonical_uri, "", &payload_hash, &now);
 
         let mut req = self.client.get(&url);
-        for (name, value) in &headers {
-            req = req.header(name.as_str(), value.as_str());
+        if self.has_credentials() {
+            let payload_hash = sha256_hex(b"");
+            let now = Utc::now();
+            let canonical_uri = if self.path_style {
+                format!("/{}/{}", self.bucket, Self::encode_uri_path(&full_key))
+            } else {
+                format!("/{}", Self::encode_uri_path(&full_key))
+            };
+            let headers = self.sign_request("GET", &canonical_uri, "", &payload_hash, &now);
+            for (name, value) in &headers {
+                req = req.header(name.as_str(), value.as_str());
+            }
+        } else {
+            req = req.header("Host", self.host_header());
         }
 
         let resp = req.send().await?;
@@ -296,20 +310,22 @@ impl StorageBackend for S3Backend {
     async fn head_object(&self, key: &str) -> Result<ObjectInfo> {
         let full_key = self.full_key(key);
         let url = self.object_url(&full_key);
-        let payload_hash = sha256_hex(b"");
-        let now = Utc::now();
-
-        let canonical_uri = if self.path_style {
-            format!("/{}/{}", self.bucket, Self::encode_uri_path(&full_key))
-        } else {
-            format!("/{}", Self::encode_uri_path(&full_key))
-        };
-
-        let headers = self.sign_request("HEAD", &canonical_uri, "", &payload_hash, &now);
 
         let mut req = self.client.head(&url);
-        for (name, value) in &headers {
-            req = req.header(name.as_str(), value.as_str());
+        if self.has_credentials() {
+            let payload_hash = sha256_hex(b"");
+            let now = Utc::now();
+            let canonical_uri = if self.path_style {
+                format!("/{}/{}", self.bucket, Self::encode_uri_path(&full_key))
+            } else {
+                format!("/{}", Self::encode_uri_path(&full_key))
+            };
+            let headers = self.sign_request("HEAD", &canonical_uri, "", &payload_hash, &now);
+            for (name, value) in &headers {
+                req = req.header(name.as_str(), value.as_str());
+            }
+        } else {
+            req = req.header("Host", self.host_header());
         }
 
         let resp = req.send().await?;
@@ -352,6 +368,7 @@ impl StorageBackend for S3Backend {
     }
 
     async fn delete_object(&self, key: &str) -> Result<()> {
+        self.require_credentials("DELETE")?;
         let full_key = self.full_key(key);
         let url = self.object_url(&full_key);
         let payload_hash = sha256_hex(b"");
@@ -403,21 +420,22 @@ impl StorageBackend for S3Backend {
             .collect::<Vec<_>>()
             .join("&");
 
-        let payload_hash = sha256_hex(b"");
-        let now = Utc::now();
-
-        let canonical_uri = if self.path_style {
-            format!("/{}", self.bucket)
-        } else {
-            "/".to_string()
-        };
-
-        let headers = self.sign_request("GET", &canonical_uri, &canonical_querystring, &payload_hash, &now);
-
         let url = format!("{bucket_url}?{canonical_querystring}");
         let mut req = self.client.get(&url);
-        for (name, value) in &headers {
-            req = req.header(name.as_str(), value.as_str());
+        if self.has_credentials() {
+            let payload_hash = sha256_hex(b"");
+            let now = Utc::now();
+            let canonical_uri = if self.path_style {
+                format!("/{}", self.bucket)
+            } else {
+                "/".to_string()
+            };
+            let headers = self.sign_request("GET", &canonical_uri, &canonical_querystring, &payload_hash, &now);
+            for (name, value) in &headers {
+                req = req.header(name.as_str(), value.as_str());
+            }
+        } else {
+            req = req.header("Host", self.host_header());
         }
 
         let resp = req.send().await?;
@@ -432,20 +450,22 @@ impl StorageBackend for S3Backend {
     async fn download_to_file(&self, key: &str, dest: &Path, progress: Option<&TransferProgress>) -> Result<()> {
         let full_key = self.full_key(key);
         let url = self.object_url(&full_key);
-        let payload_hash = sha256_hex(b"");
-        let now = Utc::now();
-
-        let canonical_uri = if self.path_style {
-            format!("/{}/{}", self.bucket, Self::encode_uri_path(&full_key))
-        } else {
-            format!("/{}", Self::encode_uri_path(&full_key))
-        };
-
-        let headers = self.sign_request("GET", &canonical_uri, "", &payload_hash, &now);
 
         let mut req = self.client.get(&url);
-        for (name, value) in &headers {
-            req = req.header(name.as_str(), value.as_str());
+        if self.has_credentials() {
+            let payload_hash = sha256_hex(b"");
+            let now = Utc::now();
+            let canonical_uri = if self.path_style {
+                format!("/{}/{}", self.bucket, Self::encode_uri_path(&full_key))
+            } else {
+                format!("/{}", Self::encode_uri_path(&full_key))
+            };
+            let headers = self.sign_request("GET", &canonical_uri, "", &payload_hash, &now);
+            for (name, value) in &headers {
+                req = req.header(name.as_str(), value.as_str());
+            }
+        } else {
+            req = req.header("Host", self.host_header());
         }
 
         let resp = req.send().await?;
@@ -471,6 +491,7 @@ impl StorageBackend for S3Backend {
     }
 
     async fn upload_from_file(&self, key: &str, src: &Path, progress: Option<&TransferProgress>) -> Result<()> {
+        self.require_credentials("upload")?;
         let data = tokio::fs::read(src).await?;
         let total = data.len() as u64;
 

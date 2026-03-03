@@ -270,7 +270,6 @@ impl StorageBackend for AzureBlobBackend {
 
         let mut req = self.client.put(&url).body(data.to_vec());
         req = req.header("Content-Length", data.len().to_string());
-        req = req.header("x-ms-blob-type", "BlockBlob");
         for (name, value) in &headers {
             req = req.header(name.as_str(), value.as_str());
         }

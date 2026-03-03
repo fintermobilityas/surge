@@ -3,29 +3,24 @@ use std::process::{Child, Command, Stdio};
 
 use crate::error::{Result, SurgeError};
 
-/// Handle to a spawned child process.
 pub struct ProcessHandle {
     child: Child,
 }
 
-/// Result of waiting for a process.
 pub struct ProcessResult {
     pub exit_code: i32,
     pub timed_out: bool,
 }
 
 impl ProcessHandle {
-    /// Get the PID.
     pub fn pid(&self) -> u32 {
         self.child.id()
     }
 
-    /// Check if the process is still running.
     pub fn is_running(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))
     }
 
-    /// Wait for the process to exit. Returns the exit code.
     pub fn wait(&mut self) -> Result<ProcessResult> {
         let status = self.child.wait()?;
         Ok(ProcessResult {
@@ -34,7 +29,6 @@ impl ProcessHandle {
         })
     }
 
-    /// Terminate the process gracefully.
     #[cfg(unix)]
     pub fn terminate(&self) -> Result<()> {
         use nix::sys::signal::{Signal, kill};
@@ -52,7 +46,6 @@ impl ProcessHandle {
         Ok(())
     }
 
-    /// Force-kill the process.
     pub fn kill(&mut self) -> Result<()> {
         self.child
             .kill()
@@ -61,7 +54,6 @@ impl ProcessHandle {
     }
 }
 
-/// Spawn a new child process.
 pub fn spawn_process(exe: &Path, args: &[&str], working_dir: Option<&Path>) -> Result<ProcessHandle> {
     let mut cmd = Command::new(exe);
     cmd.args(args)
@@ -80,13 +72,12 @@ pub fn spawn_process(exe: &Path, args: &[&str], working_dir: Option<&Path>) -> R
     Ok(ProcessHandle { child })
 }
 
-/// Get the current process ID.
 #[must_use]
 pub fn current_pid() -> u32 {
     std::process::id()
 }
 
-/// Replace the current process with a new executable (Unix: exec, Windows: spawn+exit).
+/// On Unix uses `execv`; on Windows spawns the process and exits with its code.
 #[cfg(unix)]
 pub fn exec_replace(exe: &Path, args: &[&str]) -> Result<()> {
     use std::ffi::CString;

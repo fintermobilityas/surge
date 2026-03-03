@@ -4,7 +4,6 @@ use std::sync::{Mutex, MutexGuard};
 
 use crate::error::{ErrorCode, SurgeError};
 
-/// Cloud/local storage provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
 pub enum StorageProvider {
@@ -28,7 +27,6 @@ impl StorageProvider {
     }
 }
 
-/// Storage backend configuration.
 #[derive(Debug, Clone, Default)]
 pub struct StorageConfig {
     pub provider: Option<StorageProvider>,
@@ -40,13 +38,11 @@ pub struct StorageConfig {
     pub prefix: String,
 }
 
-/// Lock server configuration.
 #[derive(Debug, Clone, Default)]
 pub struct LockConfig {
     pub server_url: String,
 }
 
-/// Resource budget limits (matches `surge_resource_budget` in surge_api.h).
 #[derive(Debug, Clone)]
 #[repr(C)]
 pub struct ResourceBudget {
@@ -69,16 +65,13 @@ impl Default for ResourceBudget {
     }
 }
 
-/// Internal last-error state.
 #[allow(dead_code)]
 struct LastError {
     code: i32,
     message: String,
-    /// Cached CString for FFI returns.
     c_message: Option<CString>,
 }
 
-/// The main Surge context. Thread-safe (`Send + Sync`).
 pub struct Context {
     pub storage: Mutex<StorageConfig>,
     pub lock_config: Mutex<LockConfig>,
@@ -102,7 +95,6 @@ impl Context {
         }
     }
 
-    /// Set storage configuration.
     pub fn set_storage(
         &self,
         provider: StorageProvider,
@@ -121,40 +113,33 @@ impl Context {
         cfg.endpoint = endpoint.to_string();
     }
 
-    /// Set storage object key prefix.
     pub fn set_storage_prefix(&self, prefix: &str) {
         let mut cfg = lock_recover(&self.storage);
         cfg.prefix = prefix.to_string();
     }
 
-    /// Set lock server URL.
     pub fn set_lock_server(&self, url: &str) {
         let mut cfg = lock_recover(&self.lock_config);
         cfg.server_url = url.to_string();
     }
 
-    /// Set resource budget.
     pub fn set_resource_budget(&self, budget: ResourceBudget) {
         let mut b = lock_recover(&self.resource_budget);
         *b = budget;
     }
 
-    /// Request cancellation of in-progress operations.
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
     }
 
-    /// Check if cancellation has been requested.
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
     }
 
-    /// Reset the cancellation flag.
     pub fn reset_cancel(&self) {
         self.cancelled.store(false, Ordering::Release);
     }
 
-    /// Check cancellation and return error if cancelled.
     pub fn check_cancelled(&self) -> crate::error::Result<()> {
         if self.is_cancelled() {
             Err(SurgeError::Cancelled)
@@ -163,7 +148,6 @@ impl Context {
         }
     }
 
-    /// Set the last error.
     pub fn set_last_error(&self, code: ErrorCode, message: &str) {
         let mut err = lock_recover(&self.last_error);
         *err = Some(LastError {
@@ -173,13 +157,12 @@ impl Context {
         });
     }
 
-    /// Set the last error from a `SurgeError`.
     pub fn set_error(&self, e: &SurgeError) {
         self.set_last_error(e.error_code(), &e.to_string());
     }
 
-    /// Get the last error code and message pointer (for FFI).
-    /// Returns `None` if no error has been set.
+    /// Returns the last error code and message pointer for FFI consumers.
+    /// The pointer is valid until the next error-mutating call.
     pub fn last_error(&self) -> Option<(i32, *const std::ffi::c_char)> {
         let err = lock_recover(&self.last_error);
         err.as_ref().map(|e| {
@@ -188,23 +171,19 @@ impl Context {
         })
     }
 
-    /// Clear the last error.
     pub fn clear_error(&self) {
         let mut err = lock_recover(&self.last_error);
         *err = None;
     }
 
-    /// Get a snapshot of the storage config.
     pub fn storage_config(&self) -> StorageConfig {
         lock_recover(&self.storage).clone()
     }
 
-    /// Get a snapshot of the lock config.
     pub fn lock_config(&self) -> LockConfig {
         lock_recover(&self.lock_config).clone()
     }
 
-    /// Get a snapshot of the resource budget.
     pub fn resource_budget(&self) -> ResourceBudget {
         lock_recover(&self.resource_budget).clone()
     }

@@ -5,21 +5,18 @@ use std::path::Path;
 use crate::config::constants::IO_CHUNK_SIZE;
 use crate::error::Result;
 
-/// Compute SHA-256 of a byte slice, returning lowercase hex string.
 #[must_use]
 pub fn sha256_hex(data: &[u8]) -> String {
     let hash = Sha256::digest(data);
     hex::encode(hash)
 }
 
-/// Compute SHA-256 of a byte slice, returning raw 32-byte hash.
 #[must_use]
 pub fn sha256_raw(data: &[u8]) -> Vec<u8> {
     Sha256::digest(data).to_vec()
 }
 
-/// Compute SHA-256 of a file, returning lowercase hex string.
-/// Reads the file in chunks to handle large files efficiently.
+/// Reads the file in chunks to avoid loading it entirely into memory.
 pub fn sha256_hex_file(path: &Path) -> Result<String> {
     let mut file = std::fs::File::open(path)?;
     let mut hasher = Sha256::new();

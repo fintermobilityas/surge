@@ -1,4 +1,3 @@
-/// Operating system identifiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Os {
     Windows,
@@ -7,7 +6,6 @@ pub enum Os {
     Unknown,
 }
 
-/// CPU architecture identifiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Arch {
     X86_64,
@@ -16,7 +14,6 @@ pub enum Arch {
     Unknown,
 }
 
-/// Detect the current operating system.
 #[must_use]
 pub fn current_os() -> Os {
     if cfg!(target_os = "windows") {
@@ -30,7 +27,6 @@ pub fn current_os() -> Os {
     }
 }
 
-/// Detect the current CPU architecture.
 #[must_use]
 pub fn current_arch() -> Arch {
     if cfg!(target_arch = "x86_64") {
@@ -44,7 +40,7 @@ pub fn current_arch() -> Arch {
     }
 }
 
-/// Get the Runtime Identifier string (e.g., "linux-x64", "win-arm64").
+/// Returns a Runtime Identifier like `"linux-x64"` or `"win-arm64"`.
 #[must_use]
 pub fn current_rid() -> String {
     let os = match current_os() {
@@ -62,7 +58,6 @@ pub fn current_rid() -> String {
     format!("{os}-{arch}")
 }
 
-/// Get the number of available logical CPU cores.
 #[must_use]
 pub fn cpu_count() -> usize {
     std::thread::available_parallelism()

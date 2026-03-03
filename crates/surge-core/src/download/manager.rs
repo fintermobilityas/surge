@@ -11,59 +11,41 @@ use tokio::sync::Semaphore;
 use crate::context::Context;
 use crate::error::{Result, SurgeError};
 
-/// A request to download a single file.
 #[derive(Debug, Clone)]
 pub struct DownloadRequest {
-    /// The URL to download from.
     pub url: String,
-    /// Local destination path for the downloaded file.
     pub dest_path: PathBuf,
-    /// Expected SHA-256 hash (lowercase hex). Empty string to skip verification.
+    /// Lowercase hex. Empty to skip verification.
     pub expected_sha256: String,
-    /// Expected file size in bytes. 0 to skip size verification.
+    /// 0 to skip size verification.
     pub expected_size: u64,
 }
 
-/// Result of a single download operation.
 #[derive(Debug, Clone)]
 pub struct DownloadResult {
-    /// Index into the original request list.
     pub index: usize,
-    /// Whether the download completed successfully.
     pub success: bool,
-    /// HTTP status code received.
     pub http_status: u16,
-    /// Number of bytes downloaded.
     pub bytes_downloaded: u64,
-    /// Actual SHA-256 of the downloaded content (lowercase hex).
     pub sha256: String,
-    /// Error message if the download failed.
     pub error_message: String,
 }
 
-/// Progress information for the overall download batch.
 #[derive(Debug, Clone)]
 pub struct DownloadProgress {
-    /// Total bytes downloaded so far across all files.
     pub total_bytes_done: u64,
-    /// Total expected bytes across all files (0 if unknown).
     pub total_bytes_total: u64,
-    /// Number of files completed.
     pub files_done: u64,
-    /// Total number of files in the batch.
     pub files_total: u64,
-    /// Current download speed in bytes per second.
     pub speed_bytes_per_sec: f64,
 }
 
-/// Manages parallel file downloads with verification and progress reporting.
 pub struct DownloadManager {
     ctx: Arc<Context>,
     client: reqwest::Client,
 }
 
 impl DownloadManager {
-    /// Create a new download manager.
     pub fn new(ctx: Arc<Context>) -> Self {
         let client = reqwest::Client::builder()
             .user_agent(format!("surge/{}", crate::config::constants::VERSION))
@@ -73,11 +55,7 @@ impl DownloadManager {
         Self { ctx, client }
     }
 
-    /// Download multiple files in parallel with optional progress reporting.
-    ///
-    /// Files are downloaded concurrently up to the `max_concurrent_downloads` limit
-    /// configured in the context's resource budget. Each file is SHA-256 verified
-    /// if `expected_sha256` is non-empty.
+    /// Downloads concurrently up to `max_concurrent_downloads` from the resource budget.
     pub async fn download<F>(&self, requests: Vec<DownloadRequest>, progress: Option<F>) -> Result<Vec<DownloadResult>>
     where
         F: Fn(DownloadProgress) + Send + Sync + 'static,
@@ -145,7 +123,6 @@ impl DownloadManager {
             results.push(result?);
         }
 
-        // Sort by original index
         results.sort_by_key(|r| r.index);
         Ok(results)
     }
@@ -172,12 +149,10 @@ async fn download_single_file(
         error_message: msg,
     };
 
-    // Check cancellation
     if ctx.is_cancelled() {
         return make_error(0, "Cancelled".to_string());
     }
 
-    // Send request
     let response = match client.get(&request.url).send().await {
         Ok(resp) => resp,
         Err(e) => return make_error(0, format!("HTTP request failed: {e}")),
@@ -188,14 +163,12 @@ async fn download_single_file(
         return make_error(http_status, format!("HTTP {http_status} for {}", request.url));
     }
 
-    // Create destination directory
     if let Some(parent) = request.dest_path.parent()
         && let Err(e) = tokio::fs::create_dir_all(parent).await
     {
         return make_error(http_status, format!("Failed to create directory: {e}"));
     }
 
-    // Download body and compute hash
     let body = match response.bytes().await {
         Ok(b) => b,
         Err(e) => return make_error(http_status, format!("Failed to read body: {e}")),
@@ -203,19 +176,15 @@ async fn download_single_file(
 
     let bytes_downloaded = body.len() as u64;
 
-    // Compute SHA-256
     let mut hasher = Sha256::new();
     hasher.update(&body);
     let sha256 = hex::encode(hasher.finalize());
 
-    // Write to disk
     if let Err(e) = tokio::fs::write(&request.dest_path, &body).await {
         return make_error(http_status, format!("Failed to write file: {e}"));
     }
 
-    // Verify SHA-256
     if !request.expected_sha256.is_empty() && sha256 != request.expected_sha256 {
-        // Clean up the bad file
         let _ = tokio::fs::remove_file(&request.dest_path).await;
         return make_error(
             http_status,
@@ -223,7 +192,6 @@ async fn download_single_file(
         );
     }
 
-    // Verify size
     if request.expected_size > 0 && bytes_downloaded != request.expected_size {
         let _ = tokio::fs::remove_file(&request.dest_path).await;
         return make_error(
@@ -235,7 +203,6 @@ async fn download_single_file(
         );
     }
 
-    // Update progress
     total_bytes_done.fetch_add(bytes_downloaded, Ordering::Relaxed);
     files_done.fetch_add(1, Ordering::Relaxed);
 

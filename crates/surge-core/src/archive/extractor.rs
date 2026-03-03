@@ -5,10 +5,8 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Result, SurgeError};
 
-/// Progress callback for extraction: (files_done, files_total, bytes_done, bytes_total).
 pub type ExtractProgress = dyn Fn(u64, u64, u64, u64);
 
-/// Extract a tar.zst archive from bytes to a destination directory.
 pub fn extract_to(data: &[u8], dest_dir: &Path, progress: Option<&ExtractProgress>) -> Result<()> {
     std::fs::create_dir_all(dest_dir)?;
 
@@ -67,7 +65,6 @@ pub fn extract_to(data: &[u8], dest_dir: &Path, progress: Option<&ExtractProgres
     Ok(())
 }
 
-/// An entry in an archive listing.
 #[derive(Debug, Clone)]
 pub struct ArchiveEntry {
     pub path: PathBuf,
@@ -75,7 +72,6 @@ pub struct ArchiveEntry {
     pub is_dir: bool,
 }
 
-/// List all entries in a tar.zst archive from bytes.
 pub fn list_entries_from_bytes(data: &[u8]) -> Result<Vec<ArchiveEntry>> {
     let decoder =
         zstd::Decoder::new(data).map_err(|e| SurgeError::Archive(format!("Failed to create zstd decoder: {e}")))?;
@@ -102,7 +98,6 @@ pub fn list_entries_from_bytes(data: &[u8]) -> Result<Vec<ArchiveEntry>> {
     Ok(entries)
 }
 
-/// Read a single entry from a tar.zst archive.
 pub fn read_entry(data: &[u8], entry_path: &str) -> Result<Vec<u8>> {
     let decoder =
         zstd::Decoder::new(data).map_err(|e| SurgeError::Archive(format!("Failed to create zstd decoder: {e}")))?;
@@ -129,7 +124,6 @@ pub fn read_entry(data: &[u8], entry_path: &str) -> Result<Vec<u8>> {
     Err(SurgeError::NotFound(format!("Entry not found: {entry_path}")))
 }
 
-/// Extract a tar.zst file from disk to a destination directory.
 pub fn extract_file_to(archive_path: &Path, dest_dir: &Path) -> Result<()> {
     let data = std::fs::read(archive_path)?;
     extract_to(&data, dest_dir, None)

@@ -5,7 +5,6 @@ use std::path::{Component, Path};
 
 use crate::error::{Result, SurgeError};
 
-/// Storage configuration within the manifest.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct StorageManifestConfig {
     pub provider: String,
@@ -19,14 +18,12 @@ pub struct StorageManifestConfig {
     pub prefix: String,
 }
 
-/// Lock server configuration within the manifest.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LockManifestConfig {
     #[serde(default)]
     pub url: String,
 }
 
-/// Per-target (RID) configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TargetConfig {
     pub rid: String,
@@ -50,7 +47,6 @@ pub struct TargetConfig {
     pub environment: BTreeMap<String, String>,
 }
 
-/// Per-app configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppConfig {
     pub id: String,
@@ -82,7 +78,6 @@ pub struct AppConfig {
     pub target: Option<TargetConfig>,
 }
 
-/// Supported shortcut locations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ShortcutLocation {
@@ -91,7 +86,6 @@ pub enum ShortcutLocation {
     Startup,
 }
 
-/// Supported installer output types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InstallerType {
     Web,
@@ -99,7 +93,6 @@ pub enum InstallerType {
 }
 
 impl InstallerType {
-    /// Parse installer type from manifest text.
     #[must_use]
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
@@ -109,7 +102,6 @@ impl InstallerType {
         }
     }
 
-    /// Canonical installer name.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -119,14 +111,12 @@ impl InstallerType {
     }
 }
 
-/// Optional top-level channel declaration (snapx-compatible).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ChannelManifestConfig {
     #[serde(default)]
     pub name: String,
 }
 
-/// Top-level surge.yml manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SurgeManifest {
     #[serde(default = "default_schema")]
@@ -146,7 +136,6 @@ fn default_schema() -> i32 {
 }
 
 impl SurgeManifest {
-    /// Parse a manifest from YAML bytes.
     pub fn parse(data: &[u8]) -> Result<Self> {
         let raw: Value = serde_yaml::from_slice(data)?;
         reject_embedded_storage_credentials(&raw)?;
@@ -155,19 +144,16 @@ impl SurgeManifest {
         Ok(manifest)
     }
 
-    /// Parse a manifest from a file.
     pub fn from_file(path: &Path) -> Result<Self> {
         let data = std::fs::read(path)?;
         Self::parse(&data)
     }
 
-    /// Serialize the manifest to YAML bytes.
     pub fn to_yaml(&self) -> Result<Vec<u8>> {
         let s = serde_yaml::to_string(self)?;
         Ok(s.into_bytes())
     }
 
-    /// Validate the manifest.
     pub fn validate(&self) -> Result<()> {
         if self.schema != crate::config::constants::SCHEMA_VERSION && self.schema != 2 {
             return Err(SurgeError::Config(format!(
@@ -305,12 +291,10 @@ impl SurgeManifest {
         Ok(())
     }
 
-    /// Find an app config by ID.
     pub fn find_app(&self, app_id: &str) -> Option<&AppConfig> {
         self.apps.iter().find(|a| a.id == app_id)
     }
 
-    /// Find an app and resolved target pair for the given app ID and RID.
     pub fn find_app_with_target(&self, app_id: &str, rid: &str) -> Option<(&AppConfig, TargetConfig)> {
         self.apps
             .iter()
@@ -318,12 +302,10 @@ impl SurgeManifest {
             .find_map(|app| app.find_target(rid).map(|target| (app, app.resolve_target(target))))
     }
 
-    /// Find a target config for an app.
     pub fn find_target(&self, app_id: &str, rid: &str) -> Option<TargetConfig> {
         self.find_app_with_target(app_id, rid).map(|(_, target)| target)
     }
 
-    /// Return all distinct app IDs in the manifest.
     #[must_use]
     pub fn app_ids(&self) -> Vec<String> {
         let mut ids: Vec<String> = self.apps.iter().map(|app| app.id.clone()).collect();
@@ -332,7 +314,6 @@ impl SurgeManifest {
         ids
     }
 
-    /// Return all distinct target RIDs for a specific app ID.
     #[must_use]
     pub fn target_rids(&self, app_id: &str) -> Vec<String> {
         let mut rids: Vec<String> = self
@@ -357,7 +338,6 @@ impl AppConfig {
         self.iter_targets().find(|target| target.rid == rid)
     }
 
-    /// Returns the effective main executable name (defaults to app id).
     #[must_use]
     pub fn effective_main_exe(&self) -> String {
         if self.main_exe.trim().is_empty() {
@@ -367,7 +347,6 @@ impl AppConfig {
         }
     }
 
-    /// Returns the effective install directory name (defaults to app id).
     #[must_use]
     pub fn effective_install_directory(&self) -> String {
         if self.install_directory.trim().is_empty() {
@@ -377,7 +356,7 @@ impl AppConfig {
         }
     }
 
-    /// Resolve a target by inheriting app-level defaults.
+    /// Inherits app-level defaults into the target where fields are empty.
     #[must_use]
     pub fn resolve_target(&self, target: &TargetConfig) -> TargetConfig {
         let mut resolved = target.clone();

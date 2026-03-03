@@ -14,15 +14,11 @@ use surge_core::update::manager::UpdateInfo;
 //  FFI error struct (matches `surge_error` in surge_api.h)
 // ---------------------------------------------------------------------------
 
-/// FFI-safe error information returned by `surge_context_last_error`.
-///
-/// Layout: `{ code: i32, message: *const c_char }` -- the `_message_owned`
-/// field keeps the `CString` alive so that `message` remains valid.
+/// `_message_owned` keeps the `CString` alive so `message` stays valid.
 #[repr(C)]
 pub struct SurgeErrorFfi {
     pub code: i32,
     pub message: *const c_char,
-    /// Backing storage for `message`.  Not visible to C callers.
     _message_owned: CString,
 }
 
@@ -38,7 +34,6 @@ impl SurgeErrorFfi {
     }
 }
 
-/// Thread-safe owned error state shared between related FFI handles.
 pub struct SurgeErrorOwned {
     pub code: i32,
     pub message: CString,
@@ -65,23 +60,16 @@ fn to_lossy_cstring(value: &str) -> CString {
 //  Context handle
 // ---------------------------------------------------------------------------
 
-/// Opaque handle wrapping a `Context` + tokio `Runtime`.
-///
-/// Returned by `surge_context_create`, destroyed by `surge_context_destroy`.
 pub struct SurgeContextHandle {
     pub ctx: Arc<Context>,
     pub runtime: Arc<tokio::runtime::Runtime>,
-    /// Cached FFI shape used by `surge_context_last_error`.
     pub last_error: Mutex<Option<SurgeErrorFfi>>,
-    /// Cached last-error for FFI return.
-    ///
-    /// The returned pointer from `surge_context_last_error` remains valid
-    /// until the next API call mutates this slot.
+    /// Pointer from `surge_context_last_error` stays valid until the next
+    /// error-mutating API call.
     pub shared_last_error: Arc<Mutex<Option<SurgeErrorOwned>>>,
 }
 
 impl SurgeContextHandle {
-    /// Store an error so that `surge_context_last_error` can return it.
     pub fn set_last_error(&self, code: i32, msg: &str) {
         {
             let mut shared = lock_recover(&self.shared_last_error);
@@ -91,7 +79,6 @@ impl SurgeContextHandle {
         *slot = Some(SurgeErrorFfi::new(code, msg));
     }
 
-    /// Clear any previously stored error.
     pub fn clear_last_error(&self) {
         {
             let mut shared = lock_recover(&self.shared_last_error);
@@ -102,7 +89,6 @@ impl SurgeContextHandle {
         self.ctx.clear_error();
     }
 
-    /// Return a pointer to the cached error, or null if none.
     pub fn get_last_error(&self) -> *const SurgeErrorFfi {
         let snapshot = {
             let shared = lock_recover(&self.shared_last_error);
@@ -129,9 +115,6 @@ impl SurgeContextHandle {
 //  Update manager handle
 // ---------------------------------------------------------------------------
 
-/// Opaque handle for the update manager.
-///
-/// Clones shared context/runtime/error state from `surge_context_create`.
 pub struct SurgeUpdateManagerHandle {
     pub ctx: Arc<Context>,
     pub runtime: Arc<tokio::runtime::Runtime>,
@@ -146,7 +129,6 @@ pub struct SurgeUpdateManagerHandle {
 //  Releases info handle
 // ---------------------------------------------------------------------------
 
-/// Represents a single release entry returned from an update check.
 pub struct ReleaseEntryFfi {
     pub version: String,
     pub channel: String,
@@ -154,20 +136,16 @@ pub struct ReleaseEntryFfi {
     pub is_genesis: bool,
 }
 
-/// Opaque handle for releases info (returned from `surge_update_check`).
 pub struct SurgeReleasesInfoHandle {
     pub releases: Vec<ReleaseEntryFfi>,
-    /// Cached `CString`s for version/channel accessors so that the returned
-    /// `*const c_char` pointers remain valid for the lifetime of the handle.
+    /// Cached `CString`s so returned `*const c_char` pointers stay valid.
     pub cached_strings: Vec<(CString, CString)>,
-    /// Full update info from the core library, preserved so that
-    /// `surge_update_download_and_apply` can pass the complete
-    /// `ReleaseEntry` data (filenames, hashes, etc.) back to the core.
+    /// Preserved for `surge_update_download_and_apply` to forward full
+    /// `ReleaseEntry` data back to the core.
     pub update_info: Option<UpdateInfo>,
 }
 
 impl SurgeReleasesInfoHandle {
-    /// Build cached CStrings from the release entries.
     pub fn cache_strings(&mut self) {
         self.cached_strings = self
             .releases
@@ -186,7 +164,6 @@ impl SurgeReleasesInfoHandle {
 //  Pack context handle
 // ---------------------------------------------------------------------------
 
-/// Opaque handle for the pack builder.
 pub struct SurgePackContextHandle {
     pub ctx: Arc<Context>,
     pub runtime: Arc<tokio::runtime::Runtime>,
@@ -196,7 +173,7 @@ pub struct SurgePackContextHandle {
     pub rid: String,
     pub version: String,
     pub artifacts_dir: String,
-    /// Persisted `PackBuilder` between `surge_pack_build` and `surge_pack_push`.
+    /// Lives between `surge_pack_build` and `surge_pack_push`.
     pub builder: Mutex<Option<PackBuilder>>,
 }
 

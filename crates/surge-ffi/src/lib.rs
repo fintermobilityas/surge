@@ -52,7 +52,6 @@ const SURGE_PHASE_FINALIZE: i32 = 5;
 //  #[repr(C)] structs matching surge_api.h
 // ---------------------------------------------------------------------------
 
-/// Matches `surge_progress` in surge_api.h.
 #[repr(C)]
 pub struct SurgeProgressFfi {
     pub phase: i32,
@@ -65,7 +64,6 @@ pub struct SurgeProgressFfi {
     pub speed_bytes_per_sec: f64,
 }
 
-/// Matches `surge_resource_budget` in surge_api.h.
 #[repr(C)]
 pub struct SurgeResourceBudgetFfi {
     pub max_memory_bytes: i64,
@@ -75,7 +73,6 @@ pub struct SurgeResourceBudgetFfi {
     pub zstd_compression_level: i32,
 }
 
-/// Matches `surge_bsdiff_ctx` in surge_api.h.
 #[repr(C)]
 pub struct SurgeBsdiffCtxFfi {
     pub older: *const u8,
@@ -87,7 +84,6 @@ pub struct SurgeBsdiffCtxFfi {
     pub status: i32,
 }
 
-/// Matches `surge_bspatch_ctx` in surge_api.h.
 #[repr(C)]
 pub struct SurgeBspatchCtxFfi {
     pub older: *const u8,
@@ -99,19 +95,13 @@ pub struct SurgeBspatchCtxFfi {
     pub status: i32,
 }
 
-/// Callback type matching `surge_progress_callback` in surge_api.h.
 type SurgeProgressCallback = Option<extern "C" fn(*const SurgeProgressFfi, *mut c_void)>;
-
-/// Callback type matching `surge_event_callback` in surge_api.h.
 type SurgeEventCallback = Option<extern "C" fn(*const c_char, *mut c_void)>;
 
 // ---------------------------------------------------------------------------
 //  Helpers
 // ---------------------------------------------------------------------------
 
-/// Bridges a C progress callback + user_data pointer so that it satisfies
-/// the `Send + Sync` bounds required by `UpdateManager::download_and_apply`.
-///
 /// # Safety
 ///
 /// Only safe when the pointer is valid for the duration of the async call
@@ -122,8 +112,7 @@ struct ProgressBridge {
 }
 
 impl ProgressBridge {
-    /// Convert a core `ProgressInfo` to its FFI representation and invoke
-    /// the C callback.  Core phases are 1-indexed; FFI phases are 0-indexed.
+    /// Core phases are 1-indexed; FFI phases are 0-indexed.
     fn invoke(&self, pi: &ProgressInfo) {
         let ffi = SurgeProgressFfi {
             phase: pi.phase.saturating_sub(1),
@@ -139,7 +128,6 @@ impl ProgressBridge {
     }
 }
 
-/// Build a `SurgeProgressFfi` from pack-style `(items_done, items_total)` counters.
 fn make_pack_progress(phase: i32, items_done: i32, items_total: i32) -> SurgeProgressFfi {
     let pct = if items_total > 0 {
         items_done * 100 / items_total
@@ -164,8 +152,6 @@ fn to_lossy_cstring(value: &str) -> CString {
     CString::new(bytes).unwrap_or_default()
 }
 
-/// Convert a nullable C string pointer to an owned UTF-8 string.
-///
 /// # Safety
 ///
 /// `p` must be null or point to a valid NUL-terminated C string.
@@ -179,8 +165,6 @@ unsafe fn cstr_to_string(p: *const c_char) -> String {
     }
 }
 
-/// Run a closure, catching panics and returning `SURGE_ERROR` on panic.
-/// On success the closure should return a `surge_result` code.
 fn catch_ffi<F: FnOnce() -> i32 + std::panic::UnwindSafe>(f: F) -> i32 {
     match std::panic::catch_unwind(f) {
         Ok(code) => code,
@@ -188,8 +172,6 @@ fn catch_ffi<F: FnOnce() -> i32 + std::panic::UnwindSafe>(f: F) -> i32 {
     }
 }
 
-/// Store an error on the context handle and return the appropriate error code.
-///
 fn set_ctx_error(handle: &SurgeContextHandle, e: &surge_core::error::SurgeError) -> i32 {
     let code = e.error_code() as i32;
     handle.set_last_error(code, &e.to_string());

@@ -5,13 +5,11 @@ use std::path::Path;
 
 use crate::error::{Result, SurgeError};
 
-/// Builder for creating tar.zst archives.
 pub struct ArchivePacker {
     builder: tar::Builder<zstd::Encoder<'static, Vec<u8>>>,
 }
 
 impl ArchivePacker {
-    /// Create a new archive packer with the given zstd compression level.
     pub fn new(compression_level: i32) -> Result<Self> {
         let encoder = zstd::Encoder::new(Vec::new(), compression_level)
             .map_err(|e| SurgeError::Archive(format!("Failed to create zstd encoder: {e}")))?;
@@ -19,7 +17,6 @@ impl ArchivePacker {
         Ok(Self { builder })
     }
 
-    /// Add a file from disk to the archive.
     pub fn add_file(&mut self, source: &Path, archive_path: &str) -> Result<()> {
         let mut file = std::fs::File::open(source)?;
         self.builder
@@ -28,7 +25,6 @@ impl ArchivePacker {
         Ok(())
     }
 
-    /// Add all files in a directory recursively.
     pub fn add_directory(&mut self, source_dir: &Path, prefix: &str) -> Result<()> {
         self.builder
             .append_dir_all(prefix, source_dir)
@@ -36,7 +32,6 @@ impl ArchivePacker {
         Ok(())
     }
 
-    /// Add a buffer as a file entry in the archive.
     pub fn add_buffer(&mut self, archive_path: &str, data: &[u8], mode: u32) -> Result<()> {
         let mut header = tar::Header::new_gnu();
         header.set_size(data.len() as u64);
@@ -49,7 +44,6 @@ impl ArchivePacker {
         Ok(())
     }
 
-    /// Finalize the archive and return the compressed bytes.
     pub fn finalize(self) -> Result<Vec<u8>> {
         let encoder = self
             .builder
@@ -61,7 +55,6 @@ impl ArchivePacker {
         Ok(data)
     }
 
-    /// Finalize the archive and write to a file.
     pub fn finalize_to_file(self, path: &Path) -> Result<()> {
         let data = self.finalize()?;
         if let Some(parent) = path.parent() {

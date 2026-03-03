@@ -7,18 +7,12 @@ use tracing::{info, warn};
 use crate::error::{Result, SurgeError};
 use crate::platform::process::{ProcessHandle, spawn_process};
 
-/// The current state of a supervised process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessState {
-    /// Process is not running.
     Stopped,
-    /// Process is starting up.
     Starting,
-    /// Process is running normally.
     Running,
-    /// Process is shutting down.
     Stopping,
-    /// Process has terminated unexpectedly.
     Crashed,
 }
 
@@ -34,20 +28,13 @@ impl std::fmt::Display for ProcessState {
     }
 }
 
-/// Information about a supervised process.
 #[derive(Debug, Clone)]
 pub struct ProcessInfo {
-    /// Current state of the process.
     pub state: ProcessState,
-    /// Process ID (0 if not running).
     pub pid: u32,
-    /// Last exit code (0 if never exited).
     pub exit_code: i32,
-    /// Version of the application being supervised.
     pub version: String,
-    /// Path to the executable.
     pub exe_path: PathBuf,
-    /// Working directory.
     pub working_dir: PathBuf,
 }
 
@@ -64,7 +51,6 @@ impl Default for ProcessInfo {
     }
 }
 
-/// Manages the lifecycle of a supervised child process.
 #[allow(dead_code)]
 pub struct Supervisor {
     supervisor_id: String,
@@ -74,7 +60,6 @@ pub struct Supervisor {
 }
 
 impl Supervisor {
-    /// Create a new supervisor.
     pub fn new(supervisor_id: &str, install_dir: &str) -> Self {
         Self {
             supervisor_id: supervisor_id.to_string(),
@@ -84,13 +69,6 @@ impl Supervisor {
         }
     }
 
-    /// Start the supervised process.
-    ///
-    /// # Arguments
-    ///
-    /// * `exe_path` - Path to the executable to run
-    /// * `working_dir` - Working directory for the process
-    /// * `args` - Command-line arguments
     pub fn start(&mut self, exe_path: &str, working_dir: &str, args: &[&str]) -> Result<()> {
         if self.is_running() {
             return Err(SurgeError::Supervisor("Process is already running".to_string()));
@@ -119,11 +97,7 @@ impl Supervisor {
         Ok(())
     }
 
-    /// Stop the supervised process.
-    ///
-    /// Sends a termination signal and waits up to `timeout_ms` milliseconds
-    /// for the process to exit. If the process does not exit in time, it is
-    /// force-killed.
+    /// Sends SIGTERM and waits up to `timeout_ms` before force-killing.
     pub fn stop(&mut self, timeout_ms: u64) -> Result<()> {
         let handle = if let Some(h) = self.handle.as_mut() {
             h
@@ -146,12 +120,10 @@ impl Supervisor {
             "Stopping supervised process"
         );
 
-        // Try graceful termination first
         if let Err(e) = handle.terminate() {
             warn!("Graceful terminate failed: {e}");
         }
 
-        // Wait for a bit
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
         loop {
             if !handle.is_running() {
@@ -165,7 +137,6 @@ impl Supervisor {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
 
-        // Collect exit status
         let result = handle.wait()?;
         self.info.exit_code = result.exit_code;
         self.info.state = ProcessState::Stopped;
@@ -177,9 +148,6 @@ impl Supervisor {
         Ok(())
     }
 
-    /// Restart the supervised process, optionally with a new executable or arguments.
-    ///
-    /// Stops the current process (if running), then starts a new one.
     pub fn restart(&mut self, new_exe_path: Option<&str>, new_args: Option<&[&str]>) -> Result<()> {
         let exe_path = new_exe_path.map_or_else(|| self.info.exe_path.to_string_lossy().into_owned(), String::from);
         let working_dir = self.info.working_dir.to_string_lossy().into_owned();
@@ -192,7 +160,6 @@ impl Supervisor {
             "Restarting supervised process"
         );
 
-        // Stop if currently running
         if self.is_running() {
             self.stop(5000)?;
         }
@@ -200,15 +167,12 @@ impl Supervisor {
         self.start(&exe_path, &working_dir, args)
     }
 
-    /// Check if the supervised process is currently running.
-    ///
-    /// Also updates the internal state if the process has exited unexpectedly.
+    /// Also transitions state to `Crashed` if the process exited unexpectedly.
     pub fn is_running(&mut self) -> bool {
         if let Some(handle) = self.handle.as_mut() {
             if handle.is_running() {
                 return true;
             }
-            // Process exited unexpectedly
             if self.info.state == ProcessState::Running {
                 self.info.state = ProcessState::Crashed;
                 warn!(
@@ -223,7 +187,6 @@ impl Supervisor {
         }
     }
 
-    /// Get information about the supervised process.
     pub fn process_info(&self) -> &ProcessInfo {
         &self.info
     }

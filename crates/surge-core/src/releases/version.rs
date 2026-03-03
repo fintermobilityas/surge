@@ -2,15 +2,12 @@
 
 use std::cmp::Ordering;
 
-/// Parse a dotted-integer version string into a vector of numeric parts.
-/// Missing parts are filled with 0, so "1.2" becomes [1, 2, 0].
 fn parse_version(version: &str) -> Vec<u64> {
     let parts: Vec<u64> = version
         .split('.')
         .filter_map(|p| p.trim().parse::<u64>().ok())
         .collect();
 
-    // Ensure at least 3 parts (major.minor.patch)
     let mut result = parts;
     while result.len() < 3 {
         result.push(0);

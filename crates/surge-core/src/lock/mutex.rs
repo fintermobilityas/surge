@@ -11,18 +11,15 @@ use serde::Serialize;
 use crate::context::Context;
 use crate::error::{Result, SurgeError};
 
-/// Default lock server URL.
 const DEFAULT_LOCK_SERVER: &str = "https://snapx.dev";
 
-/// Request body for acquiring a lock (matches snapx.dev `Lock` record).
 #[derive(Debug, Serialize)]
 struct AcquireRequest {
     name: String,
-    /// Duration as a .NET `TimeSpan` string, e.g. `"00:05:00"` for 5 minutes.
+    /// .NET `TimeSpan` string, e.g. `"00:05:00"`.
     duration: String,
 }
 
-/// Request body for releasing a lock (matches snapx.dev `Unlock` record).
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ReleaseRequest {
@@ -31,7 +28,6 @@ struct ReleaseRequest {
     break_period: Option<String>,
 }
 
-/// Format seconds as a .NET `TimeSpan` string (`HH:MM:SS`).
 fn format_duration(seconds: i32) -> String {
     let h = seconds / 3600;
     let m = (seconds % 3600) / 60;
@@ -39,13 +35,6 @@ fn format_duration(seconds: i32) -> String {
     format!("{h:02}:{m:02}:{s:02}")
 }
 
-/// A distributed mutex backed by the snapx.dev lock server.
-///
-/// The lock server is a simple HTTP service:
-/// - `POST /lock` with a JSON `{ "name", "duration" }` body acquires the lock
-///   and returns the challenge token as plain text.
-/// - `DELETE /unlock` with a JSON `{ "name", "challenge", "breakPeriod" }` body
-///   releases the lock.
 pub struct DistributedMutex {
     ctx: Arc<Context>,
     name: String,
@@ -54,7 +43,6 @@ pub struct DistributedMutex {
 }
 
 impl DistributedMutex {
-    /// Create a new distributed mutex with the given name.
     pub fn new(ctx: Arc<Context>, name: &str) -> Self {
         let client = reqwest::Client::builder()
             .user_agent(format!("surge/{}", crate::config::constants::VERSION))
@@ -69,10 +57,6 @@ impl DistributedMutex {
         }
     }
 
-    /// Resolve the lock server base URL.
-    ///
-    /// Uses the configured URL if set, otherwise falls back to
-    /// `https://snapx.dev`.
     fn server_url(&self) -> String {
         let cfg = self.ctx.lock_config();
         if cfg.server_url.is_empty() {
@@ -82,12 +66,8 @@ impl DistributedMutex {
         }
     }
 
-    /// Try to acquire the distributed lock.
-    ///
-    /// Returns `true` if the lock was successfully acquired, `false` if
-    /// it could not be acquired (e.g., held by another process).
-    /// The `timeout_seconds` parameter tells the lock server how long
-    /// to hold the lock before auto-releasing.
+    /// Returns `false` if the lock is already held. `timeout_seconds` controls
+    /// the server-side auto-release duration.
     pub async fn try_acquire(&mut self, timeout_seconds: i32) -> Result<bool> {
         self.ctx.check_cancelled()?;
 
@@ -109,7 +89,6 @@ impl DistributedMutex {
 
         if !response.status().is_success() {
             let status = response.status().as_u16();
-            // 409 Conflict typically means the lock is held by another process
             if status == 409 {
                 return Ok(false);
             }
@@ -119,7 +98,6 @@ impl DistributedMutex {
             )));
         }
 
-        // snapx.dev returns the challenge token as plain text.
         let challenge = response
             .text()
             .await
@@ -134,10 +112,6 @@ impl DistributedMutex {
         Ok(true)
     }
 
-    /// Try to release the distributed lock.
-    ///
-    /// Requires that the lock was previously acquired (i.e., a challenge
-    /// token is available). Returns an error if the lock was not held.
     pub async fn try_release(&mut self) -> Result<()> {
         self.ctx.check_cancelled()?;
 
@@ -174,22 +148,17 @@ impl DistributedMutex {
         Ok(())
     }
 
-    /// Set the challenge token externally.
-    ///
-    /// Used by the FFI layer for `surge_lock_release`, where the challenge
-    /// string is passed in from the C caller rather than obtained from a
-    /// prior `try_acquire` call on this instance.
+    /// Allows the FFI layer to inject a challenge obtained from a different
+    /// `DistributedMutex` instance or a C caller.
     pub fn set_challenge(&mut self, challenge: String) {
         self.challenge = Some(challenge);
     }
 
-    /// Check if the lock is currently held by this instance.
     #[must_use]
     pub fn is_locked(&self) -> bool {
         self.challenge.is_some()
     }
 
-    /// Get the challenge token if the lock is held.
     #[must_use]
     pub fn challenge(&self) -> Option<&str> {
         self.challenge.as_deref()

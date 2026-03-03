@@ -30,6 +30,10 @@ pub struct TargetConfig {
     #[serde(default)]
     pub os: String,
     #[serde(default)]
+    pub distro: String,
+    #[serde(default)]
+    pub variant: String,
+    #[serde(default)]
     pub artifacts_dir: String,
     #[serde(default)]
     pub include: Vec<String>,
@@ -49,6 +53,7 @@ pub struct TargetConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppConfig {
+    #[serde(default)]
     pub id: String,
     #[serde(default)]
     pub name: String,
@@ -139,9 +144,71 @@ impl SurgeManifest {
     pub fn parse(data: &[u8]) -> Result<Self> {
         let raw: Value = serde_yaml::from_slice(data)?;
         reject_embedded_storage_credentials(&raw)?;
-        let manifest: Self = serde_yaml::from_value(raw)?;
+        let mut manifest: Self = serde_yaml::from_value(raw)?;
+        manifest.normalize();
         manifest.validate()?;
         Ok(manifest)
+    }
+
+    /// Expands multi-target apps with no explicit ID into separate single-target
+    /// apps with IDs derived as `{main}-{distro}-{rid}[-{variant}]`.
+    /// Also collects channels from apps when top-level channels are empty.
+    fn normalize(&mut self) {
+        // Expand apps: split multi-target apps without explicit IDs.
+        let mut expanded = Vec::new();
+        for app in std::mem::take(&mut self.apps) {
+            if !app.id.is_empty() {
+                expanded.push(app);
+                continue;
+            }
+
+            let targets: Vec<TargetConfig> = app.iter_targets().cloned().collect();
+            if targets.is_empty() {
+                expanded.push(app);
+                continue;
+            }
+
+            let main = if app.main_exe.is_empty() { &app.name } else { &app.main_exe };
+            for target in targets {
+                let mut derived_id = format!("{}-{}-{}", main, target.distro, target.rid);
+                if !target.variant.is_empty() {
+                    derived_id.push('-');
+                    derived_id.push_str(&target.variant);
+                }
+
+                expanded.push(AppConfig {
+                    id: derived_id,
+                    name: app.name.clone(),
+                    main_exe: app.main_exe.clone(),
+                    install_directory: app.install_directory.clone(),
+                    supervisor_id: app.supervisor_id.clone(),
+                    channels: app.channels.clone(),
+                    os: app.os.clone(),
+                    icon: app.icon.clone(),
+                    shortcuts: app.shortcuts.clone(),
+                    persistent_assets: app.persistent_assets.clone(),
+                    installers: app.installers.clone(),
+                    environment: app.environment.clone(),
+                    targets: vec![target],
+                    target: None,
+                });
+            }
+        }
+        self.apps = expanded;
+
+        // Collect channels from apps when top-level channels are empty.
+        if self.channels.is_empty() {
+            let mut seen = HashSet::new();
+            for app in &self.apps {
+                for channel in &app.channels {
+                    if seen.insert(channel.clone()) {
+                        self.channels.push(ChannelManifestConfig {
+                            name: channel.clone(),
+                        });
+                    }
+                }
+            }
+        }
     }
 
     pub fn from_file(path: &Path) -> Result<Self> {
@@ -201,7 +268,9 @@ impl SurgeManifest {
 
         for app in &self.apps {
             if app.id.is_empty() {
-                return Err(SurgeError::Config("App id is required".to_string()));
+                return Err(SurgeError::Config(
+                    "App id is required (set 'id' explicitly or provide 'main'/'distro'/'rid' for auto-derivation)".to_string(),
+                ));
             }
 
             if app.iter_targets().next().is_none() {

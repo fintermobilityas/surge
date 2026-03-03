@@ -36,9 +36,22 @@ impl AzureBlobBackend {
     /// - `config.access_key` as the storage account name
     /// - `config.secret_key` as the base64-encoded account key
     pub fn new(config: &StorageConfig) -> Result<Self> {
-        if config.access_key.is_empty() || config.secret_key.is_empty() {
+        let access_key = if config.access_key.is_empty() {
+            std::env::var("SURGE_AZURE_ACCESS_KEY").unwrap_or_default()
+        } else {
+            config.access_key.clone()
+        };
+        let secret_key = if config.secret_key.is_empty() {
+            std::env::var("SURGE_AZURE_SECRET_KEY").unwrap_or_default()
+        } else {
+            config.secret_key.clone()
+        };
+
+        if access_key.is_empty() || secret_key.is_empty() {
             return Err(SurgeError::Config(
-                "Azure Blob storage requires access_key (account name) and secret_key (account key)".to_string(),
+                "Azure Blob storage requires access_key (account name) and secret_key (account key). \
+                 Set SURGE_AZURE_ACCESS_KEY and SURGE_AZURE_SECRET_KEY environment variables."
+                    .to_string(),
             ));
         }
         if config.bucket.is_empty() {
@@ -48,11 +61,11 @@ impl AzureBlobBackend {
         }
 
         let key_bytes = BASE64
-            .decode(&config.secret_key)
+            .decode(&secret_key)
             .map_err(|e| SurgeError::Config(format!("Azure account key is not valid base64: {e}")))?;
 
         let endpoint = if config.endpoint.is_empty() {
-            format!("https://{}.blob.core.windows.net", config.access_key)
+            format!("https://{}.blob.core.windows.net", access_key)
         } else {
             config.endpoint.clone()
         };
@@ -62,7 +75,7 @@ impl AzureBlobBackend {
             .map_err(|e| SurgeError::Storage(format!("Failed to build HTTP client: {e}")))?;
 
         debug!(
-            account = %config.access_key,
+            account = %access_key,
             container = %config.bucket,
             endpoint = %endpoint,
             "Azure Blob backend initialized"
@@ -70,7 +83,7 @@ impl AzureBlobBackend {
 
         Ok(Self {
             client,
-            account: config.access_key.clone(),
+            account: access_key,
             key_bytes,
             container: config.bucket.clone(),
             endpoint,

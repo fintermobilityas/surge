@@ -80,6 +80,8 @@ pub async fn execute(
             targets: vec![TargetConfig {
                 rid: init.rid,
                 os: String::new(),
+                distro: String::new(),
+                variant: String::new(),
                 artifacts_dir: String::new(),
                 include: vec![],
                 exclude: vec![],

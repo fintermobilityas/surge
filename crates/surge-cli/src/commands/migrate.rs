@@ -226,7 +226,7 @@ fn resolve_source_app_and_rid(
         };
     }
 
-    let source_app_id = super::resolve_app_id(manifest, None)?;
+    let source_app_id = super::resolve_app_id_with_rid_hint(manifest, None, requested_rid.as_deref())?;
     let rid = super::resolve_rid(manifest, &source_app_id, requested_rid.as_deref())?;
     Ok((source_app_id, rid))
 }

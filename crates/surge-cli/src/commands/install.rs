@@ -53,7 +53,7 @@ pub async fn execute(
 ) -> Result<()> {
     let theme = UiTheme::global();
     let manifest = load_install_manifest(application_manifest_path, manifest_path)?;
-    let app_id = super::resolve_app_id(&manifest, app_id)?;
+    let app_id = super::resolve_app_id_with_rid_hint(&manifest, app_id, rid)?;
 
     let install_target = match node.map(str::trim).filter(|value| !value.is_empty()) {
         Some(node) => {

@@ -36,6 +36,46 @@ pub(crate) fn resolve_app_id(manifest: &SurgeManifest, requested_app_id: Option<
     }
 }
 
+pub(crate) fn resolve_app_id_with_rid_hint(
+    manifest: &SurgeManifest,
+    requested_app_id: Option<&str>,
+    requested_rid: Option<&str>,
+) -> Result<String> {
+    if let Some(app_id) = requested_app_id.map(str::trim).filter(|value| !value.is_empty()) {
+        return Ok(app_id.to_string());
+    }
+
+    let requested_rid = requested_rid.map(str::trim).filter(|value| !value.is_empty());
+    if let Some(rid) = requested_rid {
+        let mut candidates: Vec<String> = manifest
+            .app_ids()
+            .into_iter()
+            .filter(|app_id| manifest.target_rids(app_id).iter().any(|target_rid| target_rid == rid))
+            .collect();
+        candidates.sort();
+        candidates.dedup();
+
+        return match candidates.as_slice() {
+            [single] => Ok(single.clone()),
+            [] => {
+                if manifest.apps.len() > 1 {
+                    Err(SurgeError::Config(format!(
+                        "No app in manifest defines target RID '{rid}'. Provide --app-id."
+                    )))
+                } else {
+                    resolve_app_id(manifest, None)
+                }
+            }
+            _ => Err(SurgeError::Config(format!(
+                "RID '{rid}' matches multiple apps ({}). Provide --app-id.",
+                candidates.join(", ")
+            ))),
+        };
+    }
+
+    resolve_app_id(manifest, None)
+}
+
 pub(crate) fn resolve_rid(manifest: &SurgeManifest, app_id: &str, requested_rid: Option<&str>) -> Result<String> {
     if let Some(rid) = requested_rid.map(str::trim).filter(|value| !value.is_empty()) {
         return Ok(rid.to_string());
@@ -277,6 +317,68 @@ apps:
         let manifest = SurgeManifest::parse(yaml).unwrap();
 
         let err = super::resolve_app_id(&manifest, None).unwrap_err();
+        assert!(err.to_string().contains("Provide --app-id"));
+    }
+
+    #[test]
+    fn test_resolve_app_with_rid_hint_picks_unique_matching_app() {
+        let yaml = br"schema: 1
+storage:
+  provider: filesystem
+  bucket: /tmp/releases
+apps:
+  - id: app-a
+    target:
+      rid: linux-x64
+  - id: app-b
+    target:
+      rid: linux-arm64
+";
+        let manifest = SurgeManifest::parse(yaml).unwrap();
+
+        let app_id = super::resolve_app_id_with_rid_hint(&manifest, None, Some("linux-arm64")).unwrap();
+        assert_eq!(app_id, "app-b");
+    }
+
+    #[test]
+    fn test_resolve_app_with_rid_hint_rejects_ambiguous_match() {
+        let yaml = br"schema: 1
+storage:
+  provider: filesystem
+  bucket: /tmp/releases
+apps:
+  - id: app-a
+    target:
+      rid: linux-arm64
+  - id: app-b
+    target:
+      rid: linux-arm64
+";
+        let manifest = SurgeManifest::parse(yaml).unwrap();
+
+        let err = super::resolve_app_id_with_rid_hint(&manifest, None, Some("linux-arm64")).unwrap_err();
+        assert!(err.to_string().contains("matches multiple apps"));
+        assert!(err.to_string().contains("Provide --app-id"));
+    }
+
+    #[test]
+    fn test_resolve_app_with_rid_hint_rejects_missing_rid_in_multi_app_manifest() {
+        let yaml = br"schema: 1
+storage:
+  provider: filesystem
+  bucket: /tmp/releases
+apps:
+  - id: app-a
+    target:
+      rid: linux-x64
+  - id: app-b
+    target:
+      rid: linux-arm64
+";
+        let manifest = SurgeManifest::parse(yaml).unwrap();
+
+        let err = super::resolve_app_id_with_rid_hint(&manifest, None, Some("win-x64")).unwrap_err();
+        assert!(err.to_string().contains("No app in manifest defines target RID"));
         assert!(err.to_string().contains("Provide --app-id"));
     }
 

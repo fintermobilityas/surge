@@ -24,7 +24,7 @@ pub async fn execute(
 
     print_stage(theme, 1, TOTAL_STAGES, "Resolving manifest and target release");
     let manifest = SurgeManifest::from_file(manifest_path)?;
-    let app_id = super::resolve_app_id(&manifest, app_id)?;
+    let app_id = super::resolve_app_id_with_rid_hint(&manifest, app_id, rid)?;
     let rid = super::resolve_rid(&manifest, &app_id, rid)?;
     let storage_config = super::build_app_scoped_storage_config(&manifest, &app_id)?;
     let backend = storage::create_storage_backend(&storage_config)?;

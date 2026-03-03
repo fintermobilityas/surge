@@ -27,7 +27,7 @@ pub async fn execute(
     let started = Instant::now();
     print_stage(theme, 1, TOTAL_STAGES, "Resolving manifest and target");
     let manifest = SurgeManifest::from_file(manifest_path)?;
-    let app_id = super::resolve_app_id(&manifest, app_id)?;
+    let app_id = super::resolve_app_id_with_rid_hint(&manifest, app_id, rid)?;
     let rid = super::resolve_rid(&manifest, &app_id, rid)?;
     let (app, target) = manifest
         .find_app_with_target(&app_id, &rid)

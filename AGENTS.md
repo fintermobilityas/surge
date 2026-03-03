@@ -34,6 +34,27 @@ dotnet test dotnet/Surge.slnx --configuration Release
 - Keep modules cohesive and APIs explicit (`Result<T, E>`, typed structs/enums instead of ad-hoc tuples).
 - Minimize `unsafe`: isolate it to FFI/boundary layers, prefer safe wrappers, and remove unnecessary `unsafe impl`.
 - Every remaining unsafe block must include a short `SAFETY:` rationale.
+- Run periodic panic-path sweeps in non-test targets with:
+  - `cargo clippy --workspace -- -D warnings -D clippy::unwrap_used -D clippy::expect_used`
+  - fix runtime `unwrap/expect` in production/build paths instead of suppressing lints.
+  - `expect_used` is treated the same as `unwrap_used`: both can hide panic paths in runtime code.
+- CI hardening tiers:
+  - blocking: `cargo clippy --workspace --lib --bins --examples -- -D warnings -D clippy::unwrap_used -D clippy::expect_used`
+  - advisory debt visibility: `cargo clippy --workspace --all-targets --all-features -- -D warnings -W clippy::pedantic`
+  - keep pedantic advisory until backlog is reduced; then promote selected pedantic lints to blocking.
+- Enforce unsafe boundaries by crate/module:
+  - `surge-core` denies unsafe by default; only `src/diff/*` is allowed to use it.
+  - `surge-cli` and `surge-supervisor` forbid unsafe.
+  - `surge-ffi` is the primary unsafe boundary and must stay explicit/auditable.
+
+## FFI Safety Rules
+- Do not store raw back-pointers to context handles in long-lived FFI handles; clone shared `Arc` state instead.
+- Clear out-parameters at function entry (`*out = null`) before any fallible work.
+- Free functions must safely handle zero-length buffers and null pointers.
+- Keep shared error propagation consistent across context/manager/pack handles.
+- Prefer checked conversions for lengths/indices (`i64/i32 -> usize`) and reject invalid values early.
+- Prefer safe `extern "C" fn` callback types when the function pointer itself has no extra unsafe preconditions.
+- If converting C strings for outbound FFI, sanitize embedded NULs to avoid truncated/empty fallback errors.
 
 ## Coding Style & Naming
 - Rust edition: 2024; format with `cargo fmt --all`.
@@ -46,6 +67,11 @@ dotnet test dotnet/Surge.slnx --configuration Release
 - Keep unit tests close to code (`#[cfg(test)]` in modules).
 - Add integration tests under `crates/*/tests` when behavior spans modules/commands.
 - For update/diff changes, include regression coverage for full + delta flows.
+- For FFI changes, add regression tests for:
+  - handle lifetime behavior after context destruction,
+  - out-pointer behavior on failure paths,
+  - zero-length and null-pointer edge cases.
+- Keep `crates/surge-core/tests/unsafe_boundaries.rs` passing (unsafe confined to approved modules).
 - Before push, run Rust workspace tests + clippy and .NET tests.
 
 ## Commit & Pull Request Guidelines

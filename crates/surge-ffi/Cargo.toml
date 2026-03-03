@@ -10,7 +10,7 @@ name = "surge"
 crate-type = ["cdylib"]
 
 [dependencies]
-surge-core = { path = "../surge-core", version = "0.1.0" }
+surge-core = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

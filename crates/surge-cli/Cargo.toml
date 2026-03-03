@@ -11,7 +11,7 @@ name = "surge"
 path = "src/main.rs"
 
 [dependencies]
-surge-core = { path = "../surge-core", version = "0.1.0" }
+surge-core = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 clap = { workspace = true }
 tokio = { workspace = true }

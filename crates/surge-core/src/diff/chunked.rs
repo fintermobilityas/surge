@@ -84,6 +84,20 @@ fn available_memory_bytes() -> usize {
     4 * 1024 * 1024 * 1024
 }
 
+fn lock_mutex<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match m.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn into_inner<T>(m: Mutex<T>) -> T {
+    match m.into_inner() {
+        Ok(val) => val,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
 /// Create a chunked binary diff patch.
 ///
 /// Splits `older` and `newer` into aligned chunks of `opts.chunk_size` bytes,
@@ -112,8 +126,7 @@ pub fn chunked_bsdiff(older: &[u8], newer: &[u8], opts: &ChunkedDiffOptions) -> 
         for _ in 0..num_threads {
             s.spawn(|| {
                 loop {
-                    // Check for error from another thread
-                    if error.lock().unwrap().is_some() {
+                    if lock_mutex(&error).is_some() {
                         return;
                     }
 
@@ -140,38 +153,32 @@ pub fn chunked_bsdiff(older: &[u8], newer: &[u8], opts: &ChunkedDiffOptions) -> 
                     };
 
                     let patch = if old_chunk.is_empty() {
-                        // New chunk with no old counterpart — store verbatim
-                        // (bsdiff against empty produces overhead; raw is simpler)
                         new_chunk.to_vec()
                     } else if new_chunk.is_empty() {
-                        // Old chunk removed — empty patch
                         Vec::new()
                     } else {
                         match wrapper::bsdiff_buffers(old_chunk, new_chunk) {
                             Ok(p) => p,
                             Err(e) => {
-                                *error.lock().unwrap() = Some(e);
+                                *lock_mutex(&error) = Some(e);
                                 return;
                             }
                         }
                     };
 
-                    results.lock().unwrap().push((idx, patch));
+                    lock_mutex(&results).push((idx, patch));
                 }
             });
         }
     });
 
-    // Check for errors
-    if let Some(e) = error.into_inner().unwrap() {
+    if let Some(e) = into_inner(error) {
         return Err(e);
     }
 
-    // Sort results by chunk index
-    let mut chunks = results.into_inner().unwrap();
+    let mut chunks = into_inner(results);
     chunks.sort_by_key(|(idx, _)| *idx);
 
-    // Serialize: header + chunk patches
     serialize_patch(older.len(), newer.len(), chunk_size, &chunks)
 }
 
@@ -197,7 +204,7 @@ pub fn chunked_bspatch(older: &[u8], patch: &[u8], opts: &ChunkedDiffOptions) ->
         for _ in 0..num_threads {
             s.spawn(|| {
                 loop {
-                    if error.lock().unwrap().is_some() {
+                    if lock_mutex(&error).is_some() {
                         return;
                     }
 
@@ -217,32 +224,30 @@ pub fn chunked_bspatch(older: &[u8], patch: &[u8], opts: &ChunkedDiffOptions) ->
                     };
 
                     let new_chunk = if old_chunk.is_empty() {
-                        // No old data — patch IS the verbatim new data
                         chunk_patch.to_vec()
                     } else if chunk_patch.is_empty() {
-                        // Chunk was removed
                         Vec::new()
                     } else {
                         match wrapper::bspatch_buffers(old_chunk, chunk_patch) {
                             Ok(data) => data,
                             Err(e) => {
-                                *error.lock().unwrap() = Some(e);
+                                *lock_mutex(&error) = Some(e);
                                 return;
                             }
                         }
                     };
 
-                    results.lock().unwrap().push((idx, new_chunk));
+                    lock_mutex(&results).push((idx, new_chunk));
                 }
             });
         }
     });
 
-    if let Some(e) = error.into_inner().unwrap() {
+    if let Some(e) = into_inner(error) {
         return Err(e);
     }
 
-    let mut chunks = results.into_inner().unwrap();
+    let mut chunks = into_inner(results);
     chunks.sort_by_key(|(idx, _)| *idx);
 
     // Concatenate all chunks
@@ -296,6 +301,20 @@ fn serialize_patch(
     Ok(buf)
 }
 
+fn read_u64_le(data: &[u8], offset: usize) -> Result<u64> {
+    let bytes: [u8; 8] = data[offset..offset + 8]
+        .try_into()
+        .map_err(|_| SurgeError::Diff("patch truncated reading u64".into()))?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn read_u32_le(data: &[u8], offset: usize) -> Result<u32> {
+    let bytes: [u8; 4] = data[offset..offset + 4]
+        .try_into()
+        .map_err(|_| SurgeError::Diff("patch truncated reading u32".into()))?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
 fn deserialize_patch(data: &[u8]) -> Result<(usize, usize, usize, Vec<&[u8]>)> {
     let header_size = 4 + 1 + 8 + 8 + 8 + 4;
     if data.len() < header_size {
@@ -312,10 +331,10 @@ fn deserialize_patch(data: &[u8]) -> Result<(usize, usize, usize, Vec<&[u8]>)> {
         )));
     }
 
-    let chunk_size = u64::from_le_bytes(data[5..13].try_into().unwrap()) as usize;
-    let old_size = u64::from_le_bytes(data[13..21].try_into().unwrap()) as usize;
-    let new_size = u64::from_le_bytes(data[21..29].try_into().unwrap()) as usize;
-    let num_chunks = u32::from_le_bytes(data[29..33].try_into().unwrap()) as usize;
+    let chunk_size = read_u64_le(data, 5)? as usize;
+    let old_size = read_u64_le(data, 13)? as usize;
+    let new_size = read_u64_le(data, 21)? as usize;
+    let num_chunks = read_u32_le(data, 29)? as usize;
 
     let mut offset = header_size;
     let mut chunks = Vec::with_capacity(num_chunks);
@@ -324,7 +343,7 @@ fn deserialize_patch(data: &[u8]) -> Result<(usize, usize, usize, Vec<&[u8]>)> {
         if offset + 8 > data.len() {
             return Err(SurgeError::Diff("patch truncated at chunk length".into()));
         }
-        let patch_len = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap()) as usize;
+        let patch_len = read_u64_le(data, offset)? as usize;
         offset += 8;
 
         if offset + patch_len > data.len() {
@@ -348,8 +367,8 @@ mod tests {
             chunk_size: 256,
             max_threads: 1,
         };
-        let patch = chunked_bsdiff(&data, &data, &opts).unwrap();
-        let reconstructed = chunked_bspatch(&data, &patch, &opts).unwrap();
+        let patch = chunked_bsdiff(&data, &data, &opts).expect("bsdiff");
+        let reconstructed = chunked_bspatch(&data, &patch, &opts).expect("bspatch");
         assert_eq!(reconstructed, data);
     }
 
@@ -364,8 +383,8 @@ mod tests {
             chunk_size: 512,
             max_threads: 2,
         };
-        let patch = chunked_bsdiff(&old, &new, &opts).unwrap();
-        let reconstructed = chunked_bspatch(&old, &patch, &opts).unwrap();
+        let patch = chunked_bsdiff(&old, &new, &opts).expect("bsdiff");
+        let reconstructed = chunked_bspatch(&old, &patch, &opts).expect("bspatch");
         assert_eq!(reconstructed, new);
     }
 
@@ -379,8 +398,8 @@ mod tests {
             chunk_size: 512,
             max_threads: 1,
         };
-        let patch = chunked_bsdiff(&old, &new, &opts).unwrap();
-        let reconstructed = chunked_bspatch(&old, &patch, &opts).unwrap();
+        let patch = chunked_bsdiff(&old, &new, &opts).expect("bsdiff");
+        let reconstructed = chunked_bspatch(&old, &patch, &opts).expect("bspatch");
         assert_eq!(reconstructed, new);
     }
 
@@ -393,8 +412,8 @@ mod tests {
             chunk_size: 512,
             max_threads: 1,
         };
-        let patch = chunked_bsdiff(&old, &new, &opts).unwrap();
-        let reconstructed = chunked_bspatch(&old, &patch, &opts).unwrap();
+        let patch = chunked_bsdiff(&old, &new, &opts).expect("bsdiff");
+        let reconstructed = chunked_bspatch(&old, &patch, &opts).expect("bspatch");
         assert_eq!(reconstructed, new);
     }
 
@@ -410,8 +429,8 @@ mod tests {
             chunk_size: 512,
             max_threads: 4,
         };
-        let patch = chunked_bsdiff(&old, &new, &opts).unwrap();
-        let reconstructed = chunked_bspatch(&old, &patch, &opts).unwrap();
+        let patch = chunked_bsdiff(&old, &new, &opts).expect("bsdiff");
+        let reconstructed = chunked_bspatch(&old, &patch, &opts).expect("bspatch");
         assert_eq!(reconstructed, new);
     }
 }

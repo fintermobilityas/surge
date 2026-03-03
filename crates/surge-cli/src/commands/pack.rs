@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
+use crate::ui::UiTheme;
 use serde::Serialize;
 use surge_core::archive::packer::ArchivePacker;
 use surge_core::config::constants::{DEFAULT_ZSTD_LEVEL, RELEASES_FILE_COMPRESSED};
@@ -103,15 +105,28 @@ pub async fn execute_installers_only(
     artifacts_dir: Option<&Path>,
     output_dir: &Path,
 ) -> Result<()> {
+    const TOTAL_STAGES: usize = 5;
+
+    let theme = UiTheme::global();
+    let started = Instant::now();
+
+    print_stage(theme, 1, TOTAL_STAGES, "Resolving manifest and target");
     let manifest = SurgeManifest::from_file(manifest_path)?;
     let app_id = super::resolve_app_id(&manifest, app_id)?;
     let rid = super::resolve_rid(&manifest, &app_id, rid)?;
     let (app, target) = manifest
         .find_app_with_target(&app_id, &rid)
         .ok_or_else(|| SurgeError::Config(format!("No target {rid} found for app {app_id}")))?;
-
     std::fs::create_dir_all(output_dir)?;
     let default_channel = default_channel_for_app(&manifest, app);
+    print_stage_done(
+        theme,
+        1,
+        TOTAL_STAGES,
+        &format!("Target: {app_id}/{rid} (channel: {default_channel})"),
+    );
+
+    print_stage(theme, 2, TOTAL_STAGES, "Resolving release for installer build");
     let storage_config = super::build_app_scoped_storage_config(&manifest, &app_id)?;
     let backend = storage::create_storage_backend(&storage_config)?;
     let index = fetch_release_index(&*backend).await?;
@@ -139,6 +154,12 @@ pub async fn execute_installers_only(
             selected_release.version, app_id, rid
         )));
     }
+    print_stage_done(
+        theme,
+        2,
+        TOTAL_STAGES,
+        &format!("Selected release version {selected_version}"),
+    );
 
     let artifacts_dir = artifacts_dir.map_or_else(
         || default_artifacts_dir(manifest_path, &app_id, &rid, &selected_version),
@@ -156,19 +177,37 @@ pub async fn execute_installers_only(
         .map(std::ffi::OsStr::to_os_string)
         .ok_or_else(|| SurgeError::Pack(format!("Invalid full package key: {full_key}")))?;
     let full_package_path = output_dir.join(local_full_name);
-    if !full_package_path.is_file() {
-        tracing::info!(
-            "Full package missing locally, restoring '{}' to '{}'",
-            full_key,
-            full_package_path.display()
+    print_stage(theme, 3, TOTAL_STAGES, "Ensuring full package is available");
+    if full_package_path.is_file() {
+        print_stage_done(
+            theme,
+            3,
+            TOTAL_STAGES,
+            &format!("Using local package {}", full_package_path.display()),
+        );
+    } else {
+        println!(
+            "{}",
+            theme.info(&format!(
+                "Full package missing locally; downloading '{}' to '{}'",
+                full_key,
+                full_package_path.display()
+            ))
         );
         backend.download_to_file(full_key, &full_package_path, None).await?;
+        print_stage_done(
+            theme,
+            3,
+            TOTAL_STAGES,
+            &format!("Downloaded {}", full_package_path.display()),
+        );
     }
 
-    tracing::info!(
-        "Building installers for {app_id} v{version} ({rid}) using existing package {package}",
-        version = selected_version,
-        package = full_package_path.display()
+    print_stage(
+        theme,
+        4,
+        TOTAL_STAGES,
+        &format!("Building installers for {app_id} v{selected_version} ({rid})"),
     );
 
     let installer_paths = build_installers(
@@ -183,14 +222,28 @@ pub async fn execute_installers_only(
         &full_package_path,
     )?;
     if installer_paths.is_empty() {
-        tracing::warn!(
-            "No installers configured for {app_id}/{rid}. Configure `installers: [web]` or `installers: [offline]` in the manifest."
+        print_stage_done(
+            theme,
+            4,
+            TOTAL_STAGES,
+            &format!(
+                "No installers configured for {app_id}/{rid}. Configure `installers: [web]` or `installers: [offline]` in the manifest."
+            ),
         );
         return Ok(());
     }
     for installer in installer_paths {
-        tracing::info!("Created {}", installer.display());
+        println!("{}", theme.subtle(&format!("  Created {}", installer.display())));
     }
+
+    print_stage_done(theme, 4, TOTAL_STAGES, "Installer bundles created");
+    print_stage(theme, 5, TOTAL_STAGES, "Finalize restore-installers summary");
+    print_stage_done(
+        theme,
+        5,
+        TOTAL_STAGES,
+        &format!("Completed in {}", format_duration(started.elapsed())),
+    );
 
     Ok(())
 }
@@ -427,6 +480,22 @@ fn default_artifacts_dir(manifest_path: &Path, app_id: &str, rid: &str, version:
         .join(app_id)
         .join(rid)
         .join(version)
+}
+
+fn print_stage(theme: UiTheme, stage: usize, total: usize, text: &str) {
+    println!("{}", theme.info(&format!("[{stage}/{total}] {text}")));
+}
+
+fn print_stage_done(theme: UiTheme, stage: usize, total: usize, text: &str) {
+    println!("{}", theme.success(&format!("[{stage}/{total}] {text}")));
+}
+
+fn format_duration(duration: std::time::Duration) -> String {
+    if duration.as_millis() < 1000 {
+        format!("{}ms", duration.as_millis())
+    } else {
+        format!("{:.1}s", duration.as_secs_f64())
+    }
 }
 
 fn configure_context(manifest: &SurgeManifest, app_id: &str) -> Result<Context> {

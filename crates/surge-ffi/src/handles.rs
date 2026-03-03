@@ -4,7 +4,7 @@
 //! The corresponding `_destroy` function reclaims ownership with `Box::from_raw()`.
 
 use std::ffi::{CString, c_char};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use surge_core::context::Context;
 use surge_core::pack::builder::PackBuilder;
@@ -51,6 +51,10 @@ impl SurgeErrorOwned {
     }
 }
 
+fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 // ---------------------------------------------------------------------------
 //  Context handle
 // ---------------------------------------------------------------------------
@@ -74,20 +78,20 @@ impl SurgeContextHandle {
     /// Store an error so that `surge_context_last_error` can return it.
     pub fn set_last_error(&self, code: i32, msg: &str) {
         {
-            let mut shared = self.shared_last_error.lock().unwrap();
+            let mut shared = lock_recover(&self.shared_last_error);
             *shared = Some(SurgeErrorOwned::new(code, msg));
         }
-        let mut slot = self.last_error.lock().unwrap();
+        let mut slot = lock_recover(&self.last_error);
         *slot = Some(SurgeErrorFfi::new(code, msg));
     }
 
     /// Clear any previously stored error.
     pub fn clear_last_error(&self) {
         {
-            let mut shared = self.shared_last_error.lock().unwrap();
+            let mut shared = lock_recover(&self.shared_last_error);
             *shared = None;
         }
-        let mut slot = self.last_error.lock().unwrap();
+        let mut slot = lock_recover(&self.last_error);
         *slot = None;
         self.ctx.clear_error();
     }
@@ -95,11 +99,11 @@ impl SurgeContextHandle {
     /// Return a pointer to the cached error, or null if none.
     pub fn get_last_error(&self) -> *const SurgeErrorFfi {
         let snapshot = {
-            let shared = self.shared_last_error.lock().unwrap();
+            let shared = lock_recover(&self.shared_last_error);
             shared.as_ref().map(|e| (e.code, e.message.clone()))
         };
 
-        let mut slot = self.last_error.lock().unwrap();
+        let mut slot = lock_recover(&self.last_error);
         *slot = snapshot.map(|(code, message)| {
             let ptr = message.as_ptr();
             SurgeErrorFfi {

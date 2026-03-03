@@ -10,7 +10,7 @@ mod handles;
 
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::ptr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use surge_core::context::{Context, ResourceBudget, StorageProvider};
 use surge_core::diff::wrapper::{bsdiff_buffers, bspatch_buffers};
@@ -198,20 +198,24 @@ fn set_ctx_error(handle: *const SurgeContextHandle, e: &surge_core::error::Surge
 
 fn set_shared_error(
     ctx: &Arc<Context>,
-    last_error: &Arc<std::sync::Mutex<Option<SurgeErrorOwned>>>,
+    last_error: &Arc<Mutex<Option<SurgeErrorOwned>>>,
     e: &surge_core::error::SurgeError,
 ) -> i32 {
     let code = e.error_code() as i32;
-    let mut slot = last_error.lock().unwrap();
+    let mut slot = lock_recover(last_error.as_ref());
     *slot = Some(SurgeErrorOwned::new(code, &e.to_string()));
     ctx.set_error(e);
     code
 }
 
-fn clear_shared_error(ctx: &Arc<Context>, last_error: &Arc<std::sync::Mutex<Option<SurgeErrorOwned>>>) {
-    let mut slot = last_error.lock().unwrap();
+fn clear_shared_error(ctx: &Arc<Context>, last_error: &Arc<Mutex<Option<SurgeErrorOwned>>>) {
+    let mut slot = lock_recover(last_error.as_ref());
     *slot = None;
     ctx.clear_error();
+}
+
+fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn try_len(size: i64) -> Option<usize> {
@@ -998,7 +1002,7 @@ pub unsafe extern "C" fn surge_pack_build(
         match result {
             Ok(()) => {
                 // Store the builder so surge_pack_push can use it.
-                let mut slot = pack.builder.lock().unwrap();
+                let mut slot = lock_recover(&pack.builder);
                 *slot = Some(builder);
                 SURGE_OK
             }
@@ -1031,7 +1035,7 @@ pub unsafe extern "C" fn surge_pack_push(
 
         // Take the builder that was stored by surge_pack_build.
         let builder = {
-            let mut slot = pack.builder.lock().unwrap();
+            let mut slot = lock_recover(&pack.builder);
             slot.take()
         };
 

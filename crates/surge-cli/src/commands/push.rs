@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::time::Instant;
 
+use crate::ui::UiTheme;
 use surge_core::config::constants::{DEFAULT_ZSTD_LEVEL, RELEASES_FILE_COMPRESSED, SCHEMA_VERSION};
 use surge_core::config::manifest::{ShortcutLocation, SurgeManifest};
 use surge_core::crypto::sha256::sha256_hex_file;
@@ -18,6 +20,11 @@ pub async fn execute(
     channel: &str,
     packages_dir: &Path,
 ) -> Result<()> {
+    const TOTAL_STAGES: usize = 5;
+
+    let theme = UiTheme::global();
+    let started = Instant::now();
+    print_stage(theme, 1, TOTAL_STAGES, "Resolving manifest and target");
     let manifest = SurgeManifest::from_file(manifest_path)?;
     let app_id = super::resolve_app_id(&manifest, app_id)?;
     let rid = super::resolve_rid(&manifest, &app_id, rid)?;
@@ -35,15 +42,20 @@ pub async fn execute(
 
     let storage_config = super::build_app_scoped_storage_config(&manifest, &app_id)?;
     let backend = storage::create_storage_backend(&storage_config)?;
+    print_stage_done(theme, 1, TOTAL_STAGES, &format!("Target: {app_id}/{rid}"));
 
+    print_stage(
+        theme,
+        2,
+        TOTAL_STAGES,
+        &format!("Validating package inputs at {}", packages_dir.display()),
+    );
     if !packages_dir.is_dir() {
         return Err(SurgeError::Storage(format!(
             "Packages directory does not exist: {}",
             packages_dir.display()
         )));
     }
-
-    tracing::info!("Pushing {app_id} v{version} ({rid}) to channel '{channel}'");
 
     let full_filename = format!("{app_id}-{version}-{rid}-full.tar.zst");
     let full_archive = packages_dir.join(&full_filename);
@@ -53,25 +65,44 @@ pub async fn execute(
             full_archive.display()
         )));
     }
+    print_stage_done(
+        theme,
+        2,
+        TOTAL_STAGES,
+        &format!("Found full package {}", full_archive.display()),
+    );
 
+    print_stage(theme, 3, TOTAL_STAGES, "Uploading release artifacts");
     backend.upload_from_file(&full_filename, &full_archive, None).await?;
     let full_size = std::fs::metadata(&full_archive)?.len() as i64;
     let full_sha256 = sha256_hex_file(&full_archive)?;
 
     let delta_filename = format!("{app_id}-{version}-{rid}-delta.tar.zst");
     let delta_archive = packages_dir.join(&delta_filename);
-    let (delta_filename, delta_size, delta_sha256) = if delta_archive.is_file() {
+    let (delta_filename, delta_size, delta_sha256, delta_uploaded) = if delta_archive.is_file() {
         backend.upload_from_file(&delta_filename, &delta_archive, None).await?;
         (
             delta_filename,
             std::fs::metadata(&delta_archive)?.len() as i64,
             sha256_hex_file(&delta_archive)?,
+            true,
         )
     } else {
-        (String::new(), 0, String::new())
+        (String::new(), 0, String::new(), false)
     };
+    print_stage_done(
+        theme,
+        3,
+        TOTAL_STAGES,
+        if delta_uploaded {
+            "Uploaded full and delta artifacts"
+        } else {
+            "Uploaded full artifact (no delta package found)"
+        },
+    );
 
-    update_release_index(
+    print_stage(theme, 4, TOTAL_STAGES, "Updating release index");
+    let pruned = update_release_index(
         &*backend,
         &app_id,
         version,
@@ -93,8 +124,29 @@ pub async fn execute(
         environment,
     )
     .await?;
+    print_stage_done(
+        theme,
+        4,
+        TOTAL_STAGES,
+        &format!("Updated {RELEASES_FILE_COMPRESSED} (pruned {pruned} stale artifact(s))"),
+    );
 
-    tracing::info!("Push complete for {app_id} v{version} ({rid}) -> {channel}");
+    print_stage(theme, 5, TOTAL_STAGES, "Finalize push summary");
+    let uploaded_count = if delta_uploaded { 2 } else { 1 };
+    let uploaded_bytes = if delta_uploaded {
+        full_size + delta_size
+    } else {
+        full_size
+    };
+    print_stage_done(
+        theme,
+        5,
+        TOTAL_STAGES,
+        &format!(
+            "Published {app_id} v{version} ({rid}) -> {channel} in {} (objects: {uploaded_count}, bytes: {uploaded_bytes})",
+            format_duration(started.elapsed())
+        ),
+    );
     Ok(())
 }
 
@@ -119,7 +171,7 @@ async fn update_release_index(
     persistent_assets: Vec<String>,
     installers: Vec<String>,
     environment: BTreeMap<String, String>,
-) -> Result<()> {
+) -> Result<usize> {
     let mut index = match backend.get_object(RELEASES_FILE_COMPRESSED).await {
         Ok(data) => decompress_release_index(&data)?,
         Err(SurgeError::NotFound(_)) => ReleaseIndex {
@@ -190,12 +242,12 @@ async fn update_release_index(
     backend
         .put_object(RELEASES_FILE_COMPRESSED, &compressed, "application/octet-stream")
         .await?;
-    prune_redundant_artifacts(backend, &index).await?;
+    let pruned = prune_redundant_artifacts(backend, &index).await?;
 
-    Ok(())
+    Ok(pruned)
 }
 
-async fn prune_redundant_artifacts(backend: &dyn StorageBackend, index: &ReleaseIndex) -> Result<()> {
+async fn prune_redundant_artifacts(backend: &dyn StorageBackend, index: &ReleaseIndex) -> Result<usize> {
     let required = required_artifacts_for_index(index);
 
     let mut candidates = BTreeSet::new();
@@ -227,9 +279,25 @@ async fn prune_redundant_artifacts(backend: &dyn StorageBackend, index: &Release
     if pruned > 0 {
         tracing::info!(pruned, retained = required.len(), "Pruned redundant release artifacts");
     }
-    Ok(())
+    Ok(pruned)
 }
 
 fn detect_os_from_rid(rid: &str) -> String {
     rid.split('-').next().unwrap_or("unknown").to_string()
+}
+
+fn print_stage(theme: UiTheme, stage: usize, total: usize, text: &str) {
+    println!("{}", theme.info(&format!("[{stage}/{total}] {text}")));
+}
+
+fn print_stage_done(theme: UiTheme, stage: usize, total: usize, text: &str) {
+    println!("{}", theme.success(&format!("[{stage}/{total}] {text}")));
+}
+
+fn format_duration(duration: std::time::Duration) -> String {
+    if duration.as_millis() < 1000 {
+        format!("{}ms", duration.as_millis())
+    } else {
+        format!("{:.1}s", duration.as_secs_f64())
+    }
 }

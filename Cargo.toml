@@ -27,7 +27,7 @@ cc = "1.2"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 percent-encoding = "2.3"
-quick-xml = "0.37"
+quick-xml = "0.39"
 async-trait = "0.1"
 tempfile = "3"
 

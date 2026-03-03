@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 
 fn main() {
-    let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    let manifest_dir = env_path("CARGO_MANIFEST_DIR");
     let vendor = manifest_dir.join("vendor");
-    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let out_dir = env_path("OUT_DIR");
 
     // --- bzip2 ---
     let bzip2_dir = vendor.join("3rdparty/bzip2");
@@ -119,7 +119,7 @@ extern "C" {
 
 #endif /* _CONFIG_H */
 "#;
-    std::fs::write(out_dir.join("config.h"), config_h).unwrap();
+    write_file(out_dir.join("config.h"), config_h);
 
     // Generate lfs.h
     let lfs_h = r#"#ifndef _LFS_H
@@ -152,11 +152,10 @@ extern "C" {
 
 #endif /* _LFS_H */
 "#;
-    std::fs::write(out_dir.join("lfs.h"), lfs_h).unwrap();
+    write_file(out_dir.join("lfs.h"), lfs_h);
 
     // Read the template
-    let template =
-        std::fs::read_to_string(template_dir.join("divsufsort.h.cmake")).expect("Failed to read divsufsort.h.cmake");
+    let template = read_file(template_dir.join("divsufsort.h.cmake"));
 
     // Generate divsufsort.h (32-bit)
     let header_32 = template
@@ -178,7 +177,7 @@ extern "C" {
         .replace("@SAINT_PRId@", "PRId32")
         .replace("@SAINDEX_PRId@", "PRId32");
 
-    std::fs::write(out_dir.join("divsufsort.h"), header_32).unwrap();
+    write_file(out_dir.join("divsufsort.h"), &header_32);
 
     // Generate divsufsort64.h (64-bit)
     let header_64 = template
@@ -200,5 +199,17 @@ extern "C" {
         .replace("@SAINT_PRId@", "PRId32")
         .replace("@SAINDEX_PRId@", "PRId64");
 
-    std::fs::write(out_dir.join("divsufsort64.h"), header_64).unwrap();
+    write_file(out_dir.join("divsufsort64.h"), &header_64);
+}
+
+fn env_path(name: &str) -> PathBuf {
+    PathBuf::from(std::env::var(name).unwrap_or_else(|err| panic!("missing {name}: {err}")))
+}
+
+fn write_file(path: PathBuf, contents: &str) {
+    std::fs::write(&path, contents).unwrap_or_else(|err| panic!("failed to write {}: {err}", path.display()));
+}
+
+fn read_file(path: PathBuf) -> String {
+    std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()))
 }

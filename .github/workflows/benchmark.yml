@@ -1,0 +1,67 @@
+name: Benchmark
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  schedule:
+    - cron: '0 6 * * 1'  # Weekly Monday 6am UTC
+  workflow_dispatch:
+
+concurrency:
+  group: benchmark-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  benchmark:
+    name: Performance (${{ matrix.profile }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - profile: small
+            scale: "0.01"
+          - profile: medium
+            scale: "0.05"
+          - profile: large
+            scale: "0.1"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: bench-${{ matrix.profile }}
+
+      - name: Build benchmark
+        run: cargo build --release -p surge-bench
+
+      - name: Run benchmark
+        run: |
+          cargo run --release -p surge-bench -- \
+            --scale ${{ matrix.scale }} \
+            --zstd-levels 1,3 \
+            --num-deltas 5 \
+            --json --benchmark-format \
+            > benchmark-results.json
+
+      - name: Store results
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: "Surge (${{ matrix.profile }})"
+          tool: customSmallerIsBetter
+          output-file-path: benchmark-results.json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: ${{ github.event_name != 'pull_request' }}
+          alert-threshold: '150%'
+          comment-on-alert: true
+          fail-on-alert: false
+          comment-always: ${{ github.event_name == 'pull_request' }}
+          gh-pages-branch: gh-pages
+          benchmark-data-dir-path: dev/bench

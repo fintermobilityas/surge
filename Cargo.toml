@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/surge-core", "crates/surge-ffi", "crates/surge-cli", "crates/surge-supervisor"]
+members = ["crates/surge-core", "crates/surge-ffi", "crates/surge-cli", "crates/surge-supervisor", "crates/surge-bench"]
 resolver = "3"
 
 [workspace.package]

@@ -111,6 +111,8 @@ impl PackBuilder {
             }
         }
 
+        validate_surge_dotnet_native_dependency(&artifacts_path, rid)?;
+
         Ok(Self {
             ctx,
             app_id: app_id.to_string(),
@@ -363,6 +365,39 @@ impl PackBuilder {
     }
 }
 
+fn validate_surge_dotnet_native_dependency(artifacts_path: &Path, rid: &str) -> Result<()> {
+    if !artifacts_path.join("Surge.NET.dll").is_file() {
+        return Ok(());
+    }
+
+    let candidates = native_library_candidates_for_rid(rid);
+    if candidates.iter().any(|name| artifacts_path.join(name).is_file()) {
+        return Ok(());
+    }
+
+    Err(SurgeError::Pack(format!(
+        "Surge.NET.dll found in artifacts, but no native Surge runtime library for RID '{rid}'. Expected one of: {}",
+        candidates.join(", ")
+    )))
+}
+
+fn native_library_candidates_for_rid(rid: &str) -> Vec<&'static str> {
+    let os = rid.split('-').next().unwrap_or_default();
+    match os {
+        "linux" => vec!["libsurge.so", "surge.so"],
+        "osx" | "macos" => vec!["libsurge.dylib", "surge.dylib"],
+        "win" | "windows" => vec!["surge.dll", "libsurge.dll"],
+        _ => vec![
+            "libsurge.so",
+            "surge.so",
+            "libsurge.dylib",
+            "surge.dylib",
+            "surge.dll",
+            "libsurge.dll",
+        ],
+    }
+}
+
 /// Extract OS name from a RID string (e.g., "linux-x64" -> "linux").
 fn detect_os_from_rid(rid: &str) -> String {
     rid.split('-').next().unwrap_or("unknown").to_string()
@@ -398,6 +433,47 @@ mod tests {
         };
         assert!(!artifact.is_delta);
         assert_eq!(artifact.size, 1024);
+    }
+
+    #[test]
+    fn test_native_library_candidates_for_known_rids() {
+        assert_eq!(
+            native_library_candidates_for_rid("linux-x64"),
+            vec!["libsurge.so", "surge.so"]
+        );
+        assert_eq!(
+            native_library_candidates_for_rid("osx-arm64"),
+            vec!["libsurge.dylib", "surge.dylib"]
+        );
+        assert_eq!(
+            native_library_candidates_for_rid("win-x64"),
+            vec!["surge.dll", "libsurge.dll"]
+        );
+    }
+
+    #[test]
+    fn test_validate_surge_dotnet_native_dependency_requires_matching_native_lib() {
+        let tmp = tempfile::tempdir().expect("tempdir should be created");
+        let artifacts = tmp.path();
+        std::fs::write(artifacts.join("Surge.NET.dll"), b"managed").expect("managed dll should be written");
+
+        let err = validate_surge_dotnet_native_dependency(artifacts, "linux-x64")
+            .expect_err("validation should fail without native library");
+        assert!(
+            err.to_string().contains("Surge.NET.dll found in artifacts"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_surge_dotnet_native_dependency_accepts_matching_native_lib() {
+        let tmp = tempfile::tempdir().expect("tempdir should be created");
+        let artifacts = tmp.path();
+        std::fs::write(artifacts.join("Surge.NET.dll"), b"managed").expect("managed dll should be written");
+        std::fs::write(artifacts.join("libsurge.so"), b"native").expect("native lib should be written");
+
+        validate_surge_dotnet_native_dependency(artifacts, "linux-x64")
+            .expect("validation should pass with native library");
     }
 
     #[tokio::test]

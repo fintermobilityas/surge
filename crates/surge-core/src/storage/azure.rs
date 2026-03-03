@@ -458,7 +458,31 @@ impl StorageBackend for AzureBlobBackend {
     async fn upload_from_file(&self, key: &str, src: &Path, progress: Option<&TransferProgress>) -> Result<()> {
         let data = tokio::fs::read(src).await?;
         let total = data.len() as u64;
-        self.put_object(key, &data, "application/octet-stream").await?;
+        let full_key = self.full_key(key);
+        let url = self.blob_url(&full_key);
+        let resource_path = format!("/{}/{}", self.container, full_key);
+
+        let extra_headers = vec![("x-ms-blob-type".to_string(), "BlockBlob".to_string())];
+        let headers = self.sign_request(
+            "PUT",
+            &resource_path,
+            &[],
+            Some(data.len()),
+            "application/octet-stream",
+            &extra_headers,
+        );
+
+        let mut req = self.client.put(&url).body(data);
+        req = req.header("Content-Length", total.to_string());
+        for (name, value) in &headers {
+            req = req.header(name.as_str(), value.as_str());
+        }
+
+        let resp = req.send().await?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        Self::check_response_status(status, &full_key, &body)?;
+
         if let Some(cb) = progress {
             cb(total, total);
         }

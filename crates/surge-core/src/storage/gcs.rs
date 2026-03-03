@@ -619,7 +619,47 @@ impl StorageBackend for GcsBackend {
     async fn upload_from_file(&self, key: &str, src: &Path, progress: Option<&TransferProgress>) -> Result<()> {
         let data = tokio::fs::read(src).await?;
         let total = data.len() as u64;
-        self.put_object(key, &data, "application/octet-stream").await?;
+
+        let full_key = self.full_key(key);
+        match &self.auth {
+            AuthMode::Hmac { access_key, secret_key } => {
+                let url = self.xml_object_url(&full_key);
+                let payload_hash = sha256_hex(&data);
+                let canonical_uri = format!("/{}/{}", self.bucket, Self::encode_uri_path(&full_key));
+
+                let headers = self.hmac_sign_request("PUT", &canonical_uri, "", &payload_hash, access_key, secret_key);
+
+                let mut req = self.client.put(&url).body(data);
+                req = req.header("Content-Type", "application/octet-stream");
+                for (name, value) in &headers {
+                    req = req.header(name.as_str(), value.as_str());
+                }
+
+                let resp = req.send().await?;
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                Self::check_response_status(status, &full_key, &body)?;
+            }
+            AuthMode::OAuth2 { token } => {
+                let url = self.json_upload_url();
+                let bearer = token.read().await.clone();
+
+                let resp = self
+                    .client
+                    .post(&url)
+                    .query(&[("uploadType", "media"), ("name", &full_key)])
+                    .header("Authorization", format!("Bearer {bearer}"))
+                    .header("Content-Type", "application/octet-stream")
+                    .body(data)
+                    .send()
+                    .await?;
+
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                Self::check_response_status(status, &full_key, &body)?;
+            }
+        }
+
         if let Some(cb) = progress {
             cb(total, total);
         }

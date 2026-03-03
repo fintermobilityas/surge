@@ -292,7 +292,7 @@ impl GitHubReleasesBackend {
         &self,
         release: &GitHubRelease,
         asset_name: &str,
-        data: &[u8],
+        data: Vec<u8>,
         content_type: &str,
     ) -> Result<()> {
         self.require_token()?;
@@ -308,7 +308,7 @@ impl GitHubReleasesBackend {
             .apply_common_headers(self.client.post(upload_url))
             .query(&[("name", asset_name)])
             .header("Content-Type", content_type)
-            .body(data.to_vec());
+            .body(data);
 
         let resp = req.send().await?;
         let status = resp.status();
@@ -337,7 +337,8 @@ impl StorageBackend for GitHubReleasesBackend {
             self.delete_asset_by_id(existing.id).await?;
         }
 
-        self.upload_asset(&release, &asset_name, data, content_type).await
+        self.upload_asset(&release, &asset_name, data.to_vec(), content_type)
+            .await
     }
 
     async fn get_object(&self, key: &str) -> Result<Vec<u8>> {
@@ -452,8 +453,16 @@ impl StorageBackend for GitHubReleasesBackend {
     async fn upload_from_file(&self, key: &str, src: &Path, progress: Option<&TransferProgress>) -> Result<()> {
         let data = tokio::fs::read(src).await?;
         let total = data.len() as u64;
+        let full_key = self.full_key(key);
+        let release = self.get_or_create_release().await?;
+        let asset_name = Self::object_key_to_asset_name(&full_key);
 
-        self.put_object(key, &data, "application/octet-stream").await?;
+        let assets = self.list_assets_for_release(release.id).await?;
+        if let Some(existing) = assets.into_iter().find(|asset| asset.name == asset_name) {
+            self.delete_asset_by_id(existing.id).await?;
+        }
+        self.upload_asset(&release, &asset_name, data, "application/octet-stream")
+            .await?;
 
         if let Some(cb) = progress {
             cb(total, total);

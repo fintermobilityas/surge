@@ -473,7 +473,31 @@ impl StorageBackend for S3Backend {
     async fn upload_from_file(&self, key: &str, src: &Path, progress: Option<&TransferProgress>) -> Result<()> {
         let data = tokio::fs::read(src).await?;
         let total = data.len() as u64;
-        self.put_object(key, &data, "application/octet-stream").await?;
+
+        let full_key = self.full_key(key);
+        let url = self.object_url(&full_key);
+        let payload_hash = sha256_hex(&data);
+        let now = Utc::now();
+
+        let canonical_uri = if self.path_style {
+            format!("/{}/{}", self.bucket, Self::encode_uri_path(&full_key))
+        } else {
+            format!("/{}", Self::encode_uri_path(&full_key))
+        };
+
+        let headers = self.sign_request("PUT", &canonical_uri, "", &payload_hash, &now);
+
+        let mut req = self.client.put(&url).body(data);
+        req = req.header("Content-Type", "application/octet-stream");
+        for (name, value) in &headers {
+            req = req.header(name.as_str(), value.as_str());
+        }
+
+        let resp = req.send().await?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        Self::check_response_status(status, &full_key, &body)?;
+
         if let Some(cb) = progress {
             cb(total, total);
         }

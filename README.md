@@ -105,12 +105,29 @@ surge push \
 
 Done. Your release is live. Clients on the `stable` channel will pick it up on their next update check.
 
-### Optional: install via Tailscale
+### Optional: install package (backend or Tailscale)
 
-If your devices are on a tailnet, Surge can pick a matching package for a remote node and transfer it directly:
+Install from the backend configured in `.surge/application.yml` (falls back to `.surge/surge.yml`):
 
 ```bash
-surge tailscale install \
+surge install \
+  --channel stable
+```
+
+Override backend fields without editing manifest:
+
+```bash
+surge install backend \
+  --provider s3 \
+  --bucket my-release-bucket \
+  --region eu-north-1 \
+  --prefix production
+```
+
+Install to a remote node on your tailnet:
+
+```bash
+surge install tailscale \
   --node my-node \
   --ssh-user operator \
   --channel stable
@@ -451,8 +468,8 @@ surge promote       Promote a release to another channel
 surge demote        Remove a release from a channel
 surge migrate       Copy releases between storage backends
 surge restore       Restore artifacts from backup
+surge install       Install package via method (backend, tailscale)
 surge lock          Acquire/release distributed locks
-surge tailscale     Resolve and transfer packages to a Tailscale node
 ```
 
 If the manifest has one app, `--app-id` is optional. If the app has one target, `--rid` is optional.

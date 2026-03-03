@@ -10,23 +10,38 @@ use surge_core::releases::manifest::{ReleaseEntry, ReleaseIndex, decompress_rele
 use surge_core::releases::version::compare_versions;
 use surge_core::storage::{self, StorageBackend};
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StorageOverrides<'a> {
+    pub provider: Option<&'a str>,
+    pub bucket: Option<&'a str>,
+    pub region: Option<&'a str>,
+    pub endpoint: Option<&'a str>,
+    pub prefix: Option<&'a str>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct RemoteProfile {
+struct RuntimeProfile {
     os: String,
     arch: String,
     gpu: String,
 }
 
-impl RemoteProfile {
+impl RuntimeProfile {
     fn has_nvidia_gpu(&self) -> bool {
         let gpu = self.gpu.trim().to_ascii_lowercase();
         gpu == "nvidia" || gpu == "true" || gpu == "yes"
     }
 }
 
-pub async fn install_execute(
+enum InstallTarget {
+    Local,
+    Tailscale { ssh_target: String, file_target: String },
+}
+
+pub async fn execute(
     manifest_path: &Path,
-    node: &str,
+    application_manifest_path: &Path,
+    node: Option<&str>,
     ssh_user: Option<&str>,
     app_id: Option<&str>,
     channel: &str,
@@ -34,19 +49,33 @@ pub async fn install_execute(
     version: Option<&str>,
     plan_only: bool,
     download_dir: &Path,
+    overrides: StorageOverrides<'_>,
 ) -> Result<()> {
     let theme = UiTheme::global();
-    let manifest = SurgeManifest::from_file(manifest_path)?;
+    let manifest = load_install_manifest(application_manifest_path, manifest_path)?;
     let app_id = super::resolve_app_id(&manifest, app_id)?;
-    let (ssh_target, file_target) = resolve_tailscale_targets(node, ssh_user)?;
 
-    let (rid_candidates, profile) = if let Some(requested_rid) = rid.map(str::trim).filter(|r| !r.is_empty()) {
-        (vec![requested_rid.to_string()], None)
+    let install_target = match node.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(node) => {
+            let (ssh_target, file_target) = resolve_tailscale_targets(node, ssh_user)?;
+            InstallTarget::Tailscale {
+                ssh_target,
+                file_target,
+            }
+        }
+        None => InstallTarget::Local,
+    };
+
+    let (rid_candidates, profile) = if let Some(requested_rid) = rid.map(str::trim).filter(|value| !value.is_empty()) {
+        (vec![requested_rid.to_string()], None::<RuntimeProfile>)
     } else {
-        let detected = detect_remote_profile(&ssh_target).await?;
+        let detected = match &install_target {
+            InstallTarget::Local => detect_local_profile(),
+            InstallTarget::Tailscale { ssh_target, .. } => detect_remote_profile(ssh_target).await?,
+        };
         let base_rid = derive_base_rid(&detected).ok_or_else(|| {
             SurgeError::Platform(format!(
-                "Unable to map remote profile to a RID (os='{}', arch='{}'). Use --rid to override.",
+                "Unable to map profile to a RID (os='{}', arch='{}'). Use --rid to override.",
                 detected.os, detected.arch
             ))
         })?;
@@ -56,7 +85,7 @@ pub async fn install_execute(
         )
     };
 
-    let storage_config = super::build_app_scoped_storage_config(&manifest, &app_id)?;
+    let storage_config = build_storage_config_with_overrides(&manifest, &app_id, overrides)?;
     let backend = storage::create_storage_backend(&storage_config)?;
     let index = fetch_release_index(&*backend).await?;
     if !index.app_id.is_empty() && index.app_id != app_id {
@@ -80,14 +109,23 @@ pub async fn install_execute(
         release.rid.clone()
     };
 
-    if let Some(profile) = &profile {
-        println!(
-            "{}",
-            theme.info(&format!(
-                "Remote profile for {ssh_target}: os={}, arch={}, gpu={}",
-                profile.os, profile.arch, profile.gpu
-            ))
-        );
+    if let Some(profile) = profile {
+        match &install_target {
+            InstallTarget::Local => println!(
+                "{}",
+                theme.info(&format!(
+                    "Local profile: os={}, arch={}, gpu={}",
+                    profile.os, profile.arch, profile.gpu
+                ))
+            ),
+            InstallTarget::Tailscale { ssh_target, .. } => println!(
+                "{}",
+                theme.info(&format!(
+                    "Remote profile for {ssh_target}: os={}, arch={}, gpu={}",
+                    profile.os, profile.arch, profile.gpu
+                ))
+            ),
+        }
     }
     println!(
         "{}",
@@ -118,12 +156,18 @@ pub async fn install_execute(
     }
 
     if plan_only {
-        println!(
-            "{}",
-            theme.warning(&format!(
-                "Plan only mode: no transfer performed. Remove --plan-only to download and copy package to {file_target}."
-            ))
-        );
+        match &install_target {
+            InstallTarget::Local => println!(
+                "{}",
+                theme.warning("Plan only mode: no download performed. Remove --plan-only to fetch the package.")
+            ),
+            InstallTarget::Tailscale { file_target, .. } => println!(
+                "{}",
+                theme.warning(&format!(
+                    "Plan only mode: no transfer performed. Remove --plan-only to download and copy package to {file_target}."
+                ))
+            ),
+        }
         return Ok(());
     }
 
@@ -136,24 +180,46 @@ pub async fn install_execute(
     );
     backend.download_to_file(full_filename, &local_package, None).await?;
 
-    copy_file_to_tailscale_node(&file_target, &local_package).await?;
-    println!(
-        "{}",
-        theme.success(&format!(
-            "Copied '{}' to node '{}' via tailscale file sharing.",
-            local_package.display(),
-            file_target
-        ))
-    );
-    println!(
-        "{}",
-        theme.subtle(&format!(
-            "Install hint on node {}: extract '{}' into the install directory for app '{}'.",
-            file_target,
-            Path::new(full_filename).display(),
-            app_id
-        ))
-    );
+    match &install_target {
+        InstallTarget::Local => {
+            println!(
+                "{}",
+                theme.success(&format!(
+                    "Downloaded '{}' to '{}'.",
+                    Path::new(full_filename).display(),
+                    local_package.display()
+                ))
+            );
+            println!(
+                "{}",
+                theme.subtle(&format!(
+                    "Install hint: extract '{}' into the install directory for app '{}'.",
+                    Path::new(full_filename).display(),
+                    app_id
+                ))
+            );
+        }
+        InstallTarget::Tailscale { file_target, .. } => {
+            copy_file_to_tailscale_node(file_target, &local_package).await?;
+            println!(
+                "{}",
+                theme.success(&format!(
+                    "Copied '{}' to node '{}' via tailscale file sharing.",
+                    local_package.display(),
+                    file_target
+                ))
+            );
+            println!(
+                "{}",
+                theme.subtle(&format!(
+                    "Install hint on node {}: extract '{}' into the install directory for app '{}'.",
+                    file_target,
+                    Path::new(full_filename).display(),
+                    app_id
+                ))
+            );
+        }
+    }
 
     Ok(())
 }
@@ -180,6 +246,39 @@ fn resolve_tailscale_targets(node: &str, ssh_user: Option<&str>) -> Result<(Stri
     } else {
         Ok((node.to_string(), node.to_string()))
     }
+}
+
+fn load_install_manifest(application_manifest_path: &Path, fallback_manifest_path: &Path) -> Result<SurgeManifest> {
+    if application_manifest_path.is_file() {
+        return SurgeManifest::from_file(application_manifest_path);
+    }
+    SurgeManifest::from_file(fallback_manifest_path)
+}
+
+fn build_storage_config_with_overrides(
+    manifest: &SurgeManifest,
+    app_id: &str,
+    overrides: StorageOverrides<'_>,
+) -> Result<surge_core::context::StorageConfig> {
+    let mut config = super::build_app_scoped_storage_config(manifest, app_id)?;
+
+    if let Some(provider) = overrides.provider.map(str::trim).filter(|value| !value.is_empty()) {
+        config.provider = Some(super::parse_storage_provider(provider)?);
+    }
+    if let Some(bucket) = overrides.bucket.map(str::trim).filter(|value| !value.is_empty()) {
+        config.bucket = bucket.to_string();
+    }
+    if let Some(region) = overrides.region.map(str::trim).filter(|value| !value.is_empty()) {
+        config.region = region.to_string();
+    }
+    if let Some(endpoint) = overrides.endpoint.map(str::trim).filter(|value| !value.is_empty()) {
+        config.endpoint = endpoint.to_string();
+    }
+    if let Some(prefix) = overrides.prefix.map(str::trim).filter(|value| !value.is_empty()) {
+        config.prefix = prefix.to_string();
+    }
+
+    Ok(config)
 }
 
 async fn fetch_release_index(backend: &dyn StorageBackend) -> Result<ReleaseIndex> {
@@ -226,7 +325,26 @@ fn select_release<'a>(
     generic.first().copied()
 }
 
-async fn detect_remote_profile(node: &str) -> Result<RemoteProfile> {
+fn detect_local_profile() -> RuntimeProfile {
+    let os = std::env::consts::OS.to_string();
+    let arch = std::env::consts::ARCH.to_string();
+    let gpu = if has_local_nvidia_gpu() {
+        "nvidia".to_string()
+    } else {
+        "none".to_string()
+    };
+    RuntimeProfile { os, arch, gpu }
+}
+
+fn has_local_nvidia_gpu() -> bool {
+    std::process::Command::new("nvidia-smi")
+        .arg("-L")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+async fn detect_remote_profile(node: &str) -> Result<RuntimeProfile> {
     let unix_probe = r#"os=$(uname -s 2>/dev/null || echo unknown); arch=$(uname -m 2>/dev/null || echo unknown); gpu=none; if command -v nvidia-smi >/dev/null 2>&1; then gpu=nvidia; fi; printf "os=%s\narch=%s\ngpu=%s\n" "$os" "$arch" "$gpu""#;
     let unix_failure = match run_tailscale_capture(&["ssh", node, "sh", "-lc", unix_probe]).await {
         Ok(stdout) => {
@@ -261,7 +379,7 @@ async fn detect_remote_profile(node: &str) -> Result<RemoteProfile> {
     }
 }
 
-fn parse_remote_profile(raw: &str) -> Option<RemoteProfile> {
+fn parse_remote_profile(raw: &str) -> Option<RuntimeProfile> {
     let mut os = String::new();
     let mut arch = String::new();
     let mut gpu = String::from("none");
@@ -283,10 +401,10 @@ fn parse_remote_profile(raw: &str) -> Option<RemoteProfile> {
         return None;
     }
 
-    Some(RemoteProfile { os, arch, gpu })
+    Some(RuntimeProfile { os, arch, gpu })
 }
 
-fn derive_base_rid(profile: &RemoteProfile) -> Option<String> {
+fn derive_base_rid(profile: &RuntimeProfile) -> Option<String> {
     let os = normalize_os(&profile.os)?;
     let arch = normalize_arch(&profile.arch)?;
     Some(format!("{os}-{arch}"))
@@ -480,7 +598,7 @@ apps:
 
     #[test]
     fn derive_rid_candidates_gpu() {
-        let profile = RemoteProfile {
+        let profile = RuntimeProfile {
             os: "Linux".to_string(),
             arch: "amd64".to_string(),
             gpu: "nvidia".to_string(),

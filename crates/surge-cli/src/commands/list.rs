@@ -424,8 +424,20 @@ fn build_storage_configs_for_app(manifest: &SurgeManifest, app_id: &str) -> Resu
     Ok(configs)
 }
 
+/// Build a storage config without credentials.
+///
+/// `list` only performs public reads so credentials are never required.
 fn build_storage_config(manifest: &SurgeManifest) -> Result<StorageConfig> {
-    super::build_storage_config(manifest)
+    let provider = super::parse_storage_provider(&manifest.storage.provider)?;
+    Ok(StorageConfig {
+        provider: Some(provider),
+        bucket: manifest.storage.bucket.clone(),
+        region: manifest.storage.region.clone(),
+        access_key: String::new(),
+        secret_key: String::new(),
+        endpoint: manifest.storage.endpoint.clone(),
+        prefix: manifest.storage.prefix.clone(),
+    })
 }
 
 #[cfg(test)]

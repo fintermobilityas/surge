@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -219,10 +219,22 @@ enum Commands {
         packages_dir: PathBuf,
     },
 
-    /// Tailscale-assisted install planning and package transfer
-    Tailscale {
-        #[command(subcommand)]
-        action: TailscaleAction,
+    /// Install packages using a selected transport method
+    Install {
+        /// Install method (defaults to backend)
+        #[arg(value_enum, default_value_t = InstallMethod::Backend)]
+        method: InstallMethod,
+
+        /// Target node for tailscale method (for example: my-node or user@my-node)
+        #[arg(long)]
+        node: Option<String>,
+
+        /// SSH user account used for remote profile detection (tailscale method)
+        #[arg(long)]
+        ssh_user: Option<String>,
+
+        #[command(flatten)]
+        options: InstallOptions,
     },
 }
 
@@ -251,42 +263,63 @@ enum LockAction {
     },
 }
 
-#[derive(Subcommand)]
-enum TailscaleAction {
+#[derive(ValueEnum, Clone, Debug)]
+enum InstallMethod {
+    /// Resolve a release from configured backend and download it locally
+    Backend,
     /// Detect remote RID via Tailscale, resolve release by channel, and transfer package
-    Install {
-        /// Target node (for example: my-node or user@my-node)
-        #[arg(long)]
-        node: String,
+    Tailscale,
+}
 
-        /// SSH user account used for remote profile detection (optional)
-        #[arg(long)]
-        ssh_user: Option<String>,
+#[derive(Args, Clone)]
+struct InstallOptions {
+    /// Path to application manifest used for install defaults
+    #[arg(long, default_value = ".surge/application.yml")]
+    application_manifest: PathBuf,
 
-        /// Application ID (auto-selected when manifest has exactly one app)
-        #[arg(long)]
-        app_id: Option<String>,
+    /// Application ID (auto-selected when manifest has exactly one app)
+    #[arg(long)]
+    app_id: Option<String>,
 
-        /// Channel to resolve releases from
-        #[arg(long, default_value = "stable")]
-        channel: String,
+    /// Channel to resolve releases from
+    #[arg(long, default_value = "stable")]
+    channel: String,
 
-        /// Override remote RID detection with an explicit RID
-        #[arg(long)]
-        rid: Option<String>,
+    /// Override RID detection with an explicit RID
+    #[arg(long)]
+    rid: Option<String>,
 
-        /// Specific version to install (defaults to latest matching version)
-        #[arg(long)]
-        version: Option<String>,
+    /// Specific version to install (defaults to latest matching version)
+    #[arg(long)]
+    version: Option<String>,
 
-        /// Only show the selected package and command hints, do not download/copy
-        #[arg(long)]
-        plan_only: bool,
+    /// Only show the selected package and command hints, do not download/transfer
+    #[arg(long)]
+    plan_only: bool,
 
-        /// Local cache directory for downloaded packages before transfer
-        #[arg(long, default_value = ".surge/tailscale-cache")]
-        download_dir: PathBuf,
-    },
+    /// Local cache directory for downloaded packages
+    #[arg(long, default_value = ".surge/install-cache")]
+    download_dir: PathBuf,
+
+    /// Override storage provider from application manifest (s3, azure, gcs, filesystem, github_releases)
+    #[arg(long)]
+    provider: Option<String>,
+
+    /// Override storage bucket/root from application manifest
+    #[arg(long)]
+    bucket: Option<String>,
+
+    /// Override storage region from application manifest
+    #[arg(long)]
+    region: Option<String>,
+
+    /// Override storage endpoint from application manifest
+    #[arg(long)]
+    endpoint: Option<String>,
+
+    /// Override storage prefix from application manifest
+    #[arg(long)]
+    prefix: Option<String>,
 }
 
 fn init_tracing(verbose: bool) {
@@ -474,30 +507,48 @@ async fn run(cli: Cli) -> surge_core::error::Result<()> {
             }
         }
 
-        Commands::Tailscale { action } => match action {
-            TailscaleAction::Install {
+        Commands::Install {
+            method,
+            node,
+            ssh_user,
+            options,
+        } => {
+            let node = match method {
+                InstallMethod::Backend => {
+                    if node.is_some() || ssh_user.is_some() {
+                        return Err(surge_core::error::SurgeError::Config(
+                            "--node/--ssh-user require 'tailscale' install method".to_string(),
+                        ));
+                    }
+                    None
+                }
+                InstallMethod::Tailscale => Some(node.as_deref().ok_or_else(|| {
+                    surge_core::error::SurgeError::Config(
+                        "--node is required for 'tailscale' install method".to_string(),
+                    )
+                })?),
+            };
+
+            commands::install::execute(
+                &manifest_path,
+                &options.application_manifest,
                 node,
-                ssh_user,
-                app_id,
-                channel,
-                rid,
-                version,
-                plan_only,
-                download_dir,
-            } => {
-                commands::tailscale::install_execute(
-                    &manifest_path,
-                    &node,
-                    ssh_user.as_deref(),
-                    app_id.as_deref(),
-                    &channel,
-                    rid.as_deref(),
-                    version.as_deref(),
-                    plan_only,
-                    &download_dir,
-                )
-                .await
-            }
-        },
+                ssh_user.as_deref(),
+                options.app_id.as_deref(),
+                &options.channel,
+                options.rid.as_deref(),
+                options.version.as_deref(),
+                options.plan_only,
+                &options.download_dir,
+                commands::install::StorageOverrides {
+                    provider: options.provider.as_deref(),
+                    bucket: options.bucket.as_deref(),
+                    region: options.region.as_deref(),
+                    endpoint: options.endpoint.as_deref(),
+                    prefix: options.prefix.as_deref(),
+                },
+            )
+            .await
+        }
     }
 }

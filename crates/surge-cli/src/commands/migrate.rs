@@ -116,7 +116,7 @@ fn resolve_source_app_and_rid(
     let requested_rid = requested_rid
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(std::borrow::ToOwned::to_owned);
+        .map(str::to_owned);
 
     if let Some(app_id) = requested_app_id.map(str::trim).filter(|value| !value.is_empty()) {
         if manifest.find_app(app_id).is_some() {

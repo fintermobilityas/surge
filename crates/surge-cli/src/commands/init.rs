@@ -143,7 +143,7 @@ fn build_non_wizard_input(
     let rid = rid
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map_or_else(current_rid, std::borrow::ToOwned::to_owned);
+        .map_or_else(current_rid, str::to_owned);
     let name = name.unwrap_or(&app_id).to_string();
     let main_exe = main_exe
         .map(str::trim)
@@ -210,7 +210,7 @@ fn gather_wizard_input(
     let rid_default = rid
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map_or_else(current_rid, std::borrow::ToOwned::to_owned);
+        .map_or_else(current_rid, str::to_owned);
     let rid = prompt_with_default("Runtime identifier", &rid_default)?;
     let main_exe_default = main_exe
         .map(str::trim)

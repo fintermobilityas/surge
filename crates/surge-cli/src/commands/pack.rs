@@ -154,7 +154,7 @@ pub async fn execute_installers_only(
 
     let local_full_name = Path::new(full_key)
         .file_name()
-        .map(std::borrow::ToOwned::to_owned)
+        .map(std::ffi::OsStr::to_os_string)
         .ok_or_else(|| SurgeError::Pack(format!("Invalid full package key: {full_key}")))?;
     let full_package_path = output_dir.join(local_full_name);
     if !full_package_path.is_file() {

@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1772543357342,
+  "lastUpdate": 1772543611956,
   "repoUrl": "https://github.com/fintermobilityas/surge",
   "entries": {
     "Surge (small)": [
@@ -113,6 +113,120 @@ window.BENCHMARK_DATA = {
           {
             "name": "Installer (offline)",
             "value": 21.746835,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "peter.sunde@gmail.com",
+            "name": "Peter Rekdal Khan-Sunde",
+            "username": "peters"
+          },
+          "committer": {
+            "email": "peter.sunde@gmail.com",
+            "name": "Peter Rekdal Khan-Sunde",
+            "username": "peters"
+          },
+          "distinct": true,
+          "id": "052b303f18ef690a7f3408c549de2172c198072f",
+          "message": "Bump next-version to 0.3.0, document release process in AGENTS.md",
+          "timestamp": "2026-03-03T14:12:46+01:00",
+          "tree_id": "3049b9a73c47e4253c7e3f51ce9261366f633fe1",
+          "url": "https://github.com/fintermobilityas/surge/commit/052b303f18ef690a7f3408c549de2172c198072f"
+        },
+        "date": 1772543611519,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "Archive create (zstd=1)",
+            "value": 17.089707,
+            "unit": "ms"
+          },
+          {
+            "name": "Archive create (zstd=3)",
+            "value": 16.593964,
+            "unit": "ms"
+          },
+          {
+            "name": "Archive extract",
+            "value": 29.053172,
+            "unit": "ms"
+          },
+          {
+            "name": "SHA-256 (in-memory)",
+            "value": 7.788215,
+            "unit": "ms"
+          },
+          {
+            "name": "SHA-256 (file)",
+            "value": 9.410264,
+            "unit": "ms"
+          },
+          {
+            "name": "Zstd compress (level=1)",
+            "value": 9.455959,
+            "unit": "ms"
+          },
+          {
+            "name": "Zstd compress (level=3)",
+            "value": 9.665259,
+            "unit": "ms"
+          },
+          {
+            "name": "Zstd decompress",
+            "value": 1.7379749999999998,
+            "unit": "ms"
+          },
+          {
+            "name": "bsdiff",
+            "value": 666.2874380000001,
+            "unit": "ms"
+          },
+          {
+            "name": "bspatch",
+            "value": 48.640818,
+            "unit": "ms"
+          },
+          {
+            "name": "chunked bsdiff",
+            "value": 646.118692,
+            "unit": "ms"
+          },
+          {
+            "name": "chunked bspatch",
+            "value": 48.628745,
+            "unit": "ms"
+          },
+          {
+            "name": "Full package build",
+            "value": 15.942351,
+            "unit": "ms"
+          },
+          {
+            "name": "Delta package build",
+            "value": 661.757189,
+            "unit": "ms"
+          },
+          {
+            "name": "Apply 1 delta",
+            "value": 49.629998,
+            "unit": "ms"
+          },
+          {
+            "name": "Apply 5x deltas",
+            "value": 247.27908100000002,
+            "unit": "ms"
+          },
+          {
+            "name": "Installer (web)",
+            "value": 0.120083,
+            "unit": "ms"
+          },
+          {
+            "name": "Installer (offline)",
+            "value": 21.325339,
             "unit": "ms"
           }
         ]

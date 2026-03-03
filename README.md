@@ -23,7 +23,7 @@
 
 ## Features
 
-- **Direct cloud storage** &mdash; ships updates from S3, Azure Blob, GCS, or a plain filesystem. No package feed server required.
+- **Direct cloud storage** &mdash; ships updates from S3, Azure Blob, GCS, GitHub Releases, or a plain filesystem. No package feed server required.
 - **Delta updates** &mdash; binary diffs via bsdiff minimize download sizes between versions.
 - **Native performance** &mdash; core written in Rust; single shared library (`libsurge.so` / `surge.dll` / `libsurge.dylib`) with a stable C ABI.
 - **Cross-platform** &mdash; Linux, Windows, and macOS from one codebase.
@@ -173,6 +173,18 @@ surge pack push     Upload packages and update the release index
 
 ## Building
 
+### Clone
+
+```bash
+git clone --recurse-submodules https://github.com/fintermobilityas/surge.git
+```
+
+If you already cloned without `--recurse-submodules`:
+
+```bash
+git submodule update --init
+```
+
 ### Requirements
 
 - **Rust 1.85+** (Edition 2024) &mdash; install via [rustup](https://rustup.rs/)
@@ -209,6 +221,7 @@ nm -D target/release/libsurge.so | grep ' T surge_'   # Linux
 | Amazon S3 | `SURGE_STORAGE_S3` | Supports custom endpoints (MinIO, R2, etc.) |
 | Azure Blob Storage | `SURGE_STORAGE_AZURE_BLOB` | Uses account key auth |
 | Google Cloud Storage | `SURGE_STORAGE_GCS` | Service account or default credentials |
+| GitHub Releases | `SURGE_STORAGE_GITHUB_RELEASES` | `bucket` = `owner/repo`, `region` = release tag (default `surge`), token via `secret_key`/env |
 | Local Filesystem | `SURGE_STORAGE_FILESYSTEM` | Bucket = root directory path |
 
 ## License

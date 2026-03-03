@@ -28,7 +28,7 @@ pub struct SurgeErrorFfi {
 
 impl SurgeErrorFfi {
     pub fn new(code: i32, msg: &str) -> Self {
-        let owned = CString::new(msg).unwrap_or_default();
+        let owned = to_lossy_cstring(msg);
         let ptr = owned.as_ptr();
         Self {
             code,
@@ -46,13 +46,19 @@ pub struct SurgeErrorOwned {
 
 impl SurgeErrorOwned {
     pub fn new(code: i32, msg: &str) -> Self {
-        let message = CString::new(msg).unwrap_or_default();
+        let message = to_lossy_cstring(msg);
         Self { code, message }
     }
 }
 
 fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn to_lossy_cstring(value: &str) -> CString {
+    let mut bytes = value.as_bytes().to_vec();
+    bytes.retain(|b| *b != 0);
+    CString::new(bytes).unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -167,9 +173,10 @@ impl SurgeReleasesInfoHandle {
             .releases
             .iter()
             .map(|r| {
-                let ver = CString::new(r.version.as_str()).unwrap_or_default();
-                let ch = CString::new(r.channel.as_str()).unwrap_or_default();
-                (ver, ch)
+                (
+                    to_lossy_cstring(r.version.as_str()),
+                    to_lossy_cstring(r.channel.as_str()),
+                )
             })
             .collect();
     }
@@ -191,4 +198,40 @@ pub struct SurgePackContextHandle {
     pub artifacts_dir: String,
     /// Persisted `PackBuilder` between `surge_pack_build` and `surge_pack_push`.
     pub builder: Mutex<Option<PackBuilder>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::CStr;
+
+    use super::{ReleaseEntryFfi, SurgeErrorFfi, SurgeReleasesInfoHandle};
+
+    #[test]
+    fn error_strings_strip_embedded_nuls() {
+        let err = SurgeErrorFfi::new(-1, "bad\0message");
+        // SAFETY: `SurgeErrorFfi::new` stores a valid NUL-terminated CString
+        // and `message` points to that owned storage for `err`'s lifetime.
+        let message = unsafe { CStr::from_ptr(err.message) }
+            .to_str()
+            .expect("valid UTF-8 after sanitization");
+        assert_eq!(message, "badmessage");
+    }
+
+    #[test]
+    fn release_cache_strings_strip_embedded_nuls() {
+        let mut info = SurgeReleasesInfoHandle {
+            releases: vec![ReleaseEntryFfi {
+                version: "1.0\0.0".to_string(),
+                channel: "st\0able".to_string(),
+                full_size: 1,
+                is_genesis: true,
+            }],
+            cached_strings: Vec::new(),
+            update_info: None,
+        };
+        info.cache_strings();
+        assert_eq!(info.cached_strings.len(), 1);
+        assert_eq!(info.cached_strings[0].0.to_str().expect("valid version"), "1.0.0");
+        assert_eq!(info.cached_strings[0].1.to_str().expect("valid channel"), "stable");
+    }
 }

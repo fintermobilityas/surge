@@ -205,7 +205,3 @@ impl Default for Context {
         Self::new()
     }
 }
-
-// SAFETY: All internal state is protected by Mutex or AtomicBool.
-unsafe impl Send for Context {}
-unsafe impl Sync for Context {}

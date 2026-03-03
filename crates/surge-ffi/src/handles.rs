@@ -4,7 +4,7 @@
 //! The corresponding `_destroy` function reclaims ownership with `Box::from_raw()`.
 
 use std::ffi::{CString, c_char};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use surge_core::context::Context;
 use surge_core::pack::builder::PackBuilder;
@@ -48,57 +48,35 @@ impl SurgeErrorFfi {
 pub struct SurgeContextHandle {
     pub ctx: Arc<Context>,
     pub runtime: tokio::runtime::Runtime,
-    /// Cached last-error for FFI return.  We use `UnsafeCell` because the
-    /// pointer returned by `surge_context_last_error` must remain stable
-    /// until the next API call on the same context.
-    pub last_error: std::cell::UnsafeCell<Option<SurgeErrorFfi>>,
+    /// Cached last-error for FFI return.
+    ///
+    /// The returned pointer from `surge_context_last_error` remains valid
+    /// until the next API call mutates this slot.
+    pub last_error: Mutex<Option<SurgeErrorFfi>>,
 }
 
 impl SurgeContextHandle {
     /// Store an error so that `surge_context_last_error` can return it.
-    ///
-    /// # Safety
-    /// Must only be called while no other thread is reading `last_error`.
-    /// In practice this is fine because the C API contract says the pointer
-    /// from `last_error()` is valid only until the *next* API call.
-    pub unsafe fn set_last_error(&self, code: i32, msg: &str) {
-        unsafe {
-            let slot = &mut *self.last_error.get();
-            *slot = Some(SurgeErrorFfi::new(code, msg));
-        }
+    pub fn set_last_error(&self, code: i32, msg: &str) {
+        let mut slot = self.last_error.lock().unwrap();
+        *slot = Some(SurgeErrorFfi::new(code, msg));
     }
 
     /// Clear any previously stored error.
-    ///
-    /// # Safety
-    /// Same constraints as `set_last_error`.
-    pub unsafe fn clear_last_error(&self) {
-        unsafe {
-            let slot = &mut *self.last_error.get();
-            *slot = None;
-        }
+    pub fn clear_last_error(&self) {
+        let mut slot = self.last_error.lock().unwrap();
+        *slot = None;
     }
 
     /// Return a pointer to the cached error, or null if none.
-    ///
-    /// # Safety
-    /// The returned pointer is valid until the next mutable access to `last_error`.
-    pub unsafe fn get_last_error(&self) -> *const SurgeErrorFfi {
-        unsafe {
-            let slot = &*self.last_error.get();
-            match slot {
-                Some(e) => std::ptr::from_ref::<SurgeErrorFfi>(e),
-                None => std::ptr::null(),
-            }
+    pub fn get_last_error(&self) -> *const SurgeErrorFfi {
+        let slot = self.last_error.lock().unwrap();
+        match slot.as_ref() {
+            Some(e) => std::ptr::from_ref::<SurgeErrorFfi>(e),
+            None => std::ptr::null(),
         }
     }
 }
-
-// SAFETY: The `UnsafeCell<Option<SurgeErrorFfi>>` is only accessed from the
-// FFI boundary where the C API contract guarantees single-threaded access
-// per context (except `surge_cancel` which does not touch `last_error`).
-unsafe impl Send for SurgeContextHandle {}
-unsafe impl Sync for SurgeContextHandle {}
 
 // ---------------------------------------------------------------------------
 //  Update manager handle
@@ -115,11 +93,6 @@ pub struct SurgeUpdateManagerHandle {
     pub channel: String,
     pub install_dir: String,
 }
-
-// SAFETY: The raw pointer is only dereferenced while the parent context is alive
-// (the C API contract requires the context to outlive the manager).
-unsafe impl Send for SurgeUpdateManagerHandle {}
-unsafe impl Sync for SurgeUpdateManagerHandle {}
 
 // ---------------------------------------------------------------------------
 //  Releases info handle
@@ -173,9 +146,5 @@ pub struct SurgePackContextHandle {
     pub version: String,
     pub artifacts_dir: String,
     /// Persisted `PackBuilder` between `surge_pack_build` and `surge_pack_push`.
-    pub builder: std::cell::UnsafeCell<Option<PackBuilder>>,
+    pub builder: Mutex<Option<PackBuilder>>,
 }
-
-// SAFETY: Same reasoning as SurgeUpdateManagerHandle.
-unsafe impl Send for SurgePackContextHandle {}
-unsafe impl Sync for SurgePackContextHandle {}

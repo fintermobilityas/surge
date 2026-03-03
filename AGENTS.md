@@ -52,6 +52,7 @@ If the local environment cannot run a listed command, document the exact gap in 
 - Prefer `unwrap_or_else(std::sync::PoisonError::into_inner)` over manual `match` when recovering poisoned mutexes.
 - Avoid unnecessary `crate::` path prefixes in module-local code/tests when imports already provide the item.
 - For multi-app manifests, always scope storage access and emitted installer metadata prefixes by app id; never mix base-prefix release indexes with app-scoped artifact flows.
+- For CLI commands that accept both optional `--app-id` and `--rid`, use a shared RID-hint resolver to infer app id only when the RID uniquely identifies one app.
 - Minimize `unsafe`: isolate it to FFI/boundary layers, prefer safe wrappers, and remove unnecessary `unsafe impl`.
 - Every remaining unsafe block must include a short `SAFETY:` rationale.
 - Run periodic panic-path sweeps in non-test targets with:

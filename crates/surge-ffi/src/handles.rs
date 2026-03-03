@@ -28,7 +28,7 @@ pub struct SurgeErrorFfi {
 
 impl SurgeErrorFfi {
     pub fn new(code: i32, msg: &str) -> Self {
-        let owned = CString::new(msg).unwrap_or_else(|_| CString::new("(invalid utf-8 in error message)").unwrap());
+        let owned = CString::new(msg).unwrap_or_default();
         let ptr = owned.as_ptr();
         Self {
             code,
@@ -46,7 +46,7 @@ pub struct SurgeErrorOwned {
 
 impl SurgeErrorOwned {
     pub fn new(code: i32, msg: &str) -> Self {
-        let message = CString::new(msg).unwrap_or_else(|_| CString::new("(invalid utf-8 in error message)").unwrap());
+        let message = CString::new(msg).unwrap_or_default();
         Self { code, message }
     }
 }

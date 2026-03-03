@@ -1220,6 +1220,8 @@ pub unsafe extern "C" fn surge_process_events(
     user_data: *mut c_void,
 ) -> i32 {
     catch_ffi(std::panic::AssertUnwindSafe(|| {
+        static ZERO_VERSION: &[u8] = b"0.0.0\0";
+
         // Collect argv for inspection.
         let args = unsafe { collect_argv(argc, argv) };
 
@@ -1229,14 +1231,16 @@ pub unsafe extern "C" fn surge_process_events(
         for arg in &args {
             match arg.as_str() {
                 "--surge-first-run" => {
-                    if let Some(cb) = on_first_run {
-                        let version = CString::new("0.0.0").unwrap();
+                    if let Some(cb) = on_first_run
+                        && let Ok(version) = CStr::from_bytes_with_nul(ZERO_VERSION)
+                    {
                         unsafe { cb(version.as_ptr(), user_data) };
                     }
                 }
                 "--surge-installed" => {
-                    if let Some(cb) = on_installed {
-                        let version = CString::new("0.0.0").unwrap();
+                    if let Some(cb) = on_installed
+                        && let Ok(version) = CStr::from_bytes_with_nul(ZERO_VERSION)
+                    {
                         unsafe { cb(version.as_ptr(), user_data) };
                     }
                 }

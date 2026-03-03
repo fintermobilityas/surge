@@ -74,6 +74,20 @@ dotnet test dotnet/Surge.slnx --configuration Release
 - Keep `crates/surge-core/tests/unsafe_boundaries.rs` passing (unsafe confined to approved modules).
 - Before push, run Rust workspace tests + clippy and .NET tests.
 
+## Releasing
+
+Versioning is managed by GitVersion (`GitVersion.yml`). The `next-version` field controls the base version.
+
+### Cutting a release
+1. Merge `develop` → `main` (creates the release, e.g. `0.3.0`).
+2. **Immediately** bump `next-version` in `GitVersion.yml` on `develop` to the next minor (e.g. `0.4.0`).
+3. Commit and push to `develop`.
+
+If step 2 is skipped, develop will keep producing preview versions under the *old* release number (e.g. `0.3.0-preview.N` instead of `0.4.0-preview.N`).
+
+### Major version bumps
+For a major release (e.g. `1.0.0`), manually set `next-version` to the target version before merging to main.
+
 ## Commit & Pull Request Guidelines
 - Use concise imperative commit messages, optionally scoped (examples: `feat(cli): ...`, `fix(core): ...`, `ci: ...`).
 - Keep commits focused (one logical change per commit).

@@ -96,7 +96,8 @@ Versioning is managed by GitVersion (`GitVersion.yml`). The `next-version` field
 ### Cutting a release
 1. Merge `develop` → `main` (creates the release, e.g. `0.3.0`).
 2. **Immediately** bump `next-version` in `GitVersion.yml` on `develop` to the next minor (e.g. `0.4.0`).
-3. Commit and push to `develop`.
+3. When changing version baselines, also bump Cargo workspace version in `Cargo.toml` (`[workspace.package].version`) in the same PR/commit series.
+4. Commit and push to `develop`.
 
 If step 2 is skipped, develop will keep producing preview versions under the *old* release number (e.g. `0.3.0-preview.N` instead of `0.4.0-preview.N`).
 

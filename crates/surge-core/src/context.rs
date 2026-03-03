@@ -1,6 +1,6 @@
 use std::ffi::CString;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 use crate::error::{ErrorCode, SurgeError};
 
@@ -87,6 +87,10 @@ pub struct Context {
     last_error: Mutex<Option<LastError>>,
 }
 
+fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 impl Context {
     pub fn new() -> Self {
         Self {
@@ -108,7 +112,7 @@ impl Context {
         secret_key: &str,
         endpoint: &str,
     ) {
-        let mut cfg = self.storage.lock().unwrap();
+        let mut cfg = lock_recover(&self.storage);
         cfg.provider = Some(provider);
         cfg.bucket = bucket.to_string();
         cfg.region = region.to_string();
@@ -117,15 +121,21 @@ impl Context {
         cfg.endpoint = endpoint.to_string();
     }
 
+    /// Set storage object key prefix.
+    pub fn set_storage_prefix(&self, prefix: &str) {
+        let mut cfg = lock_recover(&self.storage);
+        cfg.prefix = prefix.to_string();
+    }
+
     /// Set lock server URL.
     pub fn set_lock_server(&self, url: &str) {
-        let mut cfg = self.lock_config.lock().unwrap();
+        let mut cfg = lock_recover(&self.lock_config);
         cfg.server_url = url.to_string();
     }
 
     /// Set resource budget.
     pub fn set_resource_budget(&self, budget: ResourceBudget) {
-        let mut b = self.resource_budget.lock().unwrap();
+        let mut b = lock_recover(&self.resource_budget);
         *b = budget;
     }
 
@@ -155,7 +165,7 @@ impl Context {
 
     /// Set the last error.
     pub fn set_last_error(&self, code: ErrorCode, message: &str) {
-        let mut err = self.last_error.lock().unwrap();
+        let mut err = lock_recover(&self.last_error);
         *err = Some(LastError {
             code: code as i32,
             message: message.to_string(),
@@ -171,7 +181,7 @@ impl Context {
     /// Get the last error code and message pointer (for FFI).
     /// Returns `None` if no error has been set.
     pub fn last_error(&self) -> Option<(i32, *const std::ffi::c_char)> {
-        let err = self.last_error.lock().unwrap();
+        let err = lock_recover(&self.last_error);
         err.as_ref().map(|e| {
             let ptr = e.c_message.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
             (e.code, ptr)
@@ -180,23 +190,23 @@ impl Context {
 
     /// Clear the last error.
     pub fn clear_error(&self) {
-        let mut err = self.last_error.lock().unwrap();
+        let mut err = lock_recover(&self.last_error);
         *err = None;
     }
 
     /// Get a snapshot of the storage config.
     pub fn storage_config(&self) -> StorageConfig {
-        self.storage.lock().unwrap().clone()
+        lock_recover(&self.storage).clone()
     }
 
     /// Get a snapshot of the lock config.
     pub fn lock_config(&self) -> LockConfig {
-        self.lock_config.lock().unwrap().clone()
+        lock_recover(&self.lock_config).clone()
     }
 
     /// Get a snapshot of the resource budget.
     pub fn resource_budget(&self) -> ResourceBudget {
-        self.resource_budget.lock().unwrap().clone()
+        lock_recover(&self.resource_budget).clone()
     }
 }
 

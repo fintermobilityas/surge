@@ -285,10 +285,7 @@ fn configure_context(manifest: &SurgeManifest) -> Result<Context> {
         "", // secret_key from env
         &manifest.storage.endpoint,
     );
-    {
-        let mut cfg = ctx.storage.lock().unwrap();
-        cfg.prefix.clone_from(&manifest.storage.prefix);
-    }
+    ctx.set_storage_prefix(&manifest.storage.prefix);
 
     Ok(ctx)
 }

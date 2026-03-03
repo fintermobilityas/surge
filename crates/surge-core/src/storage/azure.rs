@@ -36,21 +36,27 @@ impl AzureBlobBackend {
     /// - `config.access_key` as the storage account name
     /// - `config.secret_key` as the base64-encoded account key
     pub fn new(config: &StorageConfig) -> Result<Self> {
-        let access_key = if config.access_key.is_empty() {
-            std::env::var("SURGE_AZURE_ACCESS_KEY").unwrap_or_default()
+        let account_name = if config.access_key.is_empty() {
+            std::env::var("AZURE_STORAGE_ACCOUNT_NAME")
+                .or_else(|_| std::env::var("AZURE_STORAGE_ACCOUNT"))
+                .or_else(|_| std::env::var("SURGE_AZURE_ACCESS_KEY"))
+                .unwrap_or_default()
         } else {
             config.access_key.clone()
         };
-        let secret_key = if config.secret_key.is_empty() {
-            std::env::var("SURGE_AZURE_SECRET_KEY").unwrap_or_default()
+        let account_key = if config.secret_key.is_empty() {
+            std::env::var("AZURE_STORAGE_ACCOUNT_KEY")
+                .or_else(|_| std::env::var("AZURE_STORAGE_KEY"))
+                .or_else(|_| std::env::var("SURGE_AZURE_SECRET_KEY"))
+                .unwrap_or_default()
         } else {
             config.secret_key.clone()
         };
 
-        if access_key.is_empty() || secret_key.is_empty() {
+        if account_name.is_empty() || account_key.is_empty() {
             return Err(SurgeError::Config(
                 "Azure Blob storage requires access_key (account name) and secret_key (account key). \
-                 Set SURGE_AZURE_ACCESS_KEY and SURGE_AZURE_SECRET_KEY environment variables."
+                 Set AZURE_STORAGE_ACCOUNT_NAME and AZURE_STORAGE_ACCOUNT_KEY environment variables."
                     .to_string(),
             ));
         }
@@ -61,11 +67,11 @@ impl AzureBlobBackend {
         }
 
         let key_bytes = BASE64
-            .decode(&secret_key)
+            .decode(&account_key)
             .map_err(|e| SurgeError::Config(format!("Azure account key is not valid base64: {e}")))?;
 
         let endpoint = if config.endpoint.is_empty() {
-            format!("https://{}.blob.core.windows.net", access_key)
+            format!("https://{account_name}.blob.core.windows.net")
         } else {
             config.endpoint.clone()
         };
@@ -75,7 +81,7 @@ impl AzureBlobBackend {
             .map_err(|e| SurgeError::Storage(format!("Failed to build HTTP client: {e}")))?;
 
         debug!(
-            account = %access_key,
+            account = %account_name,
             container = %config.bucket,
             endpoint = %endpoint,
             "Azure Blob backend initialized"
@@ -83,7 +89,7 @@ impl AzureBlobBackend {
 
         Ok(Self {
             client,
-            account: access_key,
+            account: account_name,
             key_bytes,
             container: config.bucket.clone(),
             endpoint,

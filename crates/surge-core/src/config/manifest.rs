@@ -168,7 +168,11 @@ impl SurgeManifest {
                 continue;
             }
 
-            let main = if app.main_exe.is_empty() { &app.name } else { &app.main_exe };
+            let main = if app.main_exe.is_empty() {
+                &app.name
+            } else {
+                &app.main_exe
+            };
             for target in targets {
                 let mut derived_id = format!("{}-{}-{}", main, target.distro, target.rid);
                 if !target.variant.is_empty() {
@@ -202,9 +206,7 @@ impl SurgeManifest {
             for app in &self.apps {
                 for channel in &app.channels {
                     if seen.insert(channel.clone()) {
-                        self.channels.push(ChannelManifestConfig {
-                            name: channel.clone(),
-                        });
+                        self.channels.push(ChannelManifestConfig { name: channel.clone() });
                     }
                 }
             }
@@ -269,7 +271,8 @@ impl SurgeManifest {
         for app in &self.apps {
             if app.id.is_empty() {
                 return Err(SurgeError::Config(
-                    "App id is required (set 'id' explicitly or provide 'main'/'distro'/'rid' for auto-derivation)".to_string(),
+                    "App id is required (set 'id' explicitly or provide 'main'/'distro'/'rid' for auto-derivation)"
+                        .to_string(),
                 ));
             }
 

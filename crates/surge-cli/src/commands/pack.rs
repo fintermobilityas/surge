@@ -440,6 +440,7 @@ mod tests {
 
     use super::*;
     use surge_core::archive::extractor::list_entries_from_bytes;
+    use surge_core::config::constants::DEFAULT_ZSTD_LEVEL;
     use surge_core::platform::detect::current_rid;
     use surge_core::platform::fs::make_executable;
     use surge_core::releases::manifest::{ReleaseEntry, ReleaseIndex, compress_release_index};
@@ -499,8 +500,7 @@ apps:
             releases,
             ..ReleaseIndex::default()
         };
-        let data = compress_release_index(&index, surge_core::config::constants::DEFAULT_ZSTD_LEVEL)
-            .expect("index compression");
+        let data = compress_release_index(&index, DEFAULT_ZSTD_LEVEL).expect("index compression");
         std::fs::write(store_dir.join(RELEASES_FILE_COMPRESSED), data).expect("index write should succeed");
     }
 

@@ -44,7 +44,7 @@ pub async fn execute(
 
     tracing::info!("Packing {app_id} v{version} ({rid}) from {}", artifacts_dir.display());
 
-    let ctx = Arc::new(configure_context(&manifest)?);
+    let ctx = Arc::new(configure_context(&manifest, &app_id)?);
     let manifest_path_s = manifest_path
         .to_str()
         .ok_or_else(|| SurgeError::Config(format!("Manifest path is not valid UTF-8: {}", manifest_path.display())))?;
@@ -112,8 +112,7 @@ pub async fn execute_installers_only(
 
     std::fs::create_dir_all(output_dir)?;
     let default_channel = default_channel_for_app(&manifest, app);
-    let ctx = configure_context(&manifest)?;
-    let storage_config = ctx.storage_config();
+    let storage_config = super::build_app_scoped_storage_config(&manifest, &app_id)?;
     let backend = storage::create_storage_backend(&storage_config)?;
     let index = fetch_release_index(&*backend).await?;
     if !index.app_id.is_empty() && index.app_id != app_id {
@@ -430,8 +429,8 @@ fn default_artifacts_dir(manifest_path: &Path, app_id: &str, rid: &str, version:
         .join(version)
 }
 
-fn configure_context(manifest: &SurgeManifest) -> Result<Context> {
-    super::build_storage_context(manifest)
+fn configure_context(manifest: &SurgeManifest, app_id: &str) -> Result<Context> {
+    super::build_app_scoped_storage_context(manifest, app_id)
 }
 
 #[cfg(test)]

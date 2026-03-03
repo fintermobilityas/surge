@@ -429,7 +429,7 @@ fn build_storage_configs_for_app(manifest: &SurgeManifest, app_id: &str) -> Resu
     }
 
     let mut configs = Vec::new();
-    let per_app_prefix = append_prefix(&base.prefix, app_id);
+    let per_app_prefix = super::append_prefix(&base.prefix, app_id);
     if per_app_prefix != base.prefix {
         let mut scoped = base.clone();
         scoped.prefix = per_app_prefix;
@@ -438,19 +438,6 @@ fn build_storage_configs_for_app(manifest: &SurgeManifest, app_id: &str) -> Resu
     configs.push(base);
 
     Ok(configs)
-}
-
-fn append_prefix(prefix: &str, segment: &str) -> String {
-    let prefix = prefix.trim().trim_matches('/');
-    let segment = segment.trim().trim_matches('/');
-
-    if prefix.is_empty() {
-        segment.to_string()
-    } else if segment.is_empty() {
-        prefix.to_string()
-    } else {
-        format!("{prefix}/{segment}")
-    }
 }
 
 fn build_storage_config(manifest: &SurgeManifest) -> Result<StorageConfig> {
@@ -497,6 +484,7 @@ mod tests {
 
     #[test]
     fn append_prefix_handles_empty_values() {
+        use super::super::append_prefix;
         assert_eq!(append_prefix("", "app-a"), "app-a");
         assert_eq!(append_prefix("/releases/", "/app-a/"), "releases/app-a");
         assert_eq!(append_prefix("releases", ""), "releases");

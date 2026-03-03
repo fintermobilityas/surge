@@ -56,7 +56,7 @@ pub async fn install_execute(
         )
     };
 
-    let storage_config = build_storage_config(&manifest)?;
+    let storage_config = super::build_app_scoped_storage_config(&manifest, &app_id)?;
     let backend = storage::create_storage_backend(&storage_config)?;
     let index = fetch_release_index(&*backend).await?;
     if !index.app_id.is_empty() && index.app_id != app_id {
@@ -188,10 +188,6 @@ async fn fetch_release_index(backend: &dyn StorageBackend) -> Result<ReleaseInde
         Err(SurgeError::NotFound(_)) => Ok(ReleaseIndex::default()),
         Err(e) => Err(e),
     }
-}
-
-fn build_storage_config(manifest: &SurgeManifest) -> Result<surge_core::context::StorageConfig> {
-    super::build_storage_config(manifest)
 }
 
 fn select_release<'a>(

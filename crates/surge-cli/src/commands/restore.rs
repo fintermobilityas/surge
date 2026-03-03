@@ -16,7 +16,7 @@ pub async fn execute(
     let manifest = SurgeManifest::from_file(manifest_path)?;
     let app_id = super::resolve_app_id(&manifest, app_id)?;
     let rid = super::resolve_rid(&manifest, &app_id, rid)?;
-    let storage_config = build_storage_config(&manifest)?;
+    let storage_config = super::build_app_scoped_storage_config(&manifest, &app_id)?;
     let backend = storage::create_storage_backend(&storage_config)?;
 
     if !backup_dir.is_dir() {
@@ -87,8 +87,4 @@ fn walk_recursive(dir: &Path, files: &mut Vec<std::path::PathBuf>) -> Result<()>
         }
     }
     Ok(())
-}
-
-fn build_storage_config(manifest: &SurgeManifest) -> Result<surge_core::context::StorageConfig> {
-    super::build_storage_config(manifest)
 }

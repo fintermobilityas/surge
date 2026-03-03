@@ -17,7 +17,7 @@ pub async fn execute(
     let manifest = SurgeManifest::from_file(manifest_path)?;
     let app_id = super::resolve_app_id(&manifest, app_id)?;
     let rid = super::resolve_rid(&manifest, &app_id, rid)?;
-    let storage_config = build_storage_config(&manifest)?;
+    let storage_config = super::build_app_scoped_storage_config(&manifest, &app_id)?;
     let backend = storage::create_storage_backend(&storage_config)?;
 
     tracing::info!("Demoting {app_id} v{version} ({rid}) from channel '{channel}'");
@@ -57,8 +57,4 @@ pub async fn execute(
 async fn fetch_release_index(backend: &dyn StorageBackend) -> Result<surge_core::releases::manifest::ReleaseIndex> {
     let data = backend.get_object(RELEASES_FILE_COMPRESSED).await?;
     decompress_release_index(&data)
-}
-
-fn build_storage_config(manifest: &SurgeManifest) -> Result<surge_core::context::StorageConfig> {
-    super::build_storage_config(manifest)
 }

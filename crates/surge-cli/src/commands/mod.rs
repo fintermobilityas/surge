@@ -70,6 +70,44 @@ pub(crate) fn build_storage_config(manifest: &SurgeManifest) -> Result<StorageCo
     Ok(build_storage_context(manifest)?.storage_config())
 }
 
+/// Build a storage config for an app.
+///
+/// For multi-app manifests, storage is scoped by app id to avoid release index
+/// collisions. Single-app manifests keep their existing storage prefix.
+pub(crate) fn build_app_scoped_storage_config(manifest: &SurgeManifest, app_id: &str) -> Result<StorageConfig> {
+    let mut config = build_storage_config(manifest)?;
+    if manifest.apps.len() > 1 {
+        config.prefix = append_prefix(&config.prefix, app_id);
+    }
+    Ok(config)
+}
+
+/// Build a storage context for an app.
+///
+/// For multi-app manifests, storage is scoped by app id to avoid release index
+/// collisions. Single-app manifests keep their existing storage prefix.
+pub(crate) fn build_app_scoped_storage_context(manifest: &SurgeManifest, app_id: &str) -> Result<Context> {
+    let ctx = build_storage_context(manifest)?;
+    if manifest.apps.len() > 1 {
+        let base_prefix = ctx.storage_config().prefix;
+        ctx.set_storage_prefix(&append_prefix(&base_prefix, app_id));
+    }
+    Ok(ctx)
+}
+
+pub(crate) fn append_prefix(prefix: &str, segment: &str) -> String {
+    let prefix = prefix.trim().trim_matches('/');
+    let segment = segment.trim().trim_matches('/');
+
+    if prefix.is_empty() {
+        segment.to_string()
+    } else if segment.is_empty() {
+        prefix.to_string()
+    } else {
+        format!("{prefix}/{segment}")
+    }
+}
+
 pub(crate) fn parse_storage_provider(raw: &str) -> Result<StorageProvider> {
     let normalized = raw.trim().to_ascii_lowercase().replace('-', "_");
     let provider = match normalized.as_str() {
@@ -133,11 +171,13 @@ mod tests {
     use std::path::Path;
 
     use surge_core::archive::extractor::{list_entries_from_bytes, read_entry};
-    use surge_core::config::constants::RELEASES_FILE_COMPRESSED;
+    use surge_core::config::constants::{DEFAULT_ZSTD_LEVEL, RELEASES_FILE_COMPRESSED};
     use surge_core::config::manifest::{ShortcutLocation, SurgeManifest};
     use surge_core::platform::detect::current_rid;
     use surge_core::platform::fs::make_executable;
-    use surge_core::releases::manifest::{ReleaseIndex, decompress_release_index};
+    use surge_core::releases::manifest::{
+        ReleaseEntry, ReleaseIndex, compress_release_index, decompress_release_index,
+    };
 
     fn write_manifest(path: &Path, store_dir: &Path, app_id: &str, rid: &str) {
         let yaml = format!(
@@ -161,6 +201,29 @@ apps:
         installers:
           - web
           - offline
+",
+            bucket = store_dir.display()
+        );
+        std::fs::write(path, yaml).unwrap();
+    }
+
+    fn write_multi_app_manifest(path: &Path, store_dir: &Path, app_a: &str, app_b: &str, rid: &str) {
+        let yaml = format!(
+            r"schema: 1
+storage:
+  provider: filesystem
+  bucket: {bucket}
+apps:
+  - id: {app_a}
+    name: App A
+    main_exe: demoapp
+    targets:
+      - rid: {rid}
+  - id: {app_b}
+    name: App B
+    main_exe: demoapp
+    targets:
+      - rid: {rid}
 ",
             bucket = store_dir.display()
         );
@@ -255,6 +318,40 @@ apps:
             super::storage_credentials_from_lookup(super::StorageProvider::GitHubReleases, |key| env.get(key).cloned());
         assert!(access.is_empty());
         assert_eq!(secret, "ghp_test");
+    }
+
+    #[test]
+    fn test_build_app_scoped_storage_config_scopes_only_for_multi_app_manifest() {
+        let single_yaml = br"schema: 1
+storage:
+  provider: filesystem
+  bucket: /tmp/releases
+  prefix: base
+apps:
+  - id: app-a
+    target:
+      rid: linux-x64
+";
+        let single = SurgeManifest::parse(single_yaml).unwrap();
+        let single_cfg = super::build_app_scoped_storage_config(&single, "app-a").unwrap();
+        assert_eq!(single_cfg.prefix, "base");
+
+        let multi_yaml = br"schema: 1
+storage:
+  provider: filesystem
+  bucket: /tmp/releases
+  prefix: base
+apps:
+  - id: app-a
+    target:
+      rid: linux-x64
+  - id: app-b
+    target:
+      rid: linux-x64
+";
+        let multi = SurgeManifest::parse(multi_yaml).unwrap();
+        let multi_cfg = super::build_app_scoped_storage_config(&multi, "app-a").unwrap();
+        assert_eq!(multi_cfg.prefix, "base/app-a");
     }
 
     #[tokio::test]
@@ -367,5 +464,69 @@ apps:
         super::list::execute(&manifest_path, Some(app_id), Some(&rid), Some("beta"))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_push_multi_app_uses_app_scoped_release_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_dir = tmp.path().join("store");
+        let packages_dir = tmp.path().join("packages");
+        let manifest_path = tmp.path().join("surge.yml");
+        let rid = current_rid();
+        let app_a = "multi-app-a";
+        let app_b = "multi-app-b";
+        let version = "1.0.0";
+
+        std::fs::create_dir_all(&store_dir).unwrap();
+        std::fs::create_dir_all(&packages_dir).unwrap();
+        write_multi_app_manifest(&manifest_path, &store_dir, app_a, app_b, &rid);
+
+        // Seed unscoped index with another app to ensure scoped push does not collide.
+        let root_index = ReleaseIndex {
+            app_id: app_b.to_string(),
+            releases: vec![ReleaseEntry {
+                version: "0.9.0".to_string(),
+                channels: vec!["stable".to_string()],
+                os: "linux".to_string(),
+                rid: rid.clone(),
+                is_genesis: true,
+                full_filename: format!("{app_b}-0.9.0-{rid}-full.tar.zst"),
+                full_size: 1,
+                full_sha256: String::new(),
+                delta_filename: String::new(),
+                delta_size: 0,
+                delta_sha256: String::new(),
+                created_utc: String::new(),
+                release_notes: String::new(),
+                main_exe: "demoapp".to_string(),
+                install_directory: "demoapp".to_string(),
+                supervisor_id: String::new(),
+                icon: String::new(),
+                shortcuts: Vec::new(),
+                persistent_assets: Vec::new(),
+                installers: Vec::new(),
+                environment: BTreeMap::new(),
+            }],
+            ..ReleaseIndex::default()
+        };
+        let root_bytes = compress_release_index(&root_index, DEFAULT_ZSTD_LEVEL).unwrap();
+        std::fs::write(store_dir.join(RELEASES_FILE_COMPRESSED), root_bytes).unwrap();
+
+        let full_package = packages_dir.join(format!("{app_a}-{version}-{rid}-full.tar.zst"));
+        std::fs::write(&full_package, b"full-package").unwrap();
+
+        super::push::execute(&manifest_path, Some(app_a), version, Some(&rid), "test", &packages_dir)
+            .await
+            .unwrap();
+
+        let root_after = read_index(&store_dir);
+        assert_eq!(root_after.app_id, app_b);
+
+        let scoped_data = std::fs::read(store_dir.join(app_a).join(RELEASES_FILE_COMPRESSED)).unwrap();
+        let scoped_index = decompress_release_index(&scoped_data).unwrap();
+        assert_eq!(scoped_index.app_id, app_a);
+        assert_eq!(scoped_index.releases.len(), 1);
+        assert_eq!(scoped_index.releases[0].version, version);
+        assert_eq!(scoped_index.releases[0].channels, vec!["test"]);
     }
 }

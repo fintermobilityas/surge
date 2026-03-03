@@ -33,7 +33,7 @@ pub async fn execute(
     let installers = target.installers.clone();
     let environment = target.environment.clone();
 
-    let storage_config = build_storage_config(&manifest)?;
+    let storage_config = super::build_app_scoped_storage_config(&manifest, &app_id)?;
     let backend = storage::create_storage_backend(&storage_config)?;
 
     if !packages_dir.is_dir() {
@@ -232,8 +232,4 @@ async fn prune_redundant_artifacts(backend: &dyn StorageBackend, index: &Release
 
 fn detect_os_from_rid(rid: &str) -> String {
     rid.split('-').next().unwrap_or("unknown").to_string()
-}
-
-fn build_storage_config(manifest: &SurgeManifest) -> Result<surge_core::context::StorageConfig> {
-    super::build_storage_config(manifest)
 }

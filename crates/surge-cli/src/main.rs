@@ -246,10 +246,14 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     init_tracing(cli.verbose);
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("Failed to create tokio runtime");
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build();
+    let rt = match rt {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            tracing::error!("failed to create tokio runtime: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     let result = rt.block_on(run(cli));
 

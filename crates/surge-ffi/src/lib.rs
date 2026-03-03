@@ -100,10 +100,10 @@ pub struct SurgeBspatchCtxFfi {
 }
 
 /// Callback type matching `surge_progress_callback` in surge_api.h.
-type SurgeProgressCallback = Option<unsafe extern "C" fn(*const SurgeProgressFfi, *mut c_void)>;
+type SurgeProgressCallback = Option<extern "C" fn(*const SurgeProgressFfi, *mut c_void)>;
 
 /// Callback type matching `surge_event_callback` in surge_api.h.
-type SurgeEventCallback = Option<unsafe extern "C" fn(*const c_char, *mut c_void)>;
+type SurgeEventCallback = Option<extern "C" fn(*const c_char, *mut c_void)>;
 
 // ---------------------------------------------------------------------------
 //  Helpers
@@ -117,7 +117,7 @@ type SurgeEventCallback = Option<unsafe extern "C" fn(*const c_char, *mut c_void
 /// Only safe when the pointer is valid for the duration of the async call
 /// and only accessed from the calling thread (via `Runtime::block_on`).
 struct ProgressBridge {
-    cb: unsafe extern "C" fn(*const SurgeProgressFfi, *mut c_void),
+    cb: extern "C" fn(*const SurgeProgressFfi, *mut c_void),
     user_data: usize,
 }
 
@@ -135,7 +135,7 @@ impl ProgressBridge {
             items_total: pi.items_total,
             speed_bytes_per_sec: pi.speed_bytes_per_sec,
         };
-        unsafe { (self.cb)(&ffi, self.user_data as *mut c_void) };
+        (self.cb)(&ffi, self.user_data as *mut c_void);
     }
 }
 
@@ -1013,7 +1013,7 @@ pub unsafe extern "C" fn surge_pack_build(
         let progress_fn = progress_cb.map(|cb| {
             move |done: i32, total: i32| {
                 let ffi = make_pack_progress(SURGE_PHASE_CHECK, done, total);
-                unsafe { cb(&ffi, user_data) };
+                cb(&ffi, user_data);
             }
         });
 
@@ -1073,7 +1073,7 @@ pub unsafe extern "C" fn surge_pack_push(
         let progress_fn = progress_cb.map(|cb| {
             move |done: i32, total: i32| {
                 let ffi = make_pack_progress(SURGE_PHASE_DOWNLOAD, done, total);
-                unsafe { cb(&ffi, user_data) };
+                cb(&ffi, user_data);
             }
         });
 
@@ -1256,14 +1256,14 @@ pub unsafe extern "C" fn surge_process_events(
                     if let Some(cb) = on_first_run
                         && let Ok(version) = CStr::from_bytes_with_nul(ZERO_VERSION)
                     {
-                        unsafe { cb(version.as_ptr(), user_data) };
+                        cb(version.as_ptr(), user_data);
                     }
                 }
                 "--surge-installed" => {
                     if let Some(cb) = on_installed
                         && let Ok(version) = CStr::from_bytes_with_nul(ZERO_VERSION)
                     {
-                        unsafe { cb(version.as_ptr(), user_data) };
+                        cb(version.as_ptr(), user_data);
                     }
                 }
                 _ => {
@@ -1272,7 +1272,7 @@ pub unsafe extern "C" fn surge_process_events(
                     {
                         let ver = &arg["--surge-updated=".len()..];
                         let version = to_lossy_cstring(ver);
-                        unsafe { cb(version.as_ptr(), user_data) };
+                        cb(version.as_ptr(), user_data);
                     }
                 }
             }

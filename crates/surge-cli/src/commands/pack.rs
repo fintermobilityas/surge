@@ -24,13 +24,21 @@ pub async fn execute(
     artifacts_dir: Option<&Path>,
     output_dir: &Path,
 ) -> Result<()> {
+    const TOTAL_STAGES: usize = 5;
+
+    let theme = UiTheme::global();
+    let started = Instant::now();
+
+    print_stage(theme, 1, TOTAL_STAGES, "Resolving manifest and target");
     let manifest = SurgeManifest::from_file(manifest_path)?;
     let app_id = super::resolve_app_id(&manifest, app_id)?;
     let rid = super::resolve_rid(&manifest, &app_id, rid)?;
     let (app, target) = manifest
         .find_app_with_target(&app_id, &rid)
         .ok_or_else(|| SurgeError::Config(format!("No target {rid} found for app {app_id}")))?;
+    print_stage_done(theme, 1, TOTAL_STAGES, &format!("Target: {app_id}/{rid} v{version}"));
 
+    print_stage(theme, 2, TOTAL_STAGES, "Validating artifacts and output directories");
     let artifacts_dir = artifacts_dir.map_or_else(
         || default_artifacts_dir(manifest_path, &app_id, &rid, version),
         PathBuf::from,
@@ -43,9 +51,18 @@ pub async fn execute(
     }
 
     std::fs::create_dir_all(output_dir)?;
+    print_stage_done(
+        theme,
+        2,
+        TOTAL_STAGES,
+        &format!(
+            "Artifacts: {} | Output: {}",
+            artifacts_dir.display(),
+            output_dir.display()
+        ),
+    );
 
-    tracing::info!("Packing {app_id} v{version} ({rid}) from {}", artifacts_dir.display());
-
+    print_stage(theme, 3, TOTAL_STAGES, "Building full/delta packages");
     let ctx = Arc::new(configure_context(&manifest, &app_id)?);
     let manifest_path_s = manifest_path
         .to_str()
@@ -60,13 +77,21 @@ pub async fn execute(
     let mut builder = PackBuilder::new(ctx, manifest_path_s, &app_id, &rid, version, artifacts_dir_s)?;
     builder.build(None).await?;
 
+    let mut artifact_count = 0usize;
     for artifact in builder.artifacts() {
         let dest = output_dir.join(&artifact.filename);
         if artifact.path != dest {
             std::fs::copy(&artifact.path, &dest)?;
         }
-        tracing::info!("Created {}", dest.display());
+        artifact_count += 1;
+        println!("{}", theme.subtle(&format!("  Created {}", dest.display())));
     }
+    print_stage_done(
+        theme,
+        3,
+        TOTAL_STAGES,
+        &format!("Built {artifact_count} package artifact(s)"),
+    );
 
     let full_filename = format!("{app_id}-{version}-{rid}-full.tar.zst");
     let full_package_path = output_dir.join(&full_filename);
@@ -77,6 +102,7 @@ pub async fn execute(
         )));
     }
 
+    print_stage(theme, 4, TOTAL_STAGES, "Building installer bundles");
     let installer_paths = build_installers(
         &manifest,
         app,
@@ -88,11 +114,27 @@ pub async fn execute(
         output_dir,
         &full_package_path,
     )?;
+    let installer_count = installer_paths.len();
     for installer in installer_paths {
-        tracing::info!("Created {}", installer.display());
+        println!("{}", theme.subtle(&format!("  Created {}", installer.display())));
     }
+    print_stage_done(
+        theme,
+        4,
+        TOTAL_STAGES,
+        &format!("Built {installer_count} installer artifact(s)"),
+    );
 
-    tracing::info!("Pack complete. Output: {}", output_dir.display());
+    print_stage(theme, 5, TOTAL_STAGES, "Finalize pack summary");
+    print_stage_done(
+        theme,
+        5,
+        TOTAL_STAGES,
+        &format!(
+            "Completed in {} (packages: {artifact_count}, installers: {installer_count})",
+            format_duration(started.elapsed())
+        ),
+    );
     Ok(())
 }
 

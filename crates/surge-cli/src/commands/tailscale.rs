@@ -1,10 +1,10 @@
 use std::path::Path;
 
+use crate::ui::UiTheme;
 use tokio::process::Command;
 
 use surge_core::config::constants::RELEASES_FILE_COMPRESSED;
 use surge_core::config::manifest::SurgeManifest;
-use surge_core::context::{Context, StorageConfig, StorageProvider};
 use surge_core::error::{Result, SurgeError};
 use surge_core::releases::manifest::{ReleaseEntry, ReleaseIndex, decompress_release_index};
 use surge_core::releases::version::compare_versions;
@@ -35,6 +35,7 @@ pub async fn install_execute(
     plan_only: bool,
     download_dir: &Path,
 ) -> Result<()> {
+    let theme = UiTheme::global();
     let manifest = SurgeManifest::from_file(manifest_path)?;
     let app_id = super::resolve_app_id(&manifest, app_id)?;
     let (ssh_target, file_target) = resolve_tailscale_targets(node, ssh_user)?;
@@ -81,22 +82,31 @@ pub async fn install_execute(
 
     if let Some(profile) = &profile {
         println!(
-            "Remote profile for {ssh_target}: os={}, arch={}, gpu={}",
-            profile.os, profile.arch, profile.gpu
+            "{}",
+            theme.info(&format!(
+                "Remote profile for {ssh_target}: os={}, arch={}, gpu={}",
+                profile.os, profile.arch, profile.gpu
+            ))
         );
     }
-    println!("RID candidates: {}", rid_candidates.join(", "));
     println!(
-        "Selected release: app={} version={} rid={} channels={} full_package={}",
-        app_id,
-        release.version,
-        selected_rid,
-        if release.channels.is_empty() {
-            "-".to_string()
-        } else {
-            release.channels.join(",")
-        },
-        release.full_filename
+        "{}",
+        theme.info(&format!("RID candidates: {}", rid_candidates.join(", ")))
+    );
+    println!(
+        "{}",
+        theme.success(&format!(
+            "Selected release: app={} version={} rid={} channels={} full_package={}",
+            app_id,
+            release.version,
+            selected_rid,
+            if release.channels.is_empty() {
+                "-".to_string()
+            } else {
+                release.channels.join(",")
+            },
+            release.full_filename
+        ))
     );
 
     let full_filename = release.full_filename.trim();
@@ -109,7 +119,10 @@ pub async fn install_execute(
 
     if plan_only {
         println!(
-            "Plan only mode: no transfer performed. Remove --plan-only to download and copy package to {file_target}."
+            "{}",
+            theme.warning(&format!(
+                "Plan only mode: no transfer performed. Remove --plan-only to download and copy package to {file_target}."
+            ))
         );
         return Ok(());
     }
@@ -125,15 +138,21 @@ pub async fn install_execute(
 
     copy_file_to_tailscale_node(&file_target, &local_package).await?;
     println!(
-        "Copied '{}' to node '{}' via tailscale file sharing.",
-        local_package.display(),
-        file_target
+        "{}",
+        theme.success(&format!(
+            "Copied '{}' to node '{}' via tailscale file sharing.",
+            local_package.display(),
+            file_target
+        ))
     );
     println!(
-        "Install hint on node {}: extract '{}' into the install directory for app '{}'.",
-        file_target,
-        Path::new(full_filename).display(),
-        app_id
+        "{}",
+        theme.subtle(&format!(
+            "Install hint on node {}: extract '{}' into the install directory for app '{}'.",
+            file_target,
+            Path::new(full_filename).display(),
+            app_id
+        ))
     );
 
     Ok(())
@@ -171,28 +190,8 @@ async fn fetch_release_index(backend: &dyn StorageBackend) -> Result<ReleaseInde
     }
 }
 
-fn build_storage_config(manifest: &SurgeManifest) -> Result<StorageConfig> {
-    let provider = match manifest.storage.provider.to_lowercase().as_str() {
-        "s3" => StorageProvider::S3,
-        "azure" => StorageProvider::AzureBlob,
-        "gcs" => StorageProvider::Gcs,
-        "filesystem" => StorageProvider::Filesystem,
-        "github" | "github_releases" | "github-releases" => StorageProvider::GitHubReleases,
-        other => return Err(SurgeError::Config(format!("Unknown storage provider: {other}"))),
-    };
-
-    let ctx = Context::new();
-    ctx.set_storage(
-        provider,
-        &manifest.storage.bucket,
-        &manifest.storage.region,
-        "",
-        "",
-        &manifest.storage.endpoint,
-    );
-    let mut cfg = ctx.storage_config();
-    cfg.prefix.clone_from(&manifest.storage.prefix);
-    Ok(cfg)
+fn build_storage_config(manifest: &SurgeManifest) -> Result<surge_core::context::StorageConfig> {
+    super::build_storage_config(manifest)
 }
 
 fn select_release<'a>(

@@ -1,3 +1,4 @@
+use crate::ui::UiTheme;
 use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::path::Path;
@@ -177,8 +178,9 @@ fn gather_wizard_input(
     install_directory: Option<&str>,
     supervisor_id: Option<&str>,
 ) -> Result<InitInput> {
-    println!("Surge init wizard");
-    println!("Manifest path: {}", manifest_path.display());
+    let theme = UiTheme::global();
+    println!("{}", theme.title("Surge init wizard"));
+    println!("{}", theme.info(&format!("Manifest path: {}", manifest_path.display())));
 
     let app_id_default = app_id.unwrap_or("my-app").trim();
     let app_id = prompt_with_default("App id", app_id_default)?;
@@ -196,7 +198,7 @@ fn gather_wizard_input(
         )?;
         match normalize_provider(&entered) {
             Ok(valid) => break valid,
-            Err(err) => println!("Invalid provider: {err}"),
+            Err(err) => println!("{}", theme.warning(&format!("Invalid provider: {err}"))),
         }
     };
 
@@ -232,7 +234,8 @@ fn gather_wizard_input(
 }
 
 fn prompt_with_default(prompt: &str, default: &str) -> Result<String> {
-    print!("{prompt} [{default}]: ");
+    let theme = UiTheme::global();
+    print!("{}", theme.blue(&format!("{prompt} [{default}]: ")));
     io::stdout()
         .flush()
         .map_err(|e| SurgeError::Config(format!("Failed to flush stdout: {e}")))?;

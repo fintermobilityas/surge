@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 mod commands;
+mod ui;
 
 #[derive(Parser)]
 #[command(name = "surge", version, about = "Surge update framework CLI")]
@@ -289,12 +290,14 @@ enum TailscaleAction {
 
 fn init_tracing(verbose: bool) {
     let filter = if verbose { "debug" } else { "info" };
+    let theme = ui::UiTheme::global();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(filter)),
         )
         .with_target(false)
+        .with_ansi(theme.enabled())
         .init();
 }
 

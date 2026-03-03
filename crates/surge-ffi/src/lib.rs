@@ -1327,4 +1327,73 @@ mod tests {
         let args = unsafe { collect_argv(argv.len() as c_int, argv.as_ptr()) };
         assert_eq!(args, vec!["--surge-first-run", "--surge-updated=1.2.3"]);
     }
+
+    #[test]
+    fn manager_set_channel_updates_context_last_error() {
+        let ctx = unsafe { surge_context_create() };
+        assert!(!ctx.is_null());
+
+        let app_id = CString::new("demo").unwrap();
+        let version = CString::new("1.0.0").unwrap();
+        let channel = CString::new("stable").unwrap();
+        let install_dir = CString::new("/tmp/demo").unwrap();
+
+        let mgr = unsafe {
+            surge_update_manager_create(
+                ctx,
+                app_id.as_ptr(),
+                version.as_ptr(),
+                channel.as_ptr(),
+                install_dir.as_ptr(),
+            )
+        };
+        assert!(!mgr.is_null());
+
+        let empty = CString::new("").unwrap();
+        let rc = unsafe { surge_update_manager_set_channel(mgr, empty.as_ptr()) };
+        assert_ne!(rc, SURGE_OK);
+
+        let last = unsafe { surge_context_last_error(ctx) };
+        assert!(!last.is_null());
+        let msg = unsafe { CStr::from_ptr((*last).message) }
+            .to_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(msg.contains("channel"));
+
+        unsafe {
+            surge_update_manager_destroy(mgr);
+            surge_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn manager_remains_usable_after_context_destroy() {
+        let ctx = unsafe { surge_context_create() };
+        assert!(!ctx.is_null());
+
+        let app_id = CString::new("demo").unwrap();
+        let version = CString::new("1.0.0").unwrap();
+        let channel = CString::new("stable").unwrap();
+        let install_dir = CString::new("/tmp/demo").unwrap();
+
+        let mgr = unsafe {
+            surge_update_manager_create(
+                ctx,
+                app_id.as_ptr(),
+                version.as_ptr(),
+                channel.as_ptr(),
+                install_dir.as_ptr(),
+            )
+        };
+        assert!(!mgr.is_null());
+
+        unsafe { surge_context_destroy(ctx) };
+
+        let test_channel = CString::new("test").unwrap();
+        let rc = unsafe { surge_update_manager_set_channel(mgr, test_channel.as_ptr()) };
+        assert_eq!(rc, SURGE_OK);
+
+        unsafe { surge_update_manager_destroy(mgr) };
+    }
 }

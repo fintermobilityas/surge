@@ -3,9 +3,12 @@ use std::path::Path;
 use crate::ui::UiTheme;
 use tokio::process::Command;
 
+use surge_core::archive::extractor::extract_file_to;
 use surge_core::config::constants::RELEASES_FILE_COMPRESSED;
 use surge_core::config::manifest::SurgeManifest;
 use surge_core::error::{Result, SurgeError};
+use surge_core::platform::paths::default_install_root;
+use surge_core::platform::shortcuts::install_shortcuts;
 use surge_core::releases::manifest::{ReleaseEntry, ReleaseIndex, decompress_release_index};
 use surge_core::releases::version::compare_versions;
 use surge_core::storage::{self, StorageBackend};
@@ -182,6 +185,8 @@ pub async fn execute(
 
     match &install_target {
         InstallTarget::Local => {
+            let install_root = install_package_locally(&app_id, release, &local_package)?;
+            let active_app_dir = install_root.join("app");
             println!(
                 "{}",
                 theme.success(&format!(
@@ -192,10 +197,11 @@ pub async fn execute(
             );
             println!(
                 "{}",
-                theme.subtle(&format!(
-                    "Install hint: extract '{}' into the install directory for app '{}'.",
-                    Path::new(full_filename).display(),
-                    app_id
+                theme.success(&format!(
+                    "Installed '{}' to '{}' (active app: '{}').",
+                    app_id,
+                    install_root.display(),
+                    active_app_dir.display()
                 ))
             );
         }
@@ -253,6 +259,62 @@ fn load_install_manifest(application_manifest_path: &Path, fallback_manifest_pat
         return SurgeManifest::from_file(application_manifest_path);
     }
     SurgeManifest::from_file(fallback_manifest_path)
+}
+
+fn install_package_locally(app_id: &str, release: &ReleaseEntry, package_path: &Path) -> Result<std::path::PathBuf> {
+    let install_root = default_install_root(app_id, &release.install_directory)?;
+    install_package_locally_at_root(app_id, release, package_path, &install_root)?;
+    Ok(install_root)
+}
+
+fn install_package_locally_at_root(
+    app_id: &str,
+    release: &ReleaseEntry,
+    package_path: &Path,
+    install_root: &Path,
+) -> Result<()> {
+    std::fs::create_dir_all(install_root)?;
+
+    let active_app_dir = install_root.join("app");
+    let next_app_dir = install_root.join(".surge-app-next");
+    let previous_app_dir = install_root.join(".surge-app-prev");
+
+    if next_app_dir.is_dir() {
+        std::fs::remove_dir_all(&next_app_dir)?;
+    }
+    if previous_app_dir.is_dir() {
+        std::fs::remove_dir_all(&previous_app_dir)?;
+    }
+
+    extract_file_to(package_path, &next_app_dir)?;
+
+    if active_app_dir.is_dir() {
+        std::fs::rename(&active_app_dir, &previous_app_dir)?;
+    }
+
+    if let Err(rename_err) = std::fs::rename(&next_app_dir, &active_app_dir) {
+        if previous_app_dir.is_dir() && !active_app_dir.exists() {
+            let _ = std::fs::rename(&previous_app_dir, &active_app_dir);
+        }
+        return Err(SurgeError::Io(rename_err));
+    }
+
+    if !release.shortcuts.is_empty() {
+        let main_exe = release.main_exe.trim();
+        if main_exe.is_empty() {
+            return Err(SurgeError::Config(format!(
+                "Release '{}' for app '{}' has shortcuts configured but no main executable metadata",
+                release.version, app_id
+            )));
+        }
+        install_shortcuts(app_id, &active_app_dir, main_exe, &release.icon, &release.shortcuts)?;
+    }
+
+    if previous_app_dir.is_dir() {
+        std::fs::remove_dir_all(previous_app_dir)?;
+    }
+
+    Ok(())
 }
 
 fn build_storage_config_with_overrides(
@@ -492,6 +554,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+    use surge_core::archive::packer::ArchivePacker;
     use surge_core::config::manifest::ShortcutLocation;
     use surge_core::config::manifest::SurgeManifest;
 
@@ -549,6 +612,65 @@ mod tests {
         let (ssh_target, file_target) = resolve_tailscale_targets("alice@edge-node", Some("ignored")).expect("targets");
         assert_eq!(ssh_target, "alice@edge-node");
         assert_eq!(file_target, "edge-node");
+    }
+
+    #[test]
+    fn install_package_locally_creates_expected_app_layout() {
+        let tmp = tempfile::tempdir().expect("temp dir should exist");
+        let install_root = tmp.path().join("install-root");
+        let package_path = tmp.path().join("package.tar.zst");
+
+        let mut packer = ArchivePacker::new(3).expect("archive packer should be created");
+        packer
+            .add_buffer("youpark", b"#!/bin/sh\necho ok\n", 0o755)
+            .expect("main executable should be added");
+        packer
+            .add_buffer(".surge/surge.yml", b"schema: 1\n", 0o644)
+            .expect("manifest should be added");
+        let package_bytes = packer.finalize().expect("archive should be finalized");
+        std::fs::write(&package_path, package_bytes).expect("archive should be written");
+
+        let mut entry = release("1.2.3", "test", "linux-x64-cuda", "youpark-full.tar.zst");
+        entry.main_exe = "youpark".to_string();
+        entry.install_directory = "youpark".to_string();
+        entry.shortcuts = Vec::new();
+
+        install_package_locally_at_root("youpark", &entry, &package_path, &install_root)
+            .expect("local install should succeed");
+
+        assert!(install_root.join("app").join("youpark").is_file());
+        assert!(install_root.join("app").join(".surge").join("surge.yml").is_file());
+        assert!(!install_root.join(".surge-app-next").exists());
+        assert!(!install_root.join(".surge-app-prev").exists());
+    }
+
+    #[test]
+    fn install_package_locally_replaces_existing_app_directory() {
+        let tmp = tempfile::tempdir().expect("temp dir should exist");
+        let install_root = tmp.path().join("install-root");
+        let existing_app_dir = install_root.join("app");
+        std::fs::create_dir_all(&existing_app_dir).expect("existing app dir should exist");
+        std::fs::write(existing_app_dir.join("old.txt"), b"old").expect("old file should be written");
+
+        let package_path = tmp.path().join("package.tar.zst");
+        let mut packer = ArchivePacker::new(3).expect("archive packer should be created");
+        packer
+            .add_buffer("new.txt", b"new", 0o644)
+            .expect("new payload should be added");
+        let package_bytes = packer.finalize().expect("archive should be finalized");
+        std::fs::write(&package_path, package_bytes).expect("archive should be written");
+
+        let mut entry = release("1.2.3", "test", "linux-x64-cuda", "youpark-full.tar.zst");
+        entry.main_exe = "youpark".to_string();
+        entry.install_directory = "youpark".to_string();
+        entry.shortcuts = Vec::new();
+
+        install_package_locally_at_root("youpark", &entry, &package_path, &install_root)
+            .expect("local install should succeed");
+
+        assert!(install_root.join("app").join("new.txt").is_file());
+        assert!(!install_root.join("app").join("old.txt").exists());
+        assert!(!install_root.join(".surge-app-prev").exists());
     }
 
     fn load_reference_manifest_bytes() -> Vec<u8> {

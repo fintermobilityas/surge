@@ -338,6 +338,8 @@ pub unsafe extern "C" fn surge_config_set_storage(
     }
 
     catch_ffi(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: `ctx` is checked for non-null above and owned by this FFI
+        // layer for the duration of this call.
         let handle = unsafe { &*ctx };
         handle.clear_last_error();
 
@@ -348,11 +350,18 @@ pub unsafe extern "C" fn surge_config_set_storage(
             return set_ctx_error(ctx, &e);
         };
 
-        let bucket_s = unsafe { cstr_to_string(bucket) };
-        let region_s = unsafe { cstr_to_string(region) };
-        let access_s = unsafe { cstr_to_string(access_key) };
-        let secret_s = unsafe { cstr_to_string(secret_key) };
-        let endpoint_s = unsafe { cstr_to_string(endpoint) };
+        // SAFETY: C string pointers are nullable by API contract and each
+        // non-null pointer is expected to reference a valid NUL-terminated
+        // string for the duration of this call.
+        let (bucket_s, region_s, access_s, secret_s, endpoint_s) = unsafe {
+            (
+                cstr_to_string(bucket),
+                cstr_to_string(region),
+                cstr_to_string(access_key),
+                cstr_to_string(secret_key),
+                cstr_to_string(endpoint),
+            )
+        };
 
         handle
             .ctx
@@ -369,9 +378,12 @@ pub unsafe extern "C" fn surge_config_set_lock_server(ctx: *mut SurgeContextHand
     }
 
     catch_ffi(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: `ctx` is checked for non-null above and points to a live
+        // context handle while this call executes.
         let handle = unsafe { &*ctx };
         handle.clear_last_error();
 
+        // SAFETY: `url` follows the C API contract for nullable C strings.
         let url_s = unsafe { cstr_to_string(url) };
         handle.ctx.set_lock_server(&url_s);
         SURGE_OK
@@ -389,6 +401,9 @@ pub unsafe extern "C" fn surge_config_set_resource_budget(
     }
 
     catch_ffi(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: `ctx` and `budget` are checked non-null above and both
+        // pointers are expected to reference initialized values by API
+        // contract.
         let handle = unsafe { &*ctx };
         handle.clear_last_error();
 
@@ -423,13 +438,21 @@ pub unsafe extern "C" fn surge_update_manager_create(
     }
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: `ctx` is checked non-null above and refers to a valid
+        // handle for the duration of this call.
         let handle = unsafe { &*ctx };
         handle.clear_last_error();
 
-        let app_id_s = unsafe { cstr_to_string(app_id) };
-        let version_s = unsafe { cstr_to_string(current_version) };
-        let channel_s = unsafe { cstr_to_string(channel) };
-        let install_s = unsafe { cstr_to_string(install_dir) };
+        // SAFETY: string pointer inputs follow the FFI contract described in
+        // this API; nulls map to empty strings.
+        let (app_id_s, version_s, channel_s, install_s) = unsafe {
+            (
+                cstr_to_string(app_id),
+                cstr_to_string(current_version),
+                cstr_to_string(channel),
+                cstr_to_string(install_dir),
+            )
+        };
 
         if app_id_s.is_empty() || version_s.is_empty() || channel_s.is_empty() || install_s.is_empty() {
             let e =
@@ -475,9 +498,11 @@ pub unsafe extern "C" fn surge_update_manager_set_channel(
     }
 
     catch_ffi(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: `mgr` is checked non-null above.
         let mgr_ref = unsafe { &mut *mgr };
         clear_shared_error(&mgr_ref.ctx, &mgr_ref.last_error);
 
+        // SAFETY: `channel` follows the nullable C string contract.
         let channel_s = unsafe { cstr_to_string(channel) };
         let channel_s = channel_s.trim().to_string();
         if channel_s.is_empty() {
@@ -501,9 +526,11 @@ pub unsafe extern "C" fn surge_update_manager_set_current_version(
     }
 
     catch_ffi(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: `mgr` is checked non-null above.
         let mgr_ref = unsafe { &mut *mgr };
         clear_shared_error(&mgr_ref.ctx, &mgr_ref.last_error);
 
+        // SAFETY: `current_version` follows the nullable C string contract.
         let version_s = unsafe { cstr_to_string(current_version) };
         let version_s = version_s.trim().to_string();
         if version_s.is_empty() {
@@ -529,8 +556,12 @@ pub unsafe extern "C" fn surge_update_check(
     }
 
     catch_ffi(std::panic::AssertUnwindSafe(|| {
-        unsafe { *info = ptr::null_mut() };
-        let mgr_ref = unsafe { &*mgr };
+        // SAFETY: `mgr`/`info` are checked non-null above. The out pointer is
+        // cleared first to avoid leaking stale values on early exits.
+        let mgr_ref = unsafe {
+            *info = ptr::null_mut();
+            &*mgr
+        };
         clear_shared_error(&mgr_ref.ctx, &mgr_ref.last_error);
 
         if mgr_ref.ctx.is_cancelled() {
@@ -570,6 +601,7 @@ pub unsafe extern "C" fn surge_update_check(
                 });
                 releases_handle.cache_strings();
 
+                // SAFETY: `info` is a valid out pointer checked above.
                 unsafe { *info = Box::into_raw(releases_handle) };
                 SURGE_OK
             }
@@ -579,6 +611,7 @@ pub unsafe extern "C" fn surge_update_check(
                     cached_strings: Vec::new(),
                     update_info: None,
                 });
+                // SAFETY: `info` is a valid out pointer checked above.
                 unsafe { *info = Box::into_raw(releases_handle) };
                 SURGE_NOT_FOUND
             }
@@ -947,14 +980,21 @@ pub unsafe extern "C" fn surge_pack_create(
     }
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: `ctx` is checked non-null above.
         let handle = unsafe { &*ctx };
         handle.clear_last_error();
 
-        let manifest_s = unsafe { cstr_to_string(manifest_path) };
-        let app_id_s = unsafe { cstr_to_string(app_id) };
-        let rid_s = unsafe { cstr_to_string(rid) };
-        let version_s = unsafe { cstr_to_string(version) };
-        let artifacts_s = unsafe { cstr_to_string(artifacts_dir) };
+        // SAFETY: string pointers follow this API's nullable C string
+        // contract.
+        let (manifest_s, app_id_s, rid_s, version_s, artifacts_s) = unsafe {
+            (
+                cstr_to_string(manifest_path),
+                cstr_to_string(app_id),
+                cstr_to_string(rid),
+                cstr_to_string(version),
+                cstr_to_string(artifacts_dir),
+            )
+        };
 
         if manifest_s.is_empty() || app_id_s.is_empty() || version_s.is_empty() || artifacts_s.is_empty() {
             let e = surge_core::error::SurgeError::Config(
@@ -994,6 +1034,7 @@ pub unsafe extern "C" fn surge_pack_build(
     }
 
     catch_ffi(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: `pack_ctx` is checked non-null above.
         let pack = unsafe { &*pack_ctx };
         clear_shared_error(&pack.ctx, &pack.last_error);
 
@@ -1056,6 +1097,7 @@ pub unsafe extern "C" fn surge_pack_push(
             return SURGE_CANCELLED;
         }
 
+        // SAFETY: `channel` follows the nullable C string contract.
         let channel_s = unsafe { cstr_to_string(channel) };
 
         // Take the builder that was stored by surge_pack_build.
@@ -1121,14 +1163,19 @@ pub unsafe extern "C" fn surge_lock_acquire(
     }
 
     catch_ffi(std::panic::AssertUnwindSafe(|| {
-        unsafe { *challenge_out = ptr::null_mut() };
-        let handle = unsafe { &*ctx };
+        // SAFETY: `ctx`/`challenge_out` are checked non-null above. The out
+        // pointer is cleared immediately to avoid stale outputs on failure.
+        let handle = unsafe {
+            *challenge_out = ptr::null_mut();
+            &*ctx
+        };
         handle.clear_last_error();
 
         if handle.ctx.is_cancelled() {
             return SURGE_CANCELLED;
         }
 
+        // SAFETY: `name` follows the nullable C string contract.
         let name_s = unsafe { cstr_to_string(name) };
 
         let mut mutex = DistributedMutex::new(handle.ctx.clone(), &name_s);
@@ -1144,6 +1191,9 @@ pub unsafe extern "C" fn surge_lock_acquire(
                     let e = surge_core::error::SurgeError::Other("malloc failed".into());
                     return set_ctx_error(ctx, &e);
                 }
+                // SAFETY: `buf` points to `len` writable bytes allocated by
+                // malloc above and `c_challenge` contains exactly `len`
+                // initialized bytes including terminator.
                 unsafe {
                     ptr::copy_nonoverlapping(c_challenge.as_ptr(), buf, len);
                     *challenge_out = buf;
@@ -1171,11 +1221,13 @@ pub unsafe extern "C" fn surge_lock_release(
     }
 
     catch_ffi(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: `ctx` is checked non-null above.
         let handle = unsafe { &*ctx };
         handle.clear_last_error();
 
-        let name_s = unsafe { cstr_to_string(name) };
-        let challenge_s = unsafe { cstr_to_string(challenge) };
+        // SAFETY: `name` and `challenge` follow the nullable C string
+        // contract.
+        let (name_s, challenge_s) = unsafe { (cstr_to_string(name), cstr_to_string(challenge)) };
 
         let mut mutex = DistributedMutex::new(handle.ctx.clone(), &name_s);
         mutex.set_challenge(challenge_s);
@@ -1207,12 +1259,16 @@ pub unsafe extern "C" fn surge_supervisor_start(
             return SURGE_ERROR;
         }
 
-        let exe_s = unsafe { cstr_to_string(exe_path) };
-        let wd_s = unsafe { cstr_to_string(working_dir) };
-        let sup_id = unsafe { cstr_to_string(supervisor_id) };
-
+        // SAFETY: pointer inputs satisfy this API's FFI contract.
+        let (exe_s, wd_s, sup_id, args_owned) = unsafe {
+            (
+                cstr_to_string(exe_path),
+                cstr_to_string(working_dir),
+                cstr_to_string(supervisor_id),
+                collect_argv(argc, argv),
+            )
+        };
         // Collect argv into a Vec<&str>.
-        let args_owned = unsafe { collect_argv(argc, argv) };
         let args: Vec<&str> = args_owned.iter().map(String::as_str).collect();
 
         let mut supervisor = Supervisor::new(&sup_id, &wd_s);
@@ -1248,6 +1304,7 @@ pub unsafe extern "C" fn surge_process_events(
         static ZERO_VERSION: &[u8] = b"0.0.0\0";
 
         // Collect argv for inspection.
+        // SAFETY: `argv` follows this API's FFI contract.
         let args = unsafe { collect_argv(argc, argv) };
 
         // TODO: When surge_core::platform lifecycle detection is implemented,

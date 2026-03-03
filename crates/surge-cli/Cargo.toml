@@ -25,6 +25,7 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+zstd = { workspace = true }
 
 [lints]
 workspace = true

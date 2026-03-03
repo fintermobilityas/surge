@@ -10,6 +10,7 @@ use surge_core::error::{Result, SurgeError};
 use surge_core::platform::paths::default_install_root;
 use surge_core::platform::shortcuts::install_shortcuts;
 use surge_core::releases::manifest::{ReleaseEntry, ReleaseIndex, decompress_release_index};
+use surge_core::releases::restore::restore_full_archive_for_version;
 use surge_core::releases::version::compare_versions;
 use surge_core::storage::{self, StorageBackend};
 
@@ -181,7 +182,24 @@ pub async fn execute(
         full_filename,
         local_package.display()
     );
-    backend.download_to_file(full_filename, &local_package, None).await?;
+    let reconstructed = download_release_archive(
+        &*backend,
+        &index,
+        release,
+        &rid_candidates,
+        full_filename,
+        &local_package,
+    )
+    .await?;
+    if reconstructed {
+        println!(
+            "{}",
+            theme.warning(&format!(
+                "Direct full package '{}' missing in backend; reconstructed from retained release artifacts.",
+                Path::new(full_filename).display()
+            ))
+        );
+    }
 
     match &install_target {
         InstallTarget::Local => {
@@ -347,6 +365,30 @@ async fn fetch_release_index(backend: &dyn StorageBackend) -> Result<ReleaseInde
     match backend.get_object(RELEASES_FILE_COMPRESSED).await {
         Ok(data) => decompress_release_index(&data),
         Err(SurgeError::NotFound(_)) => Ok(ReleaseIndex::default()),
+        Err(e) => Err(e),
+    }
+}
+
+async fn download_release_archive(
+    backend: &dyn StorageBackend,
+    index: &ReleaseIndex,
+    release: &ReleaseEntry,
+    rid_candidates: &[String],
+    full_filename: &str,
+    destination: &Path,
+) -> Result<bool> {
+    match backend.download_to_file(full_filename, destination, None).await {
+        Ok(()) => Ok(false),
+        Err(SurgeError::NotFound(_)) => {
+            let restore_rid = if release.rid.trim().is_empty() {
+                rid_candidates.first().map_or("", String::as_str)
+            } else {
+                release.rid.as_str()
+            };
+            let rebuilt = restore_full_archive_for_version(backend, index, restore_rid, &release.version).await?;
+            std::fs::write(destination, rebuilt)?;
+            Ok(true)
+        }
         Err(e) => Err(e),
     }
 }
@@ -557,6 +599,9 @@ mod tests {
     use surge_core::archive::packer::ArchivePacker;
     use surge_core::config::manifest::ShortcutLocation;
     use surge_core::config::manifest::SurgeManifest;
+    use surge_core::crypto::sha256::sha256_hex;
+    use surge_core::diff::wrapper::bsdiff_buffers;
+    use surge_core::storage::filesystem::FilesystemBackend;
 
     fn release(version: &str, channel: &str, rid: &str, full: &str) -> ReleaseEntry {
         ReleaseEntry {
@@ -671,6 +716,60 @@ mod tests {
         assert!(install_root.join("app").join("new.txt").is_file());
         assert!(!install_root.join("app").join("old.txt").exists());
         assert!(!install_root.join(".surge-app-prev").exists());
+    }
+
+    #[tokio::test]
+    async fn download_release_archive_reconstructs_missing_full_from_deltas() {
+        let tmp = tempfile::tempdir().expect("temp dir should exist");
+        let backend = FilesystemBackend::new(tmp.path().to_str().expect("temp path should be utf-8"), "");
+
+        let full_v1 = b"payload-v1".to_vec();
+        let full_v2 = b"payload-v2".to_vec();
+        let patch_v2 = bsdiff_buffers(&full_v1, &full_v2).expect("patch should build");
+        let delta_v2 = zstd::encode_all(patch_v2.as_slice(), 3).expect("delta should encode");
+
+        let mut v1 = release("1.0.0", "test", "linux-x64", "demo-1.0.0-linux-x64-full.tar.zst");
+        v1.full_sha256 = sha256_hex(&full_v1);
+        v1.delta_filename.clear();
+        v1.delta_sha256.clear();
+
+        let mut v2 = release("1.1.0", "test", "linux-x64", "demo-1.1.0-linux-x64-full.tar.zst");
+        v2.full_sha256 = sha256_hex(&full_v2);
+        v2.delta_filename = "demo-1.1.0-linux-x64-delta.tar.zst".to_string();
+        v2.delta_sha256 = sha256_hex(&delta_v2);
+
+        backend
+            .put_object(&v1.full_filename, &full_v1, "application/octet-stream")
+            .await
+            .expect("v1 full should upload");
+        backend
+            .put_object(&v2.delta_filename, &delta_v2, "application/octet-stream")
+            .await
+            .expect("v2 delta should upload");
+
+        let index = ReleaseIndex {
+            app_id: "demo".to_string(),
+            releases: vec![v1.clone(), v2.clone()],
+            ..ReleaseIndex::default()
+        };
+
+        let destination = tmp.path().join("downloaded-full.tar.zst");
+        let rebuilt = download_release_archive(
+            &backend,
+            &index,
+            &v2,
+            &[String::from("linux-x64")],
+            &v2.full_filename,
+            &destination,
+        )
+        .await
+        .expect("fallback restore should succeed");
+
+        assert!(rebuilt, "archive should be reconstructed from deltas");
+        assert_eq!(
+            std::fs::read(destination).expect("rebuilt archive should be readable"),
+            full_v2
+        );
     }
 
     fn load_reference_manifest_bytes() -> Vec<u8> {

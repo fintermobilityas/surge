@@ -2,6 +2,7 @@
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tracing::{debug, info, warn};
 
@@ -457,6 +458,8 @@ impl UpdateManager {
         let next_app_dir = self.install_dir.join(".surge-app-next");
         let previous_swap_dir = self.install_dir.join(".surge-app-prev");
 
+        request_supervisor_shutdown(&self.install_dir, &latest.supervisor_id).await?;
+
         if next_app_dir.exists() {
             tokio::fs::remove_dir_all(&next_app_dir).await?;
         }
@@ -593,6 +596,49 @@ fn find_previous_app_dir(install_dir: &Path, current_version: &str) -> Option<Pa
     }
 
     crate::supervisor::stub::find_latest_app_dir(install_dir).ok()
+}
+
+async fn request_supervisor_shutdown(install_dir: &Path, supervisor_id: &str) -> Result<()> {
+    request_supervisor_shutdown_with_timeout(
+        install_dir,
+        supervisor_id,
+        Duration::from_secs(20),
+        Duration::from_millis(100),
+    )
+    .await
+}
+
+async fn request_supervisor_shutdown_with_timeout(
+    install_dir: &Path,
+    supervisor_id: &str,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> Result<()> {
+    let supervisor_id = supervisor_id.trim();
+    if supervisor_id.is_empty() {
+        return Ok(());
+    }
+
+    let pid_file = install_dir.join(format!(".surge-supervisor-{supervisor_id}.pid"));
+    if !pid_file.is_file() {
+        return Ok(());
+    }
+
+    let stop_file = install_dir.join(format!(".surge-supervisor-{supervisor_id}.stop"));
+    tokio::fs::write(&stop_file, b"surge-update").await?;
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    while pid_file.exists() {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(SurgeError::Update(format!(
+                "Timed out waiting for supervisor '{supervisor_id}' to stop before applying update"
+            )));
+        }
+        tokio::time::sleep(poll_interval).await;
+    }
+
+    let _ = tokio::fs::remove_file(&stop_file).await;
+    Ok(())
 }
 
 fn copy_persistent_assets(previous_app_dir: &Path, new_app_dir: &Path, assets: &[String]) -> Result<()> {
@@ -799,6 +845,69 @@ mod tests {
         let release = make_entry("1.0.0", "stable", "linux", "linux-x64");
         assert!(release_matches_rid(&release, "linux-x64"));
         assert!(!release_matches_rid(&release, "win-x64"));
+    }
+
+    #[tokio::test]
+    async fn test_request_supervisor_shutdown_noop_when_supervisor_is_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        request_supervisor_shutdown(tmp.path(), "").await.unwrap();
+        request_supervisor_shutdown(tmp.path(), "missing").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_request_supervisor_shutdown_waits_for_pid_file_to_disappear() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install_dir = tmp.path();
+        let supervisor_id = "test-supervisor";
+        let pid_file = install_dir.join(format!(".surge-supervisor-{supervisor_id}.pid"));
+        let stop_file = install_dir.join(format!(".surge-supervisor-{supervisor_id}.stop"));
+        std::fs::write(&pid_file, "123").unwrap();
+
+        let pid_file_for_task = pid_file.clone();
+        let stop_file_for_task = stop_file.clone();
+        let waiter = tokio::spawn(async move {
+            for _ in 0..100 {
+                if stop_file_for_task.exists() {
+                    std::fs::remove_file(pid_file_for_task).unwrap();
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("timed out waiting for stop file to be created");
+        });
+
+        request_supervisor_shutdown_with_timeout(
+            install_dir,
+            supervisor_id,
+            Duration::from_secs(2),
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap();
+
+        waiter.await.unwrap();
+        assert!(!stop_file.exists());
+    }
+
+    #[tokio::test]
+    async fn test_request_supervisor_shutdown_times_out_when_supervisor_does_not_exit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install_dir = tmp.path();
+        let supervisor_id = "test-supervisor";
+        let pid_file = install_dir.join(format!(".surge-supervisor-{supervisor_id}.pid"));
+        let stop_file = install_dir.join(format!(".surge-supervisor-{supervisor_id}.stop"));
+        std::fs::write(&pid_file, "123").unwrap();
+
+        let err = request_supervisor_shutdown_with_timeout(
+            install_dir,
+            supervisor_id,
+            Duration::from_millis(50),
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("Timed out waiting for supervisor"));
+        assert!(stop_file.exists());
     }
 
     #[tokio::test]

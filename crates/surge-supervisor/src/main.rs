@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
-use std::path::PathBuf;
-use std::process::{Command, ExitCode};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitCode};
 
 use clap::Parser;
 
@@ -71,6 +71,13 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let pid_file = cli
         .install_dir
         .join(format!(".surge-supervisor-{}.pid", cli.supervisor_id));
+    let stop_file = cli
+        .install_dir
+        .join(format!(".surge-supervisor-{}.stop", cli.supervisor_id));
+
+    if stop_file.exists() {
+        let _ = std::fs::remove_file(&stop_file);
+    }
     write_pid_file(&pid_file)?;
 
     // Install signal handlers
@@ -78,7 +85,7 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     // Main supervision loop
     loop {
-        if shutdown.load(std::sync::atomic::Ordering::Acquire) {
+        if shutdown.load(std::sync::atomic::Ordering::Acquire) || stop_file.exists() {
             tracing::info!("Shutdown signal received, exiting supervisor loop");
             break;
         }
@@ -92,9 +99,15 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 
         tracing::info!("Child process started with PID {}", child.id());
 
-        let status = child.wait()?;
+        let status = match wait_for_child_or_stop(&mut child, &shutdown, &stop_file)? {
+            Some(status) => status,
+            None => {
+                tracing::info!("Stop requested, child terminated and supervisor loop is exiting");
+                break;
+            }
+        };
 
-        if shutdown.load(std::sync::atomic::Ordering::Acquire) {
+        if shutdown.load(std::sync::atomic::Ordering::Acquire) || stop_file.exists() {
             tracing::info!("Child exited with {status} after shutdown signal, not restarting");
             break;
         }
@@ -112,6 +125,9 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     if pid_file.exists() {
         let _ = std::fs::remove_file(&pid_file);
     }
+    if stop_file.exists() {
+        let _ = std::fs::remove_file(&stop_file);
+    }
 
     tracing::info!("Supervisor '{}' exiting", cli.supervisor_id);
     Ok(())
@@ -121,6 +137,57 @@ fn write_pid_file(path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let pid = std::process::id();
     std::fs::write(path, pid.to_string())?;
     tracing::debug!("Wrote PID file: {} (pid={})", path.display(), pid);
+    Ok(())
+}
+
+fn wait_for_child_or_stop(
+    child: &mut Child,
+    shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    stop_file: &Path,
+) -> Result<Option<std::process::ExitStatus>, Box<dyn std::error::Error>> {
+    loop {
+        if shutdown.load(std::sync::atomic::Ordering::Acquire) || stop_file.exists() {
+            terminate_child_process(child)?;
+            return Ok(None);
+        }
+
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+fn terminate_child_process(child: &mut Child) -> Result<(), Box<dyn std::error::Error>> {
+    if child.try_wait()?.is_some() {
+        return Ok(());
+    }
+
+    #[cfg(unix)]
+    {
+        use nix::sys::signal::{Signal, kill};
+        use nix::unistd::Pid;
+
+        let _ = kill(Pid::from_raw(child.id() as i32), Signal::SIGTERM);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if child.try_wait()?.is_some() {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        if child.try_wait()?.is_some() {
+            return Ok(());
+        }
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
     Ok(())
 }
 

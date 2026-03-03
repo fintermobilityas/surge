@@ -7,6 +7,7 @@ pub mod pack;
 pub mod promote;
 pub mod push;
 pub mod restore;
+pub mod tailscale;
 
 use surge_core::config::manifest::SurgeManifest;
 use surge_core::error::{Result, SurgeError};

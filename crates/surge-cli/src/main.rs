@@ -204,6 +204,12 @@ enum Commands {
         #[arg(long)]
         backup_dir: PathBuf,
     },
+
+    /// Tailscale-assisted install planning and package transfer
+    Tailscale {
+        #[command(subcommand)]
+        action: TailscaleAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -228,6 +234,40 @@ enum LockAction {
         /// Challenge token from acquire
         #[arg(long)]
         challenge: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum TailscaleAction {
+    /// Detect remote RID via Tailscale, resolve release by channel, and transfer package
+    Install {
+        /// Target node (for example: my-node or user@my-node)
+        #[arg(long)]
+        node: String,
+
+        /// Application ID (auto-selected when manifest has exactly one app)
+        #[arg(long)]
+        app_id: Option<String>,
+
+        /// Channel to resolve releases from
+        #[arg(long, default_value = "stable")]
+        channel: String,
+
+        /// Override remote RID detection with an explicit RID
+        #[arg(long)]
+        rid: Option<String>,
+
+        /// Specific version to install (defaults to latest matching version)
+        #[arg(long)]
+        version: Option<String>,
+
+        /// Only show the selected package and command hints, do not download/copy
+        #[arg(long)]
+        plan_only: bool,
+
+        /// Local cache directory for downloaded packages before transfer
+        #[arg(long, default_value = ".surge/tailscale-cache")]
+        download_dir: PathBuf,
     },
 }
 
@@ -393,5 +433,29 @@ async fn run(cli: Cli) -> surge_core::error::Result<()> {
             )
             .await
         }
+
+        Commands::Tailscale { action } => match action {
+            TailscaleAction::Install {
+                node,
+                app_id,
+                channel,
+                rid,
+                version,
+                plan_only,
+                download_dir,
+            } => {
+                commands::tailscale::install_execute(
+                    &manifest_path,
+                    &node,
+                    app_id.as_deref(),
+                    &channel,
+                    rid.as_deref(),
+                    version.as_deref(),
+                    plan_only,
+                    &download_dir,
+                )
+                .await
+            }
+        },
     }
 }

@@ -101,6 +101,23 @@ surge push \
 
 Done. Your release is live. Clients on the `stable` channel will pick it up on their next update check.
 
+### Optional: install via Tailscale
+
+If your devices are on a tailnet, Surge can pick a matching package for a remote node and transfer it directly:
+
+```bash
+surge tailscale install \
+  --node my-node \
+  --channel stable
+```
+
+This command:
+- probes remote OS/architecture and checks for NVIDIA GPU support,
+- resolves the newest matching release on the selected channel,
+- downloads it locally and sends it with `tailscale file cp`.
+
+Use `--plan-only` to preview selection without transfer, or `--rid` to force a specific RID.
+
 ### 4. Add update checking to your app
 
 **.NET**
@@ -429,6 +446,7 @@ surge demote        Remove a release from a channel
 surge migrate       Copy releases between storage backends
 surge restore       Restore artifacts from backup
 surge lock          Acquire/release distributed locks
+surge tailscale     Resolve and transfer packages to a Tailscale node
 ```
 
 If the manifest has one app, `--app-id` is optional. If the app has one target, `--rid` is optional.

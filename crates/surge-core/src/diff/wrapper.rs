@@ -6,165 +6,149 @@ use std::mem::MaybeUninit;
 use crate::diff::bsdiff_sys::*;
 use crate::error::{Result, SurgeError};
 
-/// Create a binary diff patch from two buffers.
-pub fn bsdiff_buffers(older: &[u8], newer: &[u8]) -> Result<Vec<u8>> {
-    unsafe {
-        // Open memory streams for old and new data
-        let mut old_stream = MaybeUninit::<BsdiffStream>::zeroed().assume_init();
-        let mut new_stream = MaybeUninit::<BsdiffStream>::zeroed().assume_init();
-        let mut patch_stream = MaybeUninit::<BsdiffStream>::zeroed().assume_init();
-        let mut packer = MaybeUninit::<BsdiffPatchPacker>::zeroed().assume_init();
-        let mut ctx = BsdiffCtx {
-            opaque: std::ptr::null_mut(),
-            log_error: None,
-        };
+struct StreamHandle {
+    inner: BsdiffStream,
+    owned: bool,
+}
 
-        let rc = bsdiff_open_memory_stream(BSDIFF_MODE_READ, older.as_ptr().cast(), older.len(), &mut old_stream);
+impl StreamHandle {
+    fn open(mode: i32, buffer: *const c_void, size: usize, label: &str) -> Result<Self> {
+        let mut stream = MaybeUninit::<BsdiffStream>::zeroed();
+        // SAFETY: `stream` points to writable memory for the C initializer,
+        // and `buffer/size` follow the contract of bsdiff_open_memory_stream.
+        let rc = unsafe { bsdiff_open_memory_stream(mode, buffer, size, stream.as_mut_ptr()) };
         if rc != BSDIFF_SUCCESS {
-            return Err(SurgeError::Diff(format!("Failed to open old stream: {rc}")));
+            return Err(SurgeError::Diff(format!("Failed to open {label} stream: {rc}")));
         }
 
-        let rc = bsdiff_open_memory_stream(BSDIFF_MODE_READ, newer.as_ptr().cast(), newer.len(), &mut new_stream);
+        Ok(Self {
+            // SAFETY: Successful initializer call populated the struct.
+            inner: unsafe { stream.assume_init() },
+            owned: true,
+        })
+    }
+
+    fn as_mut(&mut self) -> &mut BsdiffStream {
+        &mut self.inner
+    }
+
+    fn release(&mut self) {
+        self.owned = false;
+    }
+
+    fn copy_buffer(&mut self, label: &str, allow_empty: bool) -> Result<Vec<u8>> {
+        let get_buffer = self
+            .inner
+            .get_buffer
+            .ok_or_else(|| SurgeError::Diff(format!("No get_buffer on {label} stream")))?;
+
+        let mut buf_ptr: *const c_void = std::ptr::null();
+        let mut buf_size: usize = 0;
+        // SAFETY: Callback comes from initialized C stream and pointers are valid outputs.
+        let rc = unsafe { get_buffer(self.inner.state, &mut buf_ptr, &mut buf_size) };
         if rc != BSDIFF_SUCCESS {
-            bsdiff_close_stream(&mut old_stream);
-            return Err(SurgeError::Diff(format!("Failed to open new stream: {rc}")));
+            return Err(SurgeError::Diff(format!("Failed to get {label} buffer: {rc}")));
         }
 
-        // Patch output stream (write mode, initial capacity)
-        let rc = bsdiff_open_memory_stream(BSDIFF_MODE_WRITE, std::ptr::null(), 0, &mut patch_stream);
-        if rc != BSDIFF_SUCCESS {
-            bsdiff_close_stream(&mut new_stream);
-            bsdiff_close_stream(&mut old_stream);
-            return Err(SurgeError::Diff(format!("Failed to open patch stream: {rc}")));
+        if buf_size == 0 {
+            return if allow_empty {
+                Ok(Vec::new())
+            } else {
+                Err(SurgeError::Diff(format!("Empty {label} buffer")))
+            };
         }
 
-        let rc = bsdiff_open_bz2_patch_packer(BSDIFF_MODE_WRITE, &mut patch_stream, &mut packer);
+        if buf_ptr.is_null() {
+            return Err(SurgeError::Diff(format!("Null {label} buffer pointer")));
+        }
+
+        // SAFETY: `buf_ptr`/`buf_size` were returned by `get_buffer` above.
+        Ok(unsafe { std::slice::from_raw_parts(buf_ptr.cast::<u8>(), buf_size) }.to_vec())
+    }
+}
+
+impl Drop for StreamHandle {
+    fn drop(&mut self) {
+        if self.owned {
+            // SAFETY: `inner` is an initialized bsdiff stream that this handle owns.
+            unsafe { bsdiff_close_stream(&mut self.inner) };
+        }
+    }
+}
+
+struct PackerHandle {
+    inner: BsdiffPatchPacker,
+}
+
+impl PackerHandle {
+    fn open(mode: i32, stream: &mut StreamHandle) -> Result<Self> {
+        let mut packer = MaybeUninit::<BsdiffPatchPacker>::zeroed();
+        // SAFETY: `packer` points to writable memory and `stream` is initialized.
+        let rc = unsafe { bsdiff_open_bz2_patch_packer(mode, stream.as_mut(), packer.as_mut_ptr()) };
         if rc != BSDIFF_SUCCESS {
-            bsdiff_close_stream(&mut patch_stream);
-            bsdiff_close_stream(&mut new_stream);
-            bsdiff_close_stream(&mut old_stream);
             return Err(SurgeError::Diff(format!("Failed to open packer: {rc}")));
         }
 
-        let rc = bsdiff(&mut ctx, &mut old_stream, &mut new_stream, &mut packer);
+        // bsdiff packer close owns/cleans the wrapped stream.
+        stream.release();
 
-        if rc != BSDIFF_SUCCESS {
-            bsdiff_close_patch_packer(&mut packer);
-            // packer close already closes patch_stream
-            bsdiff_close_stream(&mut new_stream);
-            bsdiff_close_stream(&mut old_stream);
-            return Err(SurgeError::Diff(format!("bsdiff failed: {rc}")));
-        }
-
-        // bsdiff() calls flush on the packer before returning, so the stream
-        // now contains the complete compressed patch data. Get the buffer
-        // BEFORE closing the packer, because close_patch_packer frees the stream.
-        let mut buf_ptr: *const c_void = std::ptr::null();
-        let mut buf_size: usize = 0;
-        if let Some(get_buf) = patch_stream.get_buffer {
-            let _ = get_buf(patch_stream.state, &mut buf_ptr, &mut buf_size);
-        }
-
-        // Copy the patch data before closing frees the memory.
-        let patch = if buf_ptr.is_null() || buf_size == 0 {
-            bsdiff_close_patch_packer(&mut packer);
-            bsdiff_close_stream(&mut new_stream);
-            bsdiff_close_stream(&mut old_stream);
-            return Err(SurgeError::Diff("Empty patch buffer".to_string()));
-        } else {
-            std::slice::from_raw_parts(buf_ptr.cast::<u8>(), buf_size).to_vec()
-        };
-
-        // Now close everything. Packer close frees patch_stream.
-        bsdiff_close_patch_packer(&mut packer);
-        bsdiff_close_stream(&mut new_stream);
-        bsdiff_close_stream(&mut old_stream);
-
-        Ok(patch)
+        Ok(Self {
+            // SAFETY: Successful initializer call populated the struct.
+            inner: unsafe { packer.assume_init() },
+        })
     }
+
+    fn as_mut(&mut self) -> &mut BsdiffPatchPacker {
+        &mut self.inner
+    }
+}
+
+impl Drop for PackerHandle {
+    fn drop(&mut self) {
+        // SAFETY: `inner` is an initialized packer and this handle owns it.
+        unsafe { bsdiff_close_patch_packer(&mut self.inner) };
+    }
+}
+
+fn new_ctx() -> BsdiffCtx {
+    BsdiffCtx {
+        opaque: std::ptr::null_mut(),
+        log_error: None,
+    }
+}
+
+/// Create a binary diff patch from two buffers.
+pub fn bsdiff_buffers(older: &[u8], newer: &[u8]) -> Result<Vec<u8>> {
+    let mut old_stream = StreamHandle::open(BSDIFF_MODE_READ, older.as_ptr().cast(), older.len(), "old")?;
+    let mut new_stream = StreamHandle::open(BSDIFF_MODE_READ, newer.as_ptr().cast(), newer.len(), "new")?;
+    let mut patch_stream = StreamHandle::open(BSDIFF_MODE_WRITE, std::ptr::null(), 0, "patch")?;
+    let mut packer = PackerHandle::open(BSDIFF_MODE_WRITE, &mut patch_stream)?;
+    let mut ctx = new_ctx();
+
+    // SAFETY: All pointers reference initialized C-ABI structs valid for the call duration.
+    let rc = unsafe { bsdiff(&mut ctx, old_stream.as_mut(), new_stream.as_mut(), packer.as_mut()) };
+    if rc != BSDIFF_SUCCESS {
+        return Err(SurgeError::Diff(format!("bsdiff failed: {rc}")));
+    }
+
+    patch_stream.copy_buffer("patch", false)
 }
 
 /// Apply a binary diff patch to reconstruct the newer buffer.
 pub fn bspatch_buffers(older: &[u8], patch: &[u8]) -> Result<Vec<u8>> {
-    unsafe {
-        let mut old_stream = MaybeUninit::<BsdiffStream>::zeroed().assume_init();
-        let mut new_stream = MaybeUninit::<BsdiffStream>::zeroed().assume_init();
-        let mut patch_stream = MaybeUninit::<BsdiffStream>::zeroed().assume_init();
-        let mut packer = MaybeUninit::<BsdiffPatchPacker>::zeroed().assume_init();
-        let mut ctx = BsdiffCtx {
-            opaque: std::ptr::null_mut(),
-            log_error: None,
-        };
+    let mut old_stream = StreamHandle::open(BSDIFF_MODE_READ, older.as_ptr().cast(), older.len(), "old")?;
+    let mut patch_stream = StreamHandle::open(BSDIFF_MODE_READ, patch.as_ptr().cast(), patch.len(), "patch")?;
+    let mut packer = PackerHandle::open(BSDIFF_MODE_READ, &mut patch_stream)?;
+    let mut new_stream = StreamHandle::open(BSDIFF_MODE_WRITE, std::ptr::null(), 0, "new")?;
+    let mut ctx = new_ctx();
 
-        let rc = bsdiff_open_memory_stream(BSDIFF_MODE_READ, older.as_ptr().cast(), older.len(), &mut old_stream);
-        if rc != BSDIFF_SUCCESS {
-            return Err(SurgeError::Diff(format!("Failed to open old stream: {rc}")));
-        }
-
-        let rc = bsdiff_open_memory_stream(BSDIFF_MODE_READ, patch.as_ptr().cast(), patch.len(), &mut patch_stream);
-        if rc != BSDIFF_SUCCESS {
-            bsdiff_close_stream(&mut old_stream);
-            return Err(SurgeError::Diff(format!("Failed to open patch stream: {rc}")));
-        }
-
-        let rc = bsdiff_open_bz2_patch_packer(BSDIFF_MODE_READ, &mut patch_stream, &mut packer);
-        if rc != BSDIFF_SUCCESS {
-            bsdiff_close_stream(&mut patch_stream);
-            bsdiff_close_stream(&mut old_stream);
-            return Err(SurgeError::Diff(format!("Failed to open packer: {rc}")));
-        }
-
-        // New file output stream
-        let rc = bsdiff_open_memory_stream(BSDIFF_MODE_WRITE, std::ptr::null(), 0, &mut new_stream);
-        if rc != BSDIFF_SUCCESS {
-            bsdiff_close_patch_packer(&mut packer);
-            bsdiff_close_stream(&mut patch_stream);
-            bsdiff_close_stream(&mut old_stream);
-            return Err(SurgeError::Diff(format!("Failed to open new stream: {rc}")));
-        }
-
-        let rc = bspatch(&mut ctx, &mut old_stream, &mut new_stream, &mut packer);
-
-        if rc != BSDIFF_SUCCESS {
-            bsdiff_close_patch_packer(&mut packer);
-            // packer close already closes patch_stream
-            bsdiff_close_stream(&mut new_stream);
-            bsdiff_close_stream(&mut old_stream);
-            return Err(SurgeError::Diff(format!("bspatch failed: {rc}")));
-        }
-
-        // Get the result from new_stream BEFORE closing packer.
-        // (The packer wraps patch_stream, not new_stream, but let's be safe.)
-        let mut buf_ptr: *const c_void = std::ptr::null();
-        let mut buf_size: usize = 0;
-        if let Some(get_buffer) = new_stream.get_buffer {
-            let rc = get_buffer(new_stream.state, &mut buf_ptr, &mut buf_size);
-            if rc != BSDIFF_SUCCESS {
-                bsdiff_close_patch_packer(&mut packer);
-                bsdiff_close_stream(&mut new_stream);
-                bsdiff_close_stream(&mut old_stream);
-                return Err(SurgeError::Diff("Failed to get new buffer".to_string()));
-            }
-        } else {
-            bsdiff_close_patch_packer(&mut packer);
-            bsdiff_close_stream(&mut new_stream);
-            bsdiff_close_stream(&mut old_stream);
-            return Err(SurgeError::Diff("No get_buffer on new stream".to_string()));
-        }
-
-        let result = if buf_ptr.is_null() || buf_size == 0 {
-            Vec::new()
-        } else {
-            std::slice::from_raw_parts(buf_ptr.cast::<u8>(), buf_size).to_vec()
-        };
-
-        // Now close everything. Packer closes patch_stream.
-        bsdiff_close_patch_packer(&mut packer);
-        bsdiff_close_stream(&mut new_stream);
-        bsdiff_close_stream(&mut old_stream);
-
-        Ok(result)
+    // SAFETY: All pointers reference initialized C-ABI structs valid for the call duration.
+    let rc = unsafe { bspatch(&mut ctx, old_stream.as_mut(), new_stream.as_mut(), packer.as_mut()) };
+    if rc != BSDIFF_SUCCESS {
+        return Err(SurgeError::Diff(format!("bspatch failed: {rc}")));
     }
+
+    new_stream.copy_buffer("new", true)
 }
 
 #[cfg(test)]
@@ -195,36 +179,23 @@ mod tests {
 #[cfg(test)]
 mod debug_tests {
     use super::*;
-    use std::mem::MaybeUninit;
 
     #[test]
     fn test_memory_stream_get_buffer() {
-        unsafe {
-            let mut stream = MaybeUninit::<BsdiffStream>::zeroed().assume_init();
-            let rc = bsdiff_open_memory_stream(BSDIFF_MODE_WRITE, std::ptr::null(), 0, &mut stream);
-            assert_eq!(rc, BSDIFF_SUCCESS, "open_memory_stream failed");
-            assert!(
-                stream.get_buffer.is_some(),
-                "get_buffer should be set after open_memory_stream"
-            );
+        let mut stream = StreamHandle::open(BSDIFF_MODE_WRITE, std::ptr::null(), 0, "test").unwrap();
+        assert!(
+            stream.as_mut().get_buffer.is_some(),
+            "get_buffer should be set after open_memory_stream"
+        );
 
-            // Write some data
-            if let Some(write_fn) = stream.write {
-                let data = b"hello";
-                let rc = write_fn(stream.state, data.as_ptr().cast(), data.len());
-                assert_eq!(rc, BSDIFF_SUCCESS, "write failed");
-            }
-
-            // Get buffer
-            let mut buf_ptr: *const std::ffi::c_void = std::ptr::null();
-            let mut buf_size: usize = 0;
-            let get_buf = stream.get_buffer.unwrap();
-            let rc = get_buf(stream.state, &mut buf_ptr, &mut buf_size);
-            assert_eq!(rc, BSDIFF_SUCCESS, "get_buffer failed");
-            assert!(!buf_ptr.is_null(), "buffer should not be null");
-            assert_eq!(buf_size, 5, "buffer size should be 5");
-
-            bsdiff_close_stream(&mut stream);
+        if let Some(write_fn) = stream.as_mut().write {
+            let data = b"hello";
+            // SAFETY: `write_fn` belongs to the initialized stream and points to valid bytes.
+            let rc = unsafe { write_fn(stream.as_mut().state, data.as_ptr().cast(), data.len()) };
+            assert_eq!(rc, BSDIFF_SUCCESS, "write failed");
         }
+
+        let buffer = stream.copy_buffer("test", false).unwrap();
+        assert_eq!(buffer, b"hello");
     }
 }

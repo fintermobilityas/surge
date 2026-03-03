@@ -3,7 +3,6 @@ use std::path::Path;
 
 use surge_core::config::constants::{DEFAULT_ZSTD_LEVEL, RELEASES_FILE_COMPRESSED, SCHEMA_VERSION};
 use surge_core::config::manifest::{ShortcutLocation, SurgeManifest};
-use surge_core::context::{Context, StorageConfig, StorageProvider};
 use surge_core::crypto::sha256::sha256_hex_file;
 use surge_core::error::{Result, SurgeError};
 use surge_core::releases::manifest::{ReleaseEntry, ReleaseIndex, compress_release_index, decompress_release_index};
@@ -235,26 +234,6 @@ fn detect_os_from_rid(rid: &str) -> String {
     rid.split('-').next().unwrap_or("unknown").to_string()
 }
 
-fn build_storage_config(manifest: &SurgeManifest) -> Result<StorageConfig> {
-    let provider = match manifest.storage.provider.to_lowercase().as_str() {
-        "s3" => StorageProvider::S3,
-        "azure" => StorageProvider::AzureBlob,
-        "gcs" => StorageProvider::Gcs,
-        "filesystem" => StorageProvider::Filesystem,
-        "github" | "github_releases" | "github-releases" => StorageProvider::GitHubReleases,
-        other => return Err(SurgeError::Config(format!("Unknown storage provider: {other}"))),
-    };
-
-    let ctx = Context::new();
-    ctx.set_storage(
-        provider,
-        &manifest.storage.bucket,
-        &manifest.storage.region,
-        "",
-        "",
-        &manifest.storage.endpoint,
-    );
-    let mut cfg = ctx.storage_config();
-    cfg.prefix.clone_from(&manifest.storage.prefix);
-    Ok(cfg)
+fn build_storage_config(manifest: &SurgeManifest) -> Result<surge_core::context::StorageConfig> {
+    super::build_storage_config(manifest)
 }

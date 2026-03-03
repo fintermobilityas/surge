@@ -6,7 +6,7 @@ use serde::Serialize;
 use surge_core::archive::packer::ArchivePacker;
 use surge_core::config::constants::{DEFAULT_ZSTD_LEVEL, RELEASES_FILE_COMPRESSED};
 use surge_core::config::manifest::{AppConfig, InstallerType, ShortcutLocation, SurgeManifest, TargetConfig};
-use surge_core::context::{Context, StorageProvider};
+use surge_core::context::Context;
 use surge_core::error::{Result, SurgeError};
 use surge_core::pack::builder::PackBuilder;
 use surge_core::releases::manifest::{ReleaseEntry, ReleaseIndex, decompress_release_index};
@@ -431,27 +431,7 @@ fn default_artifacts_dir(manifest_path: &Path, app_id: &str, rid: &str, version:
 }
 
 fn configure_context(manifest: &SurgeManifest) -> Result<Context> {
-    let provider = match manifest.storage.provider.to_lowercase().as_str() {
-        "s3" => StorageProvider::S3,
-        "azure" => StorageProvider::AzureBlob,
-        "gcs" => StorageProvider::Gcs,
-        "filesystem" => StorageProvider::Filesystem,
-        "github" | "github_releases" | "github-releases" => StorageProvider::GitHubReleases,
-        other => return Err(SurgeError::Config(format!("Unknown storage provider: {other}"))),
-    };
-
-    let ctx = Context::new();
-    ctx.set_storage(
-        provider,
-        &manifest.storage.bucket,
-        &manifest.storage.region,
-        "", // access_key from env
-        "", // secret_key from env
-        &manifest.storage.endpoint,
-    );
-    ctx.set_storage_prefix(&manifest.storage.prefix);
-
-    Ok(ctx)
+    super::build_storage_context(manifest)
 }
 
 #[cfg(test)]

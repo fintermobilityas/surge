@@ -3,7 +3,6 @@ use std::path::Path;
 
 use surge_core::config::constants::{DEFAULT_ZSTD_LEVEL, RELEASES_FILE_COMPRESSED};
 use surge_core::config::manifest::SurgeManifest;
-use surge_core::context::{Context, StorageConfig, StorageProvider};
 use surge_core::error::{Result, SurgeError};
 use surge_core::releases::manifest::{compress_release_index, decompress_release_index};
 use surge_core::storage;
@@ -176,44 +175,16 @@ fn canonicalize_artifact_key(key: &str, source_app_id: &str, canonical_app_id: &
     }
 }
 
-fn build_storage_config(manifest: &SurgeManifest) -> Result<StorageConfig> {
-    let provider = match manifest
-        .storage
-        .provider
-        .trim()
-        .to_ascii_lowercase()
-        .replace('-', "_")
-        .as_str()
-    {
-        "s3" => StorageProvider::S3,
-        "azure" => StorageProvider::AzureBlob,
-        "gcs" => StorageProvider::Gcs,
-        "filesystem" => StorageProvider::Filesystem,
-        "github" | "github_releases" => StorageProvider::GitHubReleases,
-        "" => {
-            return Err(SurgeError::Config(
-                "Storage provider is required for migration manifests".to_string(),
-            ));
-        }
-        other => return Err(SurgeError::Config(format!("Unknown storage provider: {other}"))),
-    };
-
+fn build_storage_config(manifest: &SurgeManifest) -> Result<surge_core::context::StorageConfig> {
+    if manifest.storage.provider.trim().is_empty() {
+        return Err(SurgeError::Config(
+            "Storage provider is required for migration manifests".to_string(),
+        ));
+    }
     if manifest.storage.bucket.trim().is_empty() {
         return Err(SurgeError::Config(
             "Storage bucket/root is required for migration manifests".to_string(),
         ));
     }
-
-    let ctx = Context::new();
-    ctx.set_storage(
-        provider,
-        &manifest.storage.bucket,
-        &manifest.storage.region,
-        "",
-        "",
-        &manifest.storage.endpoint,
-    );
-    let mut cfg = ctx.storage_config();
-    cfg.prefix.clone_from(&manifest.storage.prefix);
-    Ok(cfg)
+    super::build_storage_config(manifest)
 }

@@ -39,6 +39,8 @@ const GCS_UPLOAD_ENDPOINT: &str = "https://storage.googleapis.com/upload/storage
 /// Authentication mode for GCS.
 #[derive(Debug, Clone)]
 enum AuthMode {
+    /// No credentials — only anonymous (public) reads are possible.
+    Anonymous,
     /// HMAC-based authentication using the S3-interop XML API.
     Hmac { access_key: String, secret_key: String },
     /// OAuth2 bearer token authentication using the JSON API.
@@ -85,14 +87,11 @@ impl GcsBackend {
                 config.secret_key.clone()
             };
             if token.is_empty() {
-                return Err(SurgeError::Config(
-                    "GCS storage requires either HMAC credentials (access_key + secret_key) \
-                     or an OAuth2 bearer token (secret_key or GOOGLE_ACCESS_TOKEN env var)"
-                        .to_string(),
-                ));
-            }
-            AuthMode::OAuth2 {
-                token: Arc::new(RwLock::new(token)),
+                AuthMode::Anonymous
+            } else {
+                AuthMode::OAuth2 {
+                    token: Arc::new(RwLock::new(token)),
+                }
             }
         };
 
@@ -109,6 +108,7 @@ impl GcsBackend {
         debug!(
             bucket = %config.bucket,
             auth_mode = match &auth {
+                AuthMode::Anonymous => "Anonymous",
                 AuthMode::Hmac { .. } => "HMAC",
                 AuthMode::OAuth2 { .. } => "OAuth2",
             },
@@ -133,9 +133,17 @@ impl GcsBackend {
                 *t = new_token.to_string();
                 Ok(())
             }
-            AuthMode::Hmac { .. } => Err(SurgeError::Config(
-                "Cannot set OAuth2 token on HMAC-authenticated backend".to_string(),
+            AuthMode::Anonymous | AuthMode::Hmac { .. } => Err(SurgeError::Config(
+                "Cannot set OAuth2 token on non-OAuth2 backend".to_string(),
             )),
+        }
+    }
+
+    /// Return an error when a write is attempted without credentials.
+    fn require_credentials(&self, operation: &str) -> Result<()> {
+        match &self.auth {
+            AuthMode::Anonymous => Err(SurgeError::Config(format!("GCS {operation} requires credentials"))),
+            _ => Ok(()),
         }
     }
 
@@ -275,9 +283,11 @@ impl GcsBackend {
 #[async_trait]
 impl StorageBackend for GcsBackend {
     async fn put_object(&self, key: &str, data: &[u8], content_type: &str) -> Result<()> {
+        self.require_credentials("PUT")?;
         let full_key = self.full_key(key);
 
         match &self.auth {
+            AuthMode::Anonymous => return Err(SurgeError::Config("GCS PUT requires credentials".to_string())),
             AuthMode::Hmac { access_key, secret_key } => {
                 let url = self.xml_object_url(&full_key);
                 let payload_hash = sha256_hex(data);
@@ -324,16 +334,20 @@ impl StorageBackend for GcsBackend {
         let full_key = self.full_key(key);
 
         let bytes = match &self.auth {
-            AuthMode::Hmac { access_key, secret_key } => {
+            AuthMode::Anonymous | AuthMode::Hmac { .. } => {
+                // Both Anonymous and HMAC use the XML API; only signing differs.
                 let url = self.xml_object_url(&full_key);
-                let payload_hash = sha256_hex(b"");
-                let canonical_uri = format!("/{}/{}", self.bucket, Self::encode_uri_path(&full_key));
-
-                let headers = self.hmac_sign_request("GET", &canonical_uri, "", &payload_hash, access_key, secret_key);
-
                 let mut req = self.client.get(&url);
-                for (name, value) in &headers {
-                    req = req.header(name.as_str(), value.as_str());
+                if let AuthMode::Hmac { access_key, secret_key } = &self.auth {
+                    let payload_hash = sha256_hex(b"");
+                    let canonical_uri = format!("/{}/{}", self.bucket, Self::encode_uri_path(&full_key));
+                    let headers =
+                        self.hmac_sign_request("GET", &canonical_uri, "", &payload_hash, access_key, secret_key);
+                    for (name, value) in &headers {
+                        req = req.header(name.as_str(), value.as_str());
+                    }
+                } else {
+                    req = req.header("Host", self.xml_host());
                 }
 
                 let resp = req.send().await?;
@@ -375,16 +389,20 @@ impl StorageBackend for GcsBackend {
         let full_key = self.full_key(key);
 
         match &self.auth {
-            AuthMode::Hmac { access_key, secret_key } => {
+            AuthMode::Anonymous | AuthMode::Hmac { .. } => {
+                // Both Anonymous and HMAC use the XML API; only signing differs.
                 let url = self.xml_object_url(&full_key);
-                let payload_hash = sha256_hex(b"");
-                let canonical_uri = format!("/{}/{}", self.bucket, Self::encode_uri_path(&full_key));
-
-                let headers = self.hmac_sign_request("HEAD", &canonical_uri, "", &payload_hash, access_key, secret_key);
-
                 let mut req = self.client.head(&url);
-                for (name, value) in &headers {
-                    req = req.header(name.as_str(), value.as_str());
+                if let AuthMode::Hmac { access_key, secret_key } = &self.auth {
+                    let payload_hash = sha256_hex(b"");
+                    let canonical_uri = format!("/{}/{}", self.bucket, Self::encode_uri_path(&full_key));
+                    let headers =
+                        self.hmac_sign_request("HEAD", &canonical_uri, "", &payload_hash, access_key, secret_key);
+                    for (name, value) in &headers {
+                        req = req.header(name.as_str(), value.as_str());
+                    }
+                } else {
+                    req = req.header("Host", self.xml_host());
                 }
 
                 let resp = req.send().await?;
@@ -402,7 +420,6 @@ impl StorageBackend for GcsBackend {
                     .and_then(|v| v.to_str().ok())
                     .and_then(|v| v.parse::<i64>().ok())
                     .unwrap_or(0);
-
                 let etag = resp
                     .headers()
                     .get("etag")
@@ -410,7 +427,6 @@ impl StorageBackend for GcsBackend {
                     .unwrap_or("")
                     .trim_matches('"')
                     .to_string();
-
                 let content_type = resp
                     .headers()
                     .get("content-type")
@@ -418,7 +434,7 @@ impl StorageBackend for GcsBackend {
                     .unwrap_or("application/octet-stream")
                     .to_string();
 
-                debug!(key = %full_key, size, "GCS HEAD completed (HMAC)");
+                debug!(key = %full_key, size, "GCS HEAD completed");
                 Ok(ObjectInfo {
                     size,
                     etag,
@@ -471,9 +487,11 @@ impl StorageBackend for GcsBackend {
     }
 
     async fn delete_object(&self, key: &str) -> Result<()> {
+        self.require_credentials("DELETE")?;
         let full_key = self.full_key(key);
 
         match &self.auth {
+            AuthMode::Anonymous => return Err(SurgeError::Config("GCS DELETE requires credentials".to_string())),
             AuthMode::Hmac { access_key, secret_key } => {
                 let url = self.xml_object_url(&full_key);
                 let payload_hash = sha256_hex(b"");
@@ -527,10 +545,10 @@ impl StorageBackend for GcsBackend {
         let full_prefix = self.full_key(prefix);
 
         match &self.auth {
-            AuthMode::Hmac { access_key, secret_key } => {
+            AuthMode::Anonymous | AuthMode::Hmac { .. } => {
+                // Both Anonymous and HMAC use the XML API; only signing differs.
                 let bucket_url = self.xml_bucket_url();
 
-                // Build query string (sorted alphabetically).
                 let mut query_parts: Vec<(String, String)> = vec![
                     ("max-keys".to_string(), max_keys.to_string()),
                     ("prefix".to_string(), full_prefix.clone()),
@@ -546,22 +564,24 @@ impl StorageBackend for GcsBackend {
                     .collect::<Vec<_>>()
                     .join("&");
 
-                let payload_hash = sha256_hex(b"");
-                let canonical_uri = format!("/{}", self.bucket);
-
-                let headers = self.hmac_sign_request(
-                    "GET",
-                    &canonical_uri,
-                    &canonical_querystring,
-                    &payload_hash,
-                    access_key,
-                    secret_key,
-                );
-
                 let url = format!("{bucket_url}?{canonical_querystring}");
                 let mut req = self.client.get(&url);
-                for (name, value) in &headers {
-                    req = req.header(name.as_str(), value.as_str());
+                if let AuthMode::Hmac { access_key, secret_key } = &self.auth {
+                    let payload_hash = sha256_hex(b"");
+                    let canonical_uri = format!("/{}", self.bucket);
+                    let headers = self.hmac_sign_request(
+                        "GET",
+                        &canonical_uri,
+                        &canonical_querystring,
+                        &payload_hash,
+                        access_key,
+                        secret_key,
+                    );
+                    for (name, value) in &headers {
+                        req = req.header(name.as_str(), value.as_str());
+                    }
+                } else {
+                    req = req.header("Host", self.xml_host());
                 }
 
                 let resp = req.send().await?;
@@ -569,7 +589,6 @@ impl StorageBackend for GcsBackend {
                 let body = resp.text().await.unwrap_or_default();
                 Self::check_response_status(status, &full_prefix, &body)?;
 
-                // The XML API returns ListBucketResult (same as S3).
                 parse_gcs_xml_list_response(&body)
             }
             AuthMode::OAuth2 { token } => {
@@ -617,11 +636,13 @@ impl StorageBackend for GcsBackend {
     }
 
     async fn upload_from_file(&self, key: &str, src: &Path, progress: Option<&TransferProgress>) -> Result<()> {
+        self.require_credentials("upload")?;
         let data = tokio::fs::read(src).await?;
         let total = data.len() as u64;
 
         let full_key = self.full_key(key);
         match &self.auth {
+            AuthMode::Anonymous => return Err(SurgeError::Config("GCS upload requires credentials".to_string())),
             AuthMode::Hmac { access_key, secret_key } => {
                 let url = self.xml_object_url(&full_key);
                 let payload_hash = sha256_hex(&data);

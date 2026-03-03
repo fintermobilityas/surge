@@ -7,10 +7,11 @@
 //! use `#[no_mangle] pub unsafe extern "C"` and catch panics at the boundary.
 
 mod handles;
+mod utils;
 
-use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use std::ffi::{CStr, c_char, c_int, c_void};
 use std::ptr;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 
 use surge_core::context::{Context, ResourceBudget, StorageProvider};
 use surge_core::diff::wrapper::{bsdiff_buffers, bspatch_buffers};
@@ -23,6 +24,7 @@ use crate::handles::{
     ReleaseEntryFfi, SurgeContextHandle, SurgeErrorFfi, SurgeErrorOwned, SurgePackContextHandle,
     SurgeReleasesInfoHandle, SurgeUpdateManagerHandle,
 };
+use crate::utils::{lock_recover, to_lossy_cstring};
 
 // ---------------------------------------------------------------------------
 //  Result codes (mirrors surge_result in surge_api.h)
@@ -146,12 +148,6 @@ fn make_pack_progress(phase: i32, items_done: i32, items_total: i32) -> SurgePro
     }
 }
 
-fn to_lossy_cstring(value: &str) -> CString {
-    let mut bytes = value.as_bytes().to_vec();
-    bytes.retain(|b| *b != 0);
-    CString::new(bytes).unwrap_or_default()
-}
-
 /// # Safety
 ///
 /// `p` must be null or point to a valid NUL-terminated C string.
@@ -195,10 +191,6 @@ fn clear_shared_error(ctx: &Arc<Context>, last_error: &Arc<Mutex<Option<SurgeErr
     let mut slot = lock_recover(last_error.as_ref());
     *slot = None;
     ctx.clear_error();
-}
-
-fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn try_len(size: i64) -> Option<usize> {
@@ -1356,6 +1348,8 @@ fn libc_malloc(size: usize) -> *mut u8 {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::CString;
+
     use super::*;
 
     #[test]

@@ -4,11 +4,13 @@
 //! The corresponding `_destroy` function reclaims ownership with `Box::from_raw()`.
 
 use std::ffi::{CString, c_char};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 
 use surge_core::context::Context;
 use surge_core::pack::builder::PackBuilder;
 use surge_core::update::manager::UpdateInfo;
+
+use crate::utils::{lock_recover, to_lossy_cstring};
 
 // ---------------------------------------------------------------------------
 //  FFI error struct (matches `surge_error` in surge_api.h)
@@ -44,16 +46,6 @@ impl SurgeErrorOwned {
         let message = to_lossy_cstring(msg);
         Self { code, message }
     }
-}
-
-fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-fn to_lossy_cstring(value: &str) -> CString {
-    let mut bytes = value.as_bytes().to_vec();
-    bytes.retain(|b| *b != 0);
-    CString::new(bytes).unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------

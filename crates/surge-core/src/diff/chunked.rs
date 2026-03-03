@@ -85,17 +85,11 @@ fn available_memory_bytes() -> usize {
 }
 
 fn lock_mutex<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    match m.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    }
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn into_inner<T>(m: Mutex<T>) -> T {
-    match m.into_inner() {
-        Ok(val) => val,
-        Err(poisoned) => poisoned.into_inner(),
-    }
+    m.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Create a chunked binary diff patch.

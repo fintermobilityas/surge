@@ -1,3 +1,4 @@
+pub mod compact;
 pub mod demote;
 pub mod init;
 pub mod install;

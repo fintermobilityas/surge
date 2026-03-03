@@ -167,6 +167,21 @@ enum Commands {
         channel: Option<String>,
     },
 
+    /// Compact a channel to a single latest full release and prune stale artifacts
+    Compact {
+        /// Application ID (auto-selected when manifest has exactly one app)
+        #[arg(long)]
+        app_id: Option<String>,
+
+        /// Runtime identifier (auto-selected when app has exactly one target)
+        #[arg(long)]
+        rid: Option<String>,
+
+        /// Channel to compact
+        #[arg(long, default_value = "stable")]
+        channel: String,
+    },
+
     /// Manage distributed locks
     Lock {
         #[command(subcommand)]
@@ -451,6 +466,12 @@ async fn run(cli: Cli) -> surge_core::error::Result<()> {
             rid,
             channel,
         } => commands::demote::execute(&manifest_path, app_id.as_deref(), &version, rid.as_deref(), &channel).await,
+
+        Commands::Compact {
+            app_id,
+            rid,
+            channel,
+        } => commands::compact::execute(&manifest_path, app_id.as_deref(), rid.as_deref(), &channel).await,
 
         Commands::List { app_id, rid, channel } => {
             commands::list::execute(&manifest_path, app_id.as_deref(), rid.as_deref(), channel.as_deref()).await

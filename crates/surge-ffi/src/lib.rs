@@ -251,13 +251,16 @@ unsafe fn collect_argv(argc: c_int, argv: *const *const c_char) -> Vec<String> {
         return Vec::new();
     }
 
+    // SAFETY: Caller guarantees `argv` points to at least `count` entries.
+    let argv_slice = unsafe { std::slice::from_raw_parts(argv, count) };
+
     let mut args = Vec::with_capacity(count);
-    for i in 0..count {
-        // SAFETY: Caller guarantees `argv` has `count` elements.
-        let arg_ptr = unsafe { *argv.add(i) };
+    for &arg_ptr in argv_slice {
         if arg_ptr.is_null() {
             continue;
         }
+        // SAFETY: Caller guarantees each non-null argv element points to
+        // a valid NUL-terminated C string.
         args.push(unsafe { cstr_to_string(arg_ptr) });
     }
     args

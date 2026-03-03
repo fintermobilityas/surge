@@ -47,6 +47,10 @@ If the local environment cannot run a listed command, document the exact gap in 
 - Prefer self-documenting code: clear types, names, and small functions over explanatory comments.
 - Use comments sparingly; add them only for invariants, non-obvious tradeoffs, or safety contracts.
 - Keep modules cohesive and APIs explicit (`Result<T, E>`, typed structs/enums instead of ad-hoc tuples).
+- Prefer typed error enums (`thiserror`) over `Box<dyn Error>` in binaries/crates where error cases are known.
+- Consolidate repeated crate-local helpers (for example mutex poison recovery and C-string sanitization) into a shared internal module.
+- Prefer `unwrap_or_else(std::sync::PoisonError::into_inner)` over manual `match` when recovering poisoned mutexes.
+- Avoid unnecessary `crate::` path prefixes in module-local code/tests when imports already provide the item.
 - Minimize `unsafe`: isolate it to FFI/boundary layers, prefer safe wrappers, and remove unnecessary `unsafe impl`.
 - Every remaining unsafe block must include a short `SAFETY:` rationale.
 - Run periodic panic-path sweeps in non-test targets with:

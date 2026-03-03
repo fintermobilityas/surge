@@ -271,7 +271,7 @@ unsafe fn collect_argv(argc: c_int, argv: *const *const c_char) -> Vec<String> {
 ///
 /// Returns a new context handle, or null on allocation/runtime failure.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn surge_context_create() -> *mut SurgeContextHandle {
+pub extern "C" fn surge_context_create() -> *mut SurgeContextHandle {
     let result = std::panic::catch_unwind(|| {
         let runtime = match tokio::runtime::Runtime::new() {
             Ok(rt) => Arc::new(rt),
@@ -1355,7 +1355,7 @@ mod tests {
 
     #[test]
     fn manager_set_channel_updates_context_last_error() {
-        let ctx = unsafe { surge_context_create() };
+        let ctx = surge_context_create();
         assert!(!ctx.is_null());
 
         let app_id = CString::new("demo").unwrap();
@@ -1394,7 +1394,7 @@ mod tests {
 
     #[test]
     fn manager_remains_usable_after_context_destroy() {
-        let ctx = unsafe { surge_context_create() };
+        let ctx = surge_context_create();
         assert!(!ctx.is_null());
 
         let app_id = CString::new("demo").unwrap();
@@ -1424,7 +1424,7 @@ mod tests {
 
     #[test]
     fn update_check_clears_output_pointer_on_failure() {
-        let ctx = unsafe { surge_context_create() };
+        let ctx = surge_context_create();
         assert!(!ctx.is_null());
 
         let app_id = CString::new("demo").unwrap();
@@ -1501,7 +1501,7 @@ mod tests {
 
     #[test]
     fn pack_push_without_build_sets_context_error() {
-        let ctx = unsafe { surge_context_create() };
+        let ctx = surge_context_create();
         assert!(!ctx.is_null());
 
         let manifest = CString::new("placeholder.yml").unwrap();
@@ -1542,7 +1542,7 @@ mod tests {
 
     #[test]
     fn pack_handle_survives_context_destroy() {
-        let ctx = unsafe { surge_context_create() };
+        let ctx = surge_context_create();
         assert!(!ctx.is_null());
 
         let manifest = CString::new("placeholder.yml").unwrap();

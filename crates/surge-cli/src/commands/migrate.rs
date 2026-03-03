@@ -1,6 +1,8 @@
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::time::Instant;
 
+use crate::ui::UiTheme;
 use surge_core::config::constants::{DEFAULT_ZSTD_LEVEL, RELEASES_FILE_COMPRESSED};
 use surge_core::config::manifest::SurgeManifest;
 use surge_core::error::{Result, SurgeError};
@@ -14,6 +16,12 @@ pub async fn execute(
     rid: Option<&str>,
     dest_manifest_path: &Path,
 ) -> Result<()> {
+    const TOTAL_STAGES: usize = 5;
+
+    let theme = UiTheme::global();
+    let started = Instant::now();
+
+    print_stage(theme, 1, TOTAL_STAGES, "Resolving source and destination manifests");
     let src_manifest = SurgeManifest::from_file(manifest_path)?;
     let (source_app_id, rid) = resolve_source_app_and_rid(&src_manifest, app_id, rid)?;
     let canonical_app_id = canonicalize_app_id(&source_app_id, &rid);
@@ -24,12 +32,14 @@ pub async fn execute(
 
     let src_backend = storage::create_storage_backend(&src_config)?;
     let dest_backend = storage::create_storage_backend(&dest_config)?;
-
-    tracing::info!(
-        "Migrating {source_app_id}/{rid} -> {canonical_app_id}/{rid} from {} to {}",
-        src_manifest.storage.provider,
-        dest_manifest.storage.provider
+    print_stage_done(
+        theme,
+        1,
+        TOTAL_STAGES,
+        &format!("Migrating {source_app_id}/{rid} -> {canonical_app_id}/{rid}"),
     );
+
+    print_stage(theme, 2, TOTAL_STAGES, "Loading and filtering release index");
 
     let releases_data = src_backend.get_object(RELEASES_FILE_COMPRESSED).await?;
     let release_index = decompress_release_index(&releases_data)?;
@@ -48,7 +58,17 @@ pub async fn execute(
     migrated_index
         .releases
         .retain(|release| release.rid.is_empty() || release.rid == rid);
+    print_stage_done(
+        theme,
+        2,
+        TOTAL_STAGES,
+        &format!(
+            "Retained {} release entry(ies) for migration",
+            migrated_index.releases.len()
+        ),
+    );
 
+    print_stage(theme, 3, TOTAL_STAGES, "Planning artifact copy operations");
     let mut copy_operations: BTreeSet<(String, String)> = BTreeSet::new();
     for release in &mut migrated_index.releases {
         if !release.full_filename.is_empty() {
@@ -83,7 +103,14 @@ pub async fn execute(
             }
         }
     }
+    print_stage_done(
+        theme,
+        3,
+        TOTAL_STAGES,
+        &format!("Planned {} artifact copy operation(s)", copy_operations.len()),
+    );
 
+    print_stage(theme, 4, TOTAL_STAGES, "Copying artifacts and writing release index");
     let mut migrated = 0u64;
     for (source_key, destination_key) in &copy_operations {
         tracing::debug!("Migrating: {source_key} -> {destination_key}");
@@ -102,9 +129,25 @@ pub async fn execute(
             "application/octet-stream",
         )
         .await?;
-    tracing::debug!("Migrated {}", RELEASES_FILE_COMPRESSED);
+    print_stage_done(
+        theme,
+        4,
+        TOTAL_STAGES,
+        &format!("Copied {migrated} artifact(s) and wrote {RELEASES_FILE_COMPRESSED}"),
+    );
 
-    tracing::info!("Migration complete: {migrated} object(s) migrated");
+    print_stage(theme, 5, TOTAL_STAGES, "Finalize migration summary");
+    print_stage_done(
+        theme,
+        5,
+        TOTAL_STAGES,
+        &format!(
+            "Completed in {} (source provider: {}, destination provider: {})",
+            format_duration(started.elapsed()),
+            src_manifest.storage.provider,
+            dest_manifest.storage.provider
+        ),
+    );
     Ok(())
 }
 
@@ -187,4 +230,20 @@ fn build_storage_config(manifest: &SurgeManifest, app_id: &str) -> Result<surge_
         ));
     }
     super::build_app_scoped_storage_config(manifest, app_id)
+}
+
+fn print_stage(theme: UiTheme, stage: usize, total: usize, text: &str) {
+    println!("{}", theme.info(&format!("[{stage}/{total}] {text}")));
+}
+
+fn print_stage_done(theme: UiTheme, stage: usize, total: usize, text: &str) {
+    println!("{}", theme.success(&format!("[{stage}/{total}] {text}")));
+}
+
+fn format_duration(duration: std::time::Duration) -> String {
+    if duration.as_millis() < 1000 {
+        format!("{}ms", duration.as_millis())
+    } else {
+        format!("{:.1}s", duration.as_secs_f64())
+    }
 }

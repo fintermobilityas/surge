@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use crate::formatters::format_signed_bytes;
 use crate::ui::UiTheme;
 use chrono::{DateTime, Utc};
 use surge_core::config::constants::RELEASES_FILE_COMPRESSED;
@@ -206,30 +207,13 @@ fn latest_release_for_channel<'a>(releases: &'a [&ReleaseEntry], channel: &str) 
 fn format_release_cell(release: &ReleaseEntry) -> String {
     let has_delta = !release.delta_filename.trim().is_empty() && release.delta_size > 0;
     if has_delta {
-        format!("{} (delta {})", release.version, format_bytes(release.delta_size))
+        format!(
+            "{} (delta {})",
+            release.version,
+            format_signed_bytes(release.delta_size)
+        )
     } else {
-        format!("{} (full {})", release.version, format_bytes(release.full_size))
-    }
-}
-
-fn format_bytes(bytes: i64) -> String {
-    if bytes < 0 {
-        return "-".to_string();
-    }
-
-    let units = ["B", "KB", "MB", "GB", "TB"];
-    let mut unit_idx = 0usize;
-    let mut value = bytes as f64;
-
-    while value >= 1024.0 && unit_idx < units.len() - 1 {
-        value /= 1024.0;
-        unit_idx += 1;
-    }
-
-    if unit_idx == 0 {
-        format!("{}{}", bytes, units[unit_idx])
-    } else {
-        format!("{value:.1}{}", units[unit_idx])
+        format!("{} (full {})", release.version, format_signed_bytes(release.full_size))
     }
 }
 

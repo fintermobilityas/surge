@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::Instant;
 
+use crate::formatters::{format_byte_progress, format_bytes, format_duration};
 use crate::ui::UiTheme;
 use surge_core::config::constants::{DEFAULT_ZSTD_LEVEL, RELEASES_FILE_COMPRESSED};
 use surge_core::config::manifest::SurgeManifest;
@@ -69,19 +70,27 @@ pub async fn execute(
     );
 
     print_stage(theme, 3, TOTAL_STAGES, "Planning artifact copy operations");
-    let mut copy_operations: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut copy_operations: BTreeSet<CopyOperation> = BTreeSet::new();
     for release in &mut migrated_index.releases {
         if !release.full_filename.is_empty() {
             let old_key = release.full_filename.clone();
             let new_key = canonicalize_artifact_key(&old_key, &source_app_id, &canonical_app_id);
             release.full_filename.clone_from(&new_key);
-            copy_operations.insert((old_key, new_key));
+            copy_operations.insert(CopyOperation {
+                source_key: old_key,
+                destination_key: new_key,
+                size_hint: release.full_size.max(0) as u64,
+            });
         }
         if !release.delta_filename.is_empty() {
             let old_key = release.delta_filename.clone();
             let new_key = canonicalize_artifact_key(&old_key, &source_app_id, &canonical_app_id);
             release.delta_filename.clone_from(&new_key);
-            copy_operations.insert((old_key, new_key));
+            copy_operations.insert(CopyOperation {
+                source_key: old_key,
+                destination_key: new_key,
+                size_hint: release.delta_size.max(0) as u64,
+            });
         }
     }
 
@@ -93,7 +102,11 @@ pub async fn execute(
             let listing = src_backend.list_objects(&prefix, marker.as_deref(), 100).await?;
             for entry in &listing.entries {
                 let destination_key = canonicalize_artifact_key(&entry.key, &source_app_id, &canonical_app_id);
-                copy_operations.insert((entry.key.clone(), destination_key));
+                copy_operations.insert(CopyOperation {
+                    source_key: entry.key.clone(),
+                    destination_key,
+                    size_hint: entry.size.max(0) as u64,
+                });
             }
 
             if listing.is_truncated {
@@ -111,14 +124,25 @@ pub async fn execute(
     );
 
     print_stage(theme, 4, TOTAL_STAGES, "Copying artifacts and writing release index");
+    let total_planned_bytes: u64 = copy_operations.iter().map(|op| op.size_hint).sum();
     let mut migrated = 0u64;
-    for (source_key, destination_key) in &copy_operations {
+    let mut migrated_bytes = 0u64;
+    for operation in &copy_operations {
+        let source_key = &operation.source_key;
+        let destination_key = &operation.destination_key;
         tracing::debug!("Migrating: {source_key} -> {destination_key}");
         let data = src_backend.get_object(source_key).await?;
         dest_backend
             .put_object(destination_key, &data, "application/octet-stream")
             .await?;
         migrated += 1;
+        migrated_bytes = migrated_bytes.saturating_add(data.len() as u64);
+        let progress = if total_planned_bytes > 0 {
+            format_byte_progress(migrated_bytes, total_planned_bytes, "copied")
+        } else {
+            format!("copied {migrated}/{} artifact(s)", copy_operations.len())
+        };
+        println!("{}", theme.subtle(&format!("      {progress}")));
     }
 
     let rewritten_releases_data = compress_release_index(&migrated_index, DEFAULT_ZSTD_LEVEL)?;
@@ -133,7 +157,14 @@ pub async fn execute(
         theme,
         4,
         TOTAL_STAGES,
-        &format!("Copied {migrated} artifact(s) and wrote {RELEASES_FILE_COMPRESSED}"),
+        &format!(
+            "Copied {migrated} artifact(s) and wrote {RELEASES_FILE_COMPRESSED} ({})",
+            if total_planned_bytes > 0 {
+                format_byte_progress(migrated_bytes, total_planned_bytes, "copied")
+            } else {
+                format_bytes(migrated_bytes)
+            }
+        ),
     );
 
     print_stage(theme, 5, TOTAL_STAGES, "Finalize migration summary");
@@ -218,6 +249,13 @@ fn canonicalize_artifact_key(key: &str, source_app_id: &str, canonical_app_id: &
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct CopyOperation {
+    source_key: String,
+    destination_key: String,
+    size_hint: u64,
+}
+
 fn build_storage_config(manifest: &SurgeManifest, app_id: &str) -> Result<surge_core::context::StorageConfig> {
     if manifest.storage.provider.trim().is_empty() {
         return Err(SurgeError::Config(
@@ -238,12 +276,4 @@ fn print_stage(theme: UiTheme, stage: usize, total: usize, text: &str) {
 
 fn print_stage_done(theme: UiTheme, stage: usize, total: usize, text: &str) {
     println!("{}", theme.success(&format!("[{stage}/{total}] {text}")));
-}
-
-fn format_duration(duration: std::time::Duration) -> String {
-    if duration.as_millis() < 1000 {
-        format!("{}ms", duration.as_millis())
-    } else {
-        format!("{:.1}s", duration.as_secs_f64())
-    }
 }

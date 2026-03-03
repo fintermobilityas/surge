@@ -1,6 +1,7 @@
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
+use crate::formatters::{format_byte_progress, format_duration};
 use crate::ui::UiTheme;
 use surge_core::config::constants::RELEASES_FILE_COMPRESSED;
 use surge_core::config::manifest::SurgeManifest;
@@ -66,6 +67,7 @@ pub async fn execute(
     print_stage(theme, 3, TOTAL_STAGES, "Filtering files for selected app/rid/version");
     let candidates = collect_restore_candidates(&files, backup_dir, &app_id, &rid, requested_version)?;
     summary.matched = candidates.len();
+    summary.total_bytes = candidates.iter().map(|candidate| candidate.size_bytes).sum();
     let skipped = summary.skipped();
     if summary.matched == 0 {
         print_stage_done(
@@ -98,6 +100,14 @@ pub async fn execute(
             .upload_from_file(&candidate.key, &candidate.source_path, None)
             .await?;
         summary.restored += 1;
+        summary.uploaded_bytes = summary.uploaded_bytes.saturating_add(candidate.size_bytes);
+        println!(
+            "{}",
+            theme.subtle(&format!(
+                "      {}",
+                format_byte_progress(summary.uploaded_bytes, summary.total_bytes, "uploaded")
+            ))
+        );
     }
 
     if summary.restored == 0 {
@@ -118,11 +128,12 @@ pub async fn execute(
         5,
         TOTAL_STAGES,
         &format!(
-            "Completed in {duration} (scanned: {}, matched: {}, uploaded: {}, skipped: {})",
+            "Completed in {duration} (scanned: {}, matched: {}, uploaded: {}, skipped: {}, {})",
             summary.scanned,
             summary.matched,
             summary.restored,
-            summary.skipped()
+            summary.skipped(),
+            format_byte_progress(summary.uploaded_bytes, summary.total_bytes, "uploaded")
         ),
     );
 
@@ -134,6 +145,8 @@ struct RestoreSummary {
     scanned: usize,
     matched: usize,
     restored: usize,
+    total_bytes: u64,
+    uploaded_bytes: u64,
 }
 
 impl RestoreSummary {
@@ -146,6 +159,7 @@ impl RestoreSummary {
 struct RestoreCandidate {
     source_path: std::path::PathBuf,
     key: String,
+    size_bytes: u64,
 }
 
 fn collect_restore_candidates(
@@ -164,9 +178,11 @@ fn collect_restore_candidates(
         if !is_restore_match(&key, app_id, rid, version) {
             continue;
         }
+        let size_bytes = std::fs::metadata(entry)?.len();
         candidates.push(RestoreCandidate {
             source_path: entry.clone(),
             key,
+            size_bytes,
         });
     }
     Ok(candidates)
@@ -194,14 +210,6 @@ fn print_stage(theme: UiTheme, stage: usize, total: usize, text: &str) {
 
 fn print_stage_done(theme: UiTheme, stage: usize, total: usize, text: &str) {
     println!("{}", theme.success(&format!("[{stage}/{total}] {text}")));
-}
-
-fn format_duration(duration: Duration) -> String {
-    if duration.as_millis() < 1000 {
-        format!("{}ms", duration.as_millis())
-    } else {
-        format!("{:.1}s", duration.as_secs_f64())
-    }
 }
 
 /// Recursively list all files in a directory.
@@ -288,11 +296,6 @@ apps:
             "linux-x64",
             Some("1.0.0")
         ));
-    }
-
-    #[test]
-    fn format_duration_prefers_ms_for_subsecond_values() {
-        assert_eq!(format_duration(Duration::from_millis(995)), "995ms");
     }
 
     #[tokio::test]

@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::time::Instant;
 
+use crate::formatters::format_duration;
 use crate::ui::UiTheme;
 use surge_core::config::constants::{DEFAULT_ZSTD_LEVEL, RELEASES_FILE_COMPRESSED};
 use surge_core::config::manifest::SurgeManifest;
@@ -90,12 +91,4 @@ fn print_stage(theme: UiTheme, stage: usize, total: usize, text: &str) {
 
 fn print_stage_done(theme: UiTheme, stage: usize, total: usize, text: &str) {
     println!("{}", theme.success(&format!("[{stage}/{total}] {text}")));
-}
-
-fn format_duration(duration: std::time::Duration) -> String {
-    if duration.as_millis() < 1000 {
-        format!("{}ms", duration.as_millis())
-    } else {
-        format!("{:.1}s", duration.as_secs_f64())
-    }
 }

@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Instant;
 
+use crate::formatters::{format_byte_progress, format_duration};
 use crate::ui::UiTheme;
 use surge_core::config::constants::{DEFAULT_ZSTD_LEVEL, RELEASES_FILE_COMPRESSED, SCHEMA_VERSION};
 use surge_core::config::manifest::{ShortcutLocation, SurgeManifest};
@@ -73,20 +74,39 @@ pub async fn execute(
     );
 
     print_stage(theme, 3, TOTAL_STAGES, "Uploading release artifacts");
-    backend.upload_from_file(&full_filename, &full_archive, None).await?;
     let full_size = std::fs::metadata(&full_archive)?.len() as i64;
-    let full_sha256 = sha256_hex_file(&full_archive)?;
-
     let delta_filename = format!("{app_id}-{version}-{rid}-delta.tar.zst");
     let delta_archive = packages_dir.join(&delta_filename);
+    let delta_size_hint = if delta_archive.is_file() {
+        std::fs::metadata(&delta_archive)?.len() as i64
+    } else {
+        0
+    };
+    let total_upload_bytes = full_size.saturating_add(delta_size_hint).max(0) as u64;
+
+    backend.upload_from_file(&full_filename, &full_archive, None).await?;
+    let mut uploaded_bytes_progress = full_size.max(0) as u64;
+    println!(
+        "{}",
+        theme.subtle(&format!(
+            "      {}",
+            format_byte_progress(uploaded_bytes_progress, total_upload_bytes, "uploaded")
+        ))
+    );
+
+    let full_sha256 = sha256_hex_file(&full_archive)?;
     let (delta_filename, delta_size, delta_sha256, delta_uploaded) = if delta_archive.is_file() {
         backend.upload_from_file(&delta_filename, &delta_archive, None).await?;
-        (
-            delta_filename,
-            std::fs::metadata(&delta_archive)?.len() as i64,
-            sha256_hex_file(&delta_archive)?,
-            true,
-        )
+        let delta_size = std::fs::metadata(&delta_archive)?.len() as i64;
+        uploaded_bytes_progress = uploaded_bytes_progress.saturating_add(delta_size.max(0) as u64);
+        println!(
+            "{}",
+            theme.subtle(&format!(
+                "      {}",
+                format_byte_progress(uploaded_bytes_progress, total_upload_bytes, "uploaded")
+            ))
+        );
+        (delta_filename, delta_size, sha256_hex_file(&delta_archive)?, true)
     } else {
         (String::new(), 0, String::new(), false)
     };
@@ -133,18 +153,20 @@ pub async fn execute(
 
     print_stage(theme, 5, TOTAL_STAGES, "Finalize push summary");
     let uploaded_count = if delta_uploaded { 2 } else { 1 };
-    let uploaded_bytes = if delta_uploaded {
+    let uploaded_bytes_total = if delta_uploaded {
         full_size + delta_size
     } else {
         full_size
     };
+    let uploaded_bytes_u64 = uploaded_bytes_total.max(0) as u64;
     print_stage_done(
         theme,
         5,
         TOTAL_STAGES,
         &format!(
-            "Published {app_id} v{version} ({rid}) -> {channel} in {} (objects: {uploaded_count}, bytes: {uploaded_bytes})",
-            format_duration(started.elapsed())
+            "Published {app_id} v{version} ({rid}) -> {channel} in {} (objects: {uploaded_count}, {})",
+            format_duration(started.elapsed()),
+            format_byte_progress(uploaded_bytes_u64, total_upload_bytes, "uploaded")
         ),
     );
     Ok(())
@@ -292,12 +314,4 @@ fn print_stage(theme: UiTheme, stage: usize, total: usize, text: &str) {
 
 fn print_stage_done(theme: UiTheme, stage: usize, total: usize, text: &str) {
     println!("{}", theme.success(&format!("[{stage}/{total}] {text}")));
-}
-
-fn format_duration(duration: std::time::Duration) -> String {
-    if duration.as_millis() < 1000 {
-        format!("{}ms", duration.as_millis())
-    } else {
-        format!("{:.1}s", duration.as_secs_f64())
-    }
 }

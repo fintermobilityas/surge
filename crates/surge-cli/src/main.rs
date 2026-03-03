@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 mod commands;
+mod formatters;
 mod ui;
 
 #[derive(Parser)]

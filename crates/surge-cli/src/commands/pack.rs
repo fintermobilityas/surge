@@ -13,6 +13,7 @@ use surge_core::context::Context;
 use surge_core::error::{Result, SurgeError};
 use surge_core::installer_bundle;
 use surge_core::pack::builder::PackBuilder;
+use surge_core::releases::artifact_cache::{CacheFetchOutcome, fetch_or_reuse_file};
 use surge_core::releases::manifest::{ReleaseEntry, ReleaseIndex, decompress_release_index};
 use surge_core::releases::version::compare_versions;
 use surge_core::storage::{self, StorageBackend};
@@ -226,34 +227,55 @@ pub async fn execute_installers_only(
         .ok_or_else(|| SurgeError::Pack(format!("Invalid full package key: {full_key}")))?;
     let full_package_path = output_dir.join(local_full_name);
     print_stage(theme, 3, TOTAL_STAGES, "Ensuring full package is available");
-    if full_package_path.is_file() {
-        print_stage_done(
-            theme,
-            3,
-            TOTAL_STAGES,
-            &format!(
-                "Using local package {} ({})",
-                full_package_path.display(),
-                file_size_label(&full_package_path)
-            ),
-        );
-    } else {
-        logline::info(&format!(
-            "Full package missing locally; downloading '{}' to '{}'",
-            full_key,
-            full_package_path.display()
-        ));
-        backend.download_to_file(full_key, &full_package_path, None).await?;
-        print_stage_done(
-            theme,
-            3,
-            TOTAL_STAGES,
-            &format!(
-                "Downloaded {} ({})",
-                full_package_path.display(),
-                file_size_label(&full_package_path)
-            ),
-        );
+    match fetch_or_reuse_file(
+        &*backend,
+        full_key,
+        &full_package_path,
+        &selected_release.full_sha256,
+        None,
+    )
+    .await?
+    {
+        CacheFetchOutcome::ReusedLocal => {
+            print_stage_done(
+                theme,
+                3,
+                TOTAL_STAGES,
+                &format!(
+                    "Using local package {} ({})",
+                    full_package_path.display(),
+                    file_size_label(&full_package_path)
+                ),
+            );
+        }
+        CacheFetchOutcome::DownloadedFresh => {
+            print_stage_done(
+                theme,
+                3,
+                TOTAL_STAGES,
+                &format!(
+                    "Downloaded {} ({})",
+                    full_package_path.display(),
+                    file_size_label(&full_package_path)
+                ),
+            );
+        }
+        CacheFetchOutcome::DownloadedAfterInvalidLocal => {
+            logline::warn(&format!(
+                "Local package '{}' failed checksum verification; redownloaded.",
+                full_package_path.display()
+            ));
+            print_stage_done(
+                theme,
+                3,
+                TOTAL_STAGES,
+                &format!(
+                    "Downloaded {} ({})",
+                    full_package_path.display(),
+                    file_size_label(&full_package_path)
+                ),
+            );
+        }
     }
 
     print_stage(
@@ -770,6 +792,7 @@ mod tests {
 
     use super::*;
     use surge_core::config::constants::DEFAULT_ZSTD_LEVEL;
+    use surge_core::crypto::sha256::sha256_hex;
     use surge_core::installer_bundle::read_embedded_payload;
     use surge_core::platform::detect::current_rid;
     use surge_core::platform::fs::make_executable;
@@ -814,7 +837,7 @@ apps:
         std::fs::write(path, yaml).expect("manifest write should succeed");
     }
 
-    fn make_release(version: &str, channel: &str, rid: &str, full_filename: &str) -> ReleaseEntry {
+    fn make_release(version: &str, channel: &str, rid: &str, full_filename: &str, full_sha256: &str) -> ReleaseEntry {
         ReleaseEntry {
             version: version.to_string(),
             channels: vec![channel.to_string()],
@@ -823,7 +846,7 @@ apps:
             is_genesis: true,
             full_filename: full_filename.to_string(),
             full_size: 1,
-            full_sha256: String::new(),
+            full_sha256: full_sha256.to_string(),
             deltas: Vec::new(),
             preferred_delta_id: String::new(),
             created_utc: String::new(),
@@ -874,7 +897,13 @@ apps:
         write_release_index(
             &store_dir,
             app_id,
-            vec![make_release(version, "stable", &rid, &full_name)],
+            vec![make_release(
+                version,
+                "stable",
+                &rid,
+                &full_name,
+                &sha256_hex(b"full package bytes"),
+            )],
         );
         std::fs::write(packages_dir.join(&full_name), b"full package bytes").expect("full package should be written");
 
@@ -950,8 +979,14 @@ apps:
             &store_dir,
             app_id,
             vec![
-                make_release(previous_version, "stable", &rid, &previous_full),
-                make_release(latest_version, "stable", &rid, &latest_full),
+                make_release(previous_version, "stable", &rid, &previous_full, ""),
+                make_release(
+                    latest_version,
+                    "stable",
+                    &rid,
+                    &latest_full,
+                    &sha256_hex(b"latest full package bytes"),
+                ),
             ],
         );
         std::fs::write(store_dir.join(&latest_full), b"latest full package bytes")

@@ -4,6 +4,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::stream::{self, StreamExt};
 use tracing::{debug, info, warn};
 
 use crate::archive::extractor::extract_file_to;
@@ -16,10 +17,11 @@ use crate::platform::detect::current_rid;
 use crate::platform::fs::{atomic_rename, copy_directory};
 use crate::platform::process::spawn_detached;
 use crate::platform::shortcuts::install_shortcuts;
+use crate::releases::artifact_cache::{CacheFetchOutcome, cache_path_for_key, fetch_or_reuse_file};
 use crate::releases::manifest::{
     DeltaArtifact, ReleaseEntry, ReleaseIndex, decompress_release_index, get_delta_chain, get_releases_newer_than,
 };
-use crate::releases::restore::restore_full_archive_for_version;
+use crate::releases::restore::{RestoreOptions, restore_full_archive_for_version_with_options};
 use crate::releases::version::compare_versions;
 use crate::storage::{StorageBackend, create_storage_backend};
 use crate::supervisor::stub::find_latest_app_dir;
@@ -277,20 +279,30 @@ impl UpdateManager {
     {
         self.ctx.check_cancelled()?;
 
-        let report = |phase: i32, phase_pct: i32, total_pct: i32| {
+        let report = |phase: i32,
+                      phase_pct: i32,
+                      total_pct: i32,
+                      bytes_done: i64,
+                      bytes_total: i64,
+                      items_done: i64,
+                      items_total: i64| {
             if let Some(ref cb) = progress {
                 cb(ProgressInfo {
                     phase,
                     phase_percent: phase_pct,
                     total_percent: total_pct,
-                    ..Default::default()
+                    bytes_done,
+                    bytes_total,
+                    items_done,
+                    items_total,
+                    ..ProgressInfo::default()
                 });
             }
         };
 
         // Phase 1: Check
         info!(version = %info.latest_version, "Starting update");
-        report(1, 0, 0);
+        report(1, 0, 0, 0, 0, 0, 0);
 
         if info.apply_releases.is_empty() {
             return Err(SurgeError::Update("No releases to apply".to_string()));
@@ -299,54 +311,101 @@ impl UpdateManager {
         let staging_dir = self.install_dir.join(".surge-staging");
         tokio::fs::create_dir_all(&staging_dir).await?;
 
-        report(1, 100, 5);
+        report(1, 100, 5, 0, 0, 0, 0);
 
         // Phase 2: Download
-        report(2, 0, 10);
+        report(2, 0, 10, 0, 0, 0, 0);
 
-        if matches!(info.apply_strategy, ApplyStrategy::Delta) {
-            // Download delta packages for each version in the chain
-            let total_deltas = info.apply_releases.len();
-            for (i, release) in info.apply_releases.iter().enumerate() {
-                self.ctx.check_cancelled()?;
+        #[derive(Debug, Clone)]
+        struct ArtifactDownload {
+            key: String,
+            sha256: String,
+            size: i64,
+        }
 
-                let Some(delta) = release.selected_delta() else {
-                    continue;
-                };
+        let artifact_cache_dir = self.install_dir.join(".surge-cache").join("artifacts");
+        tokio::fs::create_dir_all(&artifact_cache_dir).await?;
 
-                let dest = staging_dir.join(&delta.filename);
-                debug!(
-                    filename = %delta.filename,
-                    "Downloading delta package"
-                );
-
-                self.storage.download_to_file(&delta.filename, &dest, None).await?;
-
-                let pct = ((i + 1) * 100 / total_deltas) as i32;
-                report(2, pct, 10 + pct * 30 / 100);
-            }
+        let artifacts: Vec<ArtifactDownload> = if matches!(info.apply_strategy, ApplyStrategy::Delta) {
+            info.apply_releases
+                .iter()
+                .filter_map(ReleaseEntry::selected_delta)
+                .map(|delta| ArtifactDownload {
+                    key: delta.filename.clone(),
+                    sha256: delta.sha256.clone(),
+                    size: delta.size,
+                })
+                .collect()
         } else {
-            // Download the full package for the latest release
             let latest = info
                 .apply_releases
                 .last()
                 .ok_or_else(|| SurgeError::Update("No latest release".to_string()))?;
-
-            let dest = staging_dir.join(&latest.full_filename);
-            debug!(
-                filename = %latest.full_filename,
-                "Downloading full package"
-            );
-
-            self.storage
-                .download_to_file(&latest.full_filename, &dest, None)
-                .await?;
+            vec![ArtifactDownload {
+                key: latest.full_filename.clone(),
+                sha256: latest.full_sha256.clone(),
+                size: latest.full_size,
+            }]
+        };
+        if artifacts.is_empty() {
+            return Err(SurgeError::Update("No artifacts selected for download".to_string()));
         }
 
-        report(2, 100, 40);
+        let total_items = i64::try_from(artifacts.len()).unwrap_or(i64::MAX);
+        let total_bytes = artifacts
+            .iter()
+            .fold(0i64, |acc, artifact| acc.saturating_add(artifact.size.max(0)));
+
+        let storage = self.storage.as_ref();
+        let staging_dir_ref = &staging_dir;
+        let cache_dir_ref = &artifact_cache_dir;
+        const DOWNLOAD_CONCURRENCY: usize = 4;
+
+        let mut items_done = 0i64;
+        let mut bytes_done = 0i64;
+        let mut download_stream = stream::iter(artifacts.into_iter())
+            .map(|artifact| async move {
+                let cache_path = cache_path_for_key(cache_dir_ref, &artifact.key)?;
+                let outcome = fetch_or_reuse_file(storage, &artifact.key, &cache_path, &artifact.sha256, None).await?;
+
+                let stage_path = staging_dir_ref.join(&artifact.key);
+                if let Some(parent) = stage_path.parent() {
+                    tokio::fs::create_dir_all(parent).await?;
+                }
+                tokio::fs::copy(&cache_path, &stage_path).await?;
+
+                Ok::<(ArtifactDownload, CacheFetchOutcome), SurgeError>((artifact, outcome))
+            })
+            .buffer_unordered(DOWNLOAD_CONCURRENCY);
+
+        while let Some(result) = download_stream.next().await {
+            self.ctx.check_cancelled()?;
+            let (artifact, outcome) = result?;
+
+            debug!(key = %artifact.key, ?outcome, "Prepared artifact for update application");
+
+            items_done = items_done.saturating_add(1);
+            bytes_done = bytes_done.saturating_add(artifact.size.max(0));
+            let phase_pct = if total_bytes > 0 {
+                ((bytes_done.saturating_mul(100)) / total_bytes).clamp(0, 100) as i32
+            } else {
+                ((items_done.saturating_mul(100)) / total_items.max(1)).clamp(0, 100) as i32
+            };
+            report(
+                2,
+                phase_pct,
+                10 + phase_pct * 30 / 100,
+                bytes_done,
+                total_bytes,
+                items_done,
+                total_items,
+            );
+        }
+
+        report(2, 100, 40, total_bytes, total_bytes, total_items, total_items);
 
         // Phase 3: Verify
-        report(3, 0, 45);
+        report(3, 0, 45, 0, 0, 0, 0);
 
         if matches!(info.apply_strategy, ApplyStrategy::Delta) {
             for release in &info.apply_releases {
@@ -380,10 +439,10 @@ impl UpdateManager {
             }
         }
 
-        report(3, 100, 55);
+        report(3, 100, 55, 0, 0, 0, 0);
 
         // Phase 4: Extract
-        report(4, 0, 60);
+        report(4, 0, 60, 0, 0, 0, 0);
 
         let extract_dir = staging_dir.join("extracted");
         tokio::fs::create_dir_all(&extract_dir).await?;
@@ -398,15 +457,23 @@ impl UpdateManager {
                 decompress_release_index(&data)?
             };
             let rid = current_rid();
-            let mut rebuilt_archive =
-                restore_full_archive_for_version(self.storage.as_ref(), &index, &rid, &self.current_version)
-                    .await
-                    .map_err(|e| {
-                        SurgeError::Update(format!(
-                            "Failed to restore base full archive for {}: {e}",
-                            self.current_version
-                        ))
-                    })?;
+            let mut rebuilt_archive = restore_full_archive_for_version_with_options(
+                self.storage.as_ref(),
+                &index,
+                &rid,
+                &self.current_version,
+                RestoreOptions {
+                    cache_dir: Some(&artifact_cache_dir),
+                    progress: None,
+                },
+            )
+            .await
+            .map_err(|e| {
+                SurgeError::Update(format!(
+                    "Failed to restore base full archive for {}: {e}",
+                    self.current_version
+                ))
+            })?;
 
             for release in &info.apply_releases {
                 self.ctx.check_cancelled()?;
@@ -455,19 +522,19 @@ impl UpdateManager {
             extract_file_to(&archive_path, &extract_dir)?;
         }
 
-        report(4, 100, 75);
+        report(4, 100, 75, 0, 0, 0, 0);
 
         // Phase 5: Apply delta (if applicable)
-        report(5, 0, 80);
+        report(5, 0, 80, 0, 0, 0, 0);
 
         if matches!(info.apply_strategy, ApplyStrategy::Delta) {
             debug!("Delta chain was restored and applied during extraction");
         }
 
-        report(5, 100, 85);
+        report(5, 100, 85, 0, 0, 0, 0);
 
         // Phase 6: Finalize
-        report(6, 0, 90);
+        report(6, 0, 90, 0, 0, 0, 0);
         let latest = info
             .apply_releases
             .last()
@@ -613,7 +680,7 @@ impl UpdateManager {
             }
         }
 
-        report(6, 100, 100);
+        report(6, 100, 100, 0, 0, 0, 0);
 
         info!(
             version = %info.latest_version,
@@ -1283,6 +1350,15 @@ mod tests {
             .await
             .unwrap();
 
+        let installed_file = install_root.join("app").join("payload.txt");
+        assert!(installed_file.exists());
+        assert_eq!(std::fs::read_to_string(installed_file).unwrap(), "installed payload");
+
+        std::fs::remove_file(store_root.join(&full_filename)).unwrap();
+        manager
+            .download_and_apply(&info, None::<fn(ProgressInfo)>)
+            .await
+            .unwrap();
         let installed_file = install_root.join("app").join("payload.txt");
         assert!(installed_file.exists());
         assert_eq!(std::fs::read_to_string(installed_file).unwrap(), "installed payload");

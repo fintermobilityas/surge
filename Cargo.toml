@@ -37,6 +37,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 percent-encoding = "2.3"
 quick-xml = "0.39"
 async-trait = "0.1"
+futures-util = "0.3"
+indicatif = "0.18"
 tempfile = "3"
 uuid = { version = "1", features = ["v4"] }
 which = "7"

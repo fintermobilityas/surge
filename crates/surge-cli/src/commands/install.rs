@@ -1,18 +1,22 @@
 use std::collections::BTreeSet;
+use std::io::IsTerminal;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::logline;
+use indicatif::{ProgressBar, ProgressStyle};
 use tokio::process::Command;
 
 use surge_core::config::constants::RELEASES_FILE_COMPRESSED;
 use surge_core::config::manifest::SurgeManifest;
 use surge_core::error::{Result, SurgeError};
 use surge_core::install::{self as core_install, InstallProfile};
+use surge_core::releases::artifact_cache::{CacheFetchOutcome, fetch_or_reuse_file};
 use surge_core::releases::manifest::{ReleaseEntry, ReleaseIndex, decompress_release_index};
-use surge_core::releases::restore::restore_full_archive_for_version;
+use surge_core::releases::restore::{RestoreOptions, RestoreProgress, restore_full_archive_for_version_with_options};
 use surge_core::releases::version::compare_versions;
-use surge_core::storage::{self, StorageBackend};
+use surge_core::storage::{self, StorageBackend, TransferProgress};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StorageOverrides<'a> {
@@ -46,6 +50,13 @@ enum InstallTarget {
 struct ResolvedInstallChannel {
     name: String,
     note: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArchiveAcquisition {
+    ReusedLocal,
+    Downloaded,
+    Reconstructed,
 }
 
 pub async fn execute(
@@ -196,12 +207,7 @@ pub async fn execute(
 
     std::fs::create_dir_all(download_dir)?;
     let local_package = download_dir.join(Path::new(full_filename).file_name().unwrap_or_default());
-    logline::info(&format!(
-        "Downloading package '{}' to '{}'",
-        full_filename,
-        local_package.display()
-    ));
-    let reconstructed = download_release_archive(
+    let acquisition = download_release_archive(
         &*backend,
         &index,
         release,
@@ -210,22 +216,33 @@ pub async fn execute(
         &local_package,
     )
     .await?;
-    if reconstructed {
-        logline::warn(&format!(
-            "Direct full package '{}' missing in backend; reconstructed from retained release artifacts.",
-            Path::new(full_filename).display()
-        ));
+    match acquisition {
+        ArchiveAcquisition::ReusedLocal => {
+            logline::success(&format!(
+                "Using cached package '{}' at '{}'.",
+                Path::new(full_filename).display(),
+                local_package.display()
+            ));
+        }
+        ArchiveAcquisition::Downloaded => {
+            logline::success(&format!(
+                "Downloaded '{}' to '{}'.",
+                Path::new(full_filename).display(),
+                local_package.display()
+            ));
+        }
+        ArchiveAcquisition::Reconstructed => {
+            logline::warn(&format!(
+                "Direct full package '{}' missing in backend; reconstructed from retained release artifacts.",
+                Path::new(full_filename).display()
+            ));
+        }
     }
 
     match &install_target {
         InstallTarget::Local => {
             let install_root = install_package_locally(&app_id, release, &local_package)?;
             let active_app_dir = install_root.join("app");
-            logline::success(&format!(
-                "Downloaded '{}' to '{}'.",
-                Path::new(full_filename).display(),
-                local_package.display()
-            ));
             logline::success(&format!(
                 "Installed '{}' to '{}' (active app: '{}').",
                 app_id,
@@ -439,6 +456,35 @@ fn build_storage_config_with_overrides(
     Ok(config)
 }
 
+fn make_progress_bar(message: &str, total: u64) -> Option<ProgressBar> {
+    if !std::io::stdout().is_terminal() {
+        return None;
+    }
+
+    let bar = ProgressBar::new(total);
+    let style = ProgressStyle::with_template("{msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
+        .unwrap_or_else(|_| ProgressStyle::default_bar())
+        .progress_chars("=> ");
+    bar.set_style(style);
+    bar.set_message(message.to_string());
+    Some(bar)
+}
+
+fn make_spinner(message: &str) -> Option<ProgressBar> {
+    if !std::io::stdout().is_terminal() {
+        return None;
+    }
+
+    let spinner = ProgressBar::new_spinner();
+    let style = ProgressStyle::with_template("{spinner} {msg}")
+        .unwrap_or_else(|_| ProgressStyle::default_spinner())
+        .tick_chars("|/-\\ ");
+    spinner.set_style(style);
+    spinner.set_message(message.to_string());
+    spinner.enable_steady_tick(std::time::Duration::from_millis(80));
+    Some(spinner)
+}
+
 async fn fetch_release_index(backend: &dyn StorageBackend) -> Result<(ReleaseIndex, bool)> {
     match backend.get_object(RELEASES_FILE_COMPRESSED).await {
         Ok(data) => Ok((decompress_release_index(&data)?, true)),
@@ -454,18 +500,109 @@ async fn download_release_archive(
     rid_candidates: &[String],
     full_filename: &str,
     destination: &Path,
-) -> Result<bool> {
-    match backend.download_to_file(full_filename, destination, None).await {
-        Ok(()) => Ok(false),
+) -> Result<ArchiveAcquisition> {
+    struct FetchProgressUi {
+        verify_spinner: Option<ProgressBar>,
+        transfer_bar: Option<ProgressBar>,
+    }
+
+    let expected_sha256 = release.full_sha256.trim();
+    let ui_state = Arc::new(Mutex::new(FetchProgressUi {
+        verify_spinner: if destination.is_file() && !expected_sha256.is_empty() {
+            make_spinner("Verifying cached package integrity")
+        } else {
+            None
+        },
+        transfer_bar: None,
+    }));
+    let ui_state_for_progress = Arc::clone(&ui_state);
+    let total_hint = u64::try_from(release.full_size.max(0)).unwrap_or(0);
+    let transfer_progress: Box<TransferProgress> = Box::new(move |done: u64, total: u64| {
+        let mut ui = ui_state_for_progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(spinner) = ui.verify_spinner.take() {
+            spinner.finish_and_clear();
+        }
+        if ui.transfer_bar.is_none() {
+            let initial_total = if total > 0 { total } else { total_hint };
+            ui.transfer_bar = make_progress_bar("Fetching full package", initial_total);
+        }
+        if let Some(bar) = ui.transfer_bar.as_ref() {
+            if total > 0 {
+                bar.set_length(total);
+            }
+            bar.set_position(done);
+        }
+    });
+    let fetch_result = fetch_or_reuse_file(
+        backend,
+        full_filename,
+        destination,
+        &release.full_sha256,
+        Some(transfer_progress.as_ref()),
+    )
+    .await;
+    let (verify_spinner, direct_fetch_bar) = {
+        let mut ui = ui_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        (ui.verify_spinner.take(), ui.transfer_bar.take())
+    };
+    if let Some(spinner) = verify_spinner {
+        spinner.finish_and_clear();
+    }
+    if let Some(bar) = direct_fetch_bar {
+        bar.finish_and_clear();
+    }
+
+    match fetch_result {
+        Ok(CacheFetchOutcome::ReusedLocal) => return Ok(ArchiveAcquisition::ReusedLocal),
+        Ok(CacheFetchOutcome::DownloadedFresh | CacheFetchOutcome::DownloadedAfterInvalidLocal) => {
+            return Ok(ArchiveAcquisition::Downloaded);
+        }
         Err(SurgeError::NotFound(_)) => {
             let restore_rid = if release.rid.trim().is_empty() {
                 rid_candidates.first().map_or("", String::as_str)
             } else {
                 release.rid.as_str()
             };
-            let rebuilt = restore_full_archive_for_version(backend, index, restore_rid, &release.version).await?;
+            let restore_bar = make_progress_bar("Rebuilding full package from release graph", 0);
+            let restore_bar_for_progress = restore_bar.clone();
+            let progress = |p: RestoreProgress| {
+                if let Some(bar) = &restore_bar_for_progress {
+                    if p.bytes_total > 0 {
+                        bar.set_length(u64::try_from(p.bytes_total).unwrap_or(0));
+                        bar.set_position(u64::try_from(p.bytes_done).unwrap_or(0));
+                    } else if p.items_total > 0 {
+                        bar.set_length(u64::try_from(p.items_total).unwrap_or(0));
+                        bar.set_position(u64::try_from(p.items_done).unwrap_or(0));
+                    }
+                    bar.set_message(format!(
+                        "Rebuilding full package from release graph ({}/{})",
+                        p.items_done, p.items_total
+                    ));
+                } else {
+                    logline::subtle(&format!(
+                        "  Rebuilding full package from release graph [{}/{}] {} / {} bytes",
+                        p.items_done, p.items_total, p.bytes_done, p.bytes_total
+                    ));
+                }
+            };
+            let rebuilt = restore_full_archive_for_version_with_options(
+                backend,
+                index,
+                restore_rid,
+                &release.version,
+                RestoreOptions {
+                    cache_dir: destination.parent(),
+                    progress: Some(&progress),
+                },
+            )
+            .await?;
+            if let Some(bar) = &restore_bar {
+                bar.finish_and_clear();
+            }
             std::fs::write(destination, rebuilt)?;
-            Ok(true)
+            Ok(ArchiveAcquisition::Reconstructed)
         }
         Err(e) => Err(e),
     }
@@ -854,10 +991,45 @@ mod tests {
         .await
         .expect("fallback restore should succeed");
 
-        assert!(rebuilt, "archive should be reconstructed from deltas");
+        assert_eq!(rebuilt, ArchiveAcquisition::Reconstructed);
         assert_eq!(
             std::fs::read(destination).expect("rebuilt archive should be readable"),
             full_v2
+        );
+    }
+
+    #[tokio::test]
+    async fn download_release_archive_reuses_valid_cached_full_package() {
+        let tmp = tempfile::tempdir().expect("temp dir should exist");
+        let backend = FilesystemBackend::new(tmp.path().to_str().expect("temp path should be utf-8"), "");
+
+        let full = b"payload-v1".to_vec();
+        let mut release = release("1.0.0", "test", "linux-x64", "demo-1.0.0-linux-x64-full.tar.zst");
+        release.full_sha256 = sha256_hex(&full);
+        let index = ReleaseIndex {
+            app_id: "demo".to_string(),
+            releases: vec![release.clone()],
+            ..ReleaseIndex::default()
+        };
+
+        let destination = tmp.path().join("cached-full.tar.zst");
+        std::fs::write(&destination, &full).expect("cached full should be written");
+
+        let acquisition = download_release_archive(
+            &backend,
+            &index,
+            &release,
+            &[String::from("linux-x64")],
+            &release.full_filename,
+            &destination,
+        )
+        .await
+        .expect("reuse should succeed");
+
+        assert_eq!(acquisition, ArchiveAcquisition::ReusedLocal);
+        assert_eq!(
+            std::fs::read(destination).expect("cached full should be readable"),
+            full
         );
     }
 

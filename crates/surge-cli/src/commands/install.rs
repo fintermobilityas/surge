@@ -428,7 +428,7 @@ fn auto_start_after_install(
     active_app_dir: &std::path::Path,
 ) -> Result<u32> {
     let profile = release_install_profile(app_id, release);
-    core_install::auto_start_after_install(&profile, install_root, active_app_dir)
+    core_install::auto_start_after_install_sequence(&profile, install_root, active_app_dir, &release.version)
 }
 
 fn release_runtime_manifest_metadata<'a>(

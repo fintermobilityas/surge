@@ -1268,40 +1268,62 @@ pub unsafe extern "C" fn surge_process_events(
     user_data: *mut c_void,
 ) -> i32 {
     catch_ffi(std::panic::AssertUnwindSafe(|| {
-        static ZERO_VERSION: &[u8] = b"0.0.0\0";
+        const ZERO_VERSION: &str = "0.0.0";
 
         // Collect argv for inspection.
         // SAFETY: `argv` follows this API's FFI contract.
         let args = unsafe { collect_argv(argc, argv) };
 
-        // TODO: When surge_core::platform lifecycle detection is implemented,
-        // inspect command-line flags / sentinel files to determine which
-        // event to fire.  For now, look for surge-specific CLI flags.
-        for arg in &args {
-            match arg.as_str() {
+        let emit_event = |callback: SurgeEventCallback, version: &str| {
+            if let Some(cb) = callback {
+                let version = if version.trim().is_empty() {
+                    ZERO_VERSION
+                } else {
+                    version.trim()
+                };
+                let version_c = to_lossy_cstring(version);
+                cb(version_c.as_ptr(), user_data);
+            }
+        };
+
+        // Parse lifecycle flags similarly to Snapx:
+        // `--surge-installed <version>` and `--surge-first-run <version>`.
+        let mut index = 0usize;
+        while index < args.len() {
+            let arg = args[index].as_str();
+
+            let mut consumed_next = false;
+            let next_version = args.get(index + 1).and_then(|candidate| {
+                if candidate.starts_with("--") {
+                    None
+                } else {
+                    Some(candidate.as_str())
+                }
+            });
+
+            match arg {
                 "--surge-first-run" => {
-                    if let Some(cb) = on_first_run
-                        && let Ok(version) = CStr::from_bytes_with_nul(ZERO_VERSION)
-                    {
-                        cb(version.as_ptr(), user_data);
-                    }
+                    emit_event(on_first_run, next_version.unwrap_or(ZERO_VERSION));
+                    consumed_next = next_version.is_some();
                 }
                 "--surge-installed" => {
-                    if let Some(cb) = on_installed
-                        && let Ok(version) = CStr::from_bytes_with_nul(ZERO_VERSION)
-                    {
-                        cb(version.as_ptr(), user_data);
-                    }
+                    emit_event(on_installed, next_version.unwrap_or(ZERO_VERSION));
+                    consumed_next = next_version.is_some();
+                }
+                "--surge-updated" => {
+                    emit_event(on_updated, next_version.unwrap_or(ZERO_VERSION));
+                    consumed_next = next_version.is_some();
                 }
                 _ => {
-                    if arg.starts_with("--surge-updated=")
-                        && let Some(cb) = on_updated
-                    {
-                        let ver = &arg["--surge-updated=".len()..];
-                        let version = to_lossy_cstring(ver);
-                        cb(version.as_ptr(), user_data);
+                    if let Some(version) = arg.strip_prefix("--surge-updated=") {
+                        emit_event(on_updated, version);
                     }
                 }
+            }
+
+            index += 1;
+            if consumed_next {
+                index += 1;
             }
         }
 

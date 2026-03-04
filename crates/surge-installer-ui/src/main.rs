@@ -142,7 +142,12 @@ fn run_headless(manifest: &InstallerManifest, staging_dir: &std::path::Path, sim
 
     let profile = surge_core::install::InstallProfile::from_installer_manifest(manifest, &manifest.runtime.shortcuts);
     let active_app_dir = install_root.join("app");
-    match surge_core::install::auto_start_after_install(&profile, &install_root, &active_app_dir) {
+    match surge_core::install::auto_start_after_install_sequence(
+        &profile,
+        &install_root,
+        &active_app_dir,
+        &manifest.version,
+    ) {
         Ok(pid) => eprintln!("Started '{}' (pid {pid})", manifest.runtime.name),
         Err(e) => eprintln!("Auto-start failed: {e}"),
     }

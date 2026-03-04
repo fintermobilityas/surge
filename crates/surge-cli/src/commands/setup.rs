@@ -53,7 +53,12 @@ pub async fn execute(dir: &Path, no_start: bool) -> Result<()> {
     ));
 
     if !no_start {
-        match core_install::auto_start_after_install(&profile, &install_root, &active_app_dir) {
+        match core_install::auto_start_after_install_sequence(
+            &profile,
+            &install_root,
+            &active_app_dir,
+            &manifest.version,
+        ) {
             Ok(pid) => {
                 logline::success(&format!("Started '{}' (pid {pid})", manifest.runtime.name));
             }

@@ -3,4 +3,39 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-exec cargo run -q --manifest-path "$repo_root/Cargo.toml" -p surge-cli -- "$@"
+show_help() {
+  cat <<'EOF'
+Usage: surge-dev [--release|-r] [--debug] [--] <surge-cli-args...>
+
+Examples:
+  surge-dev install --app-id demo
+  surge-dev --release pack --version 1.2.3 --app-id demo --rid linux-x64
+EOF
+}
+
+cargo_profile_args=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --release|-r)
+      cargo_profile_args=(--release)
+      shift
+      ;;
+    --debug)
+      cargo_profile_args=()
+      shift
+      ;;
+    --dev-help)
+      show_help
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+exec cargo run -q "${cargo_profile_args[@]}" --manifest-path "$repo_root/Cargo.toml" -p surge-cli -- "$@"

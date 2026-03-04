@@ -11,6 +11,14 @@ namespace Surge
     /// </summary>
     public static class SurgeApp
     {
+        private enum LifecycleAction
+        {
+            None,
+            FirstRun,
+            Installed,
+            Updated
+        }
+
         private static SurgeAppInfo? _current;
         private static readonly object _lock = new object();
 
@@ -61,9 +69,9 @@ namespace Surge
             Action<string>? onInstalled = null,
             Action<string>? onUpdated = null)
         {
+            var lifecycleAction = DetermineLifecycleAction(args);
             var argPtrs = new IntPtr[args.Length];
             var pinnedHandles = new GCHandle[args.Length];
-            bool eventHandled = false;
 
             try
             {
@@ -88,7 +96,6 @@ namespace Surge
                         {
                             var version = MarshalUtf8(versionPtr);
                             onFirstRun(version);
-                            eventHandled = true;
                         };
                     }
 
@@ -98,7 +105,6 @@ namespace Surge
                         {
                             var version = MarshalUtf8(versionPtr);
                             onInstalled(version);
-                            eventHandled = true;
                         };
                     }
 
@@ -108,7 +114,6 @@ namespace Surge
                         {
                             var version = MarshalUtf8(versionPtr);
                             onUpdated(version);
-                            eventHandled = true;
                         };
                     }
 
@@ -120,7 +125,12 @@ namespace Surge
                         updatedCb,
                         IntPtr.Zero);
 
-                    return result == 0 && eventHandled;
+                    if (result != 0 || lifecycleAction == LifecycleAction.None)
+                    {
+                        return false;
+                    }
+
+                    return lifecycleAction is LifecycleAction.Installed or LifecycleAction.Updated;
                 }
                 finally
                 {
@@ -135,6 +145,31 @@ namespace Surge
                         pinnedHandles[i].Free();
                 }
             }
+        }
+
+        private static LifecycleAction DetermineLifecycleAction(string[] args)
+        {
+            bool sawFirstRun = false;
+
+            foreach (var arg in args)
+            {
+                if (arg == "--surge-installed")
+                {
+                    return LifecycleAction.Installed;
+                }
+
+                if (arg == "--surge-updated" || arg.StartsWith("--surge-updated=", StringComparison.Ordinal))
+                {
+                    return LifecycleAction.Updated;
+                }
+
+                if (arg == "--surge-first-run")
+                {
+                    sawFirstRun = true;
+                }
+            }
+
+            return sawFirstRun ? LifecycleAction.FirstRun : LifecycleAction.None;
         }
 
         /// <summary>

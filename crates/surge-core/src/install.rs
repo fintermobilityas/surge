@@ -10,7 +10,7 @@ use crate::config::manifest::ShortcutLocation;
 use crate::context::StorageProvider;
 use crate::error::{Result, SurgeError};
 use crate::platform::paths::default_install_root;
-use crate::platform::process::spawn_detached;
+use crate::platform::process::{ProcessHandle, spawn_detached};
 use crate::platform::shortcuts::install_shortcuts;
 
 pub const RUNTIME_MANIFEST_RELATIVE_PATH: &str = ".surge/runtime.yml";
@@ -253,29 +253,82 @@ pub fn auto_start_after_install(
     install_root: &Path,
     active_app_dir: &Path,
 ) -> Result<u32> {
-    start_installed_application(profile, install_root, active_app_dir, true, true, false)
+    start_installed_application(
+        profile,
+        install_root,
+        active_app_dir,
+        &["--surge-installed"],
+        true,
+        false,
+    )
+}
+
+/// Run the post-install lifecycle sequence:
+/// 1) invoke `--surge-installed <version>` and wait for it to finish (up to 15s),
+/// 2) invoke `--surge-first-run <version>` and return that process id.
+///
+/// This mirrors Snapx's install behavior where install hooks run in a short-lived
+/// process and first-run continues in a second process.
+pub fn auto_start_after_install_sequence(
+    profile: &InstallProfile<'_>,
+    install_root: &Path,
+    active_app_dir: &Path,
+    version: &str,
+) -> Result<u32> {
+    let installed_args = lifecycle_args("--surge-installed", version);
+    let mut installed_handle =
+        spawn_installed_application(profile, install_root, active_app_dir, &installed_args, false)?;
+    wait_for_process_exit_or_timeout(&mut installed_handle, Duration::from_secs(15));
+
+    let first_run_args = lifecycle_args("--surge-first-run", version);
+    let first_run_handle = spawn_installed_application(profile, install_root, active_app_dir, &first_run_args, false)?;
+    Ok(first_run_handle.pid())
 }
 
 /// Launch the installed application for user-facing "Launch" actions.
 ///
 /// Unlike `auto_start_after_install`, this does not pass the `--surge-installed`
 /// lifecycle argument and should keep GUI apps open for immediate use.
+///
+/// This is intentionally best-effort: some apps re-exec/hand off to another
+/// process very quickly, which can look like an early exit even when launch
+/// succeeded from the user's perspective.
 pub fn launch_installed_application(
     profile: &InstallProfile<'_>,
     install_root: &Path,
     active_app_dir: &Path,
 ) -> Result<u32> {
-    start_installed_application(profile, install_root, active_app_dir, false, false, true)
+    start_installed_application(profile, install_root, active_app_dir, &[], false, false)
 }
 
 fn start_installed_application(
     profile: &InstallProfile<'_>,
     install_root: &Path,
     active_app_dir: &Path,
-    include_lifecycle_flag: bool,
+    app_args: &[&str],
     prefer_supervisor: bool,
     verify_running: bool,
 ) -> Result<u32> {
+    let mut handle = spawn_installed_application(profile, install_root, active_app_dir, app_args, prefer_supervisor)?;
+    let pid = handle.pid();
+    if verify_running {
+        let process_label = if prefer_supervisor && !profile.supervisor_id.trim().is_empty() {
+            "supervisor"
+        } else {
+            "application"
+        };
+        verify_process_stays_running(&mut handle, process_label)?;
+    }
+    Ok(pid)
+}
+
+fn spawn_installed_application(
+    profile: &InstallProfile<'_>,
+    install_root: &Path,
+    active_app_dir: &Path,
+    app_args: &[&str],
+    prefer_supervisor: bool,
+) -> Result<ProcessHandle> {
     let main_exe = profile.main_exe.trim();
     if main_exe.is_empty() {
         return Err(SurgeError::Config(
@@ -299,29 +352,41 @@ fn start_installed_application(
             "--exe-path",
             &exe_path_str,
         ];
-        if include_lifecycle_flag {
+        if !app_args.is_empty() {
             args.push("--");
-            args.push("--surge-installed");
+            args.extend_from_slice(app_args);
         }
-        let mut handle = spawn_detached(&supervisor_path, &args, Some(install_root), profile.environment)?;
-        let pid = handle.pid();
-        if verify_running {
-            verify_process_stays_running(&mut handle, "supervisor")?;
-        }
-        return Ok(pid);
+        return spawn_detached(&supervisor_path, &args, Some(install_root), profile.environment);
     }
 
-    let app_args: &[&str] = if include_lifecycle_flag {
-        &["--surge-installed"]
-    } else {
-        &[]
-    };
-    let mut handle = spawn_detached(&exe_path, app_args, Some(install_root), profile.environment)?;
-    let pid = handle.pid();
-    if verify_running {
-        verify_process_stays_running(&mut handle, "application")?;
+    spawn_detached(&exe_path, app_args, Some(install_root), profile.environment)
+}
+
+fn lifecycle_args<'a>(flag: &'a str, version: &'a str) -> Vec<&'a str> {
+    let mut args = vec![flag];
+    let version = version.trim();
+    if !version.is_empty() {
+        args.push(version);
     }
-    Ok(pid)
+    args
+}
+
+fn wait_for_process_exit_or_timeout(handle: &mut ProcessHandle, timeout: Duration) {
+    let check_interval = Duration::from_millis(100);
+    let checks = (timeout.as_millis() / check_interval.as_millis()) as usize;
+
+    for _ in 0..checks {
+        if !handle.poll_running() {
+            let _ = handle.wait();
+            return;
+        }
+        std::thread::sleep(check_interval);
+    }
+
+    if handle.poll_running() {
+        let _ = handle.kill();
+        let _ = handle.wait();
+    }
 }
 
 fn verify_process_stays_running(

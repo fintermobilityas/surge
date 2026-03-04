@@ -249,6 +249,14 @@ enum Commands {
         #[arg(value_enum, default_value_t = InstallMethod::Backend)]
         method: InstallMethod,
 
+        /// Force tailscale install mode (shortcut for selecting method=tailscale)
+        #[arg(long)]
+        tailscale: bool,
+
+        /// Target node for tailscale method as positional value (for example: my-node or user@my-node)
+        #[arg(index = 2, value_name = "NODE", conflicts_with = "node")]
+        target: Option<String>,
+
         /// Target node for tailscale method (for example: my-node or user@my-node)
         #[arg(long)]
         node: Option<String>,
@@ -292,6 +300,7 @@ enum InstallMethod {
     /// Resolve a release from configured backend and download it locally
     Backend,
     /// Detect remote RID via Tailscale, resolve release by channel, and transfer package
+    #[value(alias = "ssh")]
     Tailscale,
 }
 
@@ -597,10 +606,14 @@ async fn run(cli: Cli) -> surge_core::error::Result<()> {
 
         Commands::Install {
             method,
+            tailscale,
+            target,
             node,
             ssh_user,
             options,
         } => {
+            let method = if tailscale { InstallMethod::Tailscale } else { method };
+            let node = node.or(target);
             let node = match method {
                 InstallMethod::Backend => {
                     if node.is_some() || ssh_user.is_some() {

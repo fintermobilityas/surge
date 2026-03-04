@@ -1,15 +1,20 @@
 use std::collections::BTreeSet;
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 use std::path::Path;
+use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::logline;
+use crate::ui::UiTheme;
 use indicatif::{ProgressBar, ProgressStyle};
 use tokio::process::Command;
 
 use surge_core::config::constants::RELEASES_FILE_COMPRESSED;
-use surge_core::config::manifest::SurgeManifest;
+use surge_core::config::installer::{
+    InstallerManifest, InstallerRelease, InstallerRuntime, InstallerStorage, InstallerUi,
+};
+use surge_core::config::manifest::{ShortcutLocation, SurgeManifest};
 use surge_core::error::{Result, SurgeError};
 use surge_core::install::{self as core_install, InstallProfile};
 use surge_core::releases::artifact_cache::{CacheFetchOutcome, fetch_or_reuse_file};
@@ -41,6 +46,24 @@ impl RuntimeProfile {
     }
 }
 
+fn ensure_supported_tailscale_profile(profile: &RuntimeProfile) -> Result<()> {
+    if normalize_os(&profile.os) == Some("linux") {
+        return Ok(());
+    }
+
+    Err(SurgeError::Config(format!(
+        "Tailscale install currently supports Linux targets only. Detected remote profile: os='{}', arch='{}'.",
+        profile.os, profile.arch
+    )))
+}
+
+#[derive(Debug, Clone, Default)]
+struct RemoteLaunchEnvironment {
+    display: Option<String>,
+    xauthority: Option<String>,
+    dbus_session_bus_address: Option<String>,
+}
+
 enum InstallTarget {
     Local,
     Tailscale { ssh_target: String, file_target: String },
@@ -59,6 +82,25 @@ enum ArchiveAcquisition {
     Reconstructed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TailscaleCopyMethod {
+    Taildrop,
+    SshStream,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InstallSelection {
+    app_id: String,
+    os: String,
+    rid: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AppInstallTargetOption {
+    os: String,
+    rid: String,
+}
+
 pub async fn execute(
     manifest_path: &Path,
     application_manifest_path: &Path,
@@ -74,7 +116,18 @@ pub async fn execute(
     overrides: StorageOverrides<'_>,
 ) -> Result<()> {
     let manifest = load_install_manifest(application_manifest_path, manifest_path)?;
-    let app_id = super::resolve_app_id_with_rid_hint(&manifest, app_id, rid)?;
+    let interactive_wizard = should_prompt_install_selection();
+    let interactive_selection = if interactive_wizard {
+        Some(prompt_install_selection(&manifest, app_id, rid)?)
+    } else {
+        None
+    };
+    let app_id = if let Some(selection) = &interactive_selection {
+        selection.app_id.clone()
+    } else {
+        super::resolve_app_id_with_rid_hint(&manifest, app_id, rid)?
+    };
+    let selected_os = interactive_selection.as_ref().map(|selection| selection.os.clone());
     let explicit_channel = channel.map(str::trim).filter(|value| !value.is_empty());
 
     let install_target = match node.map(str::trim).filter(|value| !value.is_empty()) {
@@ -88,13 +141,24 @@ pub async fn execute(
         None => InstallTarget::Local,
     };
 
-    let (rid_candidates, profile) = if let Some(requested_rid) = rid.map(str::trim).filter(|value| !value.is_empty()) {
-        (vec![requested_rid.to_string()], None::<RuntimeProfile>)
+    let selected_rid = interactive_selection
+        .as_ref()
+        .map(|selection| selection.rid.as_str())
+        .or_else(|| rid.map(str::trim).filter(|value| !value.is_empty()));
+
+    let remote_profile = match &install_target {
+        InstallTarget::Local => None,
+        InstallTarget::Tailscale { ssh_target, .. } => {
+            let profile = detect_remote_profile(ssh_target).await?;
+            ensure_supported_tailscale_profile(&profile)?;
+            Some(profile)
+        }
+    };
+
+    let (rid_candidates, profile) = if let Some(requested_rid) = selected_rid {
+        (vec![requested_rid.to_string()], remote_profile)
     } else {
-        let detected = match &install_target {
-            InstallTarget::Local => detect_local_profile(),
-            InstallTarget::Tailscale { ssh_target, .. } => detect_remote_profile(ssh_target).await?,
-        };
+        let detected = remote_profile.unwrap_or_else(detect_local_profile);
         let base_rid = derive_base_rid(&detected).ok_or_else(|| {
             SurgeError::Platform(format!(
                 "Unable to map profile to a RID (os='{}', arch='{}'). Use --rid to override.",
@@ -131,13 +195,24 @@ pub async fn execute(
             index.app_id, app_id
         )));
     }
-    let resolved_channel = resolve_install_channel(&manifest, &index, &app_id, explicit_channel)?;
+    let resolved_channel = if interactive_wizard {
+        prompt_install_channel(&manifest, &index, &app_id, explicit_channel)?
+    } else {
+        resolve_install_channel(&manifest, &index, &app_id, explicit_channel)?
+    };
     if let Some(note) = &resolved_channel.note {
         logline::info(note);
     }
     let channel = resolved_channel.name;
 
-    let release = select_release(&index.releases, &channel, version, &rid_candidates).ok_or_else(|| {
+    let release = select_release(
+        &index.releases,
+        &channel,
+        version,
+        &rid_candidates,
+        selected_os.as_deref(),
+    )
+    .ok_or_else(|| {
         let version_suffix = version.map_or_else(String::new, |v| format!(" and version '{v}'"));
         let available_channels = collect_available_channels(&index.releases);
         let channel_hint = if available_channels.is_empty() {
@@ -145,8 +220,12 @@ pub async fn execute(
         } else {
             format!(" Available channels: {}.", available_channels.join(", "))
         };
+        let os_suffix = selected_os
+            .as_ref()
+            .map(|os| format!(" and OS '{os}'"))
+            .unwrap_or_default();
         SurgeError::NotFound(format!(
-            "No release found on channel '{channel}' for RID candidates [{}]{version_suffix}.{channel_hint}",
+            "No release found on channel '{channel}' for RID candidates [{}]{version_suffix}{os_suffix}.{channel_hint}",
             rid_candidates.join(", "),
         ))
     })?;
@@ -263,19 +342,27 @@ pub async fn execute(
                 }
             }
         }
-        InstallTarget::Tailscale { file_target, .. } => {
-            copy_file_to_tailscale_node(file_target, &local_package).await?;
-            logline::success(&format!(
-                "Copied '{}' to node '{}' via tailscale file sharing.",
-                local_package.display(),
-                file_target
-            ));
-            logline::subtle(&format!(
-                "Install hint on node {}: extract '{}' into the install directory for app '{}'.",
-                file_target,
-                Path::new(full_filename).display(),
-                app_id
-            ));
+        InstallTarget::Tailscale {
+            ssh_target,
+            file_target,
+        } => {
+            let copy_method = copy_file_to_tailscale_node(file_target, ssh_target, &local_package).await?;
+            match copy_method {
+                TailscaleCopyMethod::Taildrop => logline::success(&format!(
+                    "Copied '{}' to node '{}' via tailscale file sharing.",
+                    local_package.display(),
+                    file_target
+                )),
+                TailscaleCopyMethod::SshStream => logline::success(&format!(
+                    "Copied '{}' to node '{}' via tailscale ssh stream fallback.",
+                    local_package.display(),
+                    file_target
+                )),
+            }
+
+            install_package_on_tailscale_node(ssh_target, &app_id, release, &channel, &storage_config, no_start)
+                .await?;
+            logline::success(&format!("Installed '{}' on tailscale node '{}'.", app_id, file_target));
         }
     }
 
@@ -335,6 +422,37 @@ fn resolve_install_channel(
     })
 }
 
+fn prompt_install_channel(
+    manifest: &SurgeManifest,
+    index: &ReleaseIndex,
+    app_id: &str,
+    requested: Option<&str>,
+) -> Result<ResolvedInstallChannel> {
+    let options = collect_install_channel_options(manifest, index, app_id);
+    let default_index = requested
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|channel| options.iter().position(|option| option == channel))
+        .unwrap_or(0);
+    let selected_index = prompt_choice_index("Select channel", &options, default_index)?;
+    let selected = options[selected_index].clone();
+    Ok(ResolvedInstallChannel {
+        name: selected.clone(),
+        note: Some(format!("Selected channel '{selected}' via install wizard.")),
+    })
+}
+
+fn collect_install_channel_options(manifest: &SurgeManifest, index: &ReleaseIndex, app_id: &str) -> Vec<String> {
+    let mut options = collect_available_channels(&index.releases);
+    if options.is_empty() {
+        options = collect_configured_channels(manifest, app_id);
+    }
+    if options.is_empty() {
+        options.push("stable".to_string());
+    }
+    options
+}
+
 fn collect_configured_channels(manifest: &SurgeManifest, app_id: &str) -> Vec<String> {
     let mut channels = Vec::new();
 
@@ -370,6 +488,181 @@ fn collect_available_channels(releases: &[ReleaseEntry]) -> Vec<String> {
         }
     }
     channels.into_iter().collect()
+}
+
+fn should_prompt_install_selection() -> bool {
+    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+}
+
+fn prompt_install_selection(
+    manifest: &SurgeManifest,
+    requested_app_id: Option<&str>,
+    requested_rid: Option<&str>,
+) -> Result<InstallSelection> {
+    let mut app_ids = Vec::new();
+    let mut app_labels = Vec::new();
+    for app in &manifest.apps {
+        let app_id = app.id.trim();
+        if app_id.is_empty() || app_ids.iter().any(|existing: &String| existing == app_id) {
+            continue;
+        }
+        let name = app.effective_name();
+        let label = if name == app_id {
+            app_id.to_string()
+        } else {
+            format!("{name} ({app_id})")
+        };
+        app_ids.push(app_id.to_string());
+        app_labels.push(label);
+    }
+
+    if app_ids.is_empty() {
+        return Err(SurgeError::Config(
+            "Manifest has no apps. Provide --app-id explicitly.".to_string(),
+        ));
+    }
+
+    logline::title("Install target selection");
+    let requested_app_id = requested_app_id.map(str::trim).filter(|value| !value.is_empty());
+    let default_app_index = requested_app_id
+        .and_then(|app_id| app_ids.iter().position(|candidate| candidate == app_id))
+        .unwrap_or(0);
+    let selected_app_index = prompt_choice_index("Select app", &app_labels, default_app_index)?;
+    let selected_app_id = app_ids[selected_app_index].clone();
+
+    let target_options = collect_target_options_for_app(manifest, &selected_app_id)?;
+    if target_options.is_empty() {
+        return Err(SurgeError::Config(format!(
+            "App '{selected_app_id}' has no targets. Add targets to the manifest before install."
+        )));
+    }
+
+    let mut os_values = Vec::new();
+    for option in &target_options {
+        if !os_values.iter().any(|existing: &String| existing == &option.os) {
+            os_values.push(option.os.clone());
+        }
+    }
+
+    let requested_os = requested_rid.and_then(infer_os_from_rid);
+    let default_os_index = requested_os
+        .as_deref()
+        .and_then(|os| os_values.iter().position(|candidate| candidate == os))
+        .unwrap_or(0);
+    let selected_os_index = prompt_choice_index("Select operating system", &os_values, default_os_index)?;
+    let selected_os = os_values[selected_os_index].clone();
+
+    let rid_values: Vec<String> = target_options
+        .iter()
+        .filter(|option| option.os == selected_os)
+        .map(|option| option.rid.clone())
+        .collect();
+    let default_rid_index = requested_rid
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|requested| rid_values.iter().position(|candidate| candidate == requested))
+        .unwrap_or(0);
+    let selected_rid_index = prompt_choice_index("Select RID", &rid_values, default_rid_index)?;
+    let selected_rid = rid_values[selected_rid_index].clone();
+
+    Ok(InstallSelection {
+        app_id: selected_app_id,
+        os: selected_os,
+        rid: selected_rid,
+    })
+}
+
+fn prompt_choice_index(prompt: &str, options: &[String], default_index: usize) -> Result<usize> {
+    if options.is_empty() {
+        return Err(SurgeError::Config(format!(
+            "No options available for prompt '{prompt}'."
+        )));
+    }
+
+    let theme = UiTheme::global();
+    let default_index = default_index.min(options.len().saturating_sub(1));
+
+    loop {
+        println!("{}", theme.title(prompt));
+        for (index, option) in options.iter().enumerate() {
+            println!("  {}. {}", index + 1, option);
+        }
+
+        print!("{}", theme.blue(&format!("Enter choice [{}]: ", default_index + 1)));
+        std::io::stdout()
+            .flush()
+            .map_err(|e| SurgeError::Config(format!("Failed to flush stdout: {e}")))?;
+
+        let mut input = String::new();
+        std::io::stdin()
+            .read_line(&mut input)
+            .map_err(|e| SurgeError::Config(format!("Failed to read input: {e}")))?;
+
+        let value = input.trim();
+        if value.is_empty() {
+            return Ok(default_index);
+        }
+
+        match value.parse::<usize>() {
+            Ok(choice) if (1..=options.len()).contains(&choice) => return Ok(choice - 1),
+            _ => logline::warn(&format!(
+                "Invalid choice '{value}'. Enter a number between 1 and {}.",
+                options.len()
+            )),
+        }
+    }
+}
+
+fn collect_target_options_for_app(manifest: &SurgeManifest, app_id: &str) -> Result<Vec<AppInstallTargetOption>> {
+    let mut options = Vec::new();
+    let mut app_found = false;
+
+    for app in &manifest.apps {
+        if app.id != app_id {
+            continue;
+        }
+        app_found = true;
+        for target in app.target.iter().chain(app.targets.iter()) {
+            let rid = target.rid.trim();
+            if rid.is_empty() {
+                continue;
+            }
+            let os = if target.os.trim().is_empty() {
+                infer_os_from_rid(rid).unwrap_or_else(|| "unknown".to_string())
+            } else {
+                target.os.trim().to_ascii_lowercase()
+            };
+            let option = AppInstallTargetOption {
+                os,
+                rid: rid.to_string(),
+            };
+            if !options
+                .iter()
+                .any(|existing: &AppInstallTargetOption| existing == &option)
+            {
+                options.push(option);
+            }
+        }
+    }
+
+    if !app_found {
+        return Err(SurgeError::Config(format!(
+            "App '{app_id}' was not found in manifest. Provide --app-id with a valid app id."
+        )));
+    }
+
+    Ok(options)
+}
+
+fn infer_os_from_rid(rid: &str) -> Option<String> {
+    let prefix = rid.split('-').next()?.trim().to_ascii_lowercase();
+    let normalized = match prefix.as_str() {
+        "linux" => "linux",
+        "win" | "windows" => "windows",
+        "osx" | "macos" | "darwin" => "macos",
+        _ => return None,
+    };
+    Some(normalized.to_string())
 }
 
 fn resolve_tailscale_targets(node: &str, ssh_user: Option<&str>) -> Result<(String, String)> {
@@ -629,6 +922,7 @@ fn select_release<'a>(
     channel: &str,
     version: Option<&str>,
     rid_candidates: &[String],
+    selected_os: Option<&str>,
 ) -> Option<&'a ReleaseEntry> {
     let mut eligible: Vec<&ReleaseEntry> = releases
         .iter()
@@ -637,6 +931,11 @@ fn select_release<'a>(
 
     if let Some(version) = version.map(str::trim).filter(|v| !v.is_empty()) {
         eligible.retain(|release| release.version == version);
+    }
+
+    if let Some(os) = selected_os.map(str::trim).filter(|value| !value.is_empty()) {
+        let os = os.to_ascii_lowercase();
+        eligible.retain(|release| release_os(release).is_some_and(|release_os| release_os == os));
     }
 
     if eligible.is_empty() {
@@ -660,6 +959,22 @@ fn select_release<'a>(
     generic.first().copied()
 }
 
+fn release_os(release: &ReleaseEntry) -> Option<String> {
+    if let Some(os) = normalize_release_os(&release.os) {
+        return Some(os.to_string());
+    }
+    infer_os_from_rid(&release.rid)
+}
+
+fn normalize_release_os(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "linux" => Some("linux"),
+        "win" | "windows" => Some("windows"),
+        "osx" | "macos" | "darwin" => Some("macos"),
+        _ => None,
+    }
+}
+
 fn detect_local_profile() -> RuntimeProfile {
     let os = std::env::consts::OS.to_string();
     let arch = std::env::consts::ARCH.to_string();
@@ -681,7 +996,8 @@ fn has_local_nvidia_gpu() -> bool {
 
 async fn detect_remote_profile(node: &str) -> Result<RuntimeProfile> {
     let unix_probe = r#"os=$(uname -s 2>/dev/null || echo unknown); arch=$(uname -m 2>/dev/null || echo unknown); gpu=none; if command -v nvidia-smi >/dev/null 2>&1; then gpu=nvidia; fi; printf "os=%s\narch=%s\ngpu=%s\n" "$os" "$arch" "$gpu""#;
-    let unix_failure = match run_tailscale_capture(&["ssh", node, "sh", "-lc", unix_probe]).await {
+    let unix_probe_command = format!("sh -lc {}", shell_single_quote(unix_probe));
+    let unix_failure = match run_tailscale_capture(&["ssh", node, unix_probe_command.as_str()]).await {
         Ok(stdout) => {
             if let Some(profile) = parse_remote_profile(&stdout) {
                 return Ok(profile);
@@ -739,6 +1055,47 @@ fn parse_remote_profile(raw: &str) -> Option<RuntimeProfile> {
     Some(RuntimeProfile { os, arch, gpu })
 }
 
+fn parse_remote_launch_environment(raw: &str) -> RemoteLaunchEnvironment {
+    let mut environment = RemoteLaunchEnvironment::default();
+    for line in raw.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        match key.trim() {
+            "display" => environment.display = Some(value.to_string()),
+            "xauthority" => environment.xauthority = Some(value.to_string()),
+            "dbus" => environment.dbus_session_bus_address = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    environment
+}
+
+fn release_requires_display(release: &ReleaseEntry) -> bool {
+    release
+        .shortcuts
+        .iter()
+        .any(|shortcut| matches!(shortcut, ShortcutLocation::Desktop | ShortcutLocation::StartMenu))
+}
+
+async fn detect_remote_launch_environment(node: &str) -> Result<RemoteLaunchEnvironment> {
+    let probe = r#"uid=$(id -u 2>/dev/null || echo ''); display="${DISPLAY:-}"; if [ -z "$display" ] && [ -S /tmp/.X11-unix/X0 ]; then display=':0'; fi; if [ -z "$display" ] && [ -S /tmp/.X11-unix/X1 ]; then display=':1'; fi; xauthority=''; if [ -f "$HOME/.Xauthority" ]; then xauthority="$HOME/.Xauthority"; elif [ -n "$uid" ] && [ -f "/run/user/$uid/gdm/Xauthority" ]; then xauthority="/run/user/$uid/gdm/Xauthority"; fi; dbus="${DBUS_SESSION_BUS_ADDRESS:-}"; if [ -z "$dbus" ] && [ -n "$uid" ] && [ -S "/run/user/$uid/bus" ]; then dbus="unix:path=/run/user/$uid/bus"; fi; printf 'display=%s\nxauthority=%s\ndbus=%s\n' "$display" "$xauthority" "$dbus""#;
+    let command = format!("sh -lc {}", shell_single_quote(probe));
+    match run_tailscale_capture(&["ssh", node, command.as_str()]).await {
+        Ok(output) => Ok(parse_remote_launch_environment(&output)),
+        Err(e) => {
+            logline::warn(&format!(
+                "Failed to probe remote display/session environment for '{node}': {e}. Continuing without display overrides."
+            ));
+            Ok(RemoteLaunchEnvironment::default())
+        }
+    }
+}
+
 fn derive_base_rid(profile: &RuntimeProfile) -> Option<String> {
     let os = normalize_os(&profile.os)?;
     let arch = normalize_arch(&profile.arch)?;
@@ -792,11 +1149,276 @@ fn build_rid_candidates(base_rid: &str, nvidia_gpu: bool) -> Vec<String> {
     candidates
 }
 
-async fn copy_file_to_tailscale_node(node: &str, local_file: &Path) -> Result<()> {
+async fn copy_file_to_tailscale_node(
+    file_node: &str,
+    ssh_node: &str,
+    local_file: &Path,
+) -> Result<TailscaleCopyMethod> {
     let source = local_file.display().to_string();
-    let target = format!("{node}:");
+    let target = format!("{file_node}:");
     let args = ["file", "cp", source.as_str(), target.as_str()];
-    run_tailscale_capture(&args).await?;
+    match run_tailscale_capture(&args).await {
+        Ok(_) => Ok(TailscaleCopyMethod::Taildrop),
+        Err(err) if is_taildrop_capability_error(&err) => {
+            logline::warn(&format!(
+                "Taildrop unavailable for '{file_node}' ({err}). Falling back to tailscale ssh stream copy."
+            ));
+            stream_file_to_tailscale_node(ssh_node, local_file).await?;
+            Ok(TailscaleCopyMethod::SshStream)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn is_taildrop_capability_error(err: &SurgeError) -> bool {
+    let message = err.to_string().to_ascii_lowercase();
+    message.contains("missing required taildrop capability")
+        || (message.contains("cannot send files") && message.contains("tailscale file cp"))
+}
+
+fn shell_single_quote(raw: &str) -> String {
+    let mut escaped = String::from("'");
+    for ch in raw.chars() {
+        if ch == '\'' {
+            escaped.push_str("'\"'\"'");
+        } else {
+            escaped.push(ch);
+        }
+    }
+    escaped.push('\'');
+    escaped
+}
+
+fn build_remote_installer_manifest(
+    app_id: &str,
+    release: &ReleaseEntry,
+    channel: &str,
+    storage_config: &surge_core::context::StorageConfig,
+    launch_env: &RemoteLaunchEnvironment,
+) -> InstallerManifest {
+    let mut environment = release.environment.clone();
+    if let Some(display) = launch_env
+        .display
+        .as_ref()
+        .map(String::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        environment.insert("DISPLAY".to_string(), display.to_string());
+    }
+    if let Some(xauthority) = launch_env
+        .xauthority
+        .as_ref()
+        .map(String::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        environment.insert("XAUTHORITY".to_string(), xauthority.to_string());
+    }
+    if let Some(dbus) = launch_env
+        .dbus_session_bus_address
+        .as_ref()
+        .map(String::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        environment.insert("DBUS_SESSION_BUS_ADDRESS".to_string(), dbus.to_string());
+    }
+
+    InstallerManifest {
+        schema: 1,
+        format: "surge-installer-v1".to_string(),
+        ui: InstallerUi::Console,
+        installer_type: "offline".to_string(),
+        app_id: app_id.to_string(),
+        rid: release.rid.clone(),
+        version: release.version.clone(),
+        channel: channel.to_string(),
+        generated_utc: chrono::Utc::now().to_rfc3339(),
+        headless_default_if_no_display: true,
+        release_index_key: RELEASES_FILE_COMPRESSED.to_string(),
+        storage: InstallerStorage {
+            provider: core_install::storage_provider_manifest_name(storage_config.provider).to_string(),
+            bucket: storage_config.bucket.clone(),
+            region: storage_config.region.clone(),
+            endpoint: storage_config.endpoint.clone(),
+            prefix: storage_config.prefix.clone(),
+        },
+        release: InstallerRelease {
+            full_filename: release.full_filename.clone(),
+            delta_filename: String::new(),
+            delta_algorithm: String::new(),
+            delta_patch_format: String::new(),
+            delta_compression: String::new(),
+        },
+        runtime: InstallerRuntime {
+            name: release.display_name(app_id).to_string(),
+            main_exe: release.main_exe.clone(),
+            install_directory: release.install_directory.clone(),
+            supervisor_id: release.supervisor_id.clone(),
+            icon: release.icon.clone(),
+            shortcuts: release.shortcuts.clone(),
+            persistent_assets: release.persistent_assets.clone(),
+            installers: release.installers.clone(),
+            environment,
+        },
+    }
+}
+
+fn sanitize_remote_path_component(raw: &str) -> String {
+    let mut sanitized: String = raw
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        sanitized.push_str("install");
+    }
+    sanitized
+}
+
+async fn install_package_on_tailscale_node(
+    ssh_node: &str,
+    app_id: &str,
+    release: &ReleaseEntry,
+    channel: &str,
+    storage_config: &surge_core::context::StorageConfig,
+    no_start: bool,
+) -> Result<()> {
+    let launch_environment = detect_remote_launch_environment(ssh_node).await?;
+    let has_display = launch_environment
+        .display
+        .as_ref()
+        .map(String::as_str)
+        .is_some_and(|value| !value.is_empty());
+    let inferred_gui_app = release_requires_display(release);
+    let should_skip_start_for_display = inferred_gui_app && !has_display;
+    if should_skip_start_for_display {
+        logline::warn("Remote node has no detectable display session; skipping auto-start for GUI app.");
+    }
+    let effective_no_start = no_start || should_skip_start_for_display;
+
+    let surge_binary = std::env::current_exe().map_err(|e| {
+        SurgeError::Platform(format!(
+            "Failed to resolve local surge executable for remote setup: {e}"
+        ))
+    })?;
+    copy_surge_binary_to_tailscale_node(ssh_node, &surge_binary).await?;
+
+    let full_filename = release.full_filename.trim();
+    if full_filename.is_empty() {
+        return Err(SurgeError::Config(format!(
+            "Release '{}' has no full package filename for tailscale setup.",
+            release.version
+        )));
+    }
+
+    let installer_manifest =
+        build_remote_installer_manifest(app_id, release, channel, storage_config, &launch_environment);
+    let installer_yaml = serde_yaml::to_string(&installer_manifest).map_err(|e| {
+        SurgeError::Config(format!(
+            "Failed to serialize installer manifest for tailscale setup: {e}"
+        ))
+    })?;
+
+    let app_component = sanitize_remote_path_component(app_id);
+    let version_component = sanitize_remote_path_component(&release.version);
+    let no_start_flag = if effective_no_start { "--no-start " } else { "" };
+    let remote_script = format!(
+        r#"set -eu
+FULL={full_filename}
+STAGE="$HOME/.surge/remote-install/{app_component}-{version_component}"
+rm -rf "$STAGE"
+mkdir -p "$STAGE/payload"
+PAYLOAD=""
+if [ -f "$HOME/Downloads/$FULL" ]; then
+  PAYLOAD="$HOME/Downloads/$FULL"
+elif [ -f "$HOME/$FULL" ]; then
+  PAYLOAD="$HOME/$FULL"
+else
+  PAYLOAD="$(find "$HOME" -maxdepth 4 -type f -name "$FULL" -print -quit 2>/dev/null || true)"
+fi
+if [ -z "$PAYLOAD" ]; then
+  echo "Could not locate transferred package '$FULL' on remote node." >&2
+  exit 1
+fi
+ln -sf "$PAYLOAD" "$STAGE/payload/$FULL"
+cat > "$STAGE/installer.yml" <<'SURGE_INSTALLER_YAML'
+{installer_yaml}SURGE_INSTALLER_YAML
+"$HOME/.surge/bin/surge" setup {no_start_flag}"$STAGE"
+"#,
+        full_filename = shell_single_quote(full_filename),
+    );
+    let ssh_command = format!("sh -lc {}", shell_single_quote(&remote_script));
+    let output = run_tailscale_capture(&["ssh", ssh_node, ssh_command.as_str()]).await?;
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            logline::subtle(&format!("remote: {trimmed}"));
+        }
+    }
+    Ok(())
+}
+
+async fn copy_surge_binary_to_tailscale_node(node: &str, local_binary: &Path) -> Result<()> {
+    let remote_command = "mkdir -p ~/.surge/bin && cat > ~/.surge/bin/surge && chmod +x ~/.surge/bin/surge";
+    stream_file_to_tailscale_node_with_command(node, local_binary, remote_command).await
+}
+
+async fn stream_file_to_tailscale_node(node: &str, local_file: &Path) -> Result<()> {
+    let file_name = local_file
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| SurgeError::Platform(format!("Invalid package filename '{}'", local_file.display())))?;
+
+    let remote_command = format!(
+        "mkdir -p ~/Downloads && cat > ~/Downloads/{}",
+        shell_single_quote(file_name)
+    );
+    stream_file_to_tailscale_node_with_command(node, local_file, &remote_command).await
+}
+
+async fn stream_file_to_tailscale_node_with_command(node: &str, local_file: &Path, remote_command: &str) -> Result<()> {
+    let ssh_command = format!("sh -lc {}", shell_single_quote(remote_command));
+    let mut child = Command::new("tailscale")
+        .args(["ssh", node, ssh_command.as_str()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| SurgeError::Platform(format!("Failed to run tailscale ssh stream copy: {e}")))?;
+
+    let mut local_reader = tokio::fs::File::open(local_file)
+        .await
+        .map_err(|e| SurgeError::Platform(format!("Failed to open '{}' for transfer: {e}", local_file.display())))?;
+
+    let mut child_stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| SurgeError::Platform("Failed to capture tailscale ssh stdin".to_string()))?;
+
+    tokio::io::copy(&mut local_reader, &mut child_stdin)
+        .await
+        .map_err(|e| SurgeError::Platform(format!("Failed to stream '{}' to '{node}': {e}", local_file.display())))?;
+    drop(child_stdin);
+
+    let output = child
+        .wait_with_output()
+        .await
+        .map_err(|e| SurgeError::Platform(format!("Failed to wait for tailscale ssh stream copy: {e}")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let msg = if stderr.is_empty() {
+            format!("Command failed: tailscale ssh {node} sh -lc <stream-copy>")
+        } else {
+            format!("Command failed: tailscale ssh {node} sh -lc <stream-copy>: {stderr}")
+        };
+        return Err(SurgeError::Platform(msg));
+    }
+
     Ok(())
 }
 
@@ -870,6 +1492,52 @@ mod tests {
     }
 
     #[test]
+    fn ensure_supported_tailscale_profile_accepts_linux() {
+        let linux = RuntimeProfile {
+            os: "Linux".to_string(),
+            arch: "x86_64".to_string(),
+            gpu: "none".to_string(),
+        };
+        assert!(ensure_supported_tailscale_profile(&linux).is_ok());
+    }
+
+    #[test]
+    fn ensure_supported_tailscale_profile_rejects_windows() {
+        let windows = RuntimeProfile {
+            os: "Windows".to_string(),
+            arch: "x86_64".to_string(),
+            gpu: "none".to_string(),
+        };
+        let err = ensure_supported_tailscale_profile(&windows).expect_err("windows should be rejected");
+        assert!(
+            err.to_string().contains("supports Linux targets only"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_remote_launch_environment_extracts_known_keys() {
+        let raw = "display=:0\nxauthority=/run/user/1000/gdm/Xauthority\ndbus=unix:path=/run/user/1000/bus\n";
+        let env = parse_remote_launch_environment(raw);
+        assert_eq!(env.display.as_deref(), Some(":0"));
+        assert_eq!(env.xauthority.as_deref(), Some("/run/user/1000/gdm/Xauthority"));
+        assert_eq!(
+            env.dbus_session_bus_address.as_deref(),
+            Some("unix:path=/run/user/1000/bus")
+        );
+    }
+
+    #[test]
+    fn release_requires_display_when_desktop_shortcut_exists() {
+        let desktop_release = release("1.0.0", "test", "linux-x64", "desktop-full.tar.zst");
+        assert!(release_requires_display(&desktop_release));
+
+        let mut headless_release = release("1.0.1", "test", "linux-x64", "headless-full.tar.zst");
+        headless_release.shortcuts = vec![ShortcutLocation::Startup];
+        assert!(!release_requires_display(&headless_release));
+    }
+
+    #[test]
     fn resolve_targets_plain_node_without_user() {
         let (ssh_target, file_target) = resolve_tailscale_targets("edge-node", None).expect("targets");
         assert_eq!(ssh_target, "edge-node");
@@ -888,6 +1556,21 @@ mod tests {
         let (ssh_target, file_target) = resolve_tailscale_targets("alice@edge-node", Some("ignored")).expect("targets");
         assert_eq!(ssh_target, "alice@edge-node");
         assert_eq!(file_target, "edge-node");
+    }
+
+    #[test]
+    fn taildrop_capability_error_is_detected() {
+        let err = SurgeError::Platform(
+            "Command failed: tailscale file cp package.tar.zst node:: cannot send files: missing required Taildrop capability"
+                .to_string(),
+        );
+        assert!(is_taildrop_capability_error(&err));
+    }
+
+    #[test]
+    fn shell_single_quote_escapes_apostrophes() {
+        assert_eq!(shell_single_quote("plain"), "'plain'");
+        assert_eq!(shell_single_quote("O'Reilly"), "'O'\"'\"'Reilly'");
     }
 
     #[test]
@@ -1153,7 +1836,7 @@ apps:
             "linux-x64-cpu".to_string(),
         ];
 
-        let selected = select_release(&releases, "stable", None, &candidates).expect("release should resolve");
+        let selected = select_release(&releases, "stable", None, &candidates, None).expect("release should resolve");
         assert_eq!(selected.full_filename, "gpu-1.0.0");
     }
 
@@ -1162,7 +1845,7 @@ apps:
         let releases = vec![release("1.3.0", "stable", "", "generic-1.3.0")];
         let candidates = vec!["linux-arm64".to_string()];
 
-        let selected = select_release(&releases, "stable", None, &candidates).expect("release should resolve");
+        let selected = select_release(&releases, "stable", None, &candidates, None).expect("release should resolve");
         assert_eq!(selected.full_filename, "generic-1.3.0");
     }
 
@@ -1175,12 +1858,58 @@ apps:
         ];
 
         let gpu_candidates = build_rid_candidates("linux-x64", true);
-        let gpu = select_release(&releases, "production", None, &gpu_candidates).expect("gpu release should resolve");
+        let gpu =
+            select_release(&releases, "production", None, &gpu_candidates, None).expect("gpu release should resolve");
         assert_eq!(gpu.full_filename, "cuda");
 
         let cpu_candidates = build_rid_candidates("linux-x64", false);
-        let cpu = select_release(&releases, "production", None, &cpu_candidates).expect("cpu release should resolve");
+        let cpu =
+            select_release(&releases, "production", None, &cpu_candidates, None).expect("cpu release should resolve");
         assert_eq!(cpu.full_filename, "cpu");
+    }
+
+    #[test]
+    fn select_release_honors_selected_os_filter() {
+        let mut linux = release("1.0.0", "stable", "linux-x64", "linux");
+        linux.os = "linux".to_string();
+        let mut windows = release("1.0.0", "stable", "win-x64", "windows");
+        windows.os = "windows".to_string();
+        let releases = vec![linux, windows];
+
+        let candidates = vec!["linux-x64".to_string(), "win-x64".to_string()];
+        let selected =
+            select_release(&releases, "stable", None, &candidates, Some("windows")).expect("release should resolve");
+        assert_eq!(selected.full_filename, "windows");
+    }
+
+    #[test]
+    fn collect_target_options_for_app_infers_os_from_rid() {
+        let manifest = SurgeManifest::parse(
+            br"schema: 1
+storage:
+  provider: filesystem
+  bucket: /tmp/surge-test
+apps:
+  - id: demo
+    target:
+      rid: linux-x64
+",
+        )
+        .expect("manifest should parse");
+
+        let options = collect_target_options_for_app(&manifest, "demo").expect("targets should resolve");
+        assert!(options.contains(&AppInstallTargetOption {
+            os: "linux".to_string(),
+            rid: "linux-x64".to_string(),
+        }));
+    }
+
+    #[test]
+    fn infer_os_from_rid_maps_common_prefixes() {
+        assert_eq!(infer_os_from_rid("linux-x64"), Some("linux".to_string()));
+        assert_eq!(infer_os_from_rid("win-x64"), Some("windows".to_string()));
+        assert_eq!(infer_os_from_rid("osx-arm64"), Some("macos".to_string()));
+        assert_eq!(infer_os_from_rid("unknown-rid"), None);
     }
 
     #[test]
@@ -1280,6 +2009,77 @@ apps:
         let resolved = resolve_install_channel(&manifest, &index, "demo", None).expect("channel should resolve");
         assert_eq!(resolved.name, "production");
         assert!(resolved.note.is_some());
+    }
+
+    #[test]
+    fn collect_install_channel_options_prefers_release_index_channels() {
+        let manifest = SurgeManifest::parse(
+            br"schema: 1
+storage:
+  provider: filesystem
+  bucket: /tmp/releases
+channels:
+  - name: test
+apps:
+  - id: demo
+    channels: [test]
+    target:
+      rid: linux-x64
+",
+        )
+        .expect("manifest should parse");
+
+        let index = ReleaseIndex {
+            app_id: "demo".to_string(),
+            releases: vec![release("1.0.0", "production", "linux-x64", "demo-full.tar.zst")],
+            ..ReleaseIndex::default()
+        };
+        let channels = collect_install_channel_options(&manifest, &index, "demo");
+        assert_eq!(channels, vec!["production".to_string()]);
+    }
+
+    #[test]
+    fn collect_install_channel_options_falls_back_to_manifest_channels() {
+        let manifest = SurgeManifest::parse(
+            br"schema: 1
+storage:
+  provider: filesystem
+  bucket: /tmp/releases
+channels:
+  - name: test
+  - name: production
+apps:
+  - id: demo
+    channels: [test, production]
+    target:
+      rid: linux-x64
+",
+        )
+        .expect("manifest should parse");
+
+        let index = ReleaseIndex::default();
+        let channels = collect_install_channel_options(&manifest, &index, "demo");
+        assert_eq!(channels, vec!["test".to_string(), "production".to_string()]);
+    }
+
+    #[test]
+    fn collect_install_channel_options_defaults_to_stable() {
+        let manifest = SurgeManifest::parse(
+            br"schema: 1
+storage:
+  provider: filesystem
+  bucket: /tmp/releases
+apps:
+  - id: demo
+    target:
+      rid: linux-x64
+",
+        )
+        .expect("manifest should parse");
+
+        let index = ReleaseIndex::default();
+        let channels = collect_install_channel_options(&manifest, &index, "demo");
+        assert_eq!(channels, vec!["stable".to_string()]);
     }
 
     #[test]

@@ -305,7 +305,7 @@ struct InstallOptions {
     #[arg(long)]
     app_id: Option<String>,
 
-    /// Channel to resolve releases from (defaults to manifest-preferred channel)
+    /// Channel to resolve releases from (required only when multiple channels exist)
     #[arg(long)]
     channel: Option<String>,
 

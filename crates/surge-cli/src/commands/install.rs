@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::time::Instant;
 
 use crate::logline;
 use tokio::process::Command;
@@ -41,6 +42,12 @@ enum InstallTarget {
     Tailscale { ssh_target: String, file_target: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedInstallChannel {
+    name: String,
+    note: Option<String>,
+}
+
 pub async fn execute(
     manifest_path: &Path,
     application_manifest_path: &Path,
@@ -58,12 +65,6 @@ pub async fn execute(
     let manifest = load_install_manifest(application_manifest_path, manifest_path)?;
     let app_id = super::resolve_app_id_with_rid_hint(&manifest, app_id, rid)?;
     let explicit_channel = channel.map(str::trim).filter(|value| !value.is_empty());
-    let channel = resolve_install_channel(&manifest, &app_id, explicit_channel);
-    if explicit_channel.is_none() {
-        logline::info(&format!(
-            "No --channel provided; using install channel '{channel}' from manifest/defaults"
-        ));
-    }
 
     let install_target = match node.map(str::trim).filter(|value| !value.is_empty()) {
         Some(node) => {
@@ -97,13 +98,35 @@ pub async fn execute(
 
     let storage_config = build_storage_config_with_overrides(&manifest, &app_id, overrides)?;
     let backend = storage::create_storage_backend(&storage_config)?;
-    let index = fetch_release_index(&*backend).await?;
+    logline::info(&format!(
+        "Fetching release index '{}' from storage backend...",
+        RELEASES_FILE_COMPRESSED
+    ));
+    let index_fetch_started = Instant::now();
+    let (index, index_found) = fetch_release_index(&*backend).await?;
+    let index_fetch_elapsed_ms = index_fetch_started.elapsed().as_millis();
+    if index_found {
+        logline::info(&format!(
+            "Fetched release index in {index_fetch_elapsed_ms}ms ({} release entries).",
+            index.releases.len()
+        ));
+    } else {
+        logline::warn(&format!(
+            "Release index '{}' was not found ({}ms).",
+            RELEASES_FILE_COMPRESSED, index_fetch_elapsed_ms
+        ));
+    }
     if !index.app_id.is_empty() && index.app_id != app_id {
         return Err(SurgeError::NotFound(format!(
             "Release index belongs to app '{}' not '{}'",
             index.app_id, app_id
         )));
     }
+    let resolved_channel = resolve_install_channel(&manifest, &index, &app_id, explicit_channel)?;
+    if let Some(note) = &resolved_channel.note {
+        logline::info(note);
+    }
+    let channel = resolved_channel.name;
 
     let release = select_release(&index.releases, &channel, version, &rid_candidates).ok_or_else(|| {
         let version_suffix = version.map_or_else(String::new, |v| format!(" and version '{v}'"));
@@ -241,47 +264,81 @@ pub async fn execute(
     Ok(())
 }
 
-fn resolve_install_channel(manifest: &SurgeManifest, app_id: &str, explicit: Option<&str>) -> String {
+fn resolve_install_channel(
+    manifest: &SurgeManifest,
+    index: &ReleaseIndex,
+    app_id: &str,
+    explicit: Option<&str>,
+) -> Result<ResolvedInstallChannel> {
     if let Some(channel) = explicit {
-        return channel.to_string();
+        return Ok(ResolvedInstallChannel {
+            name: channel.to_string(),
+            note: None,
+        });
     }
 
-    let app_channels = manifest
-        .apps
-        .iter()
-        .find(|app| app.id == app_id)
-        .map_or_else(Vec::new, |app| app.channels.clone());
-    if let Some(channel) = preferred_manifest_channel(&app_channels) {
-        return channel;
+    let available_channels = collect_available_channels(&index.releases);
+    if available_channels.len() == 1 {
+        let selected = available_channels[0].clone();
+        return Ok(ResolvedInstallChannel {
+            name: selected.clone(),
+            note: Some(format!(
+                "No --channel provided; single available channel '{selected}' selected automatically."
+            )),
+        });
+    }
+    if available_channels.len() > 1 {
+        return Err(SurgeError::Config(format!(
+            "Multiple channels available for app '{app_id}': {}. Specify --channel <name> to choose.",
+            available_channels.join(", ")
+        )));
     }
 
-    let top_level_channels = manifest
-        .channels
-        .iter()
-        .map(|channel| channel.name.clone())
-        .collect::<Vec<_>>();
-    if let Some(channel) = preferred_manifest_channel(&top_level_channels) {
-        return channel;
+    let configured_channels = collect_configured_channels(manifest, app_id);
+    if configured_channels.len() == 1 {
+        let selected = configured_channels[0].clone();
+        return Ok(ResolvedInstallChannel {
+            name: selected.clone(),
+            note: Some(format!(
+                "No --channel provided; single configured channel '{selected}' selected automatically."
+            )),
+        });
+    }
+    if configured_channels.len() > 1 {
+        return Err(SurgeError::Config(format!(
+            "Multiple channels configured for app '{app_id}': {}. Specify --channel <name> to choose.",
+            configured_channels.join(", ")
+        )));
     }
 
-    "stable".to_string()
+    Ok(ResolvedInstallChannel {
+        name: "stable".to_string(),
+        note: Some("No channel metadata found; defaulting to 'stable'.".to_string()),
+    })
 }
 
-fn preferred_manifest_channel(channels: &[String]) -> Option<String> {
-    let normalized = channels
-        .iter()
-        .map(|channel| channel.trim())
-        .filter(|channel| !channel.is_empty())
-        .collect::<Vec<_>>();
-    for preferred in ["stable", "production"] {
-        if let Some(channel) = normalized
-            .iter()
-            .find(|channel| channel.eq_ignore_ascii_case(preferred))
-        {
-            return Some((*channel).to_string());
+fn collect_configured_channels(manifest: &SurgeManifest, app_id: &str) -> Vec<String> {
+    let mut channels = Vec::new();
+
+    if let Some(app) = manifest.apps.iter().find(|app| app.id == app_id) {
+        for channel in &app.channels {
+            let trimmed = channel.trim();
+            if !trimmed.is_empty() && !channels.iter().any(|existing| existing == trimmed) {
+                channels.push(trimmed.to_string());
+            }
         }
     }
-    normalized.first().map(|channel| (*channel).to_string())
+
+    if channels.is_empty() {
+        for channel in &manifest.channels {
+            let trimmed = channel.name.trim();
+            if !trimmed.is_empty() && !channels.iter().any(|existing| existing == trimmed) {
+                channels.push(trimmed.to_string());
+            }
+        }
+    }
+
+    channels
 }
 
 fn collect_available_channels(releases: &[ReleaseEntry]) -> Vec<String> {
@@ -382,10 +439,10 @@ fn build_storage_config_with_overrides(
     Ok(config)
 }
 
-async fn fetch_release_index(backend: &dyn StorageBackend) -> Result<ReleaseIndex> {
+async fn fetch_release_index(backend: &dyn StorageBackend) -> Result<(ReleaseIndex, bool)> {
     match backend.get_object(RELEASES_FILE_COMPRESSED).await {
-        Ok(data) => decompress_release_index(&data),
-        Err(SurgeError::NotFound(_)) => Ok(ReleaseIndex::default()),
+        Ok(data) => Ok((decompress_release_index(&data)?, true)),
+        Err(SurgeError::NotFound(_)) => Ok((ReleaseIndex::default(), false)),
         Err(e) => Err(e),
     }
 }
@@ -945,26 +1002,6 @@ apps:
     }
 
     #[test]
-    fn resolve_install_channel_prefers_production_when_stable_is_missing() {
-        let manifest = SurgeManifest::parse(
-            br"schema: 1
-channels:
-  - name: test
-  - name: production
-apps:
-  - id: demo
-    channels: [test, production]
-    target:
-      rid: linux-x64
-",
-        )
-        .expect("manifest should parse");
-
-        let channel = resolve_install_channel(&manifest, "demo", None);
-        assert_eq!(channel, "production");
-    }
-
-    #[test]
     fn resolve_install_channel_uses_explicit_override() {
         let manifest = SurgeManifest::parse(
             br"schema: 1
@@ -980,8 +1017,87 @@ apps:
         )
         .expect("manifest should parse");
 
-        let channel = resolve_install_channel(&manifest, "demo", Some("test"));
-        assert_eq!(channel, "test");
+        let index = ReleaseIndex::default();
+        let resolved =
+            resolve_install_channel(&manifest, &index, "demo", Some("test")).expect("channel should resolve");
+        assert_eq!(resolved.name, "test");
+        assert!(resolved.note.is_none());
+    }
+
+    #[test]
+    fn resolve_install_channel_auto_selects_single_available_channel() {
+        let manifest = SurgeManifest::parse(
+            br"schema: 1
+channels:
+  - name: test
+  - name: production
+apps:
+  - id: demo
+    channels: [test, production]
+    target:
+      rid: linux-x64
+",
+        )
+        .expect("manifest should parse");
+
+        let index = ReleaseIndex {
+            app_id: "demo".to_string(),
+            releases: vec![release("1.0.0", "production", "linux-x64", "demo-full.tar.zst")],
+            ..ReleaseIndex::default()
+        };
+        let resolved = resolve_install_channel(&manifest, &index, "demo", None).expect("channel should resolve");
+        assert_eq!(resolved.name, "production");
+        assert!(resolved.note.is_some());
+    }
+
+    #[test]
+    fn resolve_install_channel_requires_explicit_choice_when_multiple_channels_exist() {
+        let manifest = SurgeManifest::parse(
+            br"schema: 1
+channels:
+  - name: test
+  - name: production
+apps:
+  - id: demo
+    channels: [test, production]
+    target:
+      rid: linux-x64
+",
+        )
+        .expect("manifest should parse");
+
+        let index = ReleaseIndex {
+            app_id: "demo".to_string(),
+            releases: vec![
+                release("1.0.0", "test", "linux-x64", "demo-test.tar.zst"),
+                release("1.0.0", "production", "linux-x64", "demo-prod.tar.zst"),
+            ],
+            ..ReleaseIndex::default()
+        };
+
+        let err = resolve_install_channel(&manifest, &index, "demo", None).expect_err("choice should be required");
+        assert!(err.to_string().contains("Multiple channels available"));
+    }
+
+    #[test]
+    fn resolve_install_channel_auto_selects_single_configured_channel_when_index_is_empty() {
+        let manifest = SurgeManifest::parse(
+            br"schema: 1
+channels:
+  - name: production
+apps:
+  - id: demo
+    channels: [production]
+    target:
+      rid: linux-x64
+",
+        )
+        .expect("manifest should parse");
+
+        let index = ReleaseIndex::default();
+        let resolved = resolve_install_channel(&manifest, &index, "demo", None).expect("channel should resolve");
+        assert_eq!(resolved.name, "production");
+        assert!(resolved.note.is_some());
     }
 
     #[test]

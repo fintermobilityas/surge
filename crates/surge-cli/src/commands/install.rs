@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use crate::logline;
@@ -46,7 +47,7 @@ pub async fn execute(
     node: Option<&str>,
     ssh_user: Option<&str>,
     app_id: Option<&str>,
-    channel: &str,
+    channel: Option<&str>,
     rid: Option<&str>,
     version: Option<&str>,
     plan_only: bool,
@@ -56,6 +57,13 @@ pub async fn execute(
 ) -> Result<()> {
     let manifest = load_install_manifest(application_manifest_path, manifest_path)?;
     let app_id = super::resolve_app_id_with_rid_hint(&manifest, app_id, rid)?;
+    let explicit_channel = channel.map(str::trim).filter(|value| !value.is_empty());
+    let channel = resolve_install_channel(&manifest, &app_id, explicit_channel);
+    if explicit_channel.is_none() {
+        logline::info(&format!(
+            "No --channel provided; using install channel '{channel}' from manifest/defaults"
+        ));
+    }
 
     let install_target = match node.map(str::trim).filter(|value| !value.is_empty()) {
         Some(node) => {
@@ -97,11 +105,17 @@ pub async fn execute(
         )));
     }
 
-    let release = select_release(&index.releases, channel, version, &rid_candidates).ok_or_else(|| {
+    let release = select_release(&index.releases, &channel, version, &rid_candidates).ok_or_else(|| {
         let version_suffix = version.map_or_else(String::new, |v| format!(" and version '{v}'"));
+        let available_channels = collect_available_channels(&index.releases);
+        let channel_hint = if available_channels.is_empty() {
+            " Release index contains no channel metadata.".to_string()
+        } else {
+            format!(" Available channels: {}.", available_channels.join(", "))
+        };
         SurgeError::NotFound(format!(
-            "No release found on channel '{channel}' for RID candidates [{}]{version_suffix}",
-            rid_candidates.join(", ")
+            "No release found on channel '{channel}' for RID candidates [{}]{version_suffix}.{channel_hint}",
+            rid_candidates.join(", "),
         ))
     })?;
 
@@ -225,6 +239,62 @@ pub async fn execute(
     }
 
     Ok(())
+}
+
+fn resolve_install_channel(manifest: &SurgeManifest, app_id: &str, explicit: Option<&str>) -> String {
+    if let Some(channel) = explicit {
+        return channel.to_string();
+    }
+
+    let app_channels = manifest
+        .apps
+        .iter()
+        .find(|app| app.id == app_id)
+        .map_or_else(Vec::new, |app| app.channels.clone());
+    if let Some(channel) = preferred_manifest_channel(&app_channels) {
+        return channel;
+    }
+
+    let top_level_channels = manifest
+        .channels
+        .iter()
+        .map(|channel| channel.name.clone())
+        .collect::<Vec<_>>();
+    if let Some(channel) = preferred_manifest_channel(&top_level_channels) {
+        return channel;
+    }
+
+    "stable".to_string()
+}
+
+fn preferred_manifest_channel(channels: &[String]) -> Option<String> {
+    let normalized = channels
+        .iter()
+        .map(|channel| channel.trim())
+        .filter(|channel| !channel.is_empty())
+        .collect::<Vec<_>>();
+    for preferred in ["stable", "production"] {
+        if let Some(channel) = normalized
+            .iter()
+            .find(|channel| channel.eq_ignore_ascii_case(preferred))
+        {
+            return Some((*channel).to_string());
+        }
+    }
+    normalized.first().map(|channel| (*channel).to_string())
+}
+
+fn collect_available_channels(releases: &[ReleaseEntry]) -> Vec<String> {
+    let mut channels = BTreeSet::new();
+    for release in releases {
+        for channel in &release.channels {
+            let trimmed = channel.trim();
+            if !trimmed.is_empty() {
+                channels.insert(trimmed.to_string());
+            }
+        }
+    }
+    channels.into_iter().collect()
 }
 
 fn resolve_tailscale_targets(node: &str, ssh_user: Option<&str>) -> Result<(String, String)> {
@@ -872,5 +942,56 @@ apps:
         let cpu_candidates = build_rid_candidates("linux-x64", false);
         let cpu = select_release(&releases, "production", None, &cpu_candidates).expect("cpu release should resolve");
         assert_eq!(cpu.full_filename, "cpu");
+    }
+
+    #[test]
+    fn resolve_install_channel_prefers_production_when_stable_is_missing() {
+        let manifest = SurgeManifest::parse(
+            br"schema: 1
+channels:
+  - name: test
+  - name: production
+apps:
+  - id: demo
+    channels: [test, production]
+    target:
+      rid: linux-x64
+",
+        )
+        .expect("manifest should parse");
+
+        let channel = resolve_install_channel(&manifest, "demo", None);
+        assert_eq!(channel, "production");
+    }
+
+    #[test]
+    fn resolve_install_channel_uses_explicit_override() {
+        let manifest = SurgeManifest::parse(
+            br"schema: 1
+channels:
+  - name: test
+  - name: production
+apps:
+  - id: demo
+    channels: [test, production]
+    target:
+      rid: linux-x64
+",
+        )
+        .expect("manifest should parse");
+
+        let channel = resolve_install_channel(&manifest, "demo", Some("test"));
+        assert_eq!(channel, "test");
+    }
+
+    #[test]
+    fn collect_available_channels_deduplicates_and_sorts() {
+        let releases = vec![
+            release("1.0.0", "test", "linux-x64", "a"),
+            release("1.0.1", "production", "linux-x64", "b"),
+            release("1.0.2", "test", "linux-x64", "c"),
+        ];
+        let channels = collect_available_channels(&releases);
+        assert_eq!(channels, vec!["production".to_string(), "test".to_string()]);
     }
 }

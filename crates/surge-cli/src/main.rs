@@ -305,9 +305,9 @@ struct InstallOptions {
     #[arg(long)]
     app_id: Option<String>,
 
-    /// Channel to resolve releases from
-    #[arg(long, default_value = "stable")]
-    channel: String,
+    /// Channel to resolve releases from (defaults to manifest-preferred channel)
+    #[arg(long)]
+    channel: Option<String>,
 
     /// Override RID detection with an explicit RID
     #[arg(long)]
@@ -623,7 +623,7 @@ async fn run(cli: Cli) -> surge_core::error::Result<()> {
                 node,
                 ssh_user.as_deref(),
                 options.app_id.as_deref(),
-                &options.channel,
+                options.channel.as_deref(),
                 options.rid.as_deref(),
                 options.version.as_deref(),
                 options.plan_only,

@@ -80,6 +80,15 @@ fn run_install_inner(
     let profile = InstallProfile::from_installer_manifest(manifest, shortcuts);
 
     core_install::install_package_locally_at_root(&profile, &package.path, &install_root)?;
+    let runtime_manifest = core_install::RuntimeManifestMetadata::new(
+        &manifest.version,
+        &manifest.channel,
+        &manifest.storage.provider,
+        &manifest.storage.bucket,
+        &manifest.storage.region,
+        &manifest.storage.endpoint,
+    );
+    core_install::write_runtime_manifest(&install_root.join("app"), &profile, &runtime_manifest)?;
 
     send(progress_tx, ctx, ProgressUpdate::Progress(0.9));
     simulate_progress(progress_tx, ctx, simulator, 0.9, 0.97, 14, 2500);
@@ -216,6 +225,15 @@ pub fn run_headless(
 
     eprintln!("Installing to '{}'...", install_root.display());
     core_install::install_package_locally_at_root(&profile, &package.path, &install_root)?;
+    let runtime_manifest = core_install::RuntimeManifestMetadata::new(
+        &manifest.version,
+        &manifest.channel,
+        &manifest.storage.provider,
+        &manifest.storage.bucket,
+        &manifest.storage.region,
+        &manifest.storage.endpoint,
+    );
+    core_install::write_runtime_manifest(&install_root.join("app"), &profile, &runtime_manifest)?;
     eprintln!("Installed '{}' to '{}'", manifest.app_id, install_root.display());
 
     Ok(install_root)

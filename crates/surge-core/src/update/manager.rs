@@ -13,6 +13,7 @@ use crate::context::Context;
 use crate::crypto::sha256::{sha256_hex, sha256_hex_file};
 use crate::diff::wrapper::bspatch_buffers;
 use crate::error::{Result, SurgeError};
+use crate::install::{InstallProfile, RuntimeManifestMetadata, storage_provider_manifest_name, write_runtime_manifest};
 use crate::platform::detect::current_rid;
 use crate::platform::fs::{atomic_rename, copy_directory};
 use crate::platform::process::spawn_detached;
@@ -594,6 +595,27 @@ impl UpdateManager {
                 );
             }
         }
+
+        let storage_cfg = self.ctx.storage_config();
+        let runtime_manifest_profile = InstallProfile::new(
+            &self.app_id,
+            latest.display_name(&self.app_id),
+            &latest.main_exe,
+            &latest.install_directory,
+            &latest.supervisor_id,
+            &latest.icon,
+            &latest.shortcuts,
+            &latest.environment,
+        );
+        let runtime_manifest_metadata = RuntimeManifestMetadata::new(
+            &latest.version,
+            &self.channel,
+            storage_provider_manifest_name(storage_cfg.provider),
+            &storage_cfg.bucket,
+            &storage_cfg.region,
+            &storage_cfg.endpoint,
+        );
+        write_runtime_manifest(&active_app_dir, &runtime_manifest_profile, &runtime_manifest_metadata)?;
 
         if !latest.shortcuts.is_empty() {
             match install_shortcuts(
@@ -1353,6 +1375,14 @@ mod tests {
         let installed_file = install_root.join("app").join("payload.txt");
         assert!(installed_file.exists());
         assert_eq!(std::fs::read_to_string(installed_file).unwrap(), "installed payload");
+        let runtime_manifest = install_root
+            .join("app")
+            .join(crate::install::RUNTIME_MANIFEST_RELATIVE_PATH);
+        assert!(runtime_manifest.is_file());
+        let runtime_manifest_raw = std::fs::read_to_string(&runtime_manifest).unwrap();
+        assert!(runtime_manifest_raw.contains("id: test-app"));
+        assert!(runtime_manifest_raw.contains("version: 1.1.0"));
+        assert!(runtime_manifest_raw.contains("channel: stable"));
 
         std::fs::remove_file(store_root.join(&full_filename)).unwrap();
         manager
@@ -1362,6 +1392,7 @@ mod tests {
         let installed_file = install_root.join("app").join("payload.txt");
         assert!(installed_file.exists());
         assert_eq!(std::fs::read_to_string(installed_file).unwrap(), "installed payload");
+        assert!(runtime_manifest.is_file());
     }
 
     #[tokio::test]

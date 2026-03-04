@@ -241,6 +241,9 @@ pub async fn execute(
         InstallTarget::Local => {
             let install_root = install_package_locally(&app_id, release, &local_package)?;
             let active_app_dir = install_root.join("app");
+            let install_profile = release_install_profile(&app_id, release);
+            let runtime_manifest = release_runtime_manifest_metadata(release, &channel, &storage_config);
+            core_install::write_runtime_manifest(&active_app_dir, &install_profile, &runtime_manifest)?;
             logline::success(&format!(
                 "Installed '{}' to '{}' (active app: '{}').",
                 app_id,
@@ -426,6 +429,21 @@ fn auto_start_after_install(
 ) -> Result<u32> {
     let profile = release_install_profile(app_id, release);
     core_install::auto_start_after_install(&profile, install_root, active_app_dir)
+}
+
+fn release_runtime_manifest_metadata<'a>(
+    release: &'a ReleaseEntry,
+    channel: &'a str,
+    storage_config: &'a surge_core::context::StorageConfig,
+) -> core_install::RuntimeManifestMetadata<'a> {
+    core_install::RuntimeManifestMetadata::new(
+        &release.version,
+        channel,
+        core_install::storage_provider_manifest_name(storage_config.provider),
+        &storage_config.bucket,
+        &storage_config.region,
+        &storage_config.endpoint,
+    )
 }
 
 fn build_storage_config_with_overrides(

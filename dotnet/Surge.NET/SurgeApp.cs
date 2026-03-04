@@ -228,8 +228,15 @@ namespace Surge
         {
             var assemblyDir = GetWorkingDirectory();
             var surgeDir = Path.Combine(assemblyDir, ".surge");
-            var manifestPath = Path.Combine(surgeDir, "surge.yml");
+            var runtimeManifestPath = Path.Combine(surgeDir, "runtime.yml");
+            var legacyManifestPath = Path.Combine(surgeDir, "surge.yml");
 
+            return TryLoadCurrentAppFromManifest(runtimeManifestPath, assemblyDir)
+                ?? TryLoadCurrentAppFromManifest(legacyManifestPath, assemblyDir);
+        }
+
+        private static SurgeAppInfo? TryLoadCurrentAppFromManifest(string manifestPath, string assemblyDir)
+        {
             if (!File.Exists(manifestPath))
                 return null;
 
@@ -269,15 +276,16 @@ namespace Surge
                         storageEndpoint = trimmed.Substring(9).Trim().Trim('"');
                 }
 
-                if (appId == null)
+                if (string.IsNullOrWhiteSpace(appId))
                     return null;
 
+                var resolvedAppId = appId!.Trim();
                 return new SurgeAppInfo
                 {
-                    Id = appId,
+                    Id = resolvedAppId,
                     Version = version ?? "0.0.0",
                     Channel = channel ?? "stable",
-                    InstallDirectory = ResolveInstallDirectory(appId, installDir, assemblyDir),
+                    InstallDirectory = ResolveInstallDirectory(resolvedAppId, installDir, assemblyDir),
                     StorageProvider = storageProvider ?? "filesystem",
                     StorageBucket = storageBucket ?? "",
                     StorageRegion = storageRegion ?? "",

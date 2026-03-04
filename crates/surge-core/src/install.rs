@@ -1,13 +1,19 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use serde::Serialize;
+
 use crate::archive::extractor::extract_file_to;
 use crate::config::installer::InstallerManifest;
 use crate::config::manifest::ShortcutLocation;
+use crate::context::StorageProvider;
 use crate::error::{Result, SurgeError};
 use crate::platform::paths::default_install_root;
 use crate::platform::process::spawn_detached;
 use crate::platform::shortcuts::install_shortcuts;
+
+pub const RUNTIME_MANIFEST_RELATIVE_PATH: &str = ".surge/runtime.yml";
+pub const LEGACY_RUNTIME_MANIFEST_RELATIVE_PATH: &str = ".surge/surge.yml";
 
 /// Shared profile for installing a package locally, usable from both
 /// `surge install` (via `ReleaseEntry`) and `surge setup` (via `InstallerRuntime`).
@@ -20,6 +26,52 @@ pub struct InstallProfile<'a> {
     pub icon: &'a str,
     pub shortcuts: &'a [ShortcutLocation],
     pub environment: &'a BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeManifestMetadata<'a> {
+    pub version: &'a str,
+    pub channel: &'a str,
+    pub storage_provider: &'a str,
+    pub storage_bucket: &'a str,
+    pub storage_region: &'a str,
+    pub storage_endpoint: &'a str,
+}
+
+impl<'a> RuntimeManifestMetadata<'a> {
+    #[must_use]
+    pub fn new(
+        version: &'a str,
+        channel: &'a str,
+        storage_provider: &'a str,
+        storage_bucket: &'a str,
+        storage_region: &'a str,
+        storage_endpoint: &'a str,
+    ) -> Self {
+        Self {
+            version,
+            channel,
+            storage_provider,
+            storage_bucket,
+            storage_region,
+            storage_endpoint,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RuntimeManifestFile<'a> {
+    id: &'a str,
+    version: &'a str,
+    channel: &'a str,
+    #[serde(rename = "installDirectory")]
+    install_directory: &'a str,
+    provider: &'a str,
+    bucket: &'a str,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    region: &'a str,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    endpoint: &'a str,
 }
 
 impl<'a> InstallProfile<'a> {
@@ -59,6 +111,73 @@ impl<'a> InstallProfile<'a> {
             &manifest.runtime.environment,
         )
     }
+}
+
+#[must_use]
+pub fn storage_provider_manifest_name(provider: Option<StorageProvider>) -> &'static str {
+    match provider.unwrap_or(StorageProvider::Filesystem) {
+        StorageProvider::S3 => "s3",
+        StorageProvider::AzureBlob => "azure",
+        StorageProvider::Gcs => "gcs",
+        StorageProvider::Filesystem => "filesystem",
+        StorageProvider::GitHubReleases => "github_releases",
+    }
+}
+
+pub fn write_runtime_manifest(
+    active_app_dir: &Path,
+    profile: &InstallProfile<'_>,
+    metadata: &RuntimeManifestMetadata<'_>,
+) -> Result<std::path::PathBuf> {
+    let manifest = RuntimeManifestFile {
+        id: profile.app_id.trim(),
+        version: metadata.version.trim(),
+        channel: metadata.channel.trim(),
+        install_directory: profile.install_directory.trim(),
+        provider: metadata.storage_provider.trim(),
+        bucket: metadata.storage_bucket.trim(),
+        region: metadata.storage_region.trim(),
+        endpoint: metadata.storage_endpoint.trim(),
+    };
+
+    if manifest.id.is_empty() {
+        return Err(SurgeError::Config(
+            "Cannot write runtime manifest: app id is empty".to_string(),
+        ));
+    }
+    if manifest.version.is_empty() {
+        return Err(SurgeError::Config(
+            "Cannot write runtime manifest: version is empty".to_string(),
+        ));
+    }
+    if manifest.channel.is_empty() {
+        return Err(SurgeError::Config(
+            "Cannot write runtime manifest: channel is empty".to_string(),
+        ));
+    }
+    if manifest.provider.is_empty() {
+        return Err(SurgeError::Config(
+            "Cannot write runtime manifest: storage provider is empty".to_string(),
+        ));
+    }
+
+    let runtime_manifest_path = active_app_dir.join(RUNTIME_MANIFEST_RELATIVE_PATH);
+    if let Some(parent) = runtime_manifest_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let legacy_manifest_path = active_app_dir.join(LEGACY_RUNTIME_MANIFEST_RELATIVE_PATH);
+    if let Some(parent) = legacy_manifest_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let mut yaml = serde_yaml::to_string(&manifest)
+        .map_err(|e| SurgeError::Config(format!("Failed to serialize runtime manifest: {e}")))?;
+    if !yaml.ends_with('\n') {
+        yaml.push('\n');
+    }
+    std::fs::write(&runtime_manifest_path, &yaml)?;
+    std::fs::write(&legacy_manifest_path, yaml)?;
+    Ok(runtime_manifest_path)
 }
 
 /// Resolve the install root and install the package there.
@@ -169,4 +288,61 @@ pub fn auto_start_after_install(
         profile.environment,
     )?;
     Ok(handle.pid())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn storage_provider_manifest_name_maps_expected_values() {
+        assert_eq!(storage_provider_manifest_name(None), "filesystem");
+        assert_eq!(storage_provider_manifest_name(Some(StorageProvider::S3)), "s3");
+        assert_eq!(
+            storage_provider_manifest_name(Some(StorageProvider::AzureBlob)),
+            "azure"
+        );
+        assert_eq!(storage_provider_manifest_name(Some(StorageProvider::Gcs)), "gcs");
+        assert_eq!(
+            storage_provider_manifest_name(Some(StorageProvider::Filesystem)),
+            "filesystem"
+        );
+        assert_eq!(
+            storage_provider_manifest_name(Some(StorageProvider::GitHubReleases)),
+            "github_releases"
+        );
+    }
+
+    #[test]
+    fn write_runtime_manifest_creates_expected_file() {
+        let tmp = tempfile::tempdir().expect("temp dir should exist");
+        let environment = BTreeMap::new();
+        let shortcuts: [ShortcutLocation; 0] = [];
+        let profile = InstallProfile::new(
+            "demo-app",
+            "Demo App",
+            "demo",
+            "demo-install",
+            "",
+            "",
+            &shortcuts,
+            &environment,
+        );
+        let metadata =
+            RuntimeManifestMetadata::new("1.2.3", "test", "azure", "demo-bucket", "", "https://example.invalid");
+
+        let path = write_runtime_manifest(tmp.path(), &profile, &metadata).expect("runtime manifest should be written");
+        let raw = std::fs::read_to_string(&path).expect("runtime manifest should be readable");
+        let legacy_raw = std::fs::read_to_string(tmp.path().join(LEGACY_RUNTIME_MANIFEST_RELATIVE_PATH))
+            .expect("legacy runtime manifest should be readable");
+        assert!(raw.contains("id: demo-app"));
+        assert!(raw.contains("version: 1.2.3"));
+        assert!(raw.contains("channel: test"));
+        assert!(raw.contains("installDirectory: demo-install"));
+        assert!(raw.contains("provider: azure"));
+        assert!(raw.contains("bucket: demo-bucket"));
+        assert!(raw.contains("endpoint: https://example.invalid"));
+        assert!(!raw.contains("region:"));
+        assert_eq!(raw, legacy_raw);
+    }
 }

@@ -224,7 +224,7 @@ jobs:
       - name: Set version
         run: |
           sed -i 's/^version = ".*"/version = "${{ needs.version.outputs.semver }}"/' Cargo.toml
-          sed -i -E 's/(surge-core = \{ path = "crates\/surge-core", version = ").*(" \})/\1${{ needs.version.outputs.semver }}\2/' Cargo.toml
+          sed -i -E 's|surge-core = \{ path = "crates/surge-core", version = ".*"(, registry = "surge")? \}|surge-core = { path = "crates/surge-core", version = "${{ needs.version.outputs.semver }}", registry = "surge" }|' Cargo.toml
           cargo generate-lockfile
       - name: Install Cloudsmith CLI
         run: |

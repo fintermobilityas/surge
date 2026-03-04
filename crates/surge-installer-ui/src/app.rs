@@ -656,7 +656,7 @@ pub fn load_window_icon(staging_dir: &Path, icon_name: &str) -> egui::IconData {
 }
 
 pub fn load_app_logo(staging_dir: &Path, icon_name: &str) -> Option<egui::IconData> {
-    load_app_icon(staging_dir, icon_name)
+    Some(load_app_icon(staging_dir, icon_name).unwrap_or_else(default_surge_icon))
 }
 
 pub fn window_app_id(manifest: &InstallerManifest) -> String {

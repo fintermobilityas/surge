@@ -30,6 +30,9 @@ pub fn install_shortcuts(
     let display_name = if name.is_empty() { app_id } else { name };
     let main_exe_name = if main_exe.is_empty() { app_id } else { main_exe };
     let exe_path = resolve_target_path(app_dir, main_exe_name)?;
+    #[cfg(target_os = "linux")]
+    let icon_path = resolve_linux_shortcut_icon_path(app_id, app_dir, main_exe_name, icon)?;
+    #[cfg(not(target_os = "linux"))]
     let icon_path = if icon.is_empty() {
         None
     } else {
@@ -47,6 +50,62 @@ pub fn install_shortcuts(
         shortcuts,
         environment,
     )
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_linux_shortcut_icon_path(
+    app_id: &str,
+    app_dir: &Path,
+    main_exe_name: &str,
+    configured_icon: &str,
+) -> Result<Option<PathBuf>> {
+    let configured_icon = configured_icon.trim();
+    if !configured_icon.is_empty() {
+        return Ok(Some(resolve_target_path(app_dir, configured_icon)?));
+    }
+
+    for candidate in linux_icon_candidates(app_id, app_dir, main_exe_name) {
+        if candidate.is_file() {
+            return Ok(Some(candidate));
+        }
+    }
+
+    Ok(write_linux_fallback_icon(app_dir))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_icon_candidates(app_id: &str, app_dir: &Path, main_exe_name: &str) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let stems = [main_exe_name.trim(), app_id.trim(), "icon", "logo"];
+    let exts = ["svg", "png", "xpm"];
+
+    for stem in stems {
+        if stem.is_empty() {
+            continue;
+        }
+        for ext in exts {
+            candidates.push(app_dir.join(format!("{stem}.{ext}")));
+            candidates.push(app_dir.join(".surge").join(format!("{stem}.{ext}")));
+        }
+    }
+
+    candidates
+}
+
+#[cfg(target_os = "linux")]
+fn write_linux_fallback_icon(app_dir: &Path) -> Option<PathBuf> {
+    const SURGE_FALLBACK_ICON_BYTES: &[u8] =
+        include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/logo.svg"));
+    let icon_path = app_dir.join(".surge").join("surge-logo.svg");
+    if let Some(parent) = icon_path.parent()
+        && std::fs::create_dir_all(parent).is_err()
+    {
+        return None;
+    }
+    if std::fs::write(&icon_path, SURGE_FALLBACK_ICON_BYTES).is_err() {
+        return None;
+    }
+    Some(icon_path)
 }
 
 fn resolve_target_path(app_dir: &Path, relative_or_absolute: &str) -> Result<PathBuf> {
@@ -806,5 +865,42 @@ mod tests {
         .unwrap_err();
 
         assert!(err.to_string().contains("does not exist"));
+    }
+
+    #[test]
+    fn test_install_shortcuts_falls_back_to_bundled_surge_icon() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install_root = tmp.path().join("install");
+        let app_dir = install_root.join("app");
+        std::fs::create_dir_all(&app_dir).unwrap();
+
+        let exe_path = app_dir.join("demoapp");
+        std::fs::write(&exe_path, b"#!/bin/sh\necho hi\n").unwrap();
+        crate::platform::fs::make_executable(&exe_path).unwrap();
+
+        let applications_dir = tmp.path().join("applications");
+        let autostart_dir = tmp.path().join("autostart");
+        set_test_shortcut_paths_override(applications_dir.clone(), autostart_dir);
+        let install_result = install_shortcuts(
+            "demoapp",
+            "demoapp",
+            &app_dir,
+            "demoapp",
+            "",
+            "",
+            &[ShortcutLocation::Desktop],
+            &BTreeMap::new(),
+        );
+        clear_test_shortcut_paths_override();
+        install_result.expect("shortcut install should succeed");
+
+        let fallback_icon = app_dir.join(".surge").join("surge-logo.svg");
+        assert!(fallback_icon.is_file(), "fallback icon should be written");
+
+        let desktop_entry = std::fs::read_to_string(applications_dir.join("demoapp.desktop")).unwrap();
+        assert!(
+            desktop_entry.contains(&format!("Icon={}", fallback_icon.display())),
+            "desktop entry should reference fallback icon: {desktop_entry}"
+        );
     }
 }

@@ -13,6 +13,7 @@ use surge_core::releases::manifest::{
     DeltaArtifact, ReleaseEntry, ReleaseIndex, compress_release_index, decompress_release_index,
 };
 use surge_core::releases::restore::required_artifacts_for_index;
+use surge_core::releases::version::compare_versions;
 use surge_core::storage::{self, StorageBackend};
 
 /// Push built packages to cloud storage.
@@ -79,24 +80,40 @@ pub async fn execute(
 
     print_stage(theme, 3, TOTAL_STAGES, "Uploading release artifacts");
     let full_size = std::fs::metadata(&full_archive)?.len() as i64;
+    let full_sha256 = sha256_hex_file(&full_archive)?;
     let delta_filename = format!("{app_id}-{version}-{rid}-delta.tar.zst");
     let delta_archive = packages_dir.join(&delta_filename);
-    let delta_size_hint = if delta_archive.is_file() {
+    let delta_available = delta_archive.is_file();
+    let delta_size_hint = if delta_available {
         std::fs::metadata(&delta_archive)?.len() as i64
     } else {
         0
     };
-    let total_upload_bytes = full_size.saturating_add(delta_size_hint).max(0) as u64;
 
-    backend.upload_from_file(&full_filename, &full_archive, None).await?;
-    let mut uploaded_bytes_progress = full_size.max(0) as u64;
-    logline::subtle(&format!(
-        "      {}",
-        format_byte_progress(uploaded_bytes_progress, total_upload_bytes, "uploaded")
-    ));
+    let existing_index = fetch_existing_release_index(&*backend).await?;
+    let has_existing_full_for_rid = if let Some(index) = existing_index.as_ref() {
+        rid_has_uploaded_full_artifact(&*backend, index, &rid).await?
+    } else {
+        false
+    };
+    let full_uploaded = !has_existing_full_for_rid || !delta_available;
+    let total_upload_bytes = (if full_uploaded { full_size } else { 0 })
+        .saturating_add(delta_size_hint)
+        .max(0) as u64;
+    let mut uploaded_bytes_progress = 0u64;
 
-    let full_sha256 = sha256_hex_file(&full_archive)?;
-    let (delta_filename, delta_size, delta_sha256, delta_uploaded) = if delta_archive.is_file() {
+    if full_uploaded {
+        backend.upload_from_file(&full_filename, &full_archive, None).await?;
+        uploaded_bytes_progress = uploaded_bytes_progress.saturating_add(full_size.max(0) as u64);
+        logline::subtle(&format!(
+            "      {}",
+            format_byte_progress(uploaded_bytes_progress, total_upload_bytes, "uploaded")
+        ));
+    } else {
+        logline::info("Skipping full package upload: existing full baseline found for RID; publishing delta only.");
+    }
+
+    let (delta_filename, delta_size, delta_sha256, delta_uploaded) = if delta_available {
         backend.upload_from_file(&delta_filename, &delta_archive, None).await?;
         let delta_size = std::fs::metadata(&delta_archive)?.len() as i64;
         uploaded_bytes_progress = uploaded_bytes_progress.saturating_add(delta_size.max(0) as u64);
@@ -112,10 +129,12 @@ pub async fn execute(
         theme,
         3,
         TOTAL_STAGES,
-        if delta_uploaded {
+        if full_uploaded && delta_uploaded {
             "Uploaded full and delta artifacts"
-        } else {
+        } else if full_uploaded {
             "Uploaded full artifact (no delta package found)"
+        } else {
+            "Uploaded delta artifact (existing full baseline retained)"
         },
     );
 
@@ -151,12 +170,8 @@ pub async fn execute(
     );
 
     print_stage(theme, 5, TOTAL_STAGES, "Finalize push summary");
-    let uploaded_count = if delta_uploaded { 2 } else { 1 };
-    let uploaded_bytes_total = if delta_uploaded {
-        full_size + delta_size
-    } else {
-        full_size
-    };
+    let uploaded_count = usize::from(full_uploaded) + usize::from(delta_uploaded);
+    let uploaded_bytes_total = (if full_uploaded { full_size } else { 0 }) + delta_size;
     let uploaded_bytes_u64 = uploaded_bytes_total.max(0) as u64;
     print_stage_done(
         theme,
@@ -169,6 +184,33 @@ pub async fn execute(
         ),
     );
     Ok(())
+}
+
+async fn fetch_existing_release_index(backend: &dyn StorageBackend) -> Result<Option<ReleaseIndex>> {
+    match backend.get_object(RELEASES_FILE_COMPRESSED).await {
+        Ok(data) => Ok(Some(decompress_release_index(&data)?)),
+        Err(SurgeError::NotFound(_)) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+async fn rid_has_uploaded_full_artifact(backend: &dyn StorageBackend, index: &ReleaseIndex, rid: &str) -> Result<bool> {
+    let mut candidates: Vec<&ReleaseEntry> = index
+        .releases
+        .iter()
+        .filter(|release| (release.rid == rid || release.rid.is_empty()) && !release.full_filename.trim().is_empty())
+        .collect();
+    candidates.sort_by(|a, b| compare_versions(&a.version, &b.version));
+
+    for release in candidates {
+        match backend.head_object(release.full_filename.trim()).await {
+            Ok(_) => return Ok(true),
+            Err(SurgeError::NotFound(_)) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+
+    Ok(false)
 }
 
 #[allow(clippy::too_many_arguments)]

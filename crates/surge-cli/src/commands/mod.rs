@@ -534,4 +534,59 @@ apps:
         assert_eq!(scoped_index.releases[0].channels, vec!["test"]);
         assert_eq!(scoped_index.releases[0].name, "App A");
     }
+
+    #[tokio::test]
+    async fn test_push_uploads_delta_only_after_first_full_for_rid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_dir = tmp.path().join("store");
+        let packages_dir = tmp.path().join("packages");
+        let manifest_path = tmp.path().join("surge.yml");
+        let rid = current_rid();
+        let app_id = "delta-only-app";
+        let v1 = "1.0.0";
+        let v2 = "1.0.1";
+
+        std::fs::create_dir_all(&store_dir).unwrap();
+        std::fs::create_dir_all(&packages_dir).unwrap();
+        write_manifest(&manifest_path, &store_dir, app_id, &rid);
+
+        let v1_full_key = format!("{app_id}-{v1}-{rid}-full.tar.zst");
+        std::fs::write(packages_dir.join(&v1_full_key), b"full-v1").unwrap();
+        super::push::execute(&manifest_path, Some(app_id), v1, Some(&rid), "stable", &packages_dir)
+            .await
+            .unwrap();
+
+        let v2_full_key = format!("{app_id}-{v2}-{rid}-full.tar.zst");
+        let v2_delta_key = format!("{app_id}-{v2}-{rid}-delta.tar.zst");
+        std::fs::write(packages_dir.join(&v2_full_key), b"full-v2").unwrap();
+        std::fs::write(packages_dir.join(&v2_delta_key), b"delta-v2").unwrap();
+        super::push::execute(&manifest_path, Some(app_id), v2, Some(&rid), "stable", &packages_dir)
+            .await
+            .unwrap();
+
+        assert!(
+            store_dir.join(&v1_full_key).is_file(),
+            "base full should remain in storage"
+        );
+        assert!(
+            store_dir.join(&v2_delta_key).is_file(),
+            "delta package should be uploaded for subsequent release"
+        );
+        assert!(
+            !store_dir.join(&v2_full_key).exists(),
+            "new full package should not be uploaded once a base full exists"
+        );
+
+        let index = read_index(&store_dir);
+        let v2_entry = index
+            .releases
+            .iter()
+            .find(|release| release.version == v2 && release.rid == rid)
+            .expect("v2 release should exist in index");
+        assert_eq!(v2_entry.full_filename, v2_full_key);
+        assert_eq!(
+            v2_entry.selected_delta().expect("v2 should include delta").filename,
+            v2_delta_key
+        );
+    }
 }

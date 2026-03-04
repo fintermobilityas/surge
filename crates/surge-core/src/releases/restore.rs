@@ -322,7 +322,8 @@ async fn prefetch_artifacts_to_cache(
 }
 
 /// Compute the required artifact keys for a release index after dependency
-/// pruning. This keeps the minimum chain for each RID plus latest full.
+/// pruning. This keeps the minimum forward chain for each RID from one base
+/// full artifact plus deltas.
 #[must_use]
 pub fn required_artifacts_for_index(index: &ReleaseIndex) -> BTreeSet<String> {
     let mut by_rid: BTreeMap<&str, Vec<&ReleaseEntry>> = BTreeMap::new();
@@ -355,14 +356,6 @@ fn extend_required_artifacts_for_sorted_releases(releases: &[&ReleaseEntry], req
         if release.selected_delta().is_none() && !release.full_filename.trim().is_empty() {
             required_full_indices.push(idx);
         }
-    }
-
-    if let Some(last_full_idx) = releases
-        .iter()
-        .rposition(|release| !release.full_filename.trim().is_empty())
-        && !required_full_indices.contains(&last_full_idx)
-    {
-        required_full_indices.push(last_full_idx);
     }
 
     if required_full_indices.is_empty() {
@@ -520,9 +513,9 @@ mod tests {
         let required = required_artifacts_for_index(&index);
         assert!(required.contains(&v1.full_filename));
         assert!(required.contains(&v2_delta));
-        assert!(required.contains(&v3.full_filename));
         assert!(required.contains(&v3_delta));
         assert!(!required.contains(&v2.full_filename));
+        assert!(!required.contains(&v3.full_filename));
     }
 
     #[tokio::test]

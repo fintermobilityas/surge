@@ -7,6 +7,7 @@ repository.workspace = true
 description = "Core library for the Surge update framework"
 include = [
     "src/**/*",
+    "assets/**/*",
     "tests/**/*",
     "build.rs",
     "Cargo.toml",

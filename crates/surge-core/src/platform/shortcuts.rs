@@ -94,8 +94,7 @@ fn linux_icon_candidates(app_id: &str, app_dir: &Path, main_exe_name: &str) -> V
 
 #[cfg(target_os = "linux")]
 fn write_linux_fallback_icon(app_dir: &Path) -> Option<PathBuf> {
-    const SURGE_FALLBACK_ICON_BYTES: &[u8] =
-        include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/logo.svg"));
+    const SURGE_FALLBACK_ICON_BYTES: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/logo.svg"));
     let icon_path = app_dir.join(".surge").join("surge-logo.svg");
     if let Some(parent) = icon_path.parent()
         && std::fs::create_dir_all(parent).is_err()

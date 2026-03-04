@@ -115,6 +115,7 @@ pub async fn execute(
         &app_id,
         &rid,
         version,
+        manifest_path.parent().unwrap_or_else(|| Path::new(".")),
         artifacts_dir.as_path(),
         output_dir,
         &full_package_path,
@@ -294,6 +295,7 @@ pub async fn execute_installers_only(
         &app_id,
         &rid,
         &selected_version,
+        manifest_path.parent().unwrap_or_else(|| Path::new(".")),
         &artifacts_dir,
         output_dir,
         &full_package_path,
@@ -337,6 +339,7 @@ fn build_installers(
     app_id: &str,
     rid: &str,
     version: &str,
+    manifest_root: &Path,
     artifacts_dir: &Path,
     output_dir: &Path,
     full_package_path: &Path,
@@ -348,6 +351,7 @@ fn build_installers(
         app_id,
         rid,
         version,
+        manifest_root,
         artifacts_dir,
         output_dir,
         full_package_path,
@@ -363,6 +367,7 @@ fn build_installers_with_launcher(
     app_id: &str,
     rid: &str,
     version: &str,
+    manifest_root: &Path,
     artifacts_dir: &Path,
     output_dir: &Path,
     full_package_path: &Path,
@@ -400,20 +405,7 @@ fn build_installers_with_launcher(
         String::new()
     };
 
-    let icon_asset = if target.icon.trim().is_empty() {
-        None
-    } else {
-        let source = artifacts_dir.join(&target.icon);
-        if source.is_file() {
-            let archive_name = source
-                .file_name()
-                .map(|name| format!("assets/{}", name.to_string_lossy()))
-                .ok_or_else(|| SurgeError::Pack(format!("Invalid icon path in artifacts: {}", source.display())))?;
-            Some((source, archive_name))
-        } else {
-            None
-        }
-    };
+    let icon_asset = resolve_installer_icon_asset(&target.icon, artifacts_dir, manifest_root)?;
 
     let requires_console_launcher = installer_types.iter().any(|installer_type| !installer_type.is_gui());
     let console_launcher = if requires_console_launcher {
@@ -534,6 +526,40 @@ fn build_installers_with_launcher(
     }
 
     Ok(generated)
+}
+
+fn resolve_installer_icon_asset(
+    icon: &str,
+    artifacts_dir: &Path,
+    manifest_root: &Path,
+) -> Result<Option<(PathBuf, String)>> {
+    let icon = icon.trim();
+    if icon.is_empty() {
+        return Ok(None);
+    }
+
+    let icon_path = Path::new(icon);
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if icon_path.is_absolute() {
+        candidates.push(icon_path.to_path_buf());
+    } else {
+        candidates.push(artifacts_dir.join(icon_path));
+        candidates.push(manifest_root.join(icon_path));
+        if let Some(parent) = manifest_root.parent() {
+            candidates.push(parent.join(icon_path));
+        }
+    }
+
+    let source = candidates.into_iter().find(|candidate| candidate.is_file());
+    let Some(source) = source else {
+        return Ok(None);
+    };
+
+    let archive_name = source
+        .file_name()
+        .map(|name| format!("assets/{}", name.to_string_lossy()))
+        .ok_or_else(|| SurgeError::Pack(format!("Invalid icon path: {}", source.display())))?;
+    Ok(Some((source, archive_name)))
 }
 
 fn parse_installer_types(installers: &[String], app_id: &str, rid: &str) -> Result<Vec<InstallerType>> {
@@ -1197,6 +1223,7 @@ apps:
             app_id,
             &rid,
             version,
+            tmp.path(),
             &artifacts_dir,
             &output_dir,
             &full_package,
@@ -1269,6 +1296,7 @@ apps:
             app_id,
             &rid,
             version,
+            tmp.path(),
             &artifacts_dir,
             &output_dir,
             &full_package,
@@ -1276,6 +1304,79 @@ apps:
         )
         .expect("gui-only installer build should not require console launcher");
         assert_eq!(installers.len(), 1);
+    }
+
+    #[test]
+    fn build_installers_resolves_icon_relative_to_manifest_root_parent() {
+        let tmp = tempfile::tempdir().expect("temp dir should be created");
+
+        let store_dir = tmp.path().join("store");
+        let manifest_root = tmp.path().join(".surge");
+        let artifacts_dir = tmp.path().join("artifacts");
+        let output_dir = tmp.path().join("packages");
+        let app_id = "app-icon";
+        let rid = current_rid();
+        let version = "1.0.0";
+        let stub = create_stub_installer_launcher(tmp.path(), &rid);
+
+        std::fs::create_dir_all(&store_dir).expect("store dir should be created");
+        std::fs::create_dir_all(&manifest_root).expect("manifest root should be created");
+        std::fs::create_dir_all(&artifacts_dir).expect("artifacts dir should be created");
+        std::fs::create_dir_all(&output_dir).expect("packages dir should be created");
+
+        let icon_path = manifest_root.join("youpark.svg");
+        std::fs::write(&icon_path, b"<svg></svg>").expect("icon should be written");
+
+        let full_package = output_dir.join(format!("{app_id}-{version}-{rid}-full.tar.zst"));
+        std::fs::write(&full_package, b"full package bytes").expect("full package should be written");
+
+        let yaml = format!(
+            r"schema: 1
+storage:
+  provider: filesystem
+  bucket: {}
+apps:
+  - id: {app_id}
+    main_exe: demoapp
+    channels: [stable]
+    target:
+      rid: {rid}
+      icon: .surge/youpark.svg
+      installers: [online]
+",
+            store_dir.display(),
+            rid = rid
+        );
+        let manifest = SurgeManifest::parse(yaml.as_bytes()).expect("manifest should parse");
+        let (app, target) = manifest
+            .find_app_with_target(app_id, &rid)
+            .expect("app/target should exist in manifest");
+
+        let installers = build_installers_with_launcher(
+            &manifest,
+            app,
+            &target,
+            app_id,
+            &rid,
+            version,
+            &manifest_root,
+            &artifacts_dir,
+            &output_dir,
+            &full_package,
+            Some(&stub),
+        )
+        .expect("installer build should succeed");
+        assert_eq!(installers.len(), 1);
+
+        let installer_data = installer_payload(&installers[0]);
+        let entries = surge_core::archive::extractor::list_entries_from_bytes(&installer_data)
+            .expect("installer payload should be a valid archive");
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.path.to_string_lossy() == "assets/youpark.svg"),
+            "installer payload should contain icon asset copied from manifest-relative path"
+        );
     }
 
     #[test]

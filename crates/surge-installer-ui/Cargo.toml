@@ -17,6 +17,7 @@ egui = { workspace = true }
 image = { workspace = true }
 tokio = { workspace = true }
 serde_yaml = { workspace = true }
+resvg = { version = "0.45", default-features = false }
 
 [lints]
 workspace = true

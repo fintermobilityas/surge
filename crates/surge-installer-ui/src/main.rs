@@ -56,12 +56,16 @@ fn run() -> Result<()> {
         return run_headless(&manifest, extracted.path(), simulator);
     }
 
-    let window_icon = app::load_window_icon(extracted.path(), &manifest.runtime.icon);
+    let app_logo = app::load_app_logo(extracted.path(), &manifest.runtime.icon);
+    let window_icon = app_logo
+        .clone()
+        .unwrap_or_else(|| app::load_window_icon(extracted.path(), &manifest.runtime.icon));
 
     let gui_install_error = Arc::new(Mutex::new(None::<String>));
     match launch_gui(
         manifest.clone(),
         extracted.path().to_path_buf(),
+        app_logo,
         window_icon,
         simulator,
         Arc::clone(&gui_install_error),
@@ -96,17 +100,20 @@ fn has_display() -> bool {
 fn launch_gui(
     manifest: InstallerManifest,
     staging_dir: std::path::PathBuf,
-    window_icon: Option<egui::IconData>,
+    app_logo: Option<egui::IconData>,
+    window_icon: egui::IconData,
     simulator: bool,
     install_error: Arc<Mutex<Option<String>>>,
 ) -> std::result::Result<(), String> {
     let title = format!("Install {}", manifest.runtime.name);
+    let app_id = app::window_app_id(&manifest);
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([500.0, 440.0])
             .with_resizable(false)
-            .with_icon(window_icon.unwrap_or_default()),
+            .with_icon(window_icon)
+            .with_app_id(app_id),
         centered: true,
         ..Default::default()
     };
@@ -119,6 +126,7 @@ fn launch_gui(
             Ok(Box::new(app::InstallerApp::new(
                 manifest,
                 staging_dir,
+                app_logo,
                 simulator,
                 install_error,
             )))

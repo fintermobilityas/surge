@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::time::Duration;
 
 use serde::Serialize;
 
@@ -252,6 +253,29 @@ pub fn auto_start_after_install(
     install_root: &Path,
     active_app_dir: &Path,
 ) -> Result<u32> {
+    start_installed_application(profile, install_root, active_app_dir, true, true, false)
+}
+
+/// Launch the installed application for user-facing "Launch" actions.
+///
+/// Unlike `auto_start_after_install`, this does not pass the `--surge-installed`
+/// lifecycle argument and should keep GUI apps open for immediate use.
+pub fn launch_installed_application(
+    profile: &InstallProfile<'_>,
+    install_root: &Path,
+    active_app_dir: &Path,
+) -> Result<u32> {
+    start_installed_application(profile, install_root, active_app_dir, false, false, true)
+}
+
+fn start_installed_application(
+    profile: &InstallProfile<'_>,
+    install_root: &Path,
+    active_app_dir: &Path,
+    include_lifecycle_flag: bool,
+    prefer_supervisor: bool,
+    verify_running: bool,
+) -> Result<u32> {
     let main_exe = profile.main_exe.trim();
     if main_exe.is_empty() {
         return Err(SurgeError::Config(
@@ -262,32 +286,63 @@ pub fn auto_start_after_install(
     let exe_path = active_app_dir.join(main_exe);
 
     let supervisor_id = profile.supervisor_id.trim();
-    if !supervisor_id.is_empty() {
+    if prefer_supervisor && !supervisor_id.is_empty() {
         let supervisor_path = active_app_dir.join(crate::platform::process::supervisor_binary_name());
 
         let install_root_str = install_root.to_string_lossy();
         let exe_path_str = exe_path.to_string_lossy();
-        let args: Vec<&str> = vec![
+        let mut args: Vec<&str> = vec![
             "--supervisor-id",
             supervisor_id,
             "--install-dir",
             &install_root_str,
             "--exe-path",
             &exe_path_str,
-            "--",
-            "--surge-installed",
         ];
-        let handle = spawn_detached(&supervisor_path, &args, Some(install_root), profile.environment)?;
-        return Ok(handle.pid());
+        if include_lifecycle_flag {
+            args.push("--");
+            args.push("--surge-installed");
+        }
+        let mut handle = spawn_detached(&supervisor_path, &args, Some(install_root), profile.environment)?;
+        let pid = handle.pid();
+        if verify_running {
+            verify_process_stays_running(&mut handle, "supervisor")?;
+        }
+        return Ok(pid);
     }
 
-    let handle = spawn_detached(
-        &exe_path,
-        &["--surge-installed"],
-        Some(install_root),
-        profile.environment,
-    )?;
-    Ok(handle.pid())
+    let app_args: &[&str] = if include_lifecycle_flag {
+        &["--surge-installed"]
+    } else {
+        &[]
+    };
+    let mut handle = spawn_detached(&exe_path, app_args, Some(install_root), profile.environment)?;
+    let pid = handle.pid();
+    if verify_running {
+        verify_process_stays_running(&mut handle, "application")?;
+    }
+    Ok(pid)
+}
+
+fn verify_process_stays_running(
+    handle: &mut crate::platform::process::ProcessHandle,
+    process_label: &str,
+) -> Result<()> {
+    let check_interval = Duration::from_millis(200);
+    let total_wait = Duration::from_secs(4);
+    let checks = (total_wait.as_millis() / check_interval.as_millis()) as usize;
+
+    for _ in 0..checks {
+        std::thread::sleep(check_interval);
+        if !handle.poll_running() {
+            let result = handle.wait()?;
+            return Err(SurgeError::Platform(format!(
+                "Failed to launch {process_label}: process exited shortly after start with code {}",
+                result.exit_code
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

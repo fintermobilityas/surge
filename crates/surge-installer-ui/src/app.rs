@@ -74,6 +74,8 @@ enum Screen {
 pub struct InstallerApp {
     manifest: InstallerManifest,
     staging_dir: PathBuf,
+    app_logo: Option<egui::IconData>,
+    app_logo_texture: Option<egui::TextureHandle>,
     simulator: bool,
     install_error: Arc<Mutex<Option<String>>>,
     screen: Screen,
@@ -84,16 +86,56 @@ impl InstallerApp {
     pub fn new(
         manifest: InstallerManifest,
         staging_dir: PathBuf,
+        app_logo: Option<egui::IconData>,
         simulator: bool,
         install_error: Arc<Mutex<Option<String>>>,
     ) -> Self {
         Self {
             manifest,
             staging_dir,
+            app_logo,
+            app_logo_texture: None,
             simulator,
             install_error,
             screen: Screen::Welcome,
             progress_rx: None,
+        }
+    }
+
+    fn logo_texture(&mut self, ctx: &egui::Context) -> Option<egui::TextureHandle> {
+        if self.app_logo_texture.is_none() {
+            let logo = self.app_logo.as_ref()?;
+            let color_image =
+                egui::ColorImage::from_rgba_unmultiplied([logo.width as usize, logo.height as usize], &logo.rgba);
+            self.app_logo_texture =
+                Some(ctx.load_texture("installer-app-logo", color_image, egui::TextureOptions::LINEAR));
+        }
+
+        self.app_logo_texture.clone()
+    }
+
+    fn draw_brand_mark(&mut self, ui: &mut egui::Ui, size: f32, pulsing: bool) {
+        if let Some(texture) = self.logo_texture(ui.ctx()) {
+            let mut image = egui::Image::from_texture(&texture).fit_to_exact_size(Vec2::splat(size));
+            if pulsing {
+                let time = ui.input(|i| i.time);
+                let pulse = ((time * 1.8).sin() as f32 * 0.5 + 0.5) * 0.25 + 0.75;
+                image = image.tint(Color32::WHITE.linear_multiply(pulse));
+            }
+            ui.add(image);
+        } else {
+            if pulsing {
+                let time = ui.input(|i| i.time);
+                let pulse = ((time * 1.8).sin() as f32 * 0.5 + 0.5) * 0.3 + 0.7;
+                draw_bolt(
+                    ui,
+                    size,
+                    ACCENT.linear_multiply(pulse),
+                    ACCENT_PRESSED.linear_multiply(pulse),
+                );
+            } else {
+                draw_bolt(ui, size, ACCENT, ACCENT_PRESSED);
+            }
         }
     }
 
@@ -163,8 +205,7 @@ impl InstallerApp {
                 ui.vertical_centered(|ui| {
                     ui.add_space(h * 0.10);
 
-                    // Surge bolt
-                    draw_bolt(ui, 80.0, ACCENT, ACCENT_PRESSED);
+                    self.draw_brand_mark(ui, 80.0, false);
                     ui.add_space(20.0);
 
                     // App name
@@ -223,12 +264,12 @@ impl InstallerApp {
 
     // -- Installing ------------------------------------------------------------
 
-    fn render_installing(&self, ctx: &egui::Context) {
-        let Screen::Installing { progress, status } = &self.screen else {
-            return;
+    fn render_installing(&mut self, ctx: &egui::Context) {
+        let (target, status_text) = match &self.screen {
+            Screen::Installing { progress, status } => (*progress, status.clone()),
+            _ => return,
         };
-        let target = *progress;
-        let name = &self.manifest.runtime.name;
+        let name = self.manifest.runtime.name.clone();
 
         let animated = ctx.animate_value_with_time(Id::new("install_progress"), target, 0.3);
 
@@ -239,15 +280,7 @@ impl InstallerApp {
                 ui.vertical_centered(|ui| {
                     ui.add_space(h * 0.18);
 
-                    // Pulsing bolt
-                    let time = ui.input(|i| i.time);
-                    let pulse = ((time * 1.8).sin() as f32 * 0.5 + 0.5) * 0.3 + 0.7;
-                    draw_bolt(
-                        ui,
-                        52.0,
-                        ACCENT.linear_multiply(pulse),
-                        ACCENT_PRESSED.linear_multiply(pulse),
-                    );
+                    self.draw_brand_mark(ui, 52.0, true);
                     ui.add_space(20.0);
 
                     ui.label(
@@ -269,7 +302,7 @@ impl InstallerApp {
                     ui.add_space(6.0);
 
                     ui.label(
-                        RichText::new(status.as_str())
+                        RichText::new(status_text.as_str())
                             .font(FontId::proportional(12.0))
                             .color(TEXT_MUTED),
                     );
@@ -281,9 +314,10 @@ impl InstallerApp {
 
     // -- Complete --------------------------------------------------------------
 
-    fn render_complete(&self, ctx: &egui::Context) {
-        let Screen::Complete { install_root } = &self.screen else {
-            return;
+    fn render_complete(&mut self, ctx: &egui::Context) {
+        let install_root = match &self.screen {
+            Screen::Complete { install_root } => install_root.clone(),
+            _ => return,
         };
 
         egui::CentralPanel::default()
@@ -333,8 +367,15 @@ impl InstallerApp {
                                 &self.manifest.runtime.shortcuts,
                             );
                             let active_app_dir = install_root.join("app");
-                            let _ = core_install::auto_start_after_install(&profile, install_root, &active_app_dir);
-                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                            match core_install::launch_installed_application(&profile, &install_root, &active_app_dir) {
+                                Ok(_) => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
+                                Err(error) => {
+                                    self.screen = Screen::Error(format!(
+                                        "Failed to launch {}: {error}",
+                                        self.manifest.runtime.name
+                                    ));
+                                }
+                            }
                         }
 
                         ui.add_space(12.0);
@@ -612,17 +653,101 @@ fn draw_x_mark(ui: &mut egui::Ui, radius: f32) {
 // Icon helpers
 // ---------------------------------------------------------------------------
 
-pub fn load_window_icon(staging_dir: &Path, icon_name: &str) -> Option<egui::IconData> {
-    if icon_name.trim().is_empty() {
+pub fn load_window_icon(staging_dir: &Path, icon_name: &str) -> egui::IconData {
+    load_app_icon(staging_dir, icon_name).unwrap_or_else(default_surge_icon)
+}
+
+pub fn load_app_logo(staging_dir: &Path, icon_name: &str) -> Option<egui::IconData> {
+    load_app_icon(staging_dir, icon_name)
+}
+
+pub fn window_app_id(manifest: &InstallerManifest) -> String {
+    let preferred = manifest.runtime.install_directory.trim();
+    let fallback_name = manifest.runtime.name.trim();
+    let fallback_id = manifest.app_id.trim();
+
+    let raw = if !preferred.is_empty() {
+        preferred
+    } else if !fallback_name.is_empty() {
+        fallback_name
+    } else {
+        fallback_id
+    };
+
+    let mut normalized = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+            normalized.push(c.to_ascii_lowercase());
+        } else {
+            normalized.push('-');
+        }
+    }
+
+    let cleaned = normalized.trim_matches(['-', '.'].as_ref());
+    if cleaned.is_empty() {
+        "surge-installer".to_string()
+    } else {
+        cleaned.to_string()
+    }
+}
+
+fn load_app_icon(staging_dir: &Path, icon_name: &str) -> Option<egui::IconData> {
+    let trimmed = icon_name.trim();
+    if trimmed.is_empty() {
         return None;
     }
-    let icon_path = staging_dir.join("assets").join(icon_name);
+
+    let icon_rel = Path::new(trimmed);
+    let assets_dir = staging_dir.join("assets");
+    let mut candidates = vec![assets_dir.join(icon_rel)];
+    if let Some(file_name) = icon_rel.file_name() {
+        candidates.push(assets_dir.join(file_name));
+    }
+
+    let icon_path = candidates.into_iter().find(|candidate| candidate.is_file())?;
     let bytes = std::fs::read(&icon_path).ok()?;
-    let img = image::load_from_memory(&bytes).ok()?;
+    decode_icon(&bytes, icon_path.extension().and_then(std::ffi::OsStr::to_str))
+}
+
+fn default_surge_icon() -> egui::IconData {
+    decode_icon(include_bytes!("../../../assets/logo.svg"), Some("svg")).unwrap_or_default()
+}
+
+fn decode_icon(bytes: &[u8], extension: Option<&str>) -> Option<egui::IconData> {
+    if extension.is_some_and(|ext| ext.eq_ignore_ascii_case("svg")) || bytes.starts_with(b"<svg") {
+        return decode_svg_icon(bytes);
+    }
+
+    let img = image::load_from_memory(bytes).ok()?;
     let rgba = img.to_rgba8();
     Some(egui::IconData {
         rgba: rgba.as_raw().clone(),
         width: rgba.width(),
         height: rgba.height(),
+    })
+}
+
+fn decode_svg_icon(bytes: &[u8]) -> Option<egui::IconData> {
+    let options = resvg::usvg::Options::default();
+    let tree = resvg::usvg::Tree::from_data(bytes, &options).ok()?;
+    let size = tree.size();
+
+    const TARGET_SIZE: u32 = 128;
+    let max_dim = size.width().max(size.height());
+    if max_dim <= 0.0 {
+        return None;
+    }
+
+    let scale = (TARGET_SIZE as f32) / max_dim;
+    let width = (size.width() * scale).round().max(1.0) as u32;
+    let height = (size.height() * scale).round().max(1.0) as u32;
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)?;
+    let transform = resvg::tiny_skia::Transform::from_scale(scale, scale);
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+
+    Some(egui::IconData {
+        rgba: pixmap.data().to_vec(),
+        width,
+        height,
     })
 }

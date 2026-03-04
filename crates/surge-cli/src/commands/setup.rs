@@ -35,8 +35,17 @@ pub async fn execute(dir: &Path, no_start: bool) -> Result<()> {
     let profile = InstallProfile::from_installer_manifest(&manifest, &manifest.runtime.shortcuts);
 
     core_install::install_package_locally_at_root(&profile, package.path(), &install_root)?;
-
     let active_app_dir = install_root.join("app");
+    let runtime_manifest = core_install::RuntimeManifestMetadata::new(
+        &manifest.version,
+        &manifest.channel,
+        &manifest.storage.provider,
+        &manifest.storage.bucket,
+        &manifest.storage.region,
+        &manifest.storage.endpoint,
+    );
+    core_install::write_runtime_manifest(&active_app_dir, &profile, &runtime_manifest)?;
+
     logline::success(&format!(
         "Installed '{}' to '{}'",
         manifest.app_id,

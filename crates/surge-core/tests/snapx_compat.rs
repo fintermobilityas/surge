@@ -39,7 +39,7 @@ apps:
         - desktop
         - startup
       installers:
-        - web
+        - online
         - offline
       environment:
         OPENCV_FFMPEG_CAPTURE_OPTIONS: "rtsp_transport;tcp"
@@ -64,7 +64,7 @@ apps:
         - desktop
         - startup
       installers:
-        - web
+        - online
       environment:
         OPENCV_FFMPEG_CAPTURE_OPTIONS: "rtsp_transport;tcp"
 
@@ -88,7 +88,7 @@ apps:
         - desktop
         - startup
       installers:
-        - web
+        - online
         - offline
       environment:
         OPENCV_FFMPEG_CAPTURE_OPTIONS: "rtsp_transport;tcp"
@@ -116,7 +116,7 @@ fn parse_snapx_compat_manifest() {
         vec![ShortcutLocation::Desktop, ShortcutLocation::Startup]
     );
     assert!(target.persistent_assets.contains(&"assets".to_string()));
-    assert_eq!(target.installers, vec!["web".to_string(), "offline".to_string()]);
+    assert_eq!(target.installers, vec!["online".to_string(), "offline".to_string()]);
     assert_eq!(target.environment.get("GST_DEBUG").map(String::as_str), Some("1"));
 }
 
@@ -153,7 +153,7 @@ apps:
     icon: icon.svg
     shortcuts: [desktop]
     persistentAssets: [assets, config.json]
-    installers: [web, offline]
+    installers: [online, offline]
     environment:
       A: "1"
     targets:
@@ -173,7 +173,7 @@ apps:
         linux_x64.persistent_assets,
         vec!["assets".to_string(), "config.json".to_string()]
     );
-    assert_eq!(linux_x64.installers, vec!["web".to_string(), "offline".to_string()]);
+    assert_eq!(linux_x64.installers, vec!["online".to_string(), "offline".to_string()]);
     assert_eq!(linux_x64.environment.get("A").map(String::as_str), Some("1"));
 
     // Verify expanded child inherits name/main_exe/install_directory from parent id
@@ -236,7 +236,7 @@ apps:
     target:
       rid: linux-x64
       installers:
-        - web
+        - online
         - usb
 ";
 

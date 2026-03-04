@@ -93,16 +93,20 @@ pub enum ShortcutLocation {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InstallerType {
-    Web,
+    Online,
     Offline,
+    OnlineGui,
+    OfflineGui,
 }
 
 impl InstallerType {
     #[must_use]
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
-            "web" => Some(Self::Web),
+            "online" => Some(Self::Online),
             "offline" => Some(Self::Offline),
+            "online-gui" => Some(Self::OnlineGui),
+            "offline-gui" => Some(Self::OfflineGui),
             _ => None,
         }
     }
@@ -110,9 +114,23 @@ impl InstallerType {
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Web => "web",
+            Self::Online => "online",
             Self::Offline => "offline",
+            Self::OnlineGui => "online-gui",
+            Self::OfflineGui => "offline-gui",
         }
+    }
+
+    /// Whether this installer type uses a GUI launcher.
+    #[must_use]
+    pub fn is_gui(self) -> bool {
+        matches!(self, Self::OnlineGui | Self::OfflineGui)
+    }
+
+    /// Whether this installer type embeds the full package (offline).
+    #[must_use]
+    pub fn is_offline(self) -> bool {
+        matches!(self, Self::Offline | Self::OfflineGui)
     }
 }
 
@@ -366,7 +384,7 @@ impl SurgeManifest {
                     }
                     let installer_type = InstallerType::parse(installer).ok_or_else(|| {
                         SurgeError::Config(format!(
-                            "Unsupported installer '{}' for app '{}' target '{}'. Supported values: web, offline",
+                            "Unsupported installer '{}' for app '{}' target '{}'. Supported values: online, offline, online-gui, offline-gui",
                             installer, app.id, target.rid
                         ))
                     })?;

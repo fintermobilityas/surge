@@ -14,6 +14,7 @@ use crate::diff::wrapper::bspatch_buffers;
 use crate::error::{Result, SurgeError};
 use crate::platform::detect::current_rid;
 use crate::platform::fs::{atomic_rename, copy_directory};
+use crate::platform::process::spawn_detached;
 use crate::platform::shortcuts::install_shortcuts;
 use crate::releases::manifest::{
     ReleaseEntry, ReleaseIndex, decompress_release_index, get_delta_chain, get_releases_newer_than,
@@ -517,10 +518,13 @@ impl UpdateManager {
         if !latest.shortcuts.is_empty() {
             match install_shortcuts(
                 &self.app_id,
+                latest.display_name(&self.app_id),
                 &active_app_dir,
                 &latest.main_exe,
+                &latest.supervisor_id,
                 &latest.icon,
                 &latest.shortcuts,
+                &latest.environment,
             ) {
                 Ok(()) => {
                     debug!(version = %latest.version, "Installed shortcuts");
@@ -558,6 +562,42 @@ impl UpdateManager {
         // Clean up staging directory
         if staging_dir.exists() {
             let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+        }
+
+        // Restart supervisor after update if configured.
+        if !latest.supervisor_id.trim().is_empty() {
+            let supervisor_path = active_app_dir.join(crate::platform::process::supervisor_binary_name());
+            if supervisor_path.is_file() {
+                let exe_path = active_app_dir.join(&latest.main_exe);
+                let surge_updated_arg = format!("--surge-updated={}", self.current_version);
+                let install_dir_str = self.install_dir.to_string_lossy();
+                let exe_path_str = exe_path.to_string_lossy();
+                let args: Vec<&str> = vec![
+                    "--supervisor-id",
+                    &latest.supervisor_id,
+                    "--install-dir",
+                    &install_dir_str,
+                    "--exe-path",
+                    &exe_path_str,
+                    "--",
+                    &surge_updated_arg,
+                ];
+                match spawn_detached(&supervisor_path, &args, Some(&self.install_dir), &latest.environment) {
+                    Ok(handle) => {
+                        info!(
+                            pid = handle.pid(),
+                            supervisor_id = %latest.supervisor_id,
+                            "Restarted supervisor after update"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "Failed to restart supervisor after update (continuing)"
+                        );
+                    }
+                }
+            }
         }
 
         report(6, 100, 100);
@@ -745,6 +785,7 @@ mod tests {
             delta_sha256: String::new(),
             created_utc: String::new(),
             release_notes: String::new(),
+            name: String::new(),
             main_exe: "test-app".to_string(),
             install_directory: "test-app".to_string(),
             supervisor_id: String::new(),
@@ -1061,6 +1102,7 @@ mod tests {
                 delta_sha256: String::new(),
                 created_utc: chrono::Utc::now().to_rfc3339(),
                 release_notes: String::new(),
+                name: String::new(),
                 main_exe: "test-app".to_string(),
                 install_directory: "test-app".to_string(),
                 supervisor_id: String::new(),
@@ -1157,6 +1199,7 @@ mod tests {
                     delta_sha256: String::new(),
                     created_utc: chrono::Utc::now().to_rfc3339(),
                     release_notes: String::new(),
+                    name: String::new(),
                     main_exe: "test-app".to_string(),
                     install_directory: "test-app".to_string(),
                     supervisor_id: String::new(),
@@ -1180,6 +1223,7 @@ mod tests {
                     delta_sha256: sha256_hex(&delta_v2),
                     created_utc: chrono::Utc::now().to_rfc3339(),
                     release_notes: String::new(),
+                    name: String::new(),
                     main_exe: "test-app".to_string(),
                     install_directory: "test-app".to_string(),
                     supervisor_id: String::new(),
@@ -1203,6 +1247,7 @@ mod tests {
                     delta_sha256: sha256_hex(&delta_v3),
                     created_utc: chrono::Utc::now().to_rfc3339(),
                     release_notes: String::new(),
+                    name: String::new(),
                     main_exe: "test-app".to_string(),
                     install_directory: "test-app".to_string(),
                     supervisor_id: String::new(),
@@ -1281,6 +1326,7 @@ mod tests {
                 delta_sha256: String::new(),
                 created_utc: chrono::Utc::now().to_rfc3339(),
                 release_notes: String::new(),
+                name: String::new(),
                 main_exe: "test-app".to_string(),
                 install_directory: "test-app".to_string(),
                 supervisor_id: String::new(),
@@ -1380,6 +1426,7 @@ mod tests {
                 delta_sha256: String::new(),
                 created_utc: chrono::Utc::now().to_rfc3339(),
                 release_notes: String::new(),
+                name: String::new(),
                 main_exe: "demoapp".to_string(),
                 install_directory: "test-app".to_string(),
                 supervisor_id: String::new(),
@@ -1417,13 +1464,15 @@ mod tests {
         let installed_file = install_root.join("app").join("payload.txt");
         assert!(installed_file.exists());
 
-        let desktop_file = applications_dir.join("test-app.desktop");
-        let startup_file = autostart_dir.join("test-app.desktop");
+        // name is empty so display_name falls back to main_exe ("demoapp")
+        let desktop_file = applications_dir.join("demoapp.desktop");
+        let startup_file = autostart_dir.join("demoapp.desktop");
         assert!(desktop_file.exists());
         assert!(startup_file.exists());
 
         let desktop_content = std::fs::read_to_string(desktop_file).unwrap();
         assert!(desktop_content.contains("Icon="));
+        assert!(desktop_content.contains("Name=demoapp"));
         let stable_exe_path = install_root.join("app").join("demoapp");
         assert!(desktop_content.contains(stable_exe_path.to_string_lossy().as_ref()));
     }

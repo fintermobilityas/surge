@@ -249,6 +249,7 @@ mod tests {
             delta_sha256: String::new(),
             created_utc: String::new(),
             release_notes: String::new(),
+            name: String::new(),
             main_exe: "demo".to_string(),
             install_directory: "demo".to_string(),
             supervisor_id: String::new(),

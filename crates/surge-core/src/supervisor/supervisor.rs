@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 
 use tracing::{info, warn};
 
+use std::collections::BTreeMap;
+
 use crate::error::{Result, SurgeError};
 use crate::platform::process::{ProcessHandle, spawn_process};
 
@@ -87,7 +89,7 @@ impl Supervisor {
         let exe = Path::new(exe_path);
         let wd = Path::new(working_dir);
 
-        let handle = spawn_process(exe, args, Some(wd))?;
+        let handle = spawn_process(exe, args, Some(wd), &BTreeMap::new())?;
         self.info.pid = handle.pid();
         self.info.state = ProcessState::Running;
         self.handle = Some(handle);

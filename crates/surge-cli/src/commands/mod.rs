@@ -549,6 +549,7 @@ apps:
         assert_eq!(index.releases[0].version, version);
         assert_eq!(index.releases[0].rid, rid);
         assert_eq!(index.releases[0].channels, vec!["stable"]);
+        assert_eq!(index.releases[0].name, "Test App");
         assert_eq!(index.releases[0].main_exe, "demoapp");
         assert_eq!(index.releases[0].icon, "icon.png");
         assert_eq!(
@@ -608,6 +609,7 @@ apps:
                 delta_sha256: String::new(),
                 created_utc: String::new(),
                 release_notes: String::new(),
+                name: String::new(),
                 main_exe: "demoapp".to_string(),
                 install_directory: "demoapp".to_string(),
                 supervisor_id: String::new(),
@@ -638,5 +640,6 @@ apps:
         assert_eq!(scoped_index.releases.len(), 1);
         assert_eq!(scoped_index.releases[0].version, version);
         assert_eq!(scoped_index.releases[0].channels, vec!["test"]);
+        assert_eq!(scoped_index.releases[0].name, "App A");
     }
 }

@@ -165,7 +165,8 @@ apps:
 
     let manifest = SurgeManifest::parse(yaml).unwrap();
 
-    let linux_x64 = manifest.find_target("quasar", "linux-x64").unwrap();
+    // Multi-target apps with `id` get expanded: quasar-linux-x64, quasar-linux-arm64
+    let linux_x64 = manifest.find_target("quasar-linux-x64", "linux-x64").unwrap();
     assert_eq!(linux_x64.icon, "icon.svg");
     assert_eq!(linux_x64.shortcuts, vec![ShortcutLocation::Desktop]);
     assert_eq!(
@@ -175,7 +176,13 @@ apps:
     assert_eq!(linux_x64.installers, vec!["web".to_string(), "offline".to_string()]);
     assert_eq!(linux_x64.environment.get("A").map(String::as_str), Some("1"));
 
-    let linux_arm64 = manifest.find_target("quasar", "linux-arm64").unwrap();
+    // Verify expanded child inherits name/main_exe/install_directory from parent id
+    let app_x64 = manifest.find_app("quasar-linux-x64").unwrap();
+    assert_eq!(app_x64.effective_name(), "quasar");
+    assert_eq!(app_x64.effective_main_exe(), "quasar");
+    assert_eq!(app_x64.effective_install_directory(), "quasar");
+
+    let linux_arm64 = manifest.find_target("quasar-linux-arm64", "linux-arm64").unwrap();
     assert_eq!(linux_arm64.environment.get("A").map(String::as_str), Some("1"));
     assert_eq!(linux_arm64.environment.get("B").map(String::as_str), Some("2"));
 }

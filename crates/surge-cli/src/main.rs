@@ -310,6 +310,10 @@ struct InstallOptions {
     #[arg(long)]
     plan_only: bool,
 
+    /// Do not start the application after installation
+    #[arg(long)]
+    no_start: bool,
+
     /// Local cache directory for downloaded packages
     #[arg(long, default_value = ".surge/install-cache")]
     download_dir: PathBuf,
@@ -575,6 +579,7 @@ async fn run(cli: Cli) -> surge_core::error::Result<()> {
                 options.rid.as_deref(),
                 options.version.as_deref(),
                 options.plan_only,
+                options.no_start,
                 &options.download_dir,
                 commands::install::StorageOverrides {
                     provider: options.provider.as_deref(),

@@ -39,6 +39,8 @@ pub struct ReleaseEntry {
     #[serde(default)]
     pub release_notes: String,
     #[serde(default)]
+    pub name: String,
+    #[serde(default)]
     pub main_exe: String,
     #[serde(default)]
     pub install_directory: String,
@@ -54,6 +56,20 @@ pub struct ReleaseEntry {
     pub installers: Vec<String>,
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
+}
+
+impl ReleaseEntry {
+    /// Returns the best display name, falling back through `name → main_exe → app_id`.
+    #[must_use]
+    pub fn display_name<'a>(&'a self, app_id: &'a str) -> &'a str {
+        if !self.name.is_empty() {
+            return &self.name;
+        }
+        if !self.main_exe.is_empty() {
+            return &self.main_exe;
+        }
+        app_id
+    }
 }
 
 /// The top-level release index (releases.yml).
@@ -208,6 +224,7 @@ mod tests {
             delta_sha256: if has_delta { "def456".to_string() } else { String::new() },
             created_utc: "2025-01-01T00:00:00Z".to_string(),
             release_notes: String::new(),
+            name: String::new(),
             main_exe: "test-app".to_string(),
             install_directory: "test-app".to_string(),
             supervisor_id: String::new(),

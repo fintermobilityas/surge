@@ -156,6 +156,7 @@ mod tests {
             delta_sha256: String::new(),
             created_utc: "2025-01-01T00:00:00Z".to_string(),
             release_notes: String::new(),
+            name: String::new(),
             main_exe: "test-app".to_string(),
             install_directory: "test-app".to_string(),
             supervisor_id: String::new(),

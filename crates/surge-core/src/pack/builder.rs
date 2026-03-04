@@ -41,6 +41,7 @@ pub struct PackBuilder {
     app_id: String,
     rid: String,
     version: String,
+    name: String,
     main_exe: String,
     install_directory: String,
     supervisor_id: String,
@@ -118,6 +119,7 @@ impl PackBuilder {
             app_id: app_id.to_string(),
             rid: rid.to_string(),
             version: version.to_string(),
+            name: app.effective_name(),
             main_exe,
             install_directory: app.effective_install_directory(),
             supervisor_id: app.supervisor_id.clone(),
@@ -237,6 +239,16 @@ impl PackBuilder {
 
         let mut packer = ArchivePacker::new(budget.zstd_compression_level)?;
         packer.add_directory(&self.artifacts_dir, "")?;
+
+        // Bundle surge-supervisor if supervisor_id is configured and not already in artifacts.
+        if !self.supervisor_id.trim().is_empty() {
+            let supervisor_name = supervisor_binary_name_for_rid(&self.rid);
+            if !self.artifacts_dir.join(supervisor_name).is_file() {
+                let supervisor_source = find_supervisor_binary(supervisor_name)?;
+                packer.add_file(&supervisor_source, supervisor_name)?;
+            }
+        }
+
         packer.finalize_to_file(&output_path)?;
 
         let sha256 = sha256_hex_file(&output_path)?;
@@ -337,6 +349,7 @@ impl PackBuilder {
             delta_sha256: delta.map_or(String::new(), |a| a.sha256.clone()),
             created_utc: chrono::Utc::now().to_rfc3339(),
             release_notes: String::new(),
+            name: self.name.clone(),
             main_exe: self.main_exe.clone(),
             install_directory: self.install_directory.clone(),
             supervisor_id: self.supervisor_id.clone(),
@@ -403,6 +416,32 @@ fn detect_os_from_rid(rid: &str) -> String {
     rid.split('-').next().unwrap_or("unknown").to_string()
 }
 
+fn supervisor_binary_name() -> &'static str {
+    crate::platform::process::supervisor_binary_name()
+}
+
+fn supervisor_binary_name_for_rid(rid: &str) -> &'static str {
+    match rid.split('-').next().unwrap_or_default() {
+        "win" | "windows" => "surge-supervisor.exe",
+        "linux" | "osx" | "macos" => "surge-supervisor",
+        _ => supervisor_binary_name(),
+    }
+}
+
+fn find_supervisor_binary(name: &str) -> Result<PathBuf> {
+    if let Ok(current_exe) = std::env::current_exe()
+        && let Some(parent) = current_exe.parent()
+    {
+        let candidate = parent.join(name);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+    Err(SurgeError::Pack(format!(
+        "Supervisor binary '{name}' is required (supervisor_id is configured) but was not found next to the surge binary"
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,6 +458,13 @@ mod tests {
         assert_eq!(detect_os_from_rid("win-arm64"), "win");
         assert_eq!(detect_os_from_rid("osx-x64"), "osx");
         assert_eq!(detect_os_from_rid("unknown"), "unknown");
+    }
+
+    #[test]
+    fn test_supervisor_binary_name_follows_target_rid() {
+        assert_eq!(supervisor_binary_name_for_rid("linux-x64"), "surge-supervisor");
+        assert_eq!(supervisor_binary_name_for_rid("osx-arm64"), "surge-supervisor");
+        assert_eq!(supervisor_binary_name_for_rid("win-x64"), "surge-supervisor.exe");
     }
 
     #[test]
@@ -537,6 +583,7 @@ apps:
                     delta_sha256: String::new(),
                     created_utc: chrono::Utc::now().to_rfc3339(),
                     release_notes: String::new(),
+                    name: String::new(),
                     main_exe: app_id.to_string(),
                     install_directory: app_id.to_string(),
                     supervisor_id: String::new(),
@@ -560,6 +607,7 @@ apps:
                     delta_sha256: sha256_hex(&delta_v2),
                     created_utc: chrono::Utc::now().to_rfc3339(),
                     release_notes: String::new(),
+                    name: String::new(),
                     main_exe: app_id.to_string(),
                     install_directory: app_id.to_string(),
                     supervisor_id: String::new(),

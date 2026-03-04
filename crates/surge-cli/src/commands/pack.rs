@@ -324,6 +324,7 @@ struct InstallerRelease {
 
 #[derive(Debug, Serialize)]
 struct InstallerRuntime {
+    name: String,
     main_exe: String,
     install_directory: String,
     supervisor_id: String,
@@ -423,6 +424,7 @@ fn build_installers(
                 delta_filename: delta_filename.clone(),
             },
             runtime: InstallerRuntime {
+                name: app.effective_name(),
                 main_exe: app.effective_main_exe(),
                 install_directory: app.effective_install_directory(),
                 supervisor_id: app.supervisor_id.clone(),
@@ -594,6 +596,7 @@ apps:
             delta_sha256: String::new(),
             created_utc: String::new(),
             release_notes: String::new(),
+            name: String::new(),
             main_exe: "demoapp".to_string(),
             install_directory: "demoapp".to_string(),
             supervisor_id: String::new(),

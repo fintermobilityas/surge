@@ -33,6 +33,7 @@ pub async fn execute(
     let (app, target) = manifest
         .find_app_with_target(&app_id, &rid)
         .ok_or_else(|| SurgeError::Config(format!("Target '{rid}' not found for app '{app_id}'")))?;
+    let name = app.effective_name();
     let main_exe = app.effective_main_exe();
     let install_directory = app.effective_install_directory();
     let supervisor_id = app.supervisor_id.clone();
@@ -129,6 +130,7 @@ pub async fn execute(
         delta_filename,
         delta_size,
         delta_sha256,
+        name,
         main_exe,
         install_directory,
         supervisor_id,
@@ -180,6 +182,7 @@ async fn update_release_index(
     delta_filename: String,
     delta_size: i64,
     delta_sha256: String,
+    name: String,
     main_exe: String,
     install_directory: String,
     supervisor_id: String,
@@ -243,6 +246,7 @@ async fn update_release_index(
         delta_sha256,
         created_utc: chrono::Utc::now().to_rfc3339(),
         release_notes: String::new(),
+        name,
         main_exe,
         install_directory,
         supervisor_id,

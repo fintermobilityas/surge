@@ -470,6 +470,7 @@ mod tests {
             delta_sha256: String::new(),
             created_utc: "2026-03-03T14:00:00Z".to_string(),
             release_notes: String::new(),
+            name: String::new(),
             main_exe: String::new(),
             install_directory: String::new(),
             supervisor_id: String::new(),

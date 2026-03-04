@@ -150,41 +150,73 @@ impl SurgeManifest {
         Ok(manifest)
     }
 
-    /// Expands multi-target apps with no explicit ID into separate single-target
-    /// apps with IDs derived as `{main}-{distro}-{rid}[-{variant}]`.
+    /// Expands multi-target apps into separate single-target apps.
+    ///
+    /// When an app has more than one target and no explicit `id`, IDs are
+    /// derived as `{main}-{distro}-{rid}[-{variant}]`. When `id` is set,
+    /// the base is `{id}-{distro}-{rid}[-{variant}]` and child apps inherit
+    /// `name`, `main_exe`, `install_directory` from the parent when empty.
+    ///
     /// Also collects channels from apps when top-level channels are empty.
     fn normalize(&mut self) {
-        // Expand apps: split multi-target apps without explicit IDs.
         let mut expanded = Vec::new();
         for app in std::mem::take(&mut self.apps) {
-            if !app.id.is_empty() {
-                expanded.push(app);
-                continue;
-            }
-
             let targets: Vec<TargetConfig> = app.iter_targets().cloned().collect();
-            if targets.is_empty() {
+
+            // Single-target apps can still derive an id when omitted.
+            if targets.len() <= 1 {
+                let mut app = app;
+                if app.id.trim().is_empty()
+                    && let Some(target) = targets.first()
+                {
+                    let base = if app.main_exe.trim().is_empty() {
+                        app.name.as_str()
+                    } else {
+                        app.main_exe.as_str()
+                    };
+                    if !base.trim().is_empty() {
+                        app.id = derive_target_app_id(base, target);
+                    }
+                }
                 expanded.push(app);
                 continue;
             }
 
-            let main = if app.main_exe.is_empty() {
-                &app.name
+            // Multi-target: derive an id per target.
+            let base = if !app.id.trim().is_empty() {
+                app.id.as_str()
+            } else if !app.main_exe.trim().is_empty() {
+                app.main_exe.as_str()
             } else {
-                &app.main_exe
+                app.name.as_str()
             };
+
+            // Compute inherited fields once (loop-invariant).
+            let has_id = !app.id.is_empty();
+            let child_name = if app.name.is_empty() && has_id {
+                app.id.clone()
+            } else {
+                app.name.clone()
+            };
+            let child_main_exe = if app.main_exe.is_empty() && has_id {
+                app.id.clone()
+            } else {
+                app.main_exe.clone()
+            };
+            let child_install_dir = if app.install_directory.is_empty() && has_id {
+                app.id.clone()
+            } else {
+                app.install_directory.clone()
+            };
+
             for target in targets {
-                let mut derived_id = format!("{}-{}-{}", main, target.distro, target.rid);
-                if !target.variant.is_empty() {
-                    derived_id.push('-');
-                    derived_id.push_str(&target.variant);
-                }
+                let derived_id = derive_target_app_id(base, &target);
 
                 expanded.push(AppConfig {
                     id: derived_id,
-                    name: app.name.clone(),
-                    main_exe: app.main_exe.clone(),
-                    install_directory: app.install_directory.clone(),
+                    name: child_name.clone(),
+                    main_exe: child_main_exe.clone(),
+                    install_directory: child_install_dir.clone(),
                     supervisor_id: app.supervisor_id.clone(),
                     channels: app.channels.clone(),
                     os: app.os.clone(),
@@ -401,6 +433,20 @@ impl SurgeManifest {
     }
 }
 
+fn derive_target_app_id(base: &str, target: &TargetConfig) -> String {
+    let base = base.trim();
+    let mut derived = if target.distro.trim().is_empty() {
+        format!("{base}-{}", target.rid)
+    } else {
+        format!("{base}-{}-{}", target.distro, target.rid)
+    };
+    if !target.variant.trim().is_empty() {
+        derived.push('-');
+        derived.push_str(&target.variant);
+    }
+    derived
+}
+
 impl AppConfig {
     fn iter_targets(&self) -> impl Iterator<Item = &TargetConfig> {
         self.target.iter().chain(self.targets.iter())
@@ -408,6 +454,17 @@ impl AppConfig {
 
     fn find_target(&self, rid: &str) -> Option<&TargetConfig> {
         self.iter_targets().find(|target| target.rid == rid)
+    }
+
+    #[must_use]
+    pub fn effective_name(&self) -> String {
+        if !self.name.trim().is_empty() {
+            return self.name.clone();
+        }
+        if !self.main_exe.trim().is_empty() {
+            return self.main_exe.clone();
+        }
+        self.id.clone()
     }
 
     #[must_use]
@@ -421,11 +478,13 @@ impl AppConfig {
 
     #[must_use]
     pub fn effective_install_directory(&self) -> String {
-        if self.install_directory.trim().is_empty() {
-            self.id.clone()
-        } else {
-            self.install_directory.clone()
+        if !self.install_directory.trim().is_empty() {
+            return self.install_directory.clone();
         }
+        if !self.main_exe.trim().is_empty() {
+            return self.main_exe.clone();
+        }
+        self.id.clone()
     }
 
     /// Inherits app-level defaults into the target where fields are empty.
@@ -581,4 +640,47 @@ fn validate_persistent_asset(path: &str, app_id: &str, rid: &str) -> Result<()> 
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SurgeManifest;
+
+    #[test]
+    fn parse_derives_single_target_id_when_missing() {
+        let yaml = br"schema: 1
+storage:
+  provider: filesystem
+  bucket: /tmp/store
+apps:
+  - main: demoapp
+    target:
+      rid: linux-x64
+      distro: ubuntu24.04
+      variant: cuda
+";
+
+        let manifest = SurgeManifest::parse(yaml).expect("manifest should parse");
+        assert_eq!(manifest.apps.len(), 1);
+        assert_eq!(manifest.apps[0].id, "demoapp-ubuntu24.04-linux-x64-cuda");
+    }
+
+    #[test]
+    fn parse_preserves_explicit_single_target_id() {
+        let yaml = br"schema: 1
+storage:
+  provider: filesystem
+  bucket: /tmp/store
+apps:
+  - id: explicit-id
+    main: demoapp
+    target:
+      rid: linux-x64
+      distro: ubuntu24.04
+";
+
+        let manifest = SurgeManifest::parse(yaml).expect("manifest should parse");
+        assert_eq!(manifest.apps.len(), 1);
+        assert_eq!(manifest.apps[0].id, "explicit-id");
+    }
 }

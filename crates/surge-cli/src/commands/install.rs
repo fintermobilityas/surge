@@ -8,6 +8,7 @@ use surge_core::config::constants::RELEASES_FILE_COMPRESSED;
 use surge_core::config::manifest::SurgeManifest;
 use surge_core::error::{Result, SurgeError};
 use surge_core::platform::paths::default_install_root;
+use surge_core::platform::process::spawn_detached;
 use surge_core::platform::shortcuts::install_shortcuts;
 use surge_core::releases::manifest::{ReleaseEntry, ReleaseIndex, decompress_release_index};
 use surge_core::releases::restore::restore_full_archive_for_version;
@@ -52,6 +53,7 @@ pub async fn execute(
     rid: Option<&str>,
     version: Option<&str>,
     plan_only: bool,
+    no_start: bool,
     download_dir: &Path,
     overrides: StorageOverrides<'_>,
 ) -> Result<()> {
@@ -196,6 +198,18 @@ pub async fn execute(
                 install_root.display(),
                 active_app_dir.display()
             ));
+
+            if !no_start && !plan_only {
+                let display_name = release.display_name(&app_id);
+                match auto_start_after_install(release, &install_root, &active_app_dir) {
+                    Ok(pid) => {
+                        logline::success(&format!("Started '{display_name}' (pid {pid})."));
+                    }
+                    Err(e) => {
+                        logline::warn(&format!("Auto-start failed: {e}"));
+                    }
+                }
+            }
         }
         InstallTarget::Tailscale { file_target, .. } => {
             copy_file_to_tailscale_node(file_target, &local_package).await?;
@@ -293,7 +307,16 @@ fn install_package_locally_at_root(
                 release.version, app_id
             )));
         }
-        install_shortcuts(app_id, &active_app_dir, main_exe, &release.icon, &release.shortcuts)?;
+        install_shortcuts(
+            app_id,
+            release.display_name(app_id),
+            &active_app_dir,
+            main_exe,
+            &release.supervisor_id,
+            &release.icon,
+            &release.shortcuts,
+            &release.environment,
+        )?;
     }
 
     if previous_app_dir.is_dir() {
@@ -301,6 +324,49 @@ fn install_package_locally_at_root(
     }
 
     Ok(())
+}
+
+fn auto_start_after_install(
+    release: &ReleaseEntry,
+    install_root: &std::path::Path,
+    active_app_dir: &std::path::Path,
+) -> Result<u32> {
+    let main_exe = release.main_exe.trim();
+    if main_exe.is_empty() {
+        return Err(SurgeError::Config(
+            "Cannot auto-start: no main executable in release metadata".to_string(),
+        ));
+    }
+
+    let exe_path = active_app_dir.join(main_exe);
+
+    let supervisor_id = release.supervisor_id.trim();
+    if !supervisor_id.is_empty() {
+        let supervisor_path = active_app_dir.join(surge_core::platform::process::supervisor_binary_name());
+
+        let install_root_str = install_root.to_string_lossy();
+        let exe_path_str = exe_path.to_string_lossy();
+        let args: Vec<&str> = vec![
+            "--supervisor-id",
+            supervisor_id,
+            "--install-dir",
+            &install_root_str,
+            "--exe-path",
+            &exe_path_str,
+            "--",
+            "--surge-installed",
+        ];
+        let handle = spawn_detached(&supervisor_path, &args, Some(install_root), &release.environment)?;
+        return Ok(handle.pid());
+    }
+
+    let handle = spawn_detached(
+        &exe_path,
+        &["--surge-installed"],
+        Some(install_root),
+        &release.environment,
+    )?;
+    Ok(handle.pid())
 }
 
 fn build_storage_config_with_overrides(
@@ -586,6 +652,7 @@ mod tests {
             delta_sha256: String::new(),
             created_utc: String::new(),
             release_notes: String::new(),
+            name: String::new(),
             main_exe: String::new(),
             install_directory: String::new(),
             supervisor_id: String::new(),

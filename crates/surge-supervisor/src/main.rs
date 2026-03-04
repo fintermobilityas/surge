@@ -93,6 +93,17 @@ fn run(cli: &Cli) -> Result<(), SupervisorError> {
     // Install signal handlers
     let shutdown = install_signal_handlers();
 
+    // Separate one-shot lifecycle args (--surge-*) from regular args.
+    // On the first child start, all args are passed. After that, lifecycle
+    // args are drained so crash-restarts don't re-fire lifecycle callbacks.
+    let mut lifecycle_args: Vec<String> = cli.args.iter().filter(|a| a.starts_with("--surge-")).cloned().collect();
+    let regular_args: Vec<String> = cli
+        .args
+        .iter()
+        .filter(|a| !a.starts_with("--surge-"))
+        .cloned()
+        .collect();
+
     // Main supervision loop
     loop {
         if shutdown.load(std::sync::atomic::Ordering::Acquire) || stop_file.exists() {
@@ -100,11 +111,14 @@ fn run(cli: &Cli) -> Result<(), SupervisorError> {
             break;
         }
 
+        let mut child_args = regular_args.clone();
+        child_args.append(&mut lifecycle_args);
+
         tracing::info!("Starting child process: {}", cli.exe_path.display());
 
         let mut child = Command::new(&cli.exe_path)
             .current_dir(&cli.install_dir)
-            .args(&cli.args)
+            .args(&child_args)
             .spawn()?;
 
         tracing::info!("Child process started with PID {}", child.id());

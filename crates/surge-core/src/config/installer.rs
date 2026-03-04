@@ -4,11 +4,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::manifest::ShortcutLocation;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstallerUi {
+    Console,
+    Egui,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstallerManifest {
     pub schema: i32,
     pub format: String,
-    pub ui: String,
+    pub ui: InstallerUi,
     pub installer_type: String,
     pub app_id: String,
     pub rid: String,

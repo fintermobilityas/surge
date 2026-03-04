@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::archive::extractor::extract_file_to;
+use crate::config::installer::InstallerManifest;
 use crate::config::manifest::ShortcutLocation;
 use crate::error::{Result, SurgeError};
 use crate::platform::paths::default_install_root;
@@ -19,6 +20,45 @@ pub struct InstallProfile<'a> {
     pub icon: &'a str,
     pub shortcuts: &'a [ShortcutLocation],
     pub environment: &'a BTreeMap<String, String>,
+}
+
+impl<'a> InstallProfile<'a> {
+    #[must_use]
+    pub fn new(
+        app_id: &'a str,
+        display_name: &'a str,
+        main_exe: &'a str,
+        install_directory: &'a str,
+        supervisor_id: &'a str,
+        icon: &'a str,
+        shortcuts: &'a [ShortcutLocation],
+        environment: &'a BTreeMap<String, String>,
+    ) -> Self {
+        Self {
+            app_id,
+            display_name,
+            main_exe,
+            install_directory,
+            supervisor_id,
+            icon,
+            shortcuts,
+            environment,
+        }
+    }
+
+    #[must_use]
+    pub fn from_installer_manifest(manifest: &'a InstallerManifest, shortcuts: &'a [ShortcutLocation]) -> Self {
+        Self::new(
+            &manifest.app_id,
+            &manifest.runtime.name,
+            &manifest.runtime.main_exe,
+            &manifest.runtime.install_directory,
+            &manifest.runtime.supervisor_id,
+            &manifest.runtime.icon,
+            shortcuts,
+            &manifest.runtime.environment,
+        )
+    }
 }
 
 /// Resolve the install root and install the package there.

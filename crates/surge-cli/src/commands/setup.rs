@@ -32,16 +32,7 @@ pub async fn execute(dir: &Path, no_start: bool) -> Result<()> {
 
     let package = resolve_package(dir, &manifest).await?;
 
-    let profile = InstallProfile {
-        app_id: &manifest.app_id,
-        display_name: &manifest.runtime.name,
-        main_exe: &manifest.runtime.main_exe,
-        install_directory: &manifest.runtime.install_directory,
-        supervisor_id: &manifest.runtime.supervisor_id,
-        icon: &manifest.runtime.icon,
-        shortcuts: &manifest.runtime.shortcuts,
-        environment: &manifest.runtime.environment,
-    };
+    let profile = InstallProfile::from_installer_manifest(&manifest, &manifest.runtime.shortcuts);
 
     core_install::install_package_locally_at_root(&profile, package.path(), &install_root)?;
 

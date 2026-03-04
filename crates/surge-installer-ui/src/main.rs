@@ -132,16 +132,7 @@ fn run_headless(manifest: &InstallerManifest, staging_dir: &std::path::Path, sim
     let install_root = install::run_headless(manifest, staging_dir, None, &shortcuts, simulator)
         .map_err(|e| SurgeError::Pack(format!("Headless install failed: {e}")))?;
 
-    let profile = surge_core::install::InstallProfile {
-        app_id: &manifest.app_id,
-        display_name: &manifest.runtime.name,
-        main_exe: &manifest.runtime.main_exe,
-        install_directory: &manifest.runtime.install_directory,
-        supervisor_id: &manifest.runtime.supervisor_id,
-        icon: &manifest.runtime.icon,
-        shortcuts: &manifest.runtime.shortcuts,
-        environment: &manifest.runtime.environment,
-    };
+    let profile = surge_core::install::InstallProfile::from_installer_manifest(manifest, &manifest.runtime.shortcuts);
     let active_app_dir = install_root.join("app");
     match surge_core::install::auto_start_after_install(&profile, &install_root, &active_app_dir) {
         Ok(pid) => eprintln!("Started '{}' (pid {pid})", manifest.runtime.name),

@@ -234,14 +234,14 @@ pub async fn restore_full_archive_for_version_with_options(
                 report_progress(items_done, bytes_done);
             }
 
-            let patch = match decode_delta_patch(delta_compressed.as_slice(), &delta) {
+            let patch = match decode_delta_patch(delta_compressed.as_slice(), delta) {
                 Ok(data) => data,
                 Err(_) => {
                     chain_valid = false;
                     break;
                 }
             };
-            candidate = match apply_delta_patch(&candidate, &patch, &delta) {
+            candidate = match apply_delta_patch(&candidate, &patch, delta) {
                 Ok(bytes) => bytes,
                 Err(_) => {
                     chain_valid = false;

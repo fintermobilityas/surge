@@ -7,7 +7,9 @@ use crate::logline;
 use crate::ui::UiTheme;
 use surge_core::archive::packer::ArchivePacker;
 use surge_core::config::constants::{DEFAULT_ZSTD_LEVEL, RELEASES_FILE_COMPRESSED};
-use surge_core::config::installer::{InstallerManifest, InstallerRelease, InstallerRuntime, InstallerStorage};
+use surge_core::config::installer::{
+    InstallerManifest, InstallerRelease, InstallerRuntime, InstallerStorage, InstallerUi,
+};
 use surge_core::config::manifest::{AppConfig, InstallerType, SurgeManifest, TargetConfig};
 use surge_core::context::Context;
 use surge_core::error::{Result, SurgeError};
@@ -438,11 +440,15 @@ fn build_installers_with_launcher(
             tempfile::tempdir().map_err(|e| SurgeError::Pack(format!("Failed to create staging directory: {e}")))?;
         let staging = staging_dir.path();
 
-        let ui_mode = if installer_type.is_gui() { "egui" } else { "console" };
+        let ui_mode = if installer_type.is_gui() {
+            InstallerUi::Egui
+        } else {
+            InstallerUi::Console
+        };
         let manifest_payload = InstallerManifest {
             schema: 1,
             format: "surge-installer-v1".to_string(),
-            ui: ui_mode.to_string(),
+            ui: ui_mode,
             installer_type: installer_type.as_str().to_string(),
             app_id: app_id.to_string(),
             rid: rid.to_string(),
@@ -621,76 +627,71 @@ pub(crate) fn set_surge_installer_ui_launcher_override_for_test(path: &Path) {
 }
 
 fn find_installer_launcher_for_rid(rid: &str, override_path: Option<&Path>) -> Result<PathBuf> {
-    ensure_host_compatible_rid(rid)?;
-    if let Some(p) = override_path {
-        if p.is_file() {
-            return Ok(p.to_path_buf());
-        }
-        return Err(SurgeError::Pack(format!(
-            "Provided installer launcher path '{}' does not exist",
-            p.display()
-        )));
-    }
-
-    let thread_override = SURGE_INSTALLER_LAUNCHER_OVERRIDE.with(|cell| cell.borrow().clone());
-    if let Some(p) = thread_override
-        && p.is_file()
-    {
-        return Ok(p);
-    }
-
-    if let Ok(path) = std::env::var("SURGE_INSTALLER_LAUNCHER") {
-        let p = PathBuf::from(&path);
-        if p.is_file() {
-            return Ok(p);
-        }
-        return Err(SurgeError::Pack(format!(
-            "SURGE_INSTALLER_LAUNCHER points to '{}' which does not exist",
-            p.display()
-        )));
-    }
-
-    let launcher_name = installer_launcher_name_for_rid(rid);
-    if let Ok(current_exe) = std::env::current_exe()
-        && let Some(parent) = current_exe.parent()
-    {
-        let candidate = parent.join(launcher_name);
-        if candidate.is_file() {
-            return Ok(candidate);
-        }
-    }
-
-    if let Ok(found) = which::which(launcher_name) {
-        return Ok(found);
-    }
-
-    Err(SurgeError::Pack(format!(
-        "Installer launcher '{launcher_name}' not found. Build 'surge-installer' and place it next to surge, add it to PATH, or set SURGE_INSTALLER_LAUNCHER."
-    )))
+    find_launcher_for_rid(
+        rid,
+        override_path,
+        SURGE_INSTALLER_LAUNCHER_OVERRIDE.with(|cell| cell.borrow().clone()),
+        "SURGE_INSTALLER_LAUNCHER",
+        installer_launcher_name_for_rid,
+        Some("installer launcher"),
+        "Installer launcher",
+        "surge-installer",
+    )
 }
 
 fn find_gui_installer_launcher_for_rid(rid: &str) -> Result<PathBuf> {
+    find_launcher_for_rid(
+        rid,
+        None,
+        SURGE_INSTALLER_UI_LAUNCHER_OVERRIDE.with(|cell| cell.borrow().clone()),
+        "SURGE_INSTALLER_UI_LAUNCHER",
+        gui_installer_launcher_name_for_rid,
+        None,
+        "GUI installer launcher",
+        "surge-installer-ui",
+    )
+}
+
+fn find_launcher_for_rid(
+    rid: &str,
+    override_path: Option<&Path>,
+    thread_override: Option<PathBuf>,
+    env_var: &str,
+    launcher_name_for_rid: fn(&str) -> &'static str,
+    override_label: Option<&str>,
+    not_found_label: &str,
+    build_binary: &str,
+) -> Result<PathBuf> {
     ensure_host_compatible_rid(rid)?;
-
-    let thread_override = SURGE_INSTALLER_UI_LAUNCHER_OVERRIDE.with(|cell| cell.borrow().clone());
-    if let Some(p) = thread_override
-        && p.is_file()
-    {
-        return Ok(p);
-    }
-
-    if let Ok(path) = std::env::var("SURGE_INSTALLER_UI_LAUNCHER") {
-        let p = PathBuf::from(&path);
-        if p.is_file() {
-            return Ok(p);
+    if let Some(path) = override_path {
+        if path.is_file() {
+            return Ok(path.to_path_buf());
         }
+        let label = override_label.unwrap_or("launcher");
         return Err(SurgeError::Pack(format!(
-            "SURGE_INSTALLER_UI_LAUNCHER points to '{}' which does not exist",
-            p.display()
+            "Provided {label} path '{}' does not exist",
+            path.display()
         )));
     }
 
-    let launcher_name = gui_installer_launcher_name_for_rid(rid);
+    if let Some(path) = thread_override
+        && path.is_file()
+    {
+        return Ok(path);
+    }
+
+    if let Ok(path) = std::env::var(env_var) {
+        let candidate = PathBuf::from(&path);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+        return Err(SurgeError::Pack(format!(
+            "{env_var} points to '{}' which does not exist",
+            candidate.display()
+        )));
+    }
+
+    let launcher_name = launcher_name_for_rid(rid);
     if let Ok(current_exe) = std::env::current_exe()
         && let Some(parent) = current_exe.parent()
     {
@@ -705,7 +706,7 @@ fn find_gui_installer_launcher_for_rid(rid: &str) -> Result<PathBuf> {
     }
 
     Err(SurgeError::Pack(format!(
-        "GUI installer launcher '{launcher_name}' not found. Build 'surge-installer-ui' and place it next to surge, add it to PATH, or set SURGE_INSTALLER_UI_LAUNCHER."
+        "{not_found_label} '{launcher_name}' not found. Build '{build_binary}' and place it next to surge, add it to PATH, or set {env_var}."
     )))
 }
 

@@ -110,8 +110,7 @@ pub async fn execute(
     let storage_config = build_storage_config_with_overrides(&manifest, &app_id, overrides)?;
     let backend = storage::create_storage_backend(&storage_config)?;
     logline::info(&format!(
-        "Fetching release index '{}' from storage backend...",
-        RELEASES_FILE_COMPRESSED
+        "Fetching release index '{RELEASES_FILE_COMPRESSED}' from storage backend..."
     ));
     let index_fetch_started = Instant::now();
     let (index, index_found) = fetch_release_index(&*backend).await?;
@@ -123,8 +122,7 @@ pub async fn execute(
         ));
     } else {
         logline::warn(&format!(
-            "Release index '{}' was not found ({}ms).",
-            RELEASES_FILE_COMPRESSED, index_fetch_elapsed_ms
+            "Release index '{RELEASES_FILE_COMPRESSED}' was not found ({index_fetch_elapsed_ms}ms)."
         ));
     }
     if !index.app_id.is_empty() && index.app_id != app_id {
@@ -403,16 +401,16 @@ fn load_install_manifest(application_manifest_path: &Path, fallback_manifest_pat
 }
 
 fn release_install_profile<'a>(app_id: &'a str, release: &'a ReleaseEntry) -> InstallProfile<'a> {
-    InstallProfile {
+    InstallProfile::new(
         app_id,
-        display_name: release.display_name(app_id),
-        main_exe: &release.main_exe,
-        install_directory: &release.install_directory,
-        supervisor_id: &release.supervisor_id,
-        icon: &release.icon,
-        shortcuts: &release.shortcuts,
-        environment: &release.environment,
-    }
+        release.display_name(app_id),
+        &release.main_exe,
+        &release.install_directory,
+        &release.supervisor_id,
+        &release.icon,
+        &release.shortcuts,
+        &release.environment,
+    )
 }
 
 fn install_package_locally(app_id: &str, release: &ReleaseEntry, package_path: &Path) -> Result<std::path::PathBuf> {
@@ -555,9 +553,9 @@ async fn download_release_archive(
     }
 
     match fetch_result {
-        Ok(CacheFetchOutcome::ReusedLocal) => return Ok(ArchiveAcquisition::ReusedLocal),
+        Ok(CacheFetchOutcome::ReusedLocal) => Ok(ArchiveAcquisition::ReusedLocal),
         Ok(CacheFetchOutcome::DownloadedFresh | CacheFetchOutcome::DownloadedAfterInvalidLocal) => {
-            return Ok(ArchiveAcquisition::Downloaded);
+            Ok(ArchiveAcquisition::Downloaded)
         }
         Err(SurgeError::NotFound(_)) => {
             let restore_rid = if release.rid.trim().is_empty() {

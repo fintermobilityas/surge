@@ -328,16 +328,10 @@ impl InstallerApp {
                         ui.add_space((ui.available_width() - total_w) / 2.0);
 
                         if accent_button(ui, "Launch", 200.0, 44.0).clicked() {
-                            let profile = InstallProfile {
-                                app_id: &self.manifest.app_id,
-                                display_name: &self.manifest.runtime.name,
-                                main_exe: &self.manifest.runtime.main_exe,
-                                install_directory: &self.manifest.runtime.install_directory,
-                                supervisor_id: &self.manifest.runtime.supervisor_id,
-                                icon: &self.manifest.runtime.icon,
-                                shortcuts: &self.manifest.runtime.shortcuts,
-                                environment: &self.manifest.runtime.environment,
-                            };
+                            let profile = InstallProfile::from_installer_manifest(
+                                &self.manifest,
+                                &self.manifest.runtime.shortcuts,
+                            );
                             let active_app_dir = install_root.join("app");
                             let _ = core_install::auto_start_after_install(&profile, install_root, &active_app_dir);
                             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);

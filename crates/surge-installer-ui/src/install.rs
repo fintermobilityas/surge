@@ -77,16 +77,7 @@ fn run_install_inner(
     send(progress_tx, ctx, ProgressUpdate::Progress(0.5));
     simulate_progress(progress_tx, ctx, simulator, 0.5, 0.72, 18, 3000);
 
-    let profile = InstallProfile {
-        app_id: &manifest.app_id,
-        display_name: &manifest.runtime.name,
-        main_exe: &manifest.runtime.main_exe,
-        install_directory: &manifest.runtime.install_directory,
-        supervisor_id: &manifest.runtime.supervisor_id,
-        icon: &manifest.runtime.icon,
-        shortcuts,
-        environment: &manifest.runtime.environment,
-    };
+    let profile = InstallProfile::from_installer_manifest(manifest, shortcuts);
 
     core_install::install_package_locally_at_root(&profile, &package.path, &install_root)?;
 
@@ -221,16 +212,7 @@ pub fn run_headless(
         std::thread::sleep(Duration::from_millis(2500));
     }
 
-    let profile = InstallProfile {
-        app_id: &manifest.app_id,
-        display_name: &manifest.runtime.name,
-        main_exe: &manifest.runtime.main_exe,
-        install_directory: &manifest.runtime.install_directory,
-        supervisor_id: &manifest.runtime.supervisor_id,
-        icon: &manifest.runtime.icon,
-        shortcuts,
-        environment: &manifest.runtime.environment,
-    };
+    let profile = InstallProfile::from_installer_manifest(manifest, shortcuts);
 
     eprintln!("Installing to '{}'...", install_root.display());
     core_install::install_package_locally_at_root(&profile, &package.path, &install_root)?;

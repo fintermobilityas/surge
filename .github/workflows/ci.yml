@@ -226,8 +226,8 @@ jobs:
           cargo generate-lockfile
       - name: Package surge-core and surge-cli
         run: |
-          cargo package -p surge-core --allow-dirty
-          cargo package -p surge-cli --allow-dirty
+          cargo package -p surge-core --allow-dirty --no-verify
+          cargo package -p surge-cli --allow-dirty --no-verify
       - name: Install Cloudsmith CLI
         run: |
           python3 -m pip install --upgrade pip

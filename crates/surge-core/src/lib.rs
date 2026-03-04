@@ -14,5 +14,6 @@ pub mod pack;
 pub mod platform;
 pub mod releases;
 pub mod storage;
+pub mod storage_config;
 pub mod supervisor;
 pub mod update;

@@ -12,13 +12,10 @@ pub mod restore;
 pub mod setup;
 
 use surge_core::config::manifest::SurgeManifest;
-use surge_core::context::{Context, StorageConfig, StorageProvider};
 use surge_core::error::{Result, SurgeError};
-
-pub(crate) struct StorageCredentials {
-    pub access_key: String,
-    pub secret_key: String,
-}
+pub(crate) use surge_core::storage_config::{
+    append_prefix, build_app_scoped_storage_config, build_app_scoped_storage_context, parse_storage_provider,
+};
 
 pub(crate) fn resolve_app_id(manifest: &SurgeManifest, requested_app_id: Option<&str>) -> Result<String> {
     if let Some(app_id) = requested_app_id.map(str::trim).filter(|value| !value.is_empty()) {
@@ -96,125 +93,6 @@ pub(crate) fn resolve_rid(manifest: &SurgeManifest, app_id: &str, requested_rid:
     }
 }
 
-pub(crate) fn build_storage_context(manifest: &SurgeManifest) -> Result<Context> {
-    let provider = parse_storage_provider(&manifest.storage.provider)?;
-    let creds = storage_credentials_from_env(provider);
-
-    let ctx = Context::new();
-    ctx.set_storage(
-        provider,
-        &manifest.storage.bucket,
-        &manifest.storage.region,
-        &creds.access_key,
-        &creds.secret_key,
-        &manifest.storage.endpoint,
-    );
-    ctx.set_storage_prefix(&manifest.storage.prefix);
-    Ok(ctx)
-}
-
-pub(crate) fn build_storage_config(manifest: &SurgeManifest) -> Result<StorageConfig> {
-    Ok(build_storage_context(manifest)?.storage_config())
-}
-
-/// Build a storage config for an app.
-///
-/// For multi-app manifests, storage is scoped by app id to avoid release index
-/// collisions. Single-app manifests keep their existing storage prefix.
-pub(crate) fn build_app_scoped_storage_config(manifest: &SurgeManifest, app_id: &str) -> Result<StorageConfig> {
-    let mut config = build_storage_config(manifest)?;
-    if manifest.apps.len() > 1 {
-        config.prefix = append_prefix(&config.prefix, app_id);
-    }
-    Ok(config)
-}
-
-/// Build a storage context for an app.
-///
-/// For multi-app manifests, storage is scoped by app id to avoid release index
-/// collisions. Single-app manifests keep their existing storage prefix.
-pub(crate) fn build_app_scoped_storage_context(manifest: &SurgeManifest, app_id: &str) -> Result<Context> {
-    let ctx = build_storage_context(manifest)?;
-    if manifest.apps.len() > 1 {
-        let base_prefix = ctx.storage_config().prefix;
-        ctx.set_storage_prefix(&append_prefix(&base_prefix, app_id));
-    }
-    Ok(ctx)
-}
-
-pub(crate) fn append_prefix(prefix: &str, segment: &str) -> String {
-    let prefix = prefix.trim().trim_matches('/');
-    let segment = segment.trim().trim_matches('/');
-
-    if prefix.is_empty() {
-        segment.to_string()
-    } else if segment.is_empty() {
-        prefix.to_string()
-    } else {
-        format!("{prefix}/{segment}")
-    }
-}
-
-pub(crate) fn parse_storage_provider(raw: &str) -> Result<StorageProvider> {
-    let normalized = raw.trim().to_ascii_lowercase().replace('-', "_");
-    let provider = match normalized.as_str() {
-        "s3" => StorageProvider::S3,
-        "azure" | "azure_blob" | "azureblob" => StorageProvider::AzureBlob,
-        "gcs" => StorageProvider::Gcs,
-        "filesystem" | "fs" => StorageProvider::Filesystem,
-        "github" | "github_releases" | "githubreleases" => StorageProvider::GitHubReleases,
-        "" => return Err(SurgeError::Config("Storage provider is required".to_string())),
-        other => return Err(SurgeError::Config(format!("Unknown storage provider: {other}"))),
-    };
-    Ok(provider)
-}
-
-pub(crate) fn storage_credentials_from_env(provider: StorageProvider) -> StorageCredentials {
-    storage_credentials_from_lookup(provider, |name| std::env::var(name).ok())
-}
-
-pub(crate) fn storage_credentials_from_lookup<F>(provider: StorageProvider, mut lookup: F) -> StorageCredentials
-where
-    F: FnMut(&str) -> Option<String>,
-{
-    match provider {
-        StorageProvider::S3 => StorageCredentials {
-            access_key: first_non_empty_env(&mut lookup, &["AWS_ACCESS_KEY_ID", "AWS_ACCESS_KEY"]),
-            secret_key: first_non_empty_env(&mut lookup, &["AWS_SECRET_ACCESS_KEY", "AWS_SECRET_KEY"]),
-        },
-        StorageProvider::AzureBlob => StorageCredentials {
-            access_key: first_non_empty_env(&mut lookup, &["AZURE_STORAGE_ACCOUNT_NAME", "AZURE_STORAGE_ACCOUNT"]),
-            secret_key: first_non_empty_env(&mut lookup, &["AZURE_STORAGE_ACCOUNT_KEY"]),
-        },
-        StorageProvider::Gcs => StorageCredentials {
-            access_key: first_non_empty_env(&mut lookup, &["GCS_ACCESS_KEY_ID", "GCS_ACCESS_KEY"]),
-            secret_key: first_non_empty_env(
-                &mut lookup,
-                &["GCS_SECRET_ACCESS_KEY", "GCS_SECRET_KEY", "GOOGLE_ACCESS_TOKEN"],
-            ),
-        },
-        StorageProvider::GitHubReleases => StorageCredentials {
-            access_key: String::new(),
-            secret_key: first_non_empty_env(&mut lookup, &["GITHUB_TOKEN", "GH_TOKEN"]),
-        },
-        StorageProvider::Filesystem => StorageCredentials {
-            access_key: String::new(),
-            secret_key: String::new(),
-        },
-    }
-}
-
-fn first_non_empty_env<F>(lookup: &mut F, keys: &[&str]) -> String
-where
-    F: FnMut(&str) -> Option<String>,
-{
-    keys.iter()
-        .filter_map(|key| lookup(key))
-        .map(|value| value.trim().to_string())
-        .find(|value| !value.is_empty())
-        .unwrap_or_default()
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -250,7 +128,7 @@ apps:
           - desktop
           - startup
         installers:
-          - web
+          - online
           - offline
 ",
             bucket = store_dir.display()
@@ -387,47 +265,52 @@ apps:
 
     #[test]
     fn test_parse_storage_provider_supports_aliases() {
+        use surge_core::context::StorageProvider;
         assert_eq!(
             super::parse_storage_provider("azure_blob").unwrap(),
-            super::StorageProvider::AzureBlob
+            StorageProvider::AzureBlob
         );
         assert_eq!(
             super::parse_storage_provider("github-releases").unwrap(),
-            super::StorageProvider::GitHubReleases
+            StorageProvider::GitHubReleases
         );
         assert_eq!(
             super::parse_storage_provider("fs").unwrap(),
-            super::StorageProvider::Filesystem
+            StorageProvider::Filesystem
         );
     }
 
     #[test]
     fn test_storage_credentials_resolve_s3_keys() {
+        use surge_core::context::StorageProvider;
+        use surge_core::storage_config::storage_credentials_from_lookup;
         let mut env = BTreeMap::new();
         env.insert("AWS_ACCESS_KEY_ID".to_string(), "access".to_string());
         env.insert("AWS_SECRET_ACCESS_KEY".to_string(), "secret".to_string());
-        let creds = super::storage_credentials_from_lookup(super::StorageProvider::S3, |key| env.get(key).cloned());
+        let creds = storage_credentials_from_lookup(StorageProvider::S3, |key| env.get(key).cloned());
         assert_eq!(creds.access_key, "access");
         assert_eq!(creds.secret_key, "secret");
     }
 
     #[test]
     fn test_storage_credentials_resolve_azure_keys() {
+        use surge_core::context::StorageProvider;
+        use surge_core::storage_config::storage_credentials_from_lookup;
         let mut env = BTreeMap::new();
         env.insert("AZURE_STORAGE_ACCOUNT_NAME".to_string(), "account".to_string());
         env.insert("AZURE_STORAGE_ACCOUNT_KEY".to_string(), "key".to_string());
-        let creds =
-            super::storage_credentials_from_lookup(super::StorageProvider::AzureBlob, |key| env.get(key).cloned());
+        let creds = storage_credentials_from_lookup(StorageProvider::AzureBlob, |key| env.get(key).cloned());
         assert_eq!(creds.access_key, "account");
         assert_eq!(creds.secret_key, "key");
     }
 
     #[test]
     fn test_storage_credentials_resolve_github_token_to_secret_key() {
+        use surge_core::context::StorageProvider;
+        use surge_core::storage_config::storage_credentials_from_lookup;
         let mut env = BTreeMap::new();
         env.insert("GITHUB_TOKEN".to_string(), "ghp_test".to_string());
-        let creds =
-            super::storage_credentials_from_lookup(super::StorageProvider::GitHubReleases, |key| env.get(key).cloned());
+        let creds = storage_credentials_from_lookup(StorageProvider::GitHubReleases, |key| env.get(key).cloned());
         assert!(creds.access_key.is_empty());
         assert_eq!(creds.secret_key, "ghp_test");
     }
@@ -521,22 +404,22 @@ apps:
             .join(app_id)
             .join(&rid);
         let installer_ext = if rid.starts_with("win-") { "exe" } else { "bin" };
-        let web_installer = installers_dir.join(format!("Setup-{rid}-{app_id}-stable-web.{installer_ext}"));
+        let online_installer = installers_dir.join(format!("Setup-{rid}-{app_id}-stable-online.{installer_ext}"));
         let offline_installer = installers_dir.join(format!("Setup-{rid}-{app_id}-stable-offline.{installer_ext}"));
-        assert!(web_installer.exists());
+        assert!(online_installer.exists());
         assert!(offline_installer.exists());
 
-        let web_data = read_installer_payload(&web_installer);
-        let web_entries = list_entries_from_bytes(&web_data).unwrap();
+        let online_data = read_installer_payload(&online_installer);
+        let online_entries = list_entries_from_bytes(&online_data).unwrap();
         assert!(
-            web_entries
+            online_entries
                 .iter()
                 .any(|entry| entry.path.to_string_lossy().contains("installer.yml"))
         );
-        let web_manifest = String::from_utf8(read_entry(&web_data, "installer.yml").unwrap()).unwrap();
-        assert!(web_manifest.contains("installer_type: web"));
-        assert!(web_manifest.contains("ui: imgui"));
-        assert!(web_manifest.contains("headless_default_if_no_display: true"));
+        let online_manifest = String::from_utf8(read_entry(&online_data, "installer.yml").unwrap()).unwrap();
+        assert!(online_manifest.contains("installer_type: online"));
+        assert!(online_manifest.contains("ui: console"));
+        assert!(online_manifest.contains("headless_default_if_no_display: true"));
 
         let offline_data = read_installer_payload(&offline_installer);
         let offline_manifest = String::from_utf8(read_entry(&offline_data, "installer.yml").unwrap()).unwrap();

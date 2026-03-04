@@ -104,18 +104,7 @@ async fn resolve_package(dir: &Path, manifest: &InstallerManifest) -> Result<Res
 }
 
 fn build_storage_config_from_manifest(manifest: &InstallerManifest) -> Result<surge_core::context::StorageConfig> {
-    let provider = super::parse_storage_provider(&manifest.storage.provider)?;
-    let creds = super::storage_credentials_from_env(provider);
-
-    Ok(surge_core::context::StorageConfig {
-        provider: Some(provider),
-        bucket: manifest.storage.bucket.clone(),
-        region: manifest.storage.region.clone(),
-        access_key: creds.access_key,
-        secret_key: creds.secret_key,
-        endpoint: manifest.storage.endpoint.clone(),
-        prefix: manifest.storage.prefix.clone(),
-    })
+    surge_core::storage_config::build_storage_config_from_installer_manifest(manifest)
 }
 
 fn file_size_label(path: &Path) -> String {

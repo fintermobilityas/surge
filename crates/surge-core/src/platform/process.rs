@@ -86,6 +86,9 @@ fn spawn_impl(
     let mut cmd = Command::new(exe);
     cmd.args(args).stdin(Stdio::null()).stdout(stdout).stderr(stderr);
 
+    #[cfg(not(unix))]
+    let _ = detached;
+
     #[cfg(unix)]
     if detached {
         use std::os::unix::process::CommandExt;

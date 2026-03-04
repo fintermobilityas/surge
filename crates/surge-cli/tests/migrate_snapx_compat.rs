@@ -204,13 +204,17 @@ fn migrate_snapx_style_app_copies_full_and_delta_artifacts() {
     assert!(out.status.success(), "{}", debug_output(&out));
 
     let expected_full_v1 = dst_store.join(format!("{CANONICAL_APP_ID}-1.0.0-{rid}-full.tar.zst"));
-    let expected_full_v2 = dst_store.join(format!("{CANONICAL_APP_ID}-1.1.0-{rid}-full.tar.zst"));
     let expected_delta_v2 = dst_store.join(format!("{CANONICAL_APP_ID}-1.1.0-{rid}-delta.tar.zst"));
+    let expected_full_v2 = dst_store.join(format!("{CANONICAL_APP_ID}-1.1.0-{rid}-full.tar.zst"));
     let expected_index = dst_store.join(RELEASES_FILE_COMPRESSED);
 
     assert!(expected_full_v1.exists(), "missing {}", expected_full_v1.display());
-    assert!(expected_full_v2.exists(), "missing {}", expected_full_v2.display());
     assert!(expected_delta_v2.exists(), "missing {}", expected_delta_v2.display());
+    assert!(
+        !expected_full_v2.exists(),
+        "unexpected full artifact copied for delta release: {}",
+        expected_full_v2.display()
+    );
     assert!(expected_index.exists(), "missing {}", expected_index.display());
 
     let index_data = std::fs::read(expected_index).unwrap();

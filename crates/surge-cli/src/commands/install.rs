@@ -362,7 +362,7 @@ pub async fn execute(
 
             install_package_on_tailscale_node(ssh_target, &app_id, release, &channel, &storage_config, no_start)
                 .await?;
-            logline::success(&format!("Installed '{}' on tailscale node '{}'.", app_id, file_target));
+            logline::success(&format!("Installed '{app_id}' on tailscale node '{file_target}'."));
         }
     }
 
@@ -1197,26 +1197,15 @@ fn build_remote_installer_manifest(
     launch_env: &RemoteLaunchEnvironment,
 ) -> InstallerManifest {
     let mut environment = release.environment.clone();
-    if let Some(display) = launch_env
-        .display
-        .as_ref()
-        .map(String::as_str)
-        .filter(|value| !value.is_empty())
-    {
+    if let Some(display) = launch_env.display.as_deref().filter(|value| !value.is_empty()) {
         environment.insert("DISPLAY".to_string(), display.to_string());
     }
-    if let Some(xauthority) = launch_env
-        .xauthority
-        .as_ref()
-        .map(String::as_str)
-        .filter(|value| !value.is_empty())
-    {
+    if let Some(xauthority) = launch_env.xauthority.as_deref().filter(|value| !value.is_empty()) {
         environment.insert("XAUTHORITY".to_string(), xauthority.to_string());
     }
     if let Some(dbus) = launch_env
         .dbus_session_bus_address
-        .as_ref()
-        .map(String::as_str)
+        .as_deref()
         .filter(|value| !value.is_empty())
     {
         environment.insert("DBUS_SESSION_BUS_ADDRESS".to_string(), dbus.to_string());
@@ -1290,8 +1279,7 @@ async fn install_package_on_tailscale_node(
     let launch_environment = detect_remote_launch_environment(ssh_node).await?;
     let has_display = launch_environment
         .display
-        .as_ref()
-        .map(String::as_str)
+        .as_deref()
         .is_some_and(|value| !value.is_empty());
     let inferred_gui_app = release_requires_display(release);
     let should_skip_start_for_display = inferred_gui_app && !has_display;

@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Instant;
 
@@ -9,6 +9,7 @@ use surge_core::config::constants::{DEFAULT_ZSTD_LEVEL, RELEASES_FILE_COMPRESSED
 use surge_core::config::manifest::SurgeManifest;
 use surge_core::error::{Result, SurgeError};
 use surge_core::releases::manifest::{compress_release_index, decompress_release_index};
+use surge_core::releases::restore::required_artifacts_for_index;
 use surge_core::storage;
 
 /// Migrate release data from one storage backend to another.
@@ -72,16 +73,20 @@ pub async fn execute(
 
     print_stage(theme, 3, TOTAL_STAGES, "Planning artifact copy operations");
     let mut copy_operations: BTreeSet<CopyOperation> = BTreeSet::new();
+    let mut candidate_operations: BTreeMap<String, CopyOperation> = BTreeMap::new();
     for release in &mut migrated_index.releases {
         if !release.full_filename.is_empty() {
             let old_key = release.full_filename.clone();
             let new_key = canonicalize_artifact_key(&old_key, &source_app_id, &canonical_app_id);
             release.full_filename.clone_from(&new_key);
-            copy_operations.insert(CopyOperation {
-                source_key: old_key,
-                destination_key: new_key,
-                size_hint: release.full_size.max(0) as u64,
-            });
+            candidate_operations.insert(
+                new_key.clone(),
+                CopyOperation {
+                    source_key: old_key,
+                    destination_key: new_key,
+                    size_hint: release.full_size.max(0) as u64,
+                },
+            );
         }
         for delta in &mut release.deltas {
             if delta.filename.is_empty() {
@@ -90,16 +95,26 @@ pub async fn execute(
             let old_key = delta.filename.clone();
             let new_key = canonicalize_artifact_key(&old_key, &source_app_id, &canonical_app_id);
             delta.filename.clone_from(&new_key);
-            copy_operations.insert(CopyOperation {
-                source_key: old_key,
-                destination_key: new_key,
-                size_hint: delta.size.max(0) as u64,
-            });
+            candidate_operations.insert(
+                new_key.clone(),
+                CopyOperation {
+                    source_key: old_key,
+                    destination_key: new_key,
+                    size_hint: delta.size.max(0) as u64,
+                },
+            );
         }
         if let Some(primary) = release.selected_delta() {
             release.set_primary_delta(Some(primary));
         } else {
             release.set_primary_delta(None);
+        }
+    }
+
+    let required_artifacts = required_artifacts_for_index(&migrated_index);
+    for required_key in required_artifacts {
+        if let Some(operation) = candidate_operations.remove(&required_key) {
+            copy_operations.insert(operation);
         }
     }
 
@@ -175,7 +190,6 @@ pub async fn execute(
             }
         ),
     );
-
     print_stage(theme, 5, TOTAL_STAGES, "Finalize migration summary");
     print_stage_done(
         theme,

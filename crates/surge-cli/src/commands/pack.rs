@@ -1006,8 +1006,9 @@ apps:
             .join("installers")
             .join(app_id)
             .join(&rid);
-        let online = installers_dir.join(format!("Setup-{rid}-{app_id}-stable-online.bin"));
-        let offline = installers_dir.join(format!("Setup-{rid}-{app_id}-stable-offline.bin"));
+        let installer_ext = if rid.starts_with("win-") { "exe" } else { "bin" };
+        let online = installers_dir.join(format!("Setup-{rid}-{app_id}-stable-online.{installer_ext}"));
+        let offline = installers_dir.join(format!("Setup-{rid}-{app_id}-stable-offline.{installer_ext}"));
         assert!(online.exists(), "online installer should exist");
         assert!(offline.exists(), "offline installer should exist");
 
@@ -1088,7 +1089,8 @@ apps:
             .join("installers")
             .join(app_id)
             .join(&rid);
-        let offline = installers_dir.join(format!("Setup-{rid}-{app_id}-stable-offline.bin"));
+        let installer_ext = if rid.starts_with("win-") { "exe" } else { "bin" };
+        let offline = installers_dir.join(format!("Setup-{rid}-{app_id}-stable-offline.{installer_ext}"));
         assert!(offline.exists());
     }
 

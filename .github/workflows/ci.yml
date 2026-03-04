@@ -208,6 +208,8 @@ jobs:
       CLOUDSMITH_API_KEY: ${{ secrets.CLOUDSMITH_API_KEY }}
       CLOUDSMITH_NAMESPACE: finter-as
       CLOUDSMITH_REPOSITORY: surge
+      CARGO_REGISTRIES_SURGE_INDEX: sparse+https://cargo.cloudsmith.io/finter-as/surge/
+      CARGO_REGISTRIES_SURGE_TOKEN: ${{ secrets.CLOUDSMITH_API_KEY }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -224,28 +226,33 @@ jobs:
           sed -i 's/^version = ".*"/version = "${{ needs.version.outputs.semver }}"/' Cargo.toml
           sed -i -E 's/(surge-core = \{ path = "crates\/surge-core", version = ").*(" \})/\1${{ needs.version.outputs.semver }}\2/' Cargo.toml
           cargo generate-lockfile
-      - name: Package surge-core and surge-cli
-        run: |
-          cargo package -p surge-core --allow-dirty --no-verify
-          cargo package -p surge-cli --allow-dirty --no-verify
       - name: Install Cloudsmith CLI
         run: |
           python3 -m pip install --upgrade pip
           python3 -m pip install cloudsmith-cli
-      - name: Publish surge-core to Cloudsmith
+      - name: Ensure Cloudsmith repository exists
         run: |
-          cloudsmith push cargo \
-            "${CLOUDSMITH_NAMESPACE}/${CLOUDSMITH_REPOSITORY}" \
-            "target/package/surge-core-${{ needs.version.outputs.semver }}.crate" \
-            --api-key "${CLOUDSMITH_API_KEY}" \
-            --republish
-      - name: Publish surge-cli to Cloudsmith
+          if ! cloudsmith repos list "${CLOUDSMITH_NAMESPACE}" --output-format json --api-key "${CLOUDSMITH_API_KEY}" | jq -e --arg slug "${CLOUDSMITH_REPOSITORY}" '.data[] | select(.slug == $slug)' >/dev/null; then
+            cat > cloudsmith-repo.json <<EOF
+          {"name":"surge","description":"Public Cargo registry for Surge pre-releases","repository_type_str":"Public","slug":"surge"}
+          EOF
+            cloudsmith repos create "${CLOUDSMITH_NAMESPACE}" cloudsmith-repo.json --api-key "${CLOUDSMITH_API_KEY}"
+          fi
+      - name: Publish surge-core to Cloudsmith Cargo registry
         run: |
-          cloudsmith push cargo \
-            "${CLOUDSMITH_NAMESPACE}/${CLOUDSMITH_REPOSITORY}" \
-            "target/package/surge-cli-${{ needs.version.outputs.semver }}.crate" \
-            --api-key "${CLOUDSMITH_API_KEY}" \
-            --republish
+          cargo publish -p surge-core --registry surge --allow-dirty
+      - name: Publish surge-cli to Cloudsmith Cargo registry
+        run: |
+          for attempt in $(seq 1 10); do
+            if cargo publish -p surge-cli --registry surge --allow-dirty; then
+              exit 0
+            fi
+            if [ "${attempt}" -eq 10 ]; then
+              echo "Failed to publish surge-cli after waiting for surge-core to sync in registry."
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
 
   release:
     name: Draft Release

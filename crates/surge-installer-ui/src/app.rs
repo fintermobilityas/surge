@@ -123,19 +123,17 @@ impl InstallerApp {
                 image = image.tint(Color32::WHITE.linear_multiply(pulse));
             }
             ui.add(image);
+        } else if pulsing {
+            let time = ui.input(|i| i.time);
+            let pulse = ((time * 1.8).sin() as f32 * 0.5 + 0.5) * 0.3 + 0.7;
+            draw_bolt(
+                ui,
+                size,
+                ACCENT.linear_multiply(pulse),
+                ACCENT_PRESSED.linear_multiply(pulse),
+            );
         } else {
-            if pulsing {
-                let time = ui.input(|i| i.time);
-                let pulse = ((time * 1.8).sin() as f32 * 0.5 + 0.5) * 0.3 + 0.7;
-                draw_bolt(
-                    ui,
-                    size,
-                    ACCENT.linear_multiply(pulse),
-                    ACCENT_PRESSED.linear_multiply(pulse),
-                );
-            } else {
-                draw_bolt(ui, size, ACCENT, ACCENT_PRESSED);
-            }
+            draw_bolt(ui, size, ACCENT, ACCENT_PRESSED);
         }
     }
 

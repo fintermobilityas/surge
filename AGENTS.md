@@ -32,6 +32,7 @@ dotnet test dotnet/Surge.slnx --configuration Release
 Before any push, run the same quality gates CI uses. Do not push if any command fails.
 
 ```bash
+./scripts/check-version-sync.sh
 cargo fmt --all -- --check
 RUSTFLAGS="-D warnings" cargo test --workspace
 cargo clippy --all-targets --all-features -- -D warnings
@@ -102,10 +103,14 @@ Versioning is managed by GitVersion (`GitVersion.yml`). The `next-version` field
 ### Cutting a release
 1. Merge `develop` → `main` (creates the release, e.g. `0.3.0`).
 2. **Immediately** bump `next-version` in `GitVersion.yml` on `develop` to the next minor (e.g. `0.4.0`).
-3. When changing version baselines, also bump Cargo workspace version in `Cargo.toml` (`[workspace.package].version`) in the same PR/commit series.
+3. When changing version baselines, also bump Cargo values in `Cargo.toml` in the same PR/commit series:
+   - `[workspace.package].version`
+   - `[workspace.dependencies].surge-core` version
 4. Commit and push to `develop`.
 
 If step 2 is skipped, develop will keep producing preview versions under the *old* release number (e.g. `0.3.0-preview.N` instead of `0.4.0-preview.N`).
+
+CI enforces this with `./scripts/check-version-sync.sh`, which requires `GitVersion.yml` `next-version` to match both Cargo values above.
 
 ### Major version bumps
 For a major release (e.g. `1.0.0`), manually set `next-version` to the target version before merging to main.

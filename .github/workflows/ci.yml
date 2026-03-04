@@ -29,6 +29,8 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+      - name: Verify GitVersion and Cargo baseline versions are aligned
+        run: ./scripts/check-version-sync.sh
       - uses: gittools/actions/gitversion/setup@v4.3.3
         with:
           versionSpec: '6.x'

@@ -217,49 +217,9 @@ jobs:
           sed -i -E 's/(surge-core = \{ path = "crates\/surge-core", version = ").*(" \})/\1${{ needs.version.outputs.semver }}\2/' Cargo.toml
           cargo generate-lockfile
       - name: Publish surge-core
-        shell: bash
-        run: |
-          set -euo pipefail
-          publish_or_warn() {
-            local crate="$1"
-            set +e
-            local output
-            output="$(cargo publish -p "$crate" --allow-dirty 2>&1)"
-            local status=$?
-            set -e
-            echo "$output"
-            if [[ $status -eq 0 ]]; then
-              return 0
-            fi
-            if grep -Eq "(status 429 Too Many Requests|published too many versions|already exists on crates\\.io)" <<<"$output"; then
-              echo "::warning::Skipping publish for '$crate' due to crates.io throttling/duplicate version."
-              return 0
-            fi
-            return $status
-          }
-          publish_or_warn surge-core
+        run: cargo publish -p surge-core --allow-dirty
       - name: Publish surge-cli
-        shell: bash
-        run: |
-          set -euo pipefail
-          publish_or_warn() {
-            local crate="$1"
-            set +e
-            local output
-            output="$(cargo publish -p "$crate" --allow-dirty 2>&1)"
-            local status=$?
-            set -e
-            echo "$output"
-            if [[ $status -eq 0 ]]; then
-              return 0
-            fi
-            if grep -Eq "(status 429 Too Many Requests|published too many versions|already exists on crates\\.io)" <<<"$output"; then
-              echo "::warning::Skipping publish for '$crate' due to crates.io throttling/duplicate version."
-              return 0
-            fi
-            return $status
-          }
-          publish_or_warn surge-cli
+        run: cargo publish -p surge-cli --allow-dirty
 
   release:
     name: Draft Release

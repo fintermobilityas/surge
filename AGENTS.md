@@ -92,6 +92,10 @@ If the local environment cannot run a listed command, document the exact gap in 
 ## Dependencies
 - When adding new dependencies, always check crates.io for the latest stable version before specifying a version in `Cargo.toml`. Never assume a version number from memory.
 
+## CLI Logging Output
+- For `surge-cli` command output (including progress/status updates), use the existing `logline` facility in `crates/surge-cli/src/logline.rs`.
+- Do not introduce alternative output paths for status/progress (for example ad-hoc `println!`-driven progress UIs) when `logline` can represent the same information.
+
 ## Coding Style & Naming
 - Rust edition: 2024; format with `cargo fmt --all`.
 - Clippy/rustc warnings are treated as errors in CI; fix warnings instead of suppressing.

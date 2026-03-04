@@ -1,5 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::thread;
+use std::time::Duration;
 use std::time::Instant;
 
 use crate::formatters::{format_bytes, format_duration};
@@ -80,7 +83,47 @@ pub async fn execute(
     })?;
 
     let mut builder = PackBuilder::new(ctx, manifest_path_s, &app_id, &rid, version, artifacts_dir_s)?;
-    builder.build(None).await?;
+    let build_started = Instant::now();
+    let build_running = Arc::new(AtomicBool::new(true));
+    let build_step = Arc::new(AtomicI32::new(0));
+    let build_total = Arc::new(AtomicI32::new(2));
+    let build_last_announced = Arc::new(AtomicI32::new(-1));
+
+    let build_running_for_heartbeat = Arc::clone(&build_running);
+    let build_step_for_heartbeat = Arc::clone(&build_step);
+    let build_total_for_heartbeat = Arc::clone(&build_total);
+    let heartbeat = thread::spawn(move || {
+        while build_running_for_heartbeat.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_secs(2));
+            if !build_running_for_heartbeat.load(Ordering::Relaxed) {
+                break;
+            }
+            let step_count = build_total_for_heartbeat.load(Ordering::Relaxed).max(1);
+            let step_done = build_step_for_heartbeat.load(Ordering::Relaxed).clamp(0, step_count);
+            logline::subtle(&format!(
+                "  {} (elapsed {})",
+                pack_build_phase_message(step_done, step_count),
+                format_duration(build_started.elapsed())
+            ));
+        }
+    });
+
+    let build_step_for_progress = Arc::clone(&build_step);
+    let build_total_for_progress = Arc::clone(&build_total);
+    let build_last_announced_for_progress = Arc::clone(&build_last_announced);
+    let pack_progress = move |done: i32, total: i32| {
+        let step_count = total.max(1);
+        let step_done = done.clamp(0, step_count);
+        build_total_for_progress.store(step_count, Ordering::Relaxed);
+        build_step_for_progress.store(step_done, Ordering::Relaxed);
+        let previous = build_last_announced_for_progress.swap(step_done, Ordering::Relaxed);
+        if previous != step_done {
+            logline::subtle(&format!("  {}", pack_build_phase_message(step_done, step_count)));
+        }
+    };
+    builder.build(Some(&pack_progress)).await?;
+    build_running.store(false, Ordering::Relaxed);
+    let _ = heartbeat.join();
 
     let mut artifact_count = 0usize;
     for artifact in builder.artifacts() {
@@ -876,6 +919,16 @@ fn print_stage(theme: UiTheme, stage: usize, total: usize, text: &str) {
 fn print_stage_done(theme: UiTheme, stage: usize, total: usize, text: &str) {
     let _ = theme;
     logline::success(&format!("[{stage}/{total}] {text}"));
+}
+
+fn pack_build_phase_message(step_done: i32, step_count: i32) -> String {
+    if step_done <= 0 {
+        return format!("Packaging files (step 1/{step_count}: full archive)");
+    }
+    if step_done < step_count {
+        return format!("Packaging files (step {}/{}: delta package)", step_done + 1, step_count);
+    }
+    "Finalizing package artifacts".to_string()
 }
 
 fn configure_context(manifest: &SurgeManifest, app_id: &str) -> Result<Context> {

@@ -24,8 +24,8 @@ use crate::releases::manifest::{
 };
 use crate::releases::restore::{RestoreOptions, restore_full_archive_for_version_with_options};
 use crate::releases::version::compare_versions;
-use crate::storage_config::append_prefix;
 use crate::storage::{StorageBackend, create_storage_backend};
+use crate::storage_config::append_prefix;
 use crate::supervisor::stub::find_latest_app_dir;
 
 /// Progress information for update operations.
@@ -1192,7 +1192,12 @@ mod tests {
 
         let index = ReleaseIndex {
             app_id: app_id.to_string(),
-            releases: vec![make_entry("1.1.0", "stable", &current_os_label_for_tests(), &current_rid())],
+            releases: vec![make_entry(
+                "1.1.0",
+                "stable",
+                &current_os_label_for_tests(),
+                &current_rid(),
+            )],
             ..ReleaseIndex::default()
         };
         let compressed = compress_release_index(&index, DEFAULT_ZSTD_LEVEL).unwrap();

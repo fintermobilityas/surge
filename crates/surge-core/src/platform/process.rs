@@ -61,15 +61,7 @@ pub fn spawn_process(
     working_dir: Option<&Path>,
     envs: &BTreeMap<String, String>,
 ) -> Result<ProcessHandle> {
-    spawn_impl(
-        exe,
-        args,
-        working_dir,
-        envs,
-        Stdio::inherit(),
-        Stdio::inherit(),
-        false,
-    )
+    spawn_impl(exe, args, working_dir, envs, Stdio::inherit(), Stdio::inherit(), false)
 }
 
 /// Spawn a process fully detached (stdin/stdout/stderr = null).
@@ -79,15 +71,7 @@ pub fn spawn_detached(
     working_dir: Option<&Path>,
     envs: &BTreeMap<String, String>,
 ) -> Result<ProcessHandle> {
-    spawn_impl(
-        exe,
-        args,
-        working_dir,
-        envs,
-        Stdio::null(),
-        Stdio::null(),
-        true,
-    )
+    spawn_impl(exe, args, working_dir, envs, Stdio::null(), Stdio::null(), true)
 }
 
 fn spawn_impl(

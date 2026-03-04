@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::formatters::format_duration;
+use crate::formatters::{format_bytes, format_duration};
 use crate::logline;
 use crate::ui::UiTheme;
 use serde::Serialize;
@@ -86,7 +86,7 @@ pub async fn execute(
             std::fs::copy(&artifact.path, &dest)?;
         }
         artifact_count += 1;
-        logline::subtle(&format!("  Created {}", dest.display()));
+        logline::subtle(&format!("  Created {} ({})", dest.display(), file_size_label(&dest)));
     }
     print_stage_done(
         theme,
@@ -117,8 +117,12 @@ pub async fn execute(
         &full_package_path,
     )?;
     let installer_count = installer_paths.len();
-    for installer in installer_paths {
-        logline::subtle(&format!("  Created {}", installer.display()));
+    for installer in &installer_paths {
+        logline::subtle(&format!(
+            "  Created {} ({})",
+            installer.display(),
+            file_size_label(installer)
+        ));
     }
     print_stage_done(
         theme,
@@ -210,10 +214,10 @@ pub async fn execute_installers_only(
         PathBuf::from,
     );
     if !artifacts_dir.is_dir() {
-        return Err(SurgeError::Pack(format!(
-            "Artifacts directory does not exist: {}. Use --artifacts-dir to override.",
+        logline::warn(&format!(
+            "Artifacts directory not found: {}; installers will be built without icon assets",
             artifacts_dir.display()
-        )));
+        ));
     }
 
     let local_full_name = Path::new(full_key)
@@ -227,7 +231,11 @@ pub async fn execute_installers_only(
             theme,
             3,
             TOTAL_STAGES,
-            &format!("Using local package {}", full_package_path.display()),
+            &format!(
+                "Using local package {} ({})",
+                full_package_path.display(),
+                file_size_label(&full_package_path)
+            ),
         );
     } else {
         logline::info(&format!(
@@ -240,7 +248,11 @@ pub async fn execute_installers_only(
             theme,
             3,
             TOTAL_STAGES,
-            &format!("Downloaded {}", full_package_path.display()),
+            &format!(
+                "Downloaded {} ({})",
+                full_package_path.display(),
+                file_size_label(&full_package_path)
+            ),
         );
     }
 
@@ -273,8 +285,12 @@ pub async fn execute_installers_only(
         );
         return Ok(());
     }
-    for installer in installer_paths {
-        logline::subtle(&format!("  Created {}", installer.display()));
+    for installer in &installer_paths {
+        logline::subtle(&format!(
+            "  Created {} ({})",
+            installer.display(),
+            file_size_label(installer)
+        ));
     }
 
     print_stage_done(theme, 4, TOTAL_STAGES, "Installer bundles created");
@@ -531,6 +547,13 @@ fn default_artifacts_dir(manifest_path: &Path, app_id: &str, rid: &str, version:
         .join(app_id)
         .join(rid)
         .join(version)
+}
+
+fn file_size_label(path: &Path) -> String {
+    match std::fs::metadata(path) {
+        Ok(meta) => format_bytes(meta.len()),
+        Err(_) => "unknown size".to_string(),
+    }
 }
 
 fn print_stage(theme: UiTheme, stage: usize, total: usize, text: &str) {

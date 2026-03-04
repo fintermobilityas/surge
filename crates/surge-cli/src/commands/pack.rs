@@ -428,6 +428,21 @@ fn build_installers_with_launcher(
             release: InstallerRelease {
                 full_filename: full_filename.clone(),
                 delta_filename: delta_filename.clone(),
+                delta_algorithm: if delta_filename.is_empty() {
+                    String::new()
+                } else {
+                    surge_core::releases::manifest::DIFF_ALGORITHM_BSDIFF.to_string()
+                },
+                delta_patch_format: if delta_filename.is_empty() {
+                    String::new()
+                } else {
+                    surge_core::releases::manifest::PATCH_FORMAT_BSDIFF4.to_string()
+                },
+                delta_compression: if delta_filename.is_empty() {
+                    String::new()
+                } else {
+                    surge_core::releases::manifest::COMPRESSION_ZSTD.to_string()
+                },
             },
             runtime: InstallerRuntime {
                 name: app.effective_name(),
@@ -809,9 +824,8 @@ apps:
             full_filename: full_filename.to_string(),
             full_size: 1,
             full_sha256: String::new(),
-            delta_filename: String::new(),
-            delta_size: 0,
-            delta_sha256: String::new(),
+            deltas: Vec::new(),
+            preferred_delta_id: String::new(),
             created_utc: String::new(),
             release_notes: String::new(),
             name: String::new(),

@@ -104,9 +104,11 @@ async fn compact_single(manifest: &SurgeManifest, app_id: &str, rid: &str, chann
             continue;
         }
         if release.version == latest_version {
-            let delta = release.delta_filename.trim();
-            if !delta.is_empty() {
-                stale_filenames.insert(delta.to_string());
+            for delta in release.all_deltas() {
+                let key = delta.filename.trim();
+                if !key.is_empty() {
+                    stale_filenames.insert(key.to_string());
+                }
             }
             continue;
         }
@@ -114,9 +116,11 @@ async fn compact_single(manifest: &SurgeManifest, app_id: &str, rid: &str, chann
         if !full.is_empty() {
             stale_filenames.insert(full.to_string());
         }
-        let delta = release.delta_filename.trim();
-        if !delta.is_empty() {
-            stale_filenames.insert(delta.to_string());
+        for delta in release.all_deltas() {
+            let key = delta.filename.trim();
+            if !key.is_empty() {
+                stale_filenames.insert(key.to_string());
+            }
         }
     }
 
@@ -124,9 +128,7 @@ async fn compact_single(manifest: &SurgeManifest, app_id: &str, rid: &str, chann
 
     for release in &mut index.releases {
         if release.rid == rid && release.version == latest_version {
-            release.delta_filename = String::new();
-            release.delta_size = 0;
-            release.delta_sha256 = String::new();
+            release.set_primary_delta(None);
         }
     }
 

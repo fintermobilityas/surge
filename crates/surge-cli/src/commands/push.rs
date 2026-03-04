@@ -9,7 +9,9 @@ use surge_core::config::constants::{DEFAULT_ZSTD_LEVEL, RELEASES_FILE_COMPRESSED
 use surge_core::config::manifest::{ShortcutLocation, SurgeManifest};
 use surge_core::crypto::sha256::sha256_hex_file;
 use surge_core::error::{Result, SurgeError};
-use surge_core::releases::manifest::{ReleaseEntry, ReleaseIndex, compress_release_index, decompress_release_index};
+use surge_core::releases::manifest::{
+    DeltaArtifact, ReleaseEntry, ReleaseIndex, compress_release_index, decompress_release_index,
+};
 use surge_core::releases::restore::required_artifacts_for_index;
 use surge_core::storage::{self, StorageBackend};
 
@@ -232,7 +234,7 @@ async fn update_release_index(
         .releases
         .retain(|release| !(release.version == version && release.rid == rid));
 
-    index.releases.push(ReleaseEntry {
+    let mut entry = ReleaseEntry {
         version: version.to_string(),
         channels: channels.into_iter().collect(),
         os: detect_os_from_rid(rid),
@@ -241,9 +243,8 @@ async fn update_release_index(
         full_filename,
         full_size,
         full_sha256,
-        delta_filename,
-        delta_size,
-        delta_sha256,
+        deltas: Vec::new(),
+        preferred_delta_id: String::new(),
         created_utc: chrono::Utc::now().to_rfc3339(),
         release_notes: String::new(),
         name,
@@ -255,7 +256,20 @@ async fn update_release_index(
         persistent_assets,
         installers,
         environment,
-    });
+    };
+    let primary_delta = if delta_filename.trim().is_empty() {
+        None
+    } else {
+        Some(DeltaArtifact::bsdiff_zstd(
+            "primary",
+            "",
+            &delta_filename,
+            delta_size,
+            &delta_sha256,
+        ))
+    };
+    entry.set_primary_delta(primary_delta);
+    index.releases.push(entry);
 
     index.last_write_utc = chrono::Utc::now().to_rfc3339();
 
@@ -277,9 +291,11 @@ async fn prune_redundant_artifacts(backend: &dyn StorageBackend, index: &Release
         if !full.is_empty() {
             candidates.insert(full.to_string());
         }
-        let delta = release.delta_filename.trim();
-        if !delta.is_empty() {
-            candidates.insert(delta.to_string());
+        for delta in release.all_deltas() {
+            let key = delta.filename.trim();
+            if !key.is_empty() {
+                candidates.insert(key.to_string());
+            }
         }
     }
 

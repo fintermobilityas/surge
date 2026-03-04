@@ -206,12 +206,19 @@ fn latest_release_for_channel<'a>(releases: &'a [&ReleaseEntry], channel: &str) 
 }
 
 fn format_release_cell(release: &ReleaseEntry) -> String {
-    let has_delta = !release.delta_filename.trim().is_empty() && release.delta_size > 0;
-    if has_delta {
+    if let Some(delta) = release.selected_delta()
+        && delta.size > 0
+    {
+        let algorithm = if delta.algorithm.trim().is_empty() {
+            "bsdiff"
+        } else {
+            delta.algorithm.trim()
+        };
         format!(
-            "{} (delta {})",
+            "{} (delta {} via {})",
             release.version,
-            format_signed_bytes(release.delta_size)
+            format_signed_bytes(delta.size),
+            algorithm
         )
     } else {
         format!("{} (full {})", release.version, format_signed_bytes(release.full_size))
@@ -449,9 +456,21 @@ mod tests {
 
     use chrono::TimeZone;
     use surge_core::config::constants::DEFAULT_ZSTD_LEVEL;
-    use surge_core::releases::manifest::compress_release_index;
+    use surge_core::releases::manifest::{DeltaArtifact, compress_release_index};
 
     fn release(version: &str, channels: &[&str], rid: &str, full: i64, delta: i64) -> ReleaseEntry {
+        let deltas = if delta > 0 {
+            vec![DeltaArtifact::bsdiff_zstd(
+                "primary",
+                "",
+                &format!("{version}-delta"),
+                delta,
+                "",
+            )]
+        } else {
+            Vec::new()
+        };
+
         ReleaseEntry {
             version: version.to_string(),
             channels: channels.iter().map(|channel| (*channel).to_string()).collect(),
@@ -461,13 +480,12 @@ mod tests {
             full_filename: format!("{version}-full"),
             full_size: full,
             full_sha256: String::new(),
-            delta_filename: if delta > 0 {
-                format!("{version}-delta")
+            deltas,
+            preferred_delta_id: if delta > 0 {
+                "primary".to_string()
             } else {
                 String::new()
             },
-            delta_size: delta,
-            delta_sha256: String::new(),
             created_utc: "2026-03-03T14:00:00Z".to_string(),
             release_notes: String::new(),
             name: String::new(),

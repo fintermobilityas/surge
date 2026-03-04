@@ -552,6 +552,7 @@ mod tests {
     use surge_core::config::manifest::SurgeManifest;
     use surge_core::crypto::sha256::sha256_hex;
     use surge_core::diff::wrapper::bsdiff_buffers;
+    use surge_core::releases::manifest::DeltaArtifact;
     use surge_core::storage::filesystem::FilesystemBackend;
 
     fn release(version: &str, channel: &str, rid: &str, full: &str) -> ReleaseEntry {
@@ -564,9 +565,8 @@ mod tests {
             full_filename: full.to_string(),
             full_size: 1,
             full_sha256: "x".to_string(),
-            delta_filename: String::new(),
-            delta_size: 0,
-            delta_sha256: String::new(),
+            deltas: Vec::new(),
+            preferred_delta_id: String::new(),
             created_utc: String::new(),
             release_notes: String::new(),
             name: String::new(),
@@ -684,20 +684,28 @@ mod tests {
 
         let mut v1 = release("1.0.0", "test", "linux-x64", "demo-1.0.0-linux-x64-full.tar.zst");
         v1.full_sha256 = sha256_hex(&full_v1);
-        v1.delta_filename.clear();
-        v1.delta_sha256.clear();
+        v1.set_primary_delta(None);
 
         let mut v2 = release("1.1.0", "test", "linux-x64", "demo-1.1.0-linux-x64-full.tar.zst");
         v2.full_sha256 = sha256_hex(&full_v2);
-        v2.delta_filename = "demo-1.1.0-linux-x64-delta.tar.zst".to_string();
-        v2.delta_sha256 = sha256_hex(&delta_v2);
+        v2.set_primary_delta(Some(DeltaArtifact::bsdiff_zstd(
+            "primary",
+            "1.0.0",
+            "demo-1.1.0-linux-x64-delta.tar.zst",
+            delta_v2.len() as i64,
+            &sha256_hex(&delta_v2),
+        )));
 
         backend
             .put_object(&v1.full_filename, &full_v1, "application/octet-stream")
             .await
             .expect("v1 full should upload");
+        let v2_delta = v2
+            .selected_delta()
+            .expect("v2 should include descriptor delta")
+            .filename;
         backend
-            .put_object(&v2.delta_filename, &delta_v2, "application/octet-stream")
+            .put_object(&v2_delta, &delta_v2, "application/octet-stream")
             .await
             .expect("v2 delta should upload");
 

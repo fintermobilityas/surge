@@ -40,6 +40,12 @@ pub struct InstallerRelease {
     pub full_filename: String,
     #[serde(default)]
     pub delta_filename: String,
+    #[serde(default)]
+    pub delta_algorithm: String,
+    #[serde(default)]
+    pub delta_patch_format: String,
+    #[serde(default)]
+    pub delta_compression: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

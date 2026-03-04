@@ -83,15 +83,23 @@ pub async fn execute(
                 size_hint: release.full_size.max(0) as u64,
             });
         }
-        if !release.delta_filename.is_empty() {
-            let old_key = release.delta_filename.clone();
+        for delta in &mut release.deltas {
+            if delta.filename.is_empty() {
+                continue;
+            }
+            let old_key = delta.filename.clone();
             let new_key = canonicalize_artifact_key(&old_key, &source_app_id, &canonical_app_id);
-            release.delta_filename.clone_from(&new_key);
+            delta.filename.clone_from(&new_key);
             copy_operations.insert(CopyOperation {
                 source_key: old_key,
                 destination_key: new_key,
-                size_hint: release.delta_size.max(0) as u64,
+                size_hint: delta.size.max(0) as u64,
             });
+        }
+        if let Some(primary) = release.selected_delta() {
+            release.set_primary_delta(Some(primary));
+        } else {
+            release.set_primary_delta(None);
         }
     }
 

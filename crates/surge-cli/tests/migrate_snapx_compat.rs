@@ -227,6 +227,6 @@ fn migrate_snapx_style_app_copies_full_and_delta_artifacts() {
         index
             .releases
             .iter()
-            .any(|release| release.version == "1.1.0" && release.rid == rid && !release.delta_filename.is_empty())
+            .any(|release| release.version == "1.1.0" && release.rid == rid && release.selected_delta().is_some())
     );
 }

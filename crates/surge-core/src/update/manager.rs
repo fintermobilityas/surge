@@ -17,7 +17,7 @@ use crate::platform::fs::{atomic_rename, copy_directory};
 use crate::platform::process::spawn_detached;
 use crate::platform::shortcuts::install_shortcuts;
 use crate::releases::manifest::{
-    ReleaseEntry, ReleaseIndex, decompress_release_index, get_delta_chain, get_releases_newer_than,
+    DeltaArtifact, ReleaseEntry, ReleaseIndex, decompress_release_index, get_delta_chain, get_releases_newer_than,
 };
 use crate::releases::restore::restore_full_archive_for_version;
 use crate::releases::version::compare_versions;
@@ -223,9 +223,19 @@ impl UpdateManager {
         let delta_chain = get_delta_chain(&compatible_index, &self.current_version, &latest_version, &self.channel);
 
         let available_releases: Vec<ReleaseEntry> = newer.into_iter().cloned().collect();
-        let (apply_releases, apply_strategy, download_size) = if let Some(chain) = delta_chain {
+        let supported_delta_chain = delta_chain.filter(|chain| {
+            chain
+                .iter()
+                .all(|release| release.selected_delta().is_some_and(|delta| is_supported_delta(&delta)))
+        });
+
+        let (apply_releases, apply_strategy, download_size) = if let Some(chain) = supported_delta_chain {
             let selected: Vec<ReleaseEntry> = chain.into_iter().cloned().collect();
-            let size = selected.iter().map(|r| r.delta_size).sum();
+            let size = selected
+                .iter()
+                .filter_map(ReleaseEntry::selected_delta)
+                .map(|delta| delta.size)
+                .sum();
             (selected, ApplyStrategy::Delta, size)
         } else {
             (vec![latest.clone()], ApplyStrategy::Full, latest.full_size)
@@ -300,19 +310,17 @@ impl UpdateManager {
             for (i, release) in info.apply_releases.iter().enumerate() {
                 self.ctx.check_cancelled()?;
 
-                if release.delta_filename.is_empty() {
+                let Some(delta) = release.selected_delta() else {
                     continue;
-                }
+                };
 
-                let dest = staging_dir.join(&release.delta_filename);
+                let dest = staging_dir.join(&delta.filename);
                 debug!(
-                    filename = %release.delta_filename,
+                    filename = %delta.filename,
                     "Downloading delta package"
                 );
 
-                self.storage
-                    .download_to_file(&release.delta_filename, &dest, None)
-                    .await?;
+                self.storage.download_to_file(&delta.filename, &dest, None).await?;
 
                 let pct = ((i + 1) * 100 / total_deltas) as i32;
                 report(2, pct, 10 + pct * 30 / 100);
@@ -344,16 +352,16 @@ impl UpdateManager {
             for release in &info.apply_releases {
                 self.ctx.check_cancelled()?;
 
-                if release.delta_filename.is_empty() {
+                let Some(delta) = release.selected_delta() else {
                     continue;
-                }
+                };
 
-                let path = staging_dir.join(&release.delta_filename);
+                let path = staging_dir.join(&delta.filename);
                 let hash = sha256_hex_file(&path)?;
-                if !release.delta_sha256.is_empty() && hash != release.delta_sha256 {
+                if !delta.sha256.is_empty() && hash != delta.sha256 {
                     return Err(SurgeError::Update(format!(
                         "SHA-256 mismatch for {}: expected {}, got {hash}",
-                        release.delta_filename, release.delta_sha256
+                        delta.filename, delta.sha256
                     )));
                 }
             }
@@ -403,21 +411,26 @@ impl UpdateManager {
             for release in &info.apply_releases {
                 self.ctx.check_cancelled()?;
 
-                if release.delta_filename.is_empty() {
+                let Some(delta) = release.selected_delta() else {
                     return Err(SurgeError::Update(format!(
                         "Delta update path is missing delta filename for {}",
                         release.version
                     )));
+                };
+
+                if !is_supported_delta(&delta) {
+                    return Err(SurgeError::Update(format!(
+                        "Delta {} for {} uses unsupported descriptor (algorithm='{}', format='{}', compression='{}')",
+                        delta.filename, release.version, delta.algorithm, delta.patch_format, delta.compression
+                    )));
                 }
 
-                let delta_path = staging_dir.join(&release.delta_filename);
+                let delta_path = staging_dir.join(&delta.filename);
                 let delta_compressed = tokio::fs::read(&delta_path).await?;
-                let patch = zstd::decode_all(delta_compressed.as_slice()).map_err(|e| {
-                    SurgeError::Archive(format!("Failed to decompress delta {}: {e}", release.delta_filename))
-                })?;
-                rebuilt_archive = bspatch_buffers(&rebuilt_archive, &patch).map_err(|e| {
-                    SurgeError::Update(format!("Failed to apply delta {}: {e}", release.delta_filename))
-                })?;
+                let patch = decode_delta_patch(delta_compressed.as_slice(), &delta)
+                    .map_err(|e| SurgeError::Archive(format!("Failed to decompress delta {}: {e}", delta.filename)))?;
+                rebuilt_archive = apply_delta_patch(&rebuilt_archive, &patch, &delta)
+                    .map_err(|e| SurgeError::Update(format!("Failed to apply delta {}: {e}", delta.filename)))?;
 
                 if !release.full_sha256.is_empty() {
                     let hash = sha256_hex(&rebuilt_archive);
@@ -628,6 +641,48 @@ fn normalize_os_label(raw: &str) -> String {
     }
 }
 
+fn normalized_or_default<'a>(value: &'a str, default: &'a str) -> &'a str {
+    let trimmed = value.trim();
+    if trimmed.is_empty() { default } else { trimmed }
+}
+
+fn is_supported_delta(delta: &DeltaArtifact) -> bool {
+    let algorithm = normalized_or_default(&delta.algorithm, crate::releases::manifest::DIFF_ALGORITHM_BSDIFF);
+    let patch_format = normalized_or_default(&delta.patch_format, crate::releases::manifest::PATCH_FORMAT_BSDIFF4);
+    let compression = normalized_or_default(&delta.compression, crate::releases::manifest::COMPRESSION_ZSTD);
+
+    algorithm.eq_ignore_ascii_case(crate::releases::manifest::DIFF_ALGORITHM_BSDIFF)
+        && patch_format.eq_ignore_ascii_case(crate::releases::manifest::PATCH_FORMAT_BSDIFF4)
+        && compression.eq_ignore_ascii_case(crate::releases::manifest::COMPRESSION_ZSTD)
+}
+
+fn decode_delta_patch(data: &[u8], delta: &DeltaArtifact) -> Result<Vec<u8>> {
+    let compression = normalized_or_default(&delta.compression, crate::releases::manifest::COMPRESSION_ZSTD);
+    if compression.eq_ignore_ascii_case(crate::releases::manifest::COMPRESSION_ZSTD) {
+        return zstd::decode_all(data).map_err(|e| SurgeError::Archive(format!("{e}")));
+    }
+    Err(SurgeError::Update(format!(
+        "Unsupported delta compression '{}'",
+        delta.compression
+    )))
+}
+
+fn apply_delta_patch(older: &[u8], patch: &[u8], delta: &DeltaArtifact) -> Result<Vec<u8>> {
+    let algorithm = normalized_or_default(&delta.algorithm, crate::releases::manifest::DIFF_ALGORITHM_BSDIFF);
+    let patch_format = normalized_or_default(&delta.patch_format, crate::releases::manifest::PATCH_FORMAT_BSDIFF4);
+
+    if algorithm.eq_ignore_ascii_case(crate::releases::manifest::DIFF_ALGORITHM_BSDIFF)
+        && patch_format.eq_ignore_ascii_case(crate::releases::manifest::PATCH_FORMAT_BSDIFF4)
+    {
+        return bspatch_buffers(older, patch);
+    }
+
+    Err(SurgeError::Update(format!(
+        "Unsupported delta algorithm/format '{}/{}'",
+        delta.algorithm, delta.patch_format
+    )))
+}
+
 fn find_previous_app_dir(install_dir: &Path, current_version: &str) -> Option<PathBuf> {
     let active = install_dir.join("app");
     if active.is_dir() {
@@ -768,7 +823,7 @@ mod tests {
     use crate::diff::wrapper::bsdiff_buffers;
     #[cfg(target_os = "linux")]
     use crate::platform::shortcuts::{clear_test_shortcut_paths_override, set_test_shortcut_paths_override};
-    use crate::releases::manifest::{ReleaseEntry, ReleaseIndex, compress_release_index};
+    use crate::releases::manifest::{DeltaArtifact, ReleaseEntry, ReleaseIndex, compress_release_index};
 
     fn make_entry(version: &str, channel: &str, os: &str, rid: &str) -> ReleaseEntry {
         ReleaseEntry {
@@ -780,9 +835,14 @@ mod tests {
             full_filename: format!("{version}-full.tar.zst"),
             full_size: 1000,
             full_sha256: String::new(),
-            delta_filename: format!("{version}-delta.tar.zst"),
-            delta_size: 100,
-            delta_sha256: String::new(),
+            deltas: vec![DeltaArtifact::bsdiff_zstd(
+                "primary",
+                "",
+                &format!("{version}-delta.tar.zst"),
+                100,
+                "",
+            )],
+            preferred_delta_id: "primary".to_string(),
             created_utc: String::new(),
             release_notes: String::new(),
             name: String::new(),
@@ -997,9 +1057,7 @@ mod tests {
 
         let mut release = make_entry("1.1.0", "stable", &current_os_label_for_tests(), &current_rid());
         release.is_genesis = true;
-        release.delta_filename.clear();
-        release.delta_size = 0;
-        release.delta_sha256.clear();
+        release.set_primary_delta(None);
 
         let index = ReleaseIndex {
             app_id: "test-app".to_string(),
@@ -1027,6 +1085,93 @@ mod tests {
         assert_eq!(info.apply_strategy, ApplyStrategy::Full);
         assert_eq!(info.apply_releases.len(), 1);
         assert_eq!(info.apply_releases[0].full_filename, "1.1.0-full.tar.zst");
+    }
+
+    #[tokio::test]
+    async fn test_check_for_updates_uses_descriptor_delta_chain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("store");
+        std::fs::create_dir_all(&store_root).unwrap();
+
+        let rid = current_rid();
+        let os = current_os_label_for_tests();
+        let mut release = make_entry("1.1.0", "stable", &os, &rid);
+        release.set_primary_delta(Some(DeltaArtifact::bsdiff_zstd(
+            "primary",
+            "1.0.0",
+            "1.1.0-descriptor-delta.tar.zst",
+            99,
+            "",
+        )));
+
+        let index = ReleaseIndex {
+            app_id: "test-app".to_string(),
+            releases: vec![release],
+            ..ReleaseIndex::default()
+        };
+        let compressed = compress_release_index(&index, DEFAULT_ZSTD_LEVEL).unwrap();
+        std::fs::write(store_root.join(RELEASES_FILE_COMPRESSED), compressed).unwrap();
+
+        let ctx = Arc::new(Context::new());
+        ctx.set_storage(
+            StorageProvider::Filesystem,
+            store_root.to_str().unwrap(),
+            "",
+            "",
+            "",
+            "",
+        );
+
+        let mut manager = UpdateManager::new(ctx, "test-app", "1.0.0", "stable", tmp.path().to_str().unwrap()).unwrap();
+        let info = manager.check_for_updates().await.unwrap().unwrap();
+        assert!(info.delta_available);
+        assert_eq!(info.apply_strategy, ApplyStrategy::Delta);
+        assert_eq!(info.download_size, 99);
+    }
+
+    #[tokio::test]
+    async fn test_check_for_updates_falls_back_to_full_for_unsupported_descriptor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("store");
+        std::fs::create_dir_all(&store_root).unwrap();
+
+        let rid = current_rid();
+        let os = current_os_label_for_tests();
+        let mut release = make_entry("1.1.0", "stable", &os, &rid);
+        release.deltas = vec![DeltaArtifact {
+            id: "primary".to_string(),
+            from_version: "1.0.0".to_string(),
+            algorithm: "qbsdiff_bsdiff4".to_string(),
+            patch_format: "bsdiff4".to_string(),
+            compression: "zstd".to_string(),
+            filename: "1.1.0-unsupported-delta.tar.zst".to_string(),
+            size: 99,
+            sha256: String::new(),
+        }];
+        release.preferred_delta_id = "primary".to_string();
+
+        let index = ReleaseIndex {
+            app_id: "test-app".to_string(),
+            releases: vec![release],
+            ..ReleaseIndex::default()
+        };
+        let compressed = compress_release_index(&index, DEFAULT_ZSTD_LEVEL).unwrap();
+        std::fs::write(store_root.join(RELEASES_FILE_COMPRESSED), compressed).unwrap();
+
+        let ctx = Arc::new(Context::new());
+        ctx.set_storage(
+            StorageProvider::Filesystem,
+            store_root.to_str().unwrap(),
+            "",
+            "",
+            "",
+            "",
+        );
+
+        let mut manager = UpdateManager::new(ctx, "test-app", "1.0.0", "stable", tmp.path().to_str().unwrap()).unwrap();
+        let info = manager.check_for_updates().await.unwrap().unwrap();
+        assert!(!info.delta_available);
+        assert_eq!(info.apply_strategy, ApplyStrategy::Full);
     }
 
     #[tokio::test]
@@ -1097,9 +1242,8 @@ mod tests {
                 full_filename: full_filename.clone(),
                 full_size,
                 full_sha256,
-                delta_filename: String::new(),
-                delta_size: 0,
-                delta_sha256: String::new(),
+                deltas: Vec::new(),
+                preferred_delta_id: String::new(),
                 created_utc: chrono::Utc::now().to_rfc3339(),
                 release_notes: String::new(),
                 name: String::new(),
@@ -1194,9 +1338,8 @@ mod tests {
                     full_filename: full_v1_name.clone(),
                     full_size: full_v1.len() as i64,
                     full_sha256: sha256_hex(&full_v1),
-                    delta_filename: String::new(),
-                    delta_size: 0,
-                    delta_sha256: String::new(),
+                    deltas: Vec::new(),
+                    preferred_delta_id: String::new(),
                     created_utc: chrono::Utc::now().to_rfc3339(),
                     release_notes: String::new(),
                     name: String::new(),
@@ -1218,9 +1361,14 @@ mod tests {
                     full_filename: full_v2_name.clone(),
                     full_size: full_v2.len() as i64,
                     full_sha256: sha256_hex(&full_v2),
-                    delta_filename: delta_v2_name.clone(),
-                    delta_size: delta_v2.len() as i64,
-                    delta_sha256: sha256_hex(&delta_v2),
+                    deltas: vec![DeltaArtifact::bsdiff_zstd(
+                        "primary",
+                        "1.0.0",
+                        &delta_v2_name,
+                        delta_v2.len() as i64,
+                        &sha256_hex(&delta_v2),
+                    )],
+                    preferred_delta_id: "primary".to_string(),
                     created_utc: chrono::Utc::now().to_rfc3339(),
                     release_notes: String::new(),
                     name: String::new(),
@@ -1242,9 +1390,14 @@ mod tests {
                     full_filename: full_v3_name,
                     full_size: full_v3.len() as i64,
                     full_sha256: sha256_hex(&full_v3),
-                    delta_filename: delta_v3_name,
-                    delta_size: delta_v3.len() as i64,
-                    delta_sha256: sha256_hex(&delta_v3),
+                    deltas: vec![DeltaArtifact::bsdiff_zstd(
+                        "primary",
+                        "1.1.0",
+                        &delta_v3_name,
+                        delta_v3.len() as i64,
+                        &sha256_hex(&delta_v3),
+                    )],
+                    preferred_delta_id: "primary".to_string(),
                     created_utc: chrono::Utc::now().to_rfc3339(),
                     release_notes: String::new(),
                     name: String::new(),
@@ -1321,9 +1474,8 @@ mod tests {
                 full_filename: full_filename.clone(),
                 full_size,
                 full_sha256,
-                delta_filename: String::new(),
-                delta_size: 0,
-                delta_sha256: String::new(),
+                deltas: Vec::new(),
+                preferred_delta_id: String::new(),
                 created_utc: chrono::Utc::now().to_rfc3339(),
                 release_notes: String::new(),
                 name: String::new(),
@@ -1421,9 +1573,8 @@ mod tests {
                 full_filename: full_filename.clone(),
                 full_size,
                 full_sha256,
-                delta_filename: String::new(),
-                delta_size: 0,
-                delta_sha256: String::new(),
+                deltas: Vec::new(),
+                preferred_delta_id: String::new(),
                 created_utc: chrono::Utc::now().to_rfc3339(),
                 release_notes: String::new(),
                 name: String::new(),

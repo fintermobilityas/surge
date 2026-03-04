@@ -7,6 +7,48 @@ use crate::config::manifest::ShortcutLocation;
 use crate::error::{Result, SurgeError};
 use crate::releases::version::compare_versions;
 
+pub const DIFF_ALGORITHM_BSDIFF: &str = "bsdiff";
+pub const PATCH_FORMAT_BSDIFF4: &str = "bsdiff4";
+pub const COMPRESSION_ZSTD: &str = "zstd";
+
+/// A single delta artifact descriptor.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DeltaArtifact {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub from_version: String,
+    #[serde(default)]
+    pub algorithm: String,
+    #[serde(default)]
+    pub patch_format: String,
+    #[serde(default)]
+    pub compression: String,
+    #[serde(default)]
+    pub filename: String,
+    #[serde(default)]
+    pub size: i64,
+    #[serde(default)]
+    pub sha256: String,
+}
+
+impl DeltaArtifact {
+    /// Build a descriptor for the current default delta format (bsdiff + zstd).
+    #[must_use]
+    pub fn bsdiff_zstd(id: &str, from_version: &str, filename: &str, size: i64, sha256: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            from_version: from_version.to_string(),
+            algorithm: DIFF_ALGORITHM_BSDIFF.to_string(),
+            patch_format: PATCH_FORMAT_BSDIFF4.to_string(),
+            compression: COMPRESSION_ZSTD.to_string(),
+            filename: filename.to_string(),
+            size,
+            sha256: sha256.to_string(),
+        }
+    }
+}
+
 /// A single release entry in the release index.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReleaseEntry {
@@ -28,11 +70,9 @@ pub struct ReleaseEntry {
     pub full_sha256: String,
 
     #[serde(default)]
-    pub delta_filename: String,
+    pub deltas: Vec<DeltaArtifact>,
     #[serde(default)]
-    pub delta_size: i64,
-    #[serde(default)]
-    pub delta_sha256: String,
+    pub preferred_delta_id: String,
 
     #[serde(default)]
     pub created_utc: String,
@@ -69,6 +109,56 @@ impl ReleaseEntry {
             return &self.main_exe;
         }
         app_id
+    }
+
+    /// Return the selected delta descriptor.
+    #[must_use]
+    pub fn selected_delta(&self) -> Option<DeltaArtifact> {
+        if !self.preferred_delta_id.trim().is_empty()
+            && let Some(delta) = self
+                .deltas
+                .iter()
+                .find(|delta| delta.id == self.preferred_delta_id && !delta.filename.trim().is_empty())
+        {
+            return Some(delta.clone());
+        }
+
+        self.deltas
+            .iter()
+            .find(|delta| !delta.filename.trim().is_empty())
+            .cloned()
+    }
+
+    /// Return all declared deltas.
+    #[must_use]
+    pub fn all_deltas(&self) -> Vec<DeltaArtifact> {
+        self.deltas
+            .iter()
+            .filter(|delta| !delta.filename.trim().is_empty())
+            .cloned()
+            .collect()
+    }
+
+    /// Set one canonical delta descriptor.
+    pub fn set_primary_delta(&mut self, delta: Option<DeltaArtifact>) {
+        match delta {
+            Some(delta) if !delta.filename.trim().is_empty() => {
+                let primary_id = if delta.id.trim().is_empty() {
+                    "primary".to_string()
+                } else {
+                    delta.id.clone()
+                };
+
+                let mut primary = delta;
+                primary.id.clone_from(&primary_id);
+                self.preferred_delta_id = primary_id;
+                self.deltas = vec![primary];
+            }
+            _ => {
+                self.preferred_delta_id.clear();
+                self.deltas.clear();
+            }
+        }
     }
 }
 
@@ -150,7 +240,7 @@ pub fn get_releases_newer_than<'a>(index: &'a ReleaseIndex, version: &str, chann
 /// given channel. Returns `None` if no valid contiguous delta chain exists.
 ///
 /// The chain is ordered from oldest to newest, where:
-/// - Each entry has a non-empty `delta_filename`
+/// - Each entry has a selected non-empty delta descriptor
 /// - Entries are contiguous versions on the channel between `from` and `to`
 pub fn get_delta_chain<'a>(
     index: &'a ReleaseIndex,
@@ -193,7 +283,7 @@ pub fn get_delta_chain<'a>(
     }
 
     // Delta chains require an actual delta file for each step.
-    let all_have_deltas = chain.iter().all(|r| !r.delta_filename.is_empty());
+    let all_have_deltas = chain.iter().all(|r| r.selected_delta().is_some());
     if !all_have_deltas {
         return None;
     }
@@ -206,6 +296,18 @@ mod tests {
     use super::*;
 
     fn make_entry(version: &str, channels: &[&str], has_delta: bool) -> ReleaseEntry {
+        let delta = if has_delta {
+            Some(DeltaArtifact::bsdiff_zstd(
+                "primary",
+                "",
+                &format!("app-{version}-delta.tar.zst"),
+                200,
+                "def456",
+            ))
+        } else {
+            None
+        };
+
         ReleaseEntry {
             version: version.to_string(),
             channels: channels.iter().map(|s| (*s).to_string()).collect(),
@@ -215,13 +317,12 @@ mod tests {
             full_filename: format!("app-{version}-full.tar.zst"),
             full_size: 1000,
             full_sha256: "abc123".to_string(),
-            delta_filename: if has_delta {
-                format!("app-{version}-delta.tar.zst")
+            deltas: delta.into_iter().collect(),
+            preferred_delta_id: if has_delta {
+                "primary".to_string()
             } else {
                 String::new()
             },
-            delta_size: if has_delta { 200 } else { 0 },
-            delta_sha256: if has_delta { "def456".to_string() } else { String::new() },
             created_utc: "2025-01-01T00:00:00Z".to_string(),
             release_notes: String::new(),
             name: String::new(),
@@ -364,5 +465,27 @@ mod tests {
         let index = make_index(vec![genesis]);
         let chain = get_delta_chain(&index, "1.0.0", "1.1.0", "stable");
         assert!(chain.is_none());
+    }
+
+    #[test]
+    fn test_selected_delta_uses_descriptor_preference() {
+        let mut entry = make_entry("1.2.0", &["stable"], true);
+        entry.deltas.push(DeltaArtifact::bsdiff_zstd(
+            "secondary",
+            "1.1.0",
+            "app-1.2.0-alt-delta.tar.zst",
+            250,
+            "bead",
+        ));
+        entry.preferred_delta_id = "secondary".to_string();
+        let selected = entry.selected_delta().expect("selected delta should exist");
+        assert_eq!(selected.id, "secondary");
+        assert_eq!(selected.filename, "app-1.2.0-alt-delta.tar.zst");
+    }
+
+    #[test]
+    fn test_selected_delta_none_when_no_descriptors() {
+        let entry = make_entry("1.1.0", &["stable"], false);
+        assert!(entry.selected_delta().is_none());
     }
 }

@@ -13,7 +13,9 @@ use crate::context::Context;
 use crate::crypto::sha256::sha256_hex_file;
 use crate::diff::wrapper::bsdiff_buffers;
 use crate::error::{Result, SurgeError};
-use crate::releases::manifest::{ReleaseEntry, ReleaseIndex, compress_release_index, decompress_release_index};
+use crate::releases::manifest::{
+    DeltaArtifact, ReleaseEntry, ReleaseIndex, compress_release_index, decompress_release_index,
+};
 use crate::releases::restore::{find_previous_release_for_rid, restore_full_archive_for_version};
 use crate::storage::{StorageBackend, create_storage_backend};
 
@@ -344,9 +346,8 @@ impl PackBuilder {
             full_filename: full.map_or(String::new(), |a| a.filename.clone()),
             full_size: full.map_or(0, |a| a.size),
             full_sha256: full.map_or(String::new(), |a| a.sha256.clone()),
-            delta_filename: delta.map_or(String::new(), |a| a.filename.clone()),
-            delta_size: delta.map_or(0, |a| a.size),
-            delta_sha256: delta.map_or(String::new(), |a| a.sha256.clone()),
+            deltas: Vec::new(),
+            preferred_delta_id: String::new(),
             created_utc: chrono::Utc::now().to_rfc3339(),
             release_notes: String::new(),
             name: self.name.clone(),
@@ -359,6 +360,17 @@ impl PackBuilder {
             installers: self.installers.clone(),
             environment: self.environment.clone(),
         };
+        let mut entry = entry;
+        let primary_delta = delta.map(|artifact| {
+            DeltaArtifact::bsdiff_zstd(
+                "primary",
+                &artifact.from_version,
+                &artifact.filename,
+                artifact.size,
+                &artifact.sha256,
+            )
+        });
+        entry.set_primary_delta(primary_delta);
 
         // Remove any existing entry for this version/RID pair and add the new one.
         index
@@ -578,9 +590,8 @@ apps:
                     full_filename: full_v1_name,
                     full_size: full_v1.len() as i64,
                     full_sha256: sha256_hex(&full_v1),
-                    delta_filename: String::new(),
-                    delta_size: 0,
-                    delta_sha256: String::new(),
+                    deltas: Vec::new(),
+                    preferred_delta_id: String::new(),
                     created_utc: chrono::Utc::now().to_rfc3339(),
                     release_notes: String::new(),
                     name: String::new(),
@@ -602,9 +613,14 @@ apps:
                     full_filename: full_v2_name,
                     full_size: full_v2.len() as i64,
                     full_sha256: sha256_hex(&full_v2),
-                    delta_filename: delta_v2_name,
-                    delta_size: delta_v2.len() as i64,
-                    delta_sha256: sha256_hex(&delta_v2),
+                    deltas: vec![DeltaArtifact::bsdiff_zstd(
+                        "primary",
+                        "1.0.0",
+                        &format!("{app_id}-1.1.0-{rid}-delta.tar.zst"),
+                        delta_v2.len() as i64,
+                        &sha256_hex(&delta_v2),
+                    )],
+                    preferred_delta_id: "primary".to_string(),
                     created_utc: chrono::Utc::now().to_rfc3339(),
                     release_notes: String::new(),
                     name: String::new(),

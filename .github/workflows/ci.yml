@@ -83,72 +83,77 @@ jobs:
             echo "::warning::Pedantic lint debt detected (non-blocking advisory job)."
           }
 
-  linux:
-    name: Linux x64
-    runs-on: ubuntu-latest
+  rust-test:
+    name: Rust tests (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: Linux x64
+            cache_key: linux-test
+          - os: windows-latest
+            name: Windows x64
+            cache_key: windows-test
+          - os: macos-latest
+            name: macOS
+            cache_key: macos-test
     steps:
       - uses: actions/checkout@v6
         with:
           submodules: true
       - uses: Swatinem/rust-cache@v2
         with:
-          key: linux-release
-      - run: cargo build --release
+          key: ${{ matrix.cache_key }}
       - run: cargo test --release
-      - name: Upload artifacts
-        if: github.event_name == 'push'
-        uses: actions/upload-artifact@v7
-        with:
-          name: linux-x64
-          path: |
-            target/release/libsurge.so
-            target/release/surge
-            target/release/surge-supervisor
 
-  windows:
-    name: Windows x64
-    runs-on: windows-latest
+  rust-artifacts:
+    name: Rust artifacts (${{ matrix.name }})
+    if: github.event_name == 'push'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: Linux x64
+            cache_key: linux-artifacts
+            artifact_name: linux-x64
+            artifact_path: |
+              target/release/libsurge.so
+              target/release/surge
+              target/release/surge-supervisor
+          - os: windows-latest
+            name: Windows x64
+            cache_key: windows-artifacts
+            artifact_name: win-x64
+            artifact_path: |
+              target/release/surge.dll
+              target/release/surge.dll.lib
+              target/release/surge.exe
+              target/release/surge-supervisor.exe
+          - os: macos-latest
+            name: macOS
+            cache_key: macos-artifacts
+            artifact_name: osx-x64
+            artifact_path: |
+              target/release/libsurge.dylib
+              target/release/surge
+              target/release/surge-supervisor
     steps:
       - uses: actions/checkout@v6
         with:
           submodules: true
       - uses: Swatinem/rust-cache@v2
         with:
-          key: windows-release
+          key: ${{ matrix.cache_key }}
       - run: cargo build --release
-      - run: cargo test --release
       - name: Upload artifacts
-        if: github.event_name == 'push'
         uses: actions/upload-artifact@v7
         with:
-          name: win-x64
-          path: |
-            target/release/surge.dll
-            target/release/surge.dll.lib
-            target/release/surge.exe
-            target/release/surge-supervisor.exe
-
-  macos:
-    name: macOS
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: true
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: macos-release
-      - run: cargo build --release
-      - run: cargo test --release
-      - name: Upload artifacts
-        if: github.event_name == 'push'
-        uses: actions/upload-artifact@v7
-        with:
-          name: osx-x64
-          path: |
-            target/release/libsurge.dylib
-            target/release/surge
-            target/release/surge-supervisor
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_path }}
 
   dotnet:
     name: .NET
@@ -177,7 +182,7 @@ jobs:
   nuget:
     name: Publish NuGet
     runs-on: ubuntu-latest
-    needs: [version, clippy, clippy-strict, linux, windows, macos, dotnet]
+    needs: [version, clippy, clippy-strict, rust-test, rust-artifacts, dotnet]
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
     defaults:
       run:
@@ -202,7 +207,7 @@ jobs:
   cargo-cloudsmith-publish:
     name: Publish Cargo (Cloudsmith)
     runs-on: ubuntu-latest
-    needs: [version, clippy, clippy-strict, linux, windows, macos, dotnet]
+    needs: [version, clippy, clippy-strict, rust-test, rust-artifacts, dotnet]
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
     env:
       CLOUDSMITH_API_KEY: ${{ secrets.CLOUDSMITH_API_KEY }}
@@ -281,7 +286,7 @@ jobs:
   release:
     name: Draft Release
     runs-on: ubuntu-latest
-    needs: [version, clippy, clippy-strict, linux, windows, macos, dotnet]
+    needs: [version, clippy, clippy-strict, rust-test, rust-artifacts, dotnet]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
       contents: write

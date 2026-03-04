@@ -232,6 +232,17 @@ enum Commands {
         packages_dir: PathBuf,
     },
 
+    /// Install from an extracted installer directory (used by self-extracting installers)
+    Setup {
+        /// Path to extracted installer directory
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+
+        /// Do not start the application after installation
+        #[arg(long)]
+        no_start: bool,
+    },
+
     /// Install packages using a selected transport method
     Install {
         /// Install method (defaults to backend)
@@ -359,7 +370,29 @@ fn main() -> ExitCode {
 
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
-        Err(err) => return handle_parse_error(err),
+        Err(err) => {
+            if err.kind() == clap::error::ErrorKind::MissingSubcommand
+                && let Some(installer_dir) = detect_installer_context()
+            {
+                init_tracing(false);
+                let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build();
+                let rt = match rt {
+                    Ok(runtime) => runtime,
+                    Err(e) => {
+                        logline::error(&format!("failed to create tokio runtime: {e}"));
+                        return ExitCode::FAILURE;
+                    }
+                };
+                return match rt.block_on(commands::setup::execute(&installer_dir, false)) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        logline::error(&e.to_string());
+                        ExitCode::FAILURE
+                    }
+                };
+            }
+            return handle_parse_error(err);
+        }
     };
     logline::init_verbose(cli.verbose);
     init_tracing(cli.verbose);
@@ -381,6 +414,19 @@ fn main() -> ExitCode {
             logline::error(&e.to_string());
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Check if `installer.yml` exists next to the current executable.
+/// This is the auto-detection path for warp-extracted bundles.
+fn detect_installer_context() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    let manifest = dir.join("installer.yml");
+    if manifest.is_file() {
+        Some(dir.to_path_buf())
+    } else {
+        None
     }
 }
 
@@ -546,6 +592,8 @@ async fn run(cli: Cli) -> surge_core::error::Result<()> {
                 .await
             }
         }
+
+        Commands::Setup { dir, no_start } => commands::setup::execute(&dir, no_start).await,
 
         Commands::Install {
             method,

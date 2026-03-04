@@ -13,3 +13,6 @@ apps:
     targets:
       - rid: linux-x64
         artifacts_dir: artifacts
+        installers:
+          - web
+          - offline

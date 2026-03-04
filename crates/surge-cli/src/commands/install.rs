@@ -3,13 +3,10 @@ use std::path::Path;
 use crate::logline;
 use tokio::process::Command;
 
-use surge_core::archive::extractor::extract_file_to;
 use surge_core::config::constants::RELEASES_FILE_COMPRESSED;
 use surge_core::config::manifest::SurgeManifest;
 use surge_core::error::{Result, SurgeError};
-use surge_core::platform::paths::default_install_root;
-use surge_core::platform::process::spawn_detached;
-use surge_core::platform::shortcuts::install_shortcuts;
+use surge_core::install::{self as core_install, InstallProfile};
 use surge_core::releases::manifest::{ReleaseEntry, ReleaseIndex, decompress_release_index};
 use surge_core::releases::restore::restore_full_archive_for_version;
 use surge_core::releases::version::compare_versions;
@@ -201,7 +198,7 @@ pub async fn execute(
 
             if !no_start && !plan_only {
                 let display_name = release.display_name(&app_id);
-                match auto_start_after_install(release, &install_root, &active_app_dir) {
+                match auto_start_after_install(release, &app_id, &install_root, &active_app_dir) {
                     Ok(pid) => {
                         logline::success(&format!("Started '{display_name}' (pid {pid})."));
                     }
@@ -261,112 +258,32 @@ fn load_install_manifest(application_manifest_path: &Path, fallback_manifest_pat
     SurgeManifest::from_file(fallback_manifest_path)
 }
 
-fn install_package_locally(app_id: &str, release: &ReleaseEntry, package_path: &Path) -> Result<std::path::PathBuf> {
-    let install_root = default_install_root(app_id, &release.install_directory)?;
-    install_package_locally_at_root(app_id, release, package_path, &install_root)?;
-    Ok(install_root)
+fn release_install_profile<'a>(app_id: &'a str, release: &'a ReleaseEntry) -> InstallProfile<'a> {
+    InstallProfile {
+        app_id,
+        display_name: release.display_name(app_id),
+        main_exe: &release.main_exe,
+        install_directory: &release.install_directory,
+        supervisor_id: &release.supervisor_id,
+        icon: &release.icon,
+        shortcuts: &release.shortcuts,
+        environment: &release.environment,
+    }
 }
 
-fn install_package_locally_at_root(
-    app_id: &str,
-    release: &ReleaseEntry,
-    package_path: &Path,
-    install_root: &Path,
-) -> Result<()> {
-    std::fs::create_dir_all(install_root)?;
-
-    let active_app_dir = install_root.join("app");
-    let next_app_dir = install_root.join(".surge-app-next");
-    let previous_app_dir = install_root.join(".surge-app-prev");
-
-    if next_app_dir.is_dir() {
-        std::fs::remove_dir_all(&next_app_dir)?;
-    }
-    if previous_app_dir.is_dir() {
-        std::fs::remove_dir_all(&previous_app_dir)?;
-    }
-
-    extract_file_to(package_path, &next_app_dir)?;
-
-    if active_app_dir.is_dir() {
-        std::fs::rename(&active_app_dir, &previous_app_dir)?;
-    }
-
-    if let Err(rename_err) = std::fs::rename(&next_app_dir, &active_app_dir) {
-        if previous_app_dir.is_dir() && !active_app_dir.exists() {
-            let _ = std::fs::rename(&previous_app_dir, &active_app_dir);
-        }
-        return Err(SurgeError::Io(rename_err));
-    }
-
-    if !release.shortcuts.is_empty() {
-        let main_exe = release.main_exe.trim();
-        if main_exe.is_empty() {
-            return Err(SurgeError::Config(format!(
-                "Release '{}' for app '{}' has shortcuts configured but no main executable metadata",
-                release.version, app_id
-            )));
-        }
-        install_shortcuts(
-            app_id,
-            release.display_name(app_id),
-            &active_app_dir,
-            main_exe,
-            &release.supervisor_id,
-            &release.icon,
-            &release.shortcuts,
-            &release.environment,
-        )?;
-    }
-
-    if previous_app_dir.is_dir() {
-        std::fs::remove_dir_all(previous_app_dir)?;
-    }
-
-    Ok(())
+fn install_package_locally(app_id: &str, release: &ReleaseEntry, package_path: &Path) -> Result<std::path::PathBuf> {
+    let profile = release_install_profile(app_id, release);
+    core_install::install_package_locally(&profile, package_path)
 }
 
 fn auto_start_after_install(
     release: &ReleaseEntry,
+    app_id: &str,
     install_root: &std::path::Path,
     active_app_dir: &std::path::Path,
 ) -> Result<u32> {
-    let main_exe = release.main_exe.trim();
-    if main_exe.is_empty() {
-        return Err(SurgeError::Config(
-            "Cannot auto-start: no main executable in release metadata".to_string(),
-        ));
-    }
-
-    let exe_path = active_app_dir.join(main_exe);
-
-    let supervisor_id = release.supervisor_id.trim();
-    if !supervisor_id.is_empty() {
-        let supervisor_path = active_app_dir.join(surge_core::platform::process::supervisor_binary_name());
-
-        let install_root_str = install_root.to_string_lossy();
-        let exe_path_str = exe_path.to_string_lossy();
-        let args: Vec<&str> = vec![
-            "--supervisor-id",
-            supervisor_id,
-            "--install-dir",
-            &install_root_str,
-            "--exe-path",
-            &exe_path_str,
-            "--",
-            "--surge-installed",
-        ];
-        let handle = spawn_detached(&supervisor_path, &args, Some(install_root), &release.environment)?;
-        return Ok(handle.pid());
-    }
-
-    let handle = spawn_detached(
-        &exe_path,
-        &["--surge-installed"],
-        Some(install_root),
-        &release.environment,
-    )?;
-    Ok(handle.pid())
+    let profile = release_install_profile(app_id, release);
+    core_install::auto_start_after_install(&profile, install_root, active_app_dir)
 }
 
 fn build_storage_config_with_overrides(
@@ -715,7 +632,8 @@ mod tests {
         entry.install_directory = "youpark".to_string();
         entry.shortcuts = Vec::new();
 
-        install_package_locally_at_root("youpark", &entry, &package_path, &install_root)
+        let profile = release_install_profile("youpark", &entry);
+        core_install::install_package_locally_at_root(&profile, &package_path, &install_root)
             .expect("local install should succeed");
 
         assert!(install_root.join("app").join("youpark").is_file());
@@ -745,7 +663,8 @@ mod tests {
         entry.install_directory = "youpark".to_string();
         entry.shortcuts = Vec::new();
 
-        install_package_locally_at_root("youpark", &entry, &package_path, &install_root)
+        let profile = release_install_profile("youpark", &entry);
+        core_install::install_package_locally_at_root(&profile, &package_path, &install_root)
             .expect("local install should succeed");
 
         assert!(install_root.join("app").join("new.txt").is_file());

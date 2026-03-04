@@ -2,11 +2,10 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 use surge_core::config::constants::RELEASES_FILE_COMPRESSED;
+use surge_core::platform::detect::current_rid;
 use surge_core::releases::manifest::decompress_release_index;
 
-const SOURCE_APP_ID: &str = "quasar-ubuntu24.04-linux-arm64";
 const CANONICAL_APP_ID: &str = "quasar-ubuntu24.04";
-const RID: &str = "linux-arm64";
 
 // Expected source migration manifest (readable, snapx-compatible naming style).
 const SOURCE_MIGRATION_YML: &str = r"schema: 1
@@ -14,11 +13,11 @@ storage:
   provider: filesystem
   bucket: __SRC_STORE__
 apps:
-  - id: quasar-ubuntu24.04-linux-arm64
+  - id: __SOURCE_APP_ID__
     main: quasar
     installDirectory: quasar
     target:
-      rid: linux-arm64
+      rid: __RID__
       icon: icon.svg
       shortcuts:
         - desktop
@@ -41,15 +40,19 @@ apps:
     main: quasar
     installDirectory: quasar
     target:
-      rid: linux-arm64
+      rid: __RID__
 ";
 
 fn run(args: &[&str], cwd: &Path) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_surge"))
-        .current_dir(cwd)
-        .args(args)
-        .output()
-        .expect("failed to run surge")
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_surge"));
+    cmd.current_dir(cwd).args(args);
+    if std::env::var("SURGE_INSTALLER_BINARY").is_err() {
+        cmd.env("SURGE_INSTALLER_BINARY", env!("CARGO_BIN_EXE_surge"));
+    }
+    if std::env::var("SURGE_INSTALLER_LAUNCHER").is_err() {
+        cmd.env("SURGE_INSTALLER_LAUNCHER", env!("CARGO_BIN_EXE_surge"));
+    }
+    cmd.output().expect("failed to run surge")
 }
 
 fn debug_output(output: &Output) -> String {
@@ -64,6 +67,8 @@ fn debug_output(output: &Output) -> String {
 #[test]
 fn migrate_snapx_style_app_copies_full_and_delta_artifacts() {
     let tmp = tempfile::tempdir().unwrap();
+    let rid = current_rid();
+    let source_app_id = format!("quasar-ubuntu24.04-{rid}");
     let src_store = tmp.path().join("src-store");
     let dst_store = tmp.path().join("dst-store");
     let packages = tmp.path().join("packages");
@@ -75,11 +80,16 @@ fn migrate_snapx_style_app_copies_full_and_delta_artifacts() {
     std::fs::create_dir_all(&artifacts_v1).unwrap();
     std::fs::create_dir_all(&artifacts_v2).unwrap();
 
-    let source_manifest = SOURCE_MIGRATION_YML.replace("__SRC_STORE__", &src_store.to_string_lossy());
+    let source_manifest = SOURCE_MIGRATION_YML
+        .replace("__SRC_STORE__", &src_store.to_string_lossy())
+        .replace("__SOURCE_APP_ID__", &source_app_id)
+        .replace("__RID__", &rid);
     let source_manifest_path = tmp.path().join("source.yml");
     std::fs::write(&source_manifest_path, source_manifest).unwrap();
 
-    let destination_manifest = DEST_MIGRATION_YML.replace("__DST_STORE__", &dst_store.to_string_lossy());
+    let destination_manifest = DEST_MIGRATION_YML
+        .replace("__DST_STORE__", &dst_store.to_string_lossy())
+        .replace("__RID__", &rid);
     let destination_manifest_path = tmp.path().join("dest.yml");
     std::fs::write(&destination_manifest_path, destination_manifest).unwrap();
 
@@ -103,9 +113,9 @@ fn migrate_snapx_style_app_copies_full_and_delta_artifacts() {
             &source_manifest_path_str,
             "pack",
             "--app-id",
-            SOURCE_APP_ID,
+            &source_app_id,
             "--rid",
-            RID,
+            &rid,
             "--version",
             "1.0.0",
             "--artifacts-dir",
@@ -123,9 +133,9 @@ fn migrate_snapx_style_app_copies_full_and_delta_artifacts() {
             &source_manifest_path_str,
             "push",
             "--app-id",
-            SOURCE_APP_ID,
+            &source_app_id,
             "--rid",
-            RID,
+            &rid,
             "--version",
             "1.0.0",
             "--channel",
@@ -143,9 +153,9 @@ fn migrate_snapx_style_app_copies_full_and_delta_artifacts() {
             &source_manifest_path_str,
             "pack",
             "--app-id",
-            SOURCE_APP_ID,
+            &source_app_id,
             "--rid",
-            RID,
+            &rid,
             "--version",
             "1.1.0",
             "--artifacts-dir",
@@ -163,9 +173,9 @@ fn migrate_snapx_style_app_copies_full_and_delta_artifacts() {
             &source_manifest_path_str,
             "push",
             "--app-id",
-            SOURCE_APP_ID,
+            &source_app_id,
             "--rid",
-            RID,
+            &rid,
             "--version",
             "1.1.0",
             "--channel",
@@ -185,7 +195,7 @@ fn migrate_snapx_style_app_copies_full_and_delta_artifacts() {
             "--app-id",
             CANONICAL_APP_ID,
             "--rid",
-            RID,
+            &rid,
             "--dest-manifest",
             &destination_manifest_path_str,
         ],
@@ -193,9 +203,9 @@ fn migrate_snapx_style_app_copies_full_and_delta_artifacts() {
     );
     assert!(out.status.success(), "{}", debug_output(&out));
 
-    let expected_full_v1 = dst_store.join(format!("{CANONICAL_APP_ID}-1.0.0-{RID}-full.tar.zst"));
-    let expected_full_v2 = dst_store.join(format!("{CANONICAL_APP_ID}-1.1.0-{RID}-full.tar.zst"));
-    let expected_delta_v2 = dst_store.join(format!("{CANONICAL_APP_ID}-1.1.0-{RID}-delta.tar.zst"));
+    let expected_full_v1 = dst_store.join(format!("{CANONICAL_APP_ID}-1.0.0-{rid}-full.tar.zst"));
+    let expected_full_v2 = dst_store.join(format!("{CANONICAL_APP_ID}-1.1.0-{rid}-full.tar.zst"));
+    let expected_delta_v2 = dst_store.join(format!("{CANONICAL_APP_ID}-1.1.0-{rid}-delta.tar.zst"));
     let expected_index = dst_store.join(RELEASES_FILE_COMPRESSED);
 
     assert!(expected_full_v1.exists(), "missing {}", expected_full_v1.display());
@@ -211,12 +221,12 @@ fn migrate_snapx_style_app_copies_full_and_delta_artifacts() {
         index
             .releases
             .iter()
-            .any(|release| release.version == "1.0.0" && release.rid == RID)
+            .any(|release| release.version == "1.0.0" && release.rid == rid)
     );
     assert!(
         index
             .releases
             .iter()
-            .any(|release| release.version == "1.1.0" && release.rid == RID && !release.delta_filename.is_empty())
+            .any(|release| release.version == "1.1.0" && release.rid == rid && !release.delta_filename.is_empty())
     );
 }

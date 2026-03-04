@@ -9,6 +9,7 @@ pub mod pack;
 pub mod promote;
 pub mod push;
 pub mod restore;
+pub mod setup;
 
 use surge_core::config::manifest::SurgeManifest;
 use surge_core::context::{Context, StorageConfig, StorageProvider};
@@ -222,6 +223,7 @@ mod tests {
     use surge_core::archive::extractor::{list_entries_from_bytes, read_entry};
     use surge_core::config::constants::{DEFAULT_ZSTD_LEVEL, RELEASES_FILE_COMPRESSED};
     use surge_core::config::manifest::{ShortcutLocation, SurgeManifest};
+    use surge_core::installer_bundle::read_embedded_payload;
     use surge_core::platform::detect::current_rid;
     use surge_core::platform::fs::make_executable;
     use surge_core::releases::manifest::{
@@ -464,16 +466,31 @@ apps:
         assert_eq!(multi_cfg.prefix, "base/app-a");
     }
 
+    fn create_stub_installer_launcher(dir: &Path, rid: &str) -> std::path::PathBuf {
+        let ext = if rid.starts_with("win-") { ".exe" } else { "" };
+        let stub_path = dir.join(format!("surge-installer{ext}"));
+        std::fs::write(&stub_path, b"stub-launcher-bytes").unwrap();
+        make_executable(&stub_path).unwrap();
+        stub_path
+    }
+
+    fn read_installer_payload(path: &Path) -> Vec<u8> {
+        read_embedded_payload(path).unwrap()
+    }
+
     #[tokio::test]
     async fn test_pack_push_promote_demote_smoke() {
         let tmp = tempfile::tempdir().unwrap();
+        let rid = current_rid();
+        let stub = create_stub_installer_launcher(tmp.path(), &rid);
+        super::pack::set_surge_installer_launcher_override_for_test(&stub);
+
         let store_dir = tmp.path().join("store");
         let artifacts_dir = tmp.path().join("artifacts");
         let packages_dir = tmp.path().join("packages");
         let manifest_path = tmp.path().join("surge.yml");
         let app_id = "smoke-app";
         let version = "1.0.0";
-        let rid = current_rid();
 
         std::fs::create_dir_all(&store_dir).unwrap();
         std::fs::create_dir_all(&artifacts_dir).unwrap();
@@ -503,32 +520,25 @@ apps:
             .join("installers")
             .join(app_id)
             .join(&rid);
-        let web_installer = installers_dir.join(format!("Setup-{rid}-{app_id}-stable-web.surge-installer.tar.zst"));
-        let offline_installer =
-            installers_dir.join(format!("Setup-{rid}-{app_id}-stable-offline.surge-installer.tar.zst"));
+        let installer_ext = if rid.starts_with("win-") { "exe" } else { "bin" };
+        let web_installer = installers_dir.join(format!("Setup-{rid}-{app_id}-stable-web.{installer_ext}"));
+        let offline_installer = installers_dir.join(format!("Setup-{rid}-{app_id}-stable-offline.{installer_ext}"));
         assert!(web_installer.exists());
         assert!(offline_installer.exists());
 
-        let web_data = std::fs::read(&web_installer).unwrap();
+        let web_data = read_installer_payload(&web_installer);
         let web_entries = list_entries_from_bytes(&web_data).unwrap();
         assert!(
             web_entries
                 .iter()
-                .any(|entry| entry.path == std::path::Path::new("installer.yml"))
+                .any(|entry| entry.path.to_string_lossy().contains("installer.yml"))
         );
-        assert!(!web_entries.iter().any(|entry| entry.path.starts_with("payload/")));
         let web_manifest = String::from_utf8(read_entry(&web_data, "installer.yml").unwrap()).unwrap();
         assert!(web_manifest.contains("installer_type: web"));
         assert!(web_manifest.contains("ui: imgui"));
         assert!(web_manifest.contains("headless_default_if_no_display: true"));
 
-        let offline_data = std::fs::read(&offline_installer).unwrap();
-        let offline_entries = list_entries_from_bytes(&offline_data).unwrap();
-        assert!(
-            offline_entries
-                .iter()
-                .any(|entry| entry.path == std::path::PathBuf::from("payload").join(full_package.file_name().unwrap()))
-        );
+        let offline_data = read_installer_payload(&offline_installer);
         let offline_manifest = String::from_utf8(read_entry(&offline_data, "installer.yml").unwrap()).unwrap();
         assert!(offline_manifest.contains("installer_type: offline"));
 

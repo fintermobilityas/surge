@@ -1,5 +1,12 @@
 [workspace]
-members = ["crates/surge-core", "crates/surge-ffi", "crates/surge-cli", "crates/surge-supervisor", "crates/surge-bench"]
+members = [
+    "crates/surge-core",
+    "crates/surge-ffi",
+    "crates/surge-cli",
+    "crates/surge-supervisor",
+    "crates/surge-bench",
+    "crates/surge-installer",
+]
 resolver = "3"
 
 [workspace.package]
@@ -32,6 +39,7 @@ quick-xml = "0.39"
 async-trait = "0.1"
 tempfile = "3"
 uuid = { version = "1", features = ["v4"] }
+which = "7"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "warn"

@@ -1,3 +1,4 @@
+use crate::logline;
 use crate::ui::UiTheme;
 use std::collections::BTreeMap;
 use std::io::{self, Write};
@@ -23,7 +24,7 @@ pub async fn execute(
 ) -> Result<()> {
     let manifest_path = manifest_path.to_path_buf();
     if manifest_path.exists() {
-        tracing::warn!("Manifest already exists at {}", manifest_path.display());
+        logline::warn(&format!("Manifest already exists at {}", manifest_path.display()));
         return Err(SurgeError::Config(format!(
             "Manifest already exists at {}",
             manifest_path.display()
@@ -107,7 +108,7 @@ pub async fn execute(
     let yaml = manifest.to_yaml()?;
     std::fs::write(&manifest_path, &yaml)?;
 
-    tracing::info!("Created manifest at {}", manifest_path.display());
+    logline::success(&format!("Created manifest at {}", manifest_path.display()));
     Ok(())
 }
 
@@ -180,9 +181,8 @@ fn gather_wizard_input(
     install_directory: Option<&str>,
     supervisor_id: Option<&str>,
 ) -> Result<InitInput> {
-    let theme = UiTheme::global();
-    println!("{}", theme.title("Surge init wizard"));
-    println!("{}", theme.info(&format!("Manifest path: {}", manifest_path.display())));
+    logline::title("Surge init wizard");
+    logline::info(&format!("Manifest path: {}", manifest_path.display()));
 
     let app_id_default = app_id.unwrap_or("my-app").trim();
     let app_id = prompt_with_default("App id", app_id_default)?;
@@ -200,7 +200,7 @@ fn gather_wizard_input(
         )?;
         match normalize_provider(&entered) {
             Ok(valid) => break valid,
-            Err(err) => println!("{}", theme.warning(&format!("Invalid provider: {err}"))),
+            Err(err) => logline::warn(&format!("Invalid provider: {err}")),
         }
     };
 

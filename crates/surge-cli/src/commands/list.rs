@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use crate::formatters::format_signed_bytes;
+use crate::logline;
 use crate::ui::UiTheme;
 use chrono::{DateTime, Utc};
 use surge_core::config::constants::RELEASES_FILE_COMPRESSED;
@@ -279,7 +280,7 @@ fn humanize_relative_delta(published: DateTime<Utc>, now: DateTime<Utc>) -> Stri
 fn print_overview_table(channel_headers: &[String], rows: &[OverviewRow]) {
     let theme = UiTheme::global();
     if rows.is_empty() {
-        println!("{}", theme.warning("No releases found."));
+        logline::warn("No releases found.");
         return;
     }
 
@@ -313,8 +314,8 @@ fn print_overview_table(channel_headers: &[String], rows: &[OverviewRow]) {
     }
 
     let title = format!("Status overview ({} row(s))", table_rows.len());
-    println!("{}", theme.title(&title));
-    println!();
+    logline::title(&title);
+    logline::plain("");
 
     print_table_header_row(&headers, &widths, theme);
     print_table_separator(&widths, theme);
@@ -330,7 +331,8 @@ fn print_table_header_row(cells: &[String], widths: &[usize], theme: UiTheme) {
         .map(|(idx, cell)| format!("{cell:<width$}", width = widths[idx]))
         .collect::<Vec<_>>()
         .join("  ");
-    println!("{}", theme.title(&line));
+    let _ = theme;
+    logline::title(&line);
 }
 
 fn print_table_row(cells: &[String], widths: &[usize], theme: UiTheme) {
@@ -339,7 +341,7 @@ fn print_table_row(cells: &[String], widths: &[usize], theme: UiTheme) {
         let padded = format!("{cell:<width$}", width = widths[idx]);
         styled.push(style_data_cell(idx, cell, &padded, theme));
     }
-    println!("{}", styled.join("  "));
+    logline::plain(&styled.join("  "));
 }
 
 fn style_data_cell(idx: usize, value: &str, padded: &str, theme: UiTheme) -> String {
@@ -382,7 +384,8 @@ fn print_table_separator(widths: &[usize], theme: UiTheme) {
         .map(|width| "-".repeat(*width))
         .collect::<Vec<_>>()
         .join("  ");
-    println!("{}", theme.subtle(&line));
+    let _ = theme;
+    logline::subtle(&line);
 }
 
 async fn fetch_release_index_for_app(manifest: &SurgeManifest, app_id: &str) -> Result<Option<ReleaseIndex>> {

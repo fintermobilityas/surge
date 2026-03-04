@@ -3,6 +3,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use crate::formatters::{format_byte_progress, format_duration};
+use crate::logline;
 use crate::ui::UiTheme;
 use surge_core::config::constants::{DEFAULT_ZSTD_LEVEL, RELEASES_FILE_COMPRESSED, SCHEMA_VERSION};
 use surge_core::config::manifest::{ShortcutLocation, SurgeManifest};
@@ -86,26 +87,20 @@ pub async fn execute(
 
     backend.upload_from_file(&full_filename, &full_archive, None).await?;
     let mut uploaded_bytes_progress = full_size.max(0) as u64;
-    println!(
-        "{}",
-        theme.subtle(&format!(
-            "      {}",
-            format_byte_progress(uploaded_bytes_progress, total_upload_bytes, "uploaded")
-        ))
-    );
+    logline::subtle(&format!(
+        "      {}",
+        format_byte_progress(uploaded_bytes_progress, total_upload_bytes, "uploaded")
+    ));
 
     let full_sha256 = sha256_hex_file(&full_archive)?;
     let (delta_filename, delta_size, delta_sha256, delta_uploaded) = if delta_archive.is_file() {
         backend.upload_from_file(&delta_filename, &delta_archive, None).await?;
         let delta_size = std::fs::metadata(&delta_archive)?.len() as i64;
         uploaded_bytes_progress = uploaded_bytes_progress.saturating_add(delta_size.max(0) as u64);
-        println!(
-            "{}",
-            theme.subtle(&format!(
-                "      {}",
-                format_byte_progress(uploaded_bytes_progress, total_upload_bytes, "uploaded")
-            ))
-        );
+        logline::subtle(&format!(
+            "      {}",
+            format_byte_progress(uploaded_bytes_progress, total_upload_bytes, "uploaded")
+        ));
         (delta_filename, delta_size, sha256_hex_file(&delta_archive)?, true)
     } else {
         (String::new(), 0, String::new(), false)
@@ -309,9 +304,11 @@ fn detect_os_from_rid(rid: &str) -> String {
 }
 
 fn print_stage(theme: UiTheme, stage: usize, total: usize, text: &str) {
-    println!("{}", theme.info(&format!("[{stage}/{total}] {text}")));
+    let _ = theme;
+    logline::info(&format!("[{stage}/{total}] {text}"));
 }
 
 fn print_stage_done(theme: UiTheme, stage: usize, total: usize, text: &str) {
-    println!("{}", theme.success(&format!("[{stage}/{total}] {text}")));
+    let _ = theme;
+    logline::success(&format!("[{stage}/{total}] {text}"));
 }

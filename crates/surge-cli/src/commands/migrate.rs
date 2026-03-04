@@ -3,6 +3,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use crate::formatters::{format_byte_progress, format_bytes, format_duration};
+use crate::logline;
 use crate::ui::UiTheme;
 use surge_core::config::constants::{DEFAULT_ZSTD_LEVEL, RELEASES_FILE_COMPRESSED};
 use surge_core::config::manifest::SurgeManifest;
@@ -142,7 +143,7 @@ pub async fn execute(
         } else {
             format!("copied {migrated}/{} artifact(s)", copy_operations.len())
         };
-        println!("{}", theme.subtle(&format!("      {progress}")));
+        logline::subtle(&format!("      {progress}"));
     }
 
     let rewritten_releases_data = compress_release_index(&migrated_index, DEFAULT_ZSTD_LEVEL)?;
@@ -271,9 +272,11 @@ fn build_storage_config(manifest: &SurgeManifest, app_id: &str) -> Result<surge_
 }
 
 fn print_stage(theme: UiTheme, stage: usize, total: usize, text: &str) {
-    println!("{}", theme.info(&format!("[{stage}/{total}] {text}")));
+    let _ = theme;
+    logline::info(&format!("[{stage}/{total}] {text}"));
 }
 
 fn print_stage_done(theme: UiTheme, stage: usize, total: usize, text: &str) {
-    println!("{}", theme.success(&format!("[{stage}/{total}] {text}")));
+    let _ = theme;
+    logline::success(&format!("[{stage}/{total}] {text}"));
 }

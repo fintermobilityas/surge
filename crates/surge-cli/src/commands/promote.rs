@@ -2,6 +2,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use crate::formatters::format_duration;
+use crate::logline;
 use crate::ui::UiTheme;
 use surge_core::config::constants::{DEFAULT_ZSTD_LEVEL, RELEASES_FILE_COMPRESSED};
 use surge_core::config::manifest::SurgeManifest;
@@ -93,9 +94,11 @@ async fn fetch_release_index(backend: &dyn StorageBackend) -> Result<surge_core:
 }
 
 fn print_stage(theme: UiTheme, stage: usize, total: usize, text: &str) {
-    println!("{}", theme.info(&format!("[{stage}/{total}] {text}")));
+    let _ = theme;
+    logline::info(&format!("[{stage}/{total}] {text}"));
 }
 
 fn print_stage_done(theme: UiTheme, stage: usize, total: usize, text: &str) {
-    println!("{}", theme.success(&format!("[{stage}/{total}] {text}")));
+    let _ = theme;
+    logline::success(&format!("[{stage}/{total}] {text}"));
 }

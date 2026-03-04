@@ -2,6 +2,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use crate::formatters::{format_byte_progress, format_duration};
+use crate::logline;
 use crate::ui::UiTheme;
 use surge_core::config::constants::RELEASES_FILE_COMPRESSED;
 use surge_core::config::manifest::SurgeManifest;
@@ -92,22 +93,16 @@ pub async fn execute(
         &format!("Uploading {} object(s)", summary.matched),
     );
     for (index, candidate) in candidates.iter().enumerate() {
-        println!(
-            "{}",
-            theme.subtle(&format!("  [{}/{}] {}", index + 1, summary.matched, candidate.key))
-        );
+        logline::subtle(&format!("  [{}/{}] {}", index + 1, summary.matched, candidate.key));
         backend
             .upload_from_file(&candidate.key, &candidate.source_path, None)
             .await?;
         summary.restored += 1;
         summary.uploaded_bytes = summary.uploaded_bytes.saturating_add(candidate.size_bytes);
-        println!(
-            "{}",
-            theme.subtle(&format!(
-                "      {}",
-                format_byte_progress(summary.uploaded_bytes, summary.total_bytes, "uploaded")
-            ))
-        );
+        logline::subtle(&format!(
+            "      {}",
+            format_byte_progress(summary.uploaded_bytes, summary.total_bytes, "uploaded")
+        ));
     }
 
     if summary.restored == 0 {
@@ -205,11 +200,13 @@ fn is_restore_match(key: &str, app_id: &str, rid: &str, version: Option<&str>) -
 }
 
 fn print_stage(theme: UiTheme, stage: usize, total: usize, text: &str) {
-    println!("{}", theme.info(&format!("[{stage}/{total}] {text}")));
+    let _ = theme;
+    logline::info(&format!("[{stage}/{total}] {text}"));
 }
 
 fn print_stage_done(theme: UiTheme, stage: usize, total: usize, text: &str) {
-    println!("{}", theme.success(&format!("[{stage}/{total}] {text}")));
+    let _ = theme;
+    logline::success(&format!("[{stage}/{total}] {text}"));
 }
 
 /// Recursively list all files in a directory.

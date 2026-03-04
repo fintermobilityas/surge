@@ -3,9 +3,11 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Instant;
 
 mod commands;
 mod formatters;
+mod logline;
 mod ui;
 
 #[derive(Parser)]
@@ -337,6 +339,7 @@ fn init_tracing(verbose: bool) {
     let filter = if verbose { "debug" } else { "info" };
     let theme = ui::UiTheme::global();
     tracing_subscriber::fmt()
+        .with_timer(logline::CommandTimer::new())
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(filter)),
@@ -347,14 +350,21 @@ fn init_tracing(verbose: bool) {
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let started = Instant::now();
+    logline::init_timer(started);
+
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => return handle_parse_error(err),
+    };
+    logline::init_verbose(cli.verbose);
     init_tracing(cli.verbose);
 
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build();
     let rt = match rt {
         Ok(runtime) => runtime,
         Err(e) => {
-            tracing::error!("failed to create tokio runtime: {e}");
+            logline::error(&format!("failed to create tokio runtime: {e}"));
             return ExitCode::FAILURE;
         }
     };
@@ -364,9 +374,25 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            tracing::error!("{e}");
+            logline::error(&e.to_string());
             ExitCode::FAILURE
         }
+    }
+}
+
+fn handle_parse_error(err: clap::Error) -> ExitCode {
+    let is_success = matches!(
+        err.kind(),
+        clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+    );
+    let rendered = err.to_string();
+    let output = rendered.trim_end();
+    if is_success {
+        logline::emit_raw(output);
+        ExitCode::SUCCESS
+    } else {
+        logline::emit_raw_stderr(output);
+        ExitCode::FAILURE
     }
 }
 
@@ -467,11 +493,9 @@ async fn run(cli: Cli) -> surge_core::error::Result<()> {
             channel,
         } => commands::demote::execute(&manifest_path, app_id.as_deref(), &version, rid.as_deref(), &channel).await,
 
-        Commands::Compact {
-            app_id,
-            rid,
-            channel,
-        } => commands::compact::execute(&manifest_path, app_id.as_deref(), rid.as_deref(), &channel).await,
+        Commands::Compact { app_id, rid, channel } => {
+            commands::compact::execute(&manifest_path, app_id.as_deref(), rid.as_deref(), &channel).await
+        }
 
         Commands::List { app_id, rid, channel } => {
             commands::list::execute(&manifest_path, app_id.as_deref(), rid.as_deref(), channel.as_deref()).await

@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::ui::UiTheme;
+use crate::logline;
 use tokio::process::Command;
 
 use surge_core::archive::extractor::extract_file_to;
@@ -55,7 +55,6 @@ pub async fn execute(
     download_dir: &Path,
     overrides: StorageOverrides<'_>,
 ) -> Result<()> {
-    let theme = UiTheme::global();
     let manifest = load_install_manifest(application_manifest_path, manifest_path)?;
     let app_id = super::resolve_app_id_with_rid_hint(&manifest, app_id, rid)?;
 
@@ -115,41 +114,29 @@ pub async fn execute(
 
     if let Some(profile) = profile {
         match &install_target {
-            InstallTarget::Local => println!(
-                "{}",
-                theme.info(&format!(
-                    "Local profile: os={}, arch={}, gpu={}",
-                    profile.os, profile.arch, profile.gpu
-                ))
-            ),
-            InstallTarget::Tailscale { ssh_target, .. } => println!(
-                "{}",
-                theme.info(&format!(
-                    "Remote profile for {ssh_target}: os={}, arch={}, gpu={}",
-                    profile.os, profile.arch, profile.gpu
-                ))
-            ),
+            InstallTarget::Local => logline::info(&format!(
+                "Local profile: os={}, arch={}, gpu={}",
+                profile.os, profile.arch, profile.gpu
+            )),
+            InstallTarget::Tailscale { ssh_target, .. } => logline::info(&format!(
+                "Remote profile for {ssh_target}: os={}, arch={}, gpu={}",
+                profile.os, profile.arch, profile.gpu
+            )),
         }
     }
-    println!(
-        "{}",
-        theme.info(&format!("RID candidates: {}", rid_candidates.join(", ")))
-    );
-    println!(
-        "{}",
-        theme.success(&format!(
-            "Selected release: app={} version={} rid={} channels={} full_package={}",
-            app_id,
-            release.version,
-            selected_rid,
-            if release.channels.is_empty() {
-                "-".to_string()
-            } else {
-                release.channels.join(",")
-            },
-            release.full_filename
-        ))
-    );
+    logline::info(&format!("RID candidates: {}", rid_candidates.join(", ")));
+    logline::success(&format!(
+        "Selected release: app={} version={} rid={} channels={} full_package={}",
+        app_id,
+        release.version,
+        selected_rid,
+        if release.channels.is_empty() {
+            "-".to_string()
+        } else {
+            release.channels.join(",")
+        },
+        release.full_filename
+    ));
 
     let full_filename = release.full_filename.trim();
     if full_filename.is_empty() {
@@ -161,27 +148,23 @@ pub async fn execute(
 
     if plan_only {
         match &install_target {
-            InstallTarget::Local => println!(
-                "{}",
-                theme.warning("Plan only mode: no download performed. Remove --plan-only to fetch the package.")
-            ),
-            InstallTarget::Tailscale { file_target, .. } => println!(
-                "{}",
-                theme.warning(&format!(
-                    "Plan only mode: no transfer performed. Remove --plan-only to download and copy package to {file_target}."
-                ))
-            ),
+            InstallTarget::Local => {
+                logline::warn("Plan only mode: no download performed. Remove --plan-only to fetch the package.");
+            }
+            InstallTarget::Tailscale { file_target, .. } => logline::warn(&format!(
+                "Plan only mode: no transfer performed. Remove --plan-only to download and copy package to {file_target}."
+            )),
         }
         return Ok(());
     }
 
     std::fs::create_dir_all(download_dir)?;
     let local_package = download_dir.join(Path::new(full_filename).file_name().unwrap_or_default());
-    tracing::info!(
+    logline::info(&format!(
         "Downloading package '{}' to '{}'",
         full_filename,
         local_package.display()
-    );
+    ));
     let reconstructed = download_release_archive(
         &*backend,
         &index,
@@ -192,56 +175,41 @@ pub async fn execute(
     )
     .await?;
     if reconstructed {
-        println!(
-            "{}",
-            theme.warning(&format!(
-                "Direct full package '{}' missing in backend; reconstructed from retained release artifacts.",
-                Path::new(full_filename).display()
-            ))
-        );
+        logline::warn(&format!(
+            "Direct full package '{}' missing in backend; reconstructed from retained release artifacts.",
+            Path::new(full_filename).display()
+        ));
     }
 
     match &install_target {
         InstallTarget::Local => {
             let install_root = install_package_locally(&app_id, release, &local_package)?;
             let active_app_dir = install_root.join("app");
-            println!(
-                "{}",
-                theme.success(&format!(
-                    "Downloaded '{}' to '{}'.",
-                    Path::new(full_filename).display(),
-                    local_package.display()
-                ))
-            );
-            println!(
-                "{}",
-                theme.success(&format!(
-                    "Installed '{}' to '{}' (active app: '{}').",
-                    app_id,
-                    install_root.display(),
-                    active_app_dir.display()
-                ))
-            );
+            logline::success(&format!(
+                "Downloaded '{}' to '{}'.",
+                Path::new(full_filename).display(),
+                local_package.display()
+            ));
+            logline::success(&format!(
+                "Installed '{}' to '{}' (active app: '{}').",
+                app_id,
+                install_root.display(),
+                active_app_dir.display()
+            ));
         }
         InstallTarget::Tailscale { file_target, .. } => {
             copy_file_to_tailscale_node(file_target, &local_package).await?;
-            println!(
-                "{}",
-                theme.success(&format!(
-                    "Copied '{}' to node '{}' via tailscale file sharing.",
-                    local_package.display(),
-                    file_target
-                ))
-            );
-            println!(
-                "{}",
-                theme.subtle(&format!(
-                    "Install hint on node {}: extract '{}' into the install directory for app '{}'.",
-                    file_target,
-                    Path::new(full_filename).display(),
-                    app_id
-                ))
-            );
+            logline::success(&format!(
+                "Copied '{}' to node '{}' via tailscale file sharing.",
+                local_package.display(),
+                file_target
+            ));
+            logline::subtle(&format!(
+                "Install hint on node {}: extract '{}' into the install directory for app '{}'.",
+                file_target,
+                Path::new(full_filename).display(),
+                app_id
+            ));
         }
     }
 

@@ -3,6 +3,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use crate::formatters::format_duration;
+use crate::logline;
 use crate::ui::UiTheme;
 use surge_core::config::constants::{DEFAULT_ZSTD_LEVEL, RELEASES_FILE_COMPRESSED};
 use surge_core::config::manifest::SurgeManifest;
@@ -14,12 +15,7 @@ use surge_core::storage;
 /// Compact a channel to a single latest full release and prune stale artifacts.
 ///
 /// When `app_id` and `rid` are omitted, iterates over every app and target in the manifest.
-pub async fn execute(
-    manifest_path: &Path,
-    app_id: Option<&str>,
-    rid: Option<&str>,
-    channel: &str,
-) -> Result<()> {
+pub async fn execute(manifest_path: &Path, app_id: Option<&str>, rid: Option<&str>, channel: &str) -> Result<()> {
     let manifest = SurgeManifest::from_file(manifest_path)?;
 
     let targets: Vec<(String, String)> = if let Some(app_id) = app_id {
@@ -39,28 +35,21 @@ pub async fn execute(
             .collect()
     };
 
-    let theme = UiTheme::global();
     let total_targets = targets.len();
-    println!(
-        "{}",
-        theme.info(&format!("Compacting {total_targets} target(s) on channel '{channel}'"))
-    );
-    println!();
+    logline::info(&format!("Compacting {total_targets} target(s) on channel '{channel}'"));
+    logline::plain("");
 
     let mut errors = Vec::new();
     for (app_id, rid) in &targets {
         if let Err(e) = compact_single(&manifest, app_id, rid, channel).await {
-            println!("{}", theme.warning(&format!("  Failed {app_id}/{rid}: {e}")));
+            logline::warn(&format!("  Failed {app_id}/{rid}: {e}"));
             errors.push(format!("{app_id}/{rid}: {e}"));
         }
-        println!();
+        logline::plain("");
     }
 
     if errors.is_empty() {
-        println!(
-            "{}",
-            theme.success(&format!("All {total_targets} target(s) compacted successfully."))
-        );
+        logline::success(&format!("All {total_targets} target(s) compacted successfully."));
         Ok(())
     } else {
         Err(SurgeError::Storage(format!(
@@ -71,12 +60,7 @@ pub async fn execute(
     }
 }
 
-async fn compact_single(
-    manifest: &SurgeManifest,
-    app_id: &str,
-    rid: &str,
-    channel: &str,
-) -> Result<()> {
+async fn compact_single(manifest: &SurgeManifest, app_id: &str, rid: &str, channel: &str) -> Result<()> {
     const TOTAL_STAGES: usize = 4;
 
     let theme = UiTheme::global();
@@ -107,12 +91,7 @@ async fn compact_single(
     let latest_version = match latest_version {
         Some(v) => v,
         None => {
-            print_stage_done(
-                theme,
-                2,
-                TOTAL_STAGES,
-                &format!("No releases on '{channel}', skipped"),
-            );
+            print_stage_done(theme, 2, TOTAL_STAGES, &format!("No releases on '{channel}', skipped"));
             return Ok(());
         }
     };
@@ -141,9 +120,7 @@ async fn compact_single(
         }
     }
 
-    index
-        .releases
-        .retain(|r| r.rid != rid || r.version == latest_version);
+    index.releases.retain(|r| r.rid != rid || r.version == latest_version);
 
     for release in &mut index.releases {
         if release.rid == rid && release.version == latest_version {
@@ -192,9 +169,11 @@ async fn compact_single(
 }
 
 fn print_stage(theme: UiTheme, stage: usize, total: usize, text: &str) {
-    println!("{}", theme.info(&format!("[{stage}/{total}] {text}")));
+    let _ = theme;
+    logline::info(&format!("[{stage}/{total}] {text}"));
 }
 
 fn print_stage_done(theme: UiTheme, stage: usize, total: usize, text: &str) {
-    println!("{}", theme.success(&format!("[{stage}/{total}] {text}")));
+    let _ = theme;
+    logline::success(&format!("[{stage}/{total}] {text}"));
 }

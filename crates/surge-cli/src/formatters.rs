@@ -1,10 +1,15 @@
 use std::time::Duration;
 
 pub(crate) fn format_duration(duration: Duration) -> String {
+    let secs = duration.as_secs();
     if duration.as_millis() < 1000 {
         format!("{}ms", duration.as_millis())
-    } else {
+    } else if secs < 60 {
         format!("{:.1}s", duration.as_secs_f64())
+    } else {
+        let mins = secs / 60;
+        let rem = secs % 60;
+        format!("{mins}m{rem:02}s")
     }
 }
 
@@ -49,6 +54,18 @@ mod tests {
     #[test]
     fn format_duration_prefers_ms_for_subsecond_values() {
         assert_eq!(format_duration(Duration::from_millis(995)), "995ms");
+    }
+
+    #[test]
+    fn format_duration_uses_seconds_for_under_a_minute() {
+        assert_eq!(format_duration(Duration::from_secs_f64(12.3)), "12.3s");
+    }
+
+    #[test]
+    fn format_duration_uses_minutes_for_60s_and_above() {
+        assert_eq!(format_duration(Duration::from_secs(60)), "1m00s");
+        assert_eq!(format_duration(Duration::from_secs(90)), "1m30s");
+        assert_eq!(format_duration(Duration::from_secs(725)), "12m05s");
     }
 
     #[test]

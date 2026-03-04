@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::formatters::format_duration;
+use crate::logline;
 use crate::ui::UiTheme;
 use serde::Serialize;
 use surge_core::archive::packer::ArchivePacker;
@@ -85,7 +86,7 @@ pub async fn execute(
             std::fs::copy(&artifact.path, &dest)?;
         }
         artifact_count += 1;
-        println!("{}", theme.subtle(&format!("  Created {}", dest.display())));
+        logline::subtle(&format!("  Created {}", dest.display()));
     }
     print_stage_done(
         theme,
@@ -117,7 +118,7 @@ pub async fn execute(
     )?;
     let installer_count = installer_paths.len();
     for installer in installer_paths {
-        println!("{}", theme.subtle(&format!("  Created {}", installer.display())));
+        logline::subtle(&format!("  Created {}", installer.display()));
     }
     print_stage_done(
         theme,
@@ -229,14 +230,11 @@ pub async fn execute_installers_only(
             &format!("Using local package {}", full_package_path.display()),
         );
     } else {
-        println!(
-            "{}",
-            theme.info(&format!(
-                "Full package missing locally; downloading '{}' to '{}'",
-                full_key,
-                full_package_path.display()
-            ))
-        );
+        logline::info(&format!(
+            "Full package missing locally; downloading '{}' to '{}'",
+            full_key,
+            full_package_path.display()
+        ));
         backend.download_to_file(full_key, &full_package_path, None).await?;
         print_stage_done(
             theme,
@@ -276,7 +274,7 @@ pub async fn execute_installers_only(
         return Ok(());
     }
     for installer in installer_paths {
-        println!("{}", theme.subtle(&format!("  Created {}", installer.display())));
+        logline::subtle(&format!("  Created {}", installer.display()));
     }
 
     print_stage_done(theme, 4, TOTAL_STAGES, "Installer bundles created");
@@ -534,11 +532,13 @@ fn default_artifacts_dir(manifest_path: &Path, app_id: &str, rid: &str, version:
 }
 
 fn print_stage(theme: UiTheme, stage: usize, total: usize, text: &str) {
-    println!("{}", theme.info(&format!("[{stage}/{total}] {text}")));
+    let _ = theme;
+    logline::info(&format!("[{stage}/{total}] {text}"));
 }
 
 fn print_stage_done(theme: UiTheme, stage: usize, total: usize, text: &str) {
-    println!("{}", theme.success(&format!("[{stage}/{total}] {text}")));
+    let _ = theme;
+    logline::success(&format!("[{stage}/{total}] {text}"));
 }
 
 fn configure_context(manifest: &SurgeManifest, app_id: &str) -> Result<Context> {

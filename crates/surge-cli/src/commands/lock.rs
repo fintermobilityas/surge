@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::logline;
 use surge_core::config::manifest::SurgeManifest;
 use surge_core::context::Context;
 use surge_core::error::{Result, SurgeError};
@@ -30,7 +31,7 @@ pub async fn acquire(manifest_path: &Path, name: &str, timeout: u32) -> Result<(
 
     let challenge = mutex.challenge().unwrap_or("");
     println!("{challenge}");
-    tracing::info!("Lock '{name}' acquired");
+    logline::success(&format!("Lock '{name}' acquired"));
 
     Ok(())
 }
@@ -55,6 +56,6 @@ pub async fn release(manifest_path: &Path, name: &str, challenge: &str) -> Resul
     mutex.set_challenge(challenge.to_string());
     mutex.try_release().await?;
 
-    tracing::info!("Lock '{name}' released");
+    logline::success(&format!("Lock '{name}' released"));
     Ok(())
 }

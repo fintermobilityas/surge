@@ -5,11 +5,22 @@ Surge is a Cargo workspace plus a .NET wrapper:
 - `crates/surge-core/`: update engine (storage, releases, diff, pack, update, supervisor).
 - `crates/surge-cli/`: `surge` CLI.
 - `crates/surge-ffi/`: C ABI used by native/.NET callers.
+- `crates/surge-installer/`: console installer launcher (extracts payload, delegates to `surge setup`).
+- `crates/surge-installer-ui/`: GUI installer with egui (self-contained graphical installer).
 - `crates/surge-supervisor/`: supervisor binary.
 - `dotnet/`: managed wrapper and tests (`Surge.NET`, `Surge.NET.Tests`).
 - `include/surge/`: public C headers.
 - `vendor/bsdiff/`: required submodule for C bsdiff backend.
 - `assets/`, `demoapp/`: examples and fixtures.
+
+### Installer Types
+Surge supports four installer types configured via `installers:` in the manifest:
+- `online`: Console installer that downloads the package at install time (uses `surge-installer`).
+- `offline`: Console installer with the full package embedded (uses `surge-installer`).
+- `online-gui`: GUI installer (egui) that downloads at install time (uses `surge-installer-ui`).
+- `offline-gui`: GUI installer (egui) with the full package embedded (uses `surge-installer-ui`).
+
+The legacy `web` type has been removed; use `online` instead.
 
 ## Build, Test, and Development Commands
 Initialize submodules first:
@@ -77,6 +88,9 @@ If the local environment cannot run a listed command, document the exact gap in 
 - Prefer checked conversions for lengths/indices (`i64/i32 -> usize`) and reject invalid values early.
 - Prefer safe `extern "C" fn` callback types when the function pointer itself has no extra unsafe preconditions.
 - If converting C strings for outbound FFI, sanitize embedded NULs to avoid truncated/empty fallback errors.
+
+## Dependencies
+- When adding new dependencies, always check crates.io for the latest stable version before specifying a version in `Cargo.toml`. Never assume a version number from memory.
 
 ## Coding Style & Naming
 - Rust edition: 2024; format with `cargo fmt --all`.

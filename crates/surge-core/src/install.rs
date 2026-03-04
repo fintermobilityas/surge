@@ -289,16 +289,12 @@ pub fn auto_start_after_install_sequence(
 ///
 /// Unlike `auto_start_after_install`, this does not pass the `--surge-installed`
 /// lifecycle argument and should keep GUI apps open for immediate use.
-///
-/// This is intentionally best-effort: some apps re-exec/hand off to another
-/// process very quickly, which can look like an early exit even when launch
-/// succeeded from the user's perspective.
 pub fn launch_installed_application(
     profile: &InstallProfile<'_>,
     install_root: &Path,
     active_app_dir: &Path,
 ) -> Result<u32> {
-    start_installed_application(profile, install_root, active_app_dir, &[], false, false)
+    start_installed_application(profile, install_root, active_app_dir, &[], false, true)
 }
 
 fn start_installed_application(

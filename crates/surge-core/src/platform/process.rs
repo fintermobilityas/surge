@@ -61,7 +61,15 @@ pub fn spawn_process(
     working_dir: Option<&Path>,
     envs: &BTreeMap<String, String>,
 ) -> Result<ProcessHandle> {
-    spawn_impl(exe, args, working_dir, envs, Stdio::inherit(), Stdio::inherit())
+    spawn_impl(
+        exe,
+        args,
+        working_dir,
+        envs,
+        Stdio::inherit(),
+        Stdio::inherit(),
+        false,
+    )
 }
 
 /// Spawn a process fully detached (stdin/stdout/stderr = null).
@@ -71,7 +79,15 @@ pub fn spawn_detached(
     working_dir: Option<&Path>,
     envs: &BTreeMap<String, String>,
 ) -> Result<ProcessHandle> {
-    spawn_impl(exe, args, working_dir, envs, Stdio::null(), Stdio::null())
+    spawn_impl(
+        exe,
+        args,
+        working_dir,
+        envs,
+        Stdio::null(),
+        Stdio::null(),
+        true,
+    )
 }
 
 fn spawn_impl(
@@ -81,9 +97,16 @@ fn spawn_impl(
     envs: &BTreeMap<String, String>,
     stdout: Stdio,
     stderr: Stdio,
+    detached: bool,
 ) -> Result<ProcessHandle> {
     let mut cmd = Command::new(exe);
     cmd.args(args).stdin(Stdio::null()).stdout(stdout).stderr(stderr);
+
+    #[cfg(unix)]
+    if detached {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
 
     if let Some(wd) = working_dir {
         cmd.current_dir(wd);

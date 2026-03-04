@@ -24,6 +24,7 @@ use crate::releases::manifest::{
 };
 use crate::releases::restore::{RestoreOptions, restore_full_archive_for_version_with_options};
 use crate::releases::version::compare_versions;
+use crate::storage_config::append_prefix;
 use crate::storage::{StorageBackend, create_storage_backend};
 use crate::supervisor::stub::find_latest_app_dir;
 
@@ -99,6 +100,50 @@ pub struct UpdateManager {
 }
 
 impl UpdateManager {
+    async fn load_release_index(&mut self) -> Result<ReleaseIndex> {
+        match self.storage.get_object(RELEASES_FILE_COMPRESSED).await {
+            Ok(data) => decompress_release_index(&data),
+            Err(SurgeError::NotFound(_)) => {
+                let base_prefix = self.ctx.storage_config().prefix;
+                let scoped_prefix = append_prefix(&base_prefix, &self.app_id);
+                if scoped_prefix == base_prefix {
+                    return Err(SurgeError::NotFound(format!(
+                        "Release index '{RELEASES_FILE_COMPRESSED}' not found"
+                    )));
+                }
+
+                debug!(
+                    app_id = %self.app_id,
+                    base_prefix = %base_prefix,
+                    scoped_prefix = %scoped_prefix,
+                    "Release index not found on configured prefix; trying app-scoped prefix"
+                );
+
+                let mut scoped_config = self.ctx.storage_config();
+                scoped_config.prefix = scoped_prefix.clone();
+                let scoped_backend = create_storage_backend(&scoped_config)?;
+
+                match scoped_backend.get_object(RELEASES_FILE_COMPRESSED).await {
+                    Ok(data) => {
+                        info!(
+                            app_id = %self.app_id,
+                            scoped_prefix = %scoped_prefix,
+                            "Using app-scoped storage prefix for update checks"
+                        );
+                        self.ctx.set_storage_prefix(&scoped_prefix);
+                        self.storage = scoped_backend;
+                        decompress_release_index(&data)
+                    }
+                    Err(SurgeError::NotFound(_)) => Err(SurgeError::NotFound(format!(
+                        "Release index '{RELEASES_FILE_COMPRESSED}' not found on configured or app-scoped prefix"
+                    ))),
+                    Err(e) => Err(e),
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Create a new update manager.
     ///
     /// # Arguments
@@ -186,8 +231,7 @@ impl UpdateManager {
         );
 
         // Download release index
-        let data = self.storage.get_object(RELEASES_FILE_COMPRESSED).await?;
-        let index = decompress_release_index(&data)?;
+        let index = self.load_release_index().await?;
         let current_rid = current_rid();
         let current_os = normalize_os_label(current_rid.split('-').next().unwrap_or_default());
 
@@ -1136,6 +1180,43 @@ mod tests {
 
         let err = manager.check_for_updates().await.unwrap_err();
         assert!(err.to_string().contains("does not match requested app"));
+    }
+
+    #[tokio::test]
+    async fn test_check_for_updates_falls_back_to_app_scoped_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("store");
+        let app_id = "test-app";
+        let app_scoped_store = store_root.join(app_id);
+        std::fs::create_dir_all(&app_scoped_store).unwrap();
+
+        let index = ReleaseIndex {
+            app_id: app_id.to_string(),
+            releases: vec![make_entry("1.1.0", "stable", &current_os_label_for_tests(), &current_rid())],
+            ..ReleaseIndex::default()
+        };
+        let compressed = compress_release_index(&index, DEFAULT_ZSTD_LEVEL).unwrap();
+        std::fs::write(app_scoped_store.join(RELEASES_FILE_COMPRESSED), compressed).unwrap();
+
+        let ctx = Arc::new(Context::new());
+        ctx.set_storage(
+            StorageProvider::Filesystem,
+            store_root.to_str().unwrap(),
+            "",
+            "",
+            "",
+            "",
+        );
+        let mut manager =
+            UpdateManager::new(ctx.clone(), app_id, "1.0.0", "stable", tmp.path().to_str().unwrap()).unwrap();
+
+        let info = manager
+            .check_for_updates()
+            .await
+            .expect("update check should succeed")
+            .expect("update should be available");
+        assert_eq!(info.latest_version, "1.1.0");
+        assert_eq!(ctx.storage_config().prefix, app_id);
     }
 
     #[tokio::test]

@@ -241,6 +241,18 @@ jobs:
       - name: Publish surge-core to Cloudsmith Cargo registry
         run: |
           cargo publish -p surge-core --registry surge --allow-dirty
+      - name: Publish surge-supervisor to Cloudsmith Cargo registry
+        run: |
+          for attempt in $(seq 1 10); do
+            if cargo publish -p surge-supervisor --registry surge --allow-dirty; then
+              exit 0
+            fi
+            if [ "${attempt}" -eq 10 ]; then
+              echo "Failed to publish surge-supervisor after waiting for surge-core to sync in registry."
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
       - name: Publish surge-cli to Cloudsmith Cargo registry
         run: |
           for attempt in $(seq 1 10); do

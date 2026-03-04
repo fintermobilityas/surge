@@ -302,7 +302,7 @@ pub async fn execute_installers_only(
             4,
             TOTAL_STAGES,
             &format!(
-                "No installers configured for {app_id}/{rid}. Configure `installers: [web]` or `installers: [offline]` in the manifest."
+                "No installers configured for {app_id}/{rid}. Configure `installers: [online]` or `installers: [offline]` in the manifest."
             ),
         );
         return Ok(());
@@ -413,7 +413,17 @@ fn build_installers_with_launcher(
         }
     };
 
-    let installer_launcher = find_installer_launcher_for_rid(rid, launcher_override)?;
+    let requires_console_launcher = installer_types.iter().any(|installer_type| !installer_type.is_gui());
+    let console_launcher = if requires_console_launcher {
+        Some(find_installer_launcher_for_rid(rid, launcher_override)?)
+    } else {
+        None
+    };
+    let gui_launcher = if installer_types.iter().any(|t| t.is_gui()) {
+        Some(find_gui_installer_launcher_for_rid(rid)?)
+    } else {
+        None
+    };
     let surge_binary = find_surge_binary_for_rid(rid)?;
     let surge_binary_name = surge_binary_name_for_rid(rid).to_string();
 
@@ -428,10 +438,11 @@ fn build_installers_with_launcher(
             tempfile::tempdir().map_err(|e| SurgeError::Pack(format!("Failed to create staging directory: {e}")))?;
         let staging = staging_dir.path();
 
+        let ui_mode = if installer_type.is_gui() { "egui" } else { "console" };
         let manifest_payload = InstallerManifest {
             schema: 1,
             format: "surge-installer-v1".to_string(),
-            ui: "imgui".to_string(),
+            ui: ui_mode.to_string(),
             installer_type: installer_type.as_str().to_string(),
             app_id: app_id.to_string(),
             rid: rid.to_string(),
@@ -491,7 +502,7 @@ fn build_installers_with_launcher(
             }
         }
 
-        if matches!(installer_type, InstallerType::Offline) {
+        if installer_type.is_offline() {
             let payload_dir = staging.join("payload");
             std::fs::create_dir_all(&payload_dir)?;
             std::fs::copy(full_package_path, payload_dir.join(&full_filename))?;
@@ -502,7 +513,16 @@ fn build_installers_with_launcher(
         let mut payload_packer = ArchivePacker::new(DEFAULT_ZSTD_LEVEL)?;
         payload_packer.add_directory(staging, "")?;
         payload_packer.finalize_to_file(payload_archive.path())?;
-        installer_bundle::write_embedded_installer(&installer_launcher, payload_archive.path(), &installer_path)?;
+        let launcher = if installer_type.is_gui() {
+            gui_launcher
+                .as_ref()
+                .ok_or_else(|| SurgeError::Pack("GUI installer launcher was not resolved".to_string()))?
+        } else {
+            console_launcher
+                .as_ref()
+                .ok_or_else(|| SurgeError::Pack("Console installer launcher was not resolved".to_string()))?
+        };
+        installer_bundle::write_embedded_installer(launcher, payload_archive.path(), &installer_path)?;
         surge_core::platform::fs::make_executable(&installer_path)?;
         generated.push(installer_path);
     }
@@ -516,7 +536,7 @@ fn parse_installer_types(installers: &[String], app_id: &str, rid: &str) -> Resu
         .map(|installer| {
             InstallerType::parse(installer).ok_or_else(|| {
                 SurgeError::Config(format!(
-                    "Unsupported installer '{installer}' for app '{app_id}' target '{rid}'. Supported values: web, offline"
+                    "Unsupported installer '{installer}' for app '{app_id}' target '{rid}'. Supported values: online, offline, online-gui, offline-gui"
                 ))
             })
         })
@@ -583,11 +603,19 @@ fn installer_storage_prefix(manifest: &SurgeManifest, app_id: &str) -> String {
 
 std::thread_local! {
     static SURGE_INSTALLER_LAUNCHER_OVERRIDE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+    static SURGE_INSTALLER_UI_LAUNCHER_OVERRIDE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
 pub(crate) fn set_surge_installer_launcher_override_for_test(path: &Path) {
     SURGE_INSTALLER_LAUNCHER_OVERRIDE.with(|cell| {
+        *cell.borrow_mut() = Some(path.to_path_buf());
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn set_surge_installer_ui_launcher_override_for_test(path: &Path) {
+    SURGE_INSTALLER_UI_LAUNCHER_OVERRIDE.with(|cell| {
         *cell.borrow_mut() = Some(path.to_path_buf());
     });
 }
@@ -641,6 +669,46 @@ fn find_installer_launcher_for_rid(rid: &str, override_path: Option<&Path>) -> R
     )))
 }
 
+fn find_gui_installer_launcher_for_rid(rid: &str) -> Result<PathBuf> {
+    ensure_host_compatible_rid(rid)?;
+
+    let thread_override = SURGE_INSTALLER_UI_LAUNCHER_OVERRIDE.with(|cell| cell.borrow().clone());
+    if let Some(p) = thread_override
+        && p.is_file()
+    {
+        return Ok(p);
+    }
+
+    if let Ok(path) = std::env::var("SURGE_INSTALLER_UI_LAUNCHER") {
+        let p = PathBuf::from(&path);
+        if p.is_file() {
+            return Ok(p);
+        }
+        return Err(SurgeError::Pack(format!(
+            "SURGE_INSTALLER_UI_LAUNCHER points to '{}' which does not exist",
+            p.display()
+        )));
+    }
+
+    let launcher_name = gui_installer_launcher_name_for_rid(rid);
+    if let Ok(current_exe) = std::env::current_exe()
+        && let Some(parent) = current_exe.parent()
+    {
+        let candidate = parent.join(launcher_name);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+
+    if let Ok(found) = which::which(launcher_name) {
+        return Ok(found);
+    }
+
+    Err(SurgeError::Pack(format!(
+        "GUI installer launcher '{launcher_name}' not found. Build 'surge-installer-ui' and place it next to surge, add it to PATH, or set SURGE_INSTALLER_UI_LAUNCHER."
+    )))
+}
+
 fn find_surge_binary_for_rid(rid: &str) -> Result<PathBuf> {
     ensure_host_compatible_rid(rid)?;
     if let Ok(path) = std::env::var("SURGE_INSTALLER_BINARY") {
@@ -675,15 +743,8 @@ fn find_surge_binary_for_rid(rid: &str) -> Result<PathBuf> {
         return Ok(candidate);
     }
 
-    if current_exe.is_file() {
-        return Ok(current_exe);
-    }
-
-    Err(SurgeError::Pack(format!(
-        "No surge binary found for target RID '{rid}'. Looked for '{}' and current executable '{}'.",
-        candidate.display(),
-        current_exe.display()
-    )))
+    // current_exe is known to exist (checked above), use it as fallback.
+    Ok(current_exe)
 }
 
 fn surge_binary_name_for_rid(rid: &str) -> &'static str {
@@ -699,6 +760,14 @@ fn installer_launcher_name_for_rid(rid: &str) -> &'static str {
         "surge-installer.exe"
     } else {
         "surge-installer"
+    }
+}
+
+fn gui_installer_launcher_name_for_rid(rid: &str) -> &'static str {
+    if rid.starts_with("win-") || rid.starts_with("windows-") {
+        "surge-installer-ui.exe"
+    } else {
+        "surge-installer-ui"
     }
 }
 
@@ -802,11 +871,23 @@ mod tests {
         set_surge_installer_launcher_override_for_test(path);
     }
 
+    fn set_gui_installer_launcher_override(path: &Path) {
+        set_surge_installer_ui_launcher_override_for_test(path);
+    }
+
     fn create_stub_installer_launcher(dir: &Path, rid: &str) -> PathBuf {
         let ext = if rid.starts_with("win-") { ".exe" } else { "" };
         let stub_path = dir.join(format!("surge-installer{ext}"));
         std::fs::write(&stub_path, b"stub-launcher-bytes").expect("stub launcher write");
         make_executable(&stub_path).expect("stub launcher should be executable");
+        stub_path
+    }
+
+    fn create_stub_gui_installer_launcher(dir: &Path, rid: &str) -> PathBuf {
+        let ext = if rid.starts_with("win-") { ".exe" } else { "" };
+        let stub_path = dir.join(format!("surge-installer-ui{ext}"));
+        std::fs::write(&stub_path, b"stub-gui-launcher-bytes").expect("stub gui launcher write");
+        make_executable(&stub_path).expect("stub gui launcher should be executable");
         stub_path
     }
 
@@ -827,7 +908,7 @@ apps:
     target:
       rid: {rid}
       icon: icon.png
-      installers: [web, offline]
+      installers: [online, offline]
 ",
             bucket = store_dir.display()
         );
@@ -858,7 +939,7 @@ apps:
             icon: "icon.png".to_string(),
             shortcuts: Vec::new(),
             persistent_assets: Vec::new(),
-            installers: vec!["web".to_string(), "offline".to_string()],
+            installers: vec!["online".to_string(), "offline".to_string()],
             environment: BTreeMap::new(),
         }
     }
@@ -874,7 +955,7 @@ apps:
     }
 
     #[tokio::test]
-    async fn execute_installers_only_creates_web_and_offline_installers() {
+    async fn execute_installers_only_creates_online_and_offline_installers() {
         let tmp = tempfile::tempdir().expect("temp dir should be created");
 
         let store_dir = tmp.path().join("store");
@@ -924,9 +1005,9 @@ apps:
             .join("installers")
             .join(app_id)
             .join(&rid);
-        let web = installers_dir.join(format!("Setup-{rid}-{app_id}-stable-web.bin"));
+        let online = installers_dir.join(format!("Setup-{rid}-{app_id}-stable-online.bin"));
         let offline = installers_dir.join(format!("Setup-{rid}-{app_id}-stable-offline.bin"));
-        assert!(web.exists(), "web installer should exist");
+        assert!(online.exists(), "online installer should exist");
         assert!(offline.exists(), "offline installer should exist");
 
         let offline_data = installer_payload(&offline);
@@ -1051,7 +1132,7 @@ apps:
                 .join("installers")
                 .join(app_id)
                 .join(&rid)
-                .join(format!("Setup-{rid}-{app_id}-stable-web.{installer_ext}"))
+                .join(format!("Setup-{rid}-{app_id}-stable-online.{installer_ext}"))
                 .exists()
         );
     }
@@ -1089,14 +1170,14 @@ apps:
     target:
       rid: {rid}
       icon: icon.png
-      installers: [web]
+      installers: [online]
   - id: app-b
     main_exe: demoapp
     channels: [stable]
     target:
       rid: {rid}
       icon: icon.png
-      installers: [web]
+      installers: [online]
 ",
             store_dir.display(),
             rid = rid
@@ -1131,6 +1212,67 @@ apps:
             installer_manifest.contains("prefix: releases/app-a"),
             "installer manifest should use app-scoped prefix in multi-app manifests"
         );
+    }
+
+    #[test]
+    fn build_installers_gui_only_does_not_require_console_launcher() {
+        let tmp = tempfile::tempdir().expect("temp dir should be created");
+
+        let store_dir = tmp.path().join("store");
+        let artifacts_dir = tmp.path().join("artifacts");
+        let output_dir = tmp.path().join("packages");
+        let app_id = "app-gui";
+        let rid = current_rid();
+        let version = "1.0.0";
+
+        std::fs::create_dir_all(&store_dir).expect("store dir should be created");
+        std::fs::create_dir_all(&artifacts_dir).expect("artifacts dir should be created");
+        std::fs::create_dir_all(&output_dir).expect("packages dir should be created");
+        std::fs::write(artifacts_dir.join("icon.png"), b"icon").expect("icon should be written");
+
+        let gui_stub = create_stub_gui_installer_launcher(tmp.path(), &rid);
+        set_gui_installer_launcher_override(&gui_stub);
+
+        let full_package = output_dir.join(format!("{app_id}-{version}-{rid}-full.tar.zst"));
+        std::fs::write(&full_package, b"full package bytes").expect("full package should be written");
+
+        let yaml = format!(
+            r"schema: 1
+storage:
+  provider: filesystem
+  bucket: {}
+apps:
+  - id: {app_id}
+    main_exe: demoapp
+    channels: [stable]
+    target:
+      rid: {rid}
+      icon: icon.png
+      installers: [online-gui]
+",
+            store_dir.display(),
+            rid = rid
+        );
+        let manifest = SurgeManifest::parse(yaml.as_bytes()).expect("manifest should parse");
+        let (app, target) = manifest
+            .find_app_with_target(app_id, &rid)
+            .expect("app/target should exist in manifest");
+
+        let missing_console_launcher = tmp.path().join("missing-surge-installer");
+        let installers = build_installers_with_launcher(
+            &manifest,
+            app,
+            &target,
+            app_id,
+            &rid,
+            version,
+            &artifacts_dir,
+            &output_dir,
+            &full_package,
+            Some(&missing_console_launcher),
+        )
+        .expect("gui-only installer build should not require console launcher");
+        assert_eq!(installers.len(), 1);
     }
 
     #[test]

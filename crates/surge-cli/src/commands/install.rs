@@ -808,7 +808,6 @@ async fn run_tailscale_capture(args: &[&str]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::path::Path;
 
     use super::*;
     use surge_core::archive::packer::ArchivePacker;
@@ -1034,11 +1033,7 @@ mod tests {
     }
 
     fn load_reference_manifest_bytes() -> Vec<u8> {
-        let source = Path::new("/home/peters/github/youpark/.snapx/snapx.yml");
-        if source.is_file() {
-            std::fs::read(source).expect("failed to read /home/peters/github/youpark/.snapx/snapx.yml")
-        } else {
-            br"schema: 2
+        br"schema: 2
 channels:
   - name: test
   - name: production
@@ -1064,8 +1059,7 @@ apps:
     target:
       rid: linux-arm64
 "
-            .to_vec()
-        }
+        .to_vec()
     }
 
     #[test]

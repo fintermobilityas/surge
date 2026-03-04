@@ -275,14 +275,14 @@ fn main() {
 
     // 10-11. Installers
     if !args.skip_installers {
-        let web_result = runner::run_installer_web(&generated.v1_dir);
+        let online_result = runner::run_installer_online(&generated.v1_dir);
         log!(
             json_mode,
             "  {} {}",
-            report::format_duration(web_result.duration),
-            web_result.name
+            report::format_duration(online_result.duration),
+            online_result.name
         );
-        results.push(web_result);
+        results.push(online_result);
 
         let offline_result = runner::run_installer_offline(&generated.v1_dir);
         log!(

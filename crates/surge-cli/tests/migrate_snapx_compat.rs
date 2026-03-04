@@ -26,7 +26,7 @@ apps:
         - assets
         - logging
       installers:
-        - web
+        - online
         - offline
 ";
 

@@ -159,11 +159,11 @@ pub fn run_bspatch(v1_data: &[u8], patch: &[u8], expected_size: u64) -> Benchmar
     }
 }
 
-pub fn run_installer_web(v1_dir: &Path) -> BenchmarkResult {
+pub fn run_installer_online(v1_dir: &Path) -> BenchmarkResult {
     let input_size = dir_size(v1_dir);
 
     let (archive_data, duration) = time(|| {
-        // Web installer: manifest buffer only (small metadata archive)
+        // Online installer: manifest buffer only (small metadata archive)
         let mut packer = ArchivePacker::new(3).expect("packer");
         // Add a small manifest buffer simulating installer metadata
         let manifest = br#"{"version":"1.0.0","files":[]}"#;
@@ -175,7 +175,7 @@ pub fn run_installer_web(v1_dir: &Path) -> BenchmarkResult {
 
     let output_size = archive_data.len() as u64;
     BenchmarkResult {
-        name: "Installer (web)".to_string(),
+        name: "Installer (online)".to_string(),
         duration,
         input_size,
         output_size,

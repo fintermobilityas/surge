@@ -57,7 +57,11 @@ pub(crate) async fn stop_supervisor(install_dir: &std::path::Path, supervisor_id
         })
         .output()
         .await
-        .map_err(|e| SurgeError::Platform(format!("Failed to send terminate signal to supervisor (pid {pid}): {e}")))?;
+        .map_err(|e| {
+            SurgeError::Platform(format!(
+                "Failed to send terminate signal to supervisor (pid {pid}): {e}"
+            ))
+        })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -88,6 +92,7 @@ mod tests {
     use surge_core::archive::extractor::{list_entries_from_bytes, read_entry};
     use surge_core::config::constants::{DEFAULT_ZSTD_LEVEL, RELEASES_FILE_COMPRESSED};
     use surge_core::config::manifest::{ShortcutLocation, SurgeManifest};
+    use surge_core::diff::wrapper::bsdiff_buffers;
     use surge_core::installer_bundle::read_embedded_payload;
     use surge_core::platform::detect::current_rid;
     use surge_core::platform::fs::make_executable;
@@ -575,5 +580,92 @@ apps:
             v2_entry.selected_delta().expect("v2 should include delta").filename,
             v2_delta_key
         );
+    }
+
+    #[tokio::test]
+    async fn test_compact_materializes_latest_full_and_preserves_other_channels() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_dir = tmp.path().join("store");
+        let packages_dir = tmp.path().join("packages");
+        let manifest_path = tmp.path().join("surge.yml");
+        let rid = current_rid();
+        let app_id = "compact-app";
+        let v1 = "1.0.0";
+        let v2 = "1.1.0";
+
+        std::fs::create_dir_all(&store_dir).unwrap();
+        std::fs::create_dir_all(&packages_dir).unwrap();
+        write_manifest(&manifest_path, &store_dir, app_id, &rid);
+
+        let v1_full_key = format!("{app_id}-{v1}-{rid}-full.tar.zst");
+        let v2_full_key = format!("{app_id}-{v2}-{rid}-full.tar.zst");
+        let v2_delta_key = format!("{app_id}-{v2}-{rid}-delta.tar.zst");
+
+        let v1_full = b"compact-v1-full".to_vec();
+        let v2_full = b"compact-v2-full-with-delta".to_vec();
+        let v2_patch = bsdiff_buffers(&v1_full, &v2_full).unwrap();
+        let v2_delta = zstd::encode_all(v2_patch.as_slice(), 3).unwrap();
+
+        std::fs::write(packages_dir.join(&v1_full_key), &v1_full).unwrap();
+        super::push::execute(&manifest_path, Some(app_id), v1, Some(&rid), "stable", &packages_dir)
+            .await
+            .unwrap();
+        super::promote::execute(&manifest_path, Some(app_id), v1, Some(&rid), "test")
+            .await
+            .unwrap();
+
+        std::fs::write(packages_dir.join(&v2_full_key), &v2_full).unwrap();
+        std::fs::write(packages_dir.join(&v2_delta_key), &v2_delta).unwrap();
+        super::push::execute(&manifest_path, Some(app_id), v2, Some(&rid), "test", &packages_dir)
+            .await
+            .unwrap();
+
+        assert!(
+            !store_dir.join(&v2_full_key).exists(),
+            "delta-only release should not upload its full archive before compaction"
+        );
+        assert!(
+            store_dir.join(&v2_delta_key).is_file(),
+            "delta artifact should be present before compaction"
+        );
+
+        super::compact::execute(&manifest_path, Some(app_id), Some(&rid), "test")
+            .await
+            .unwrap();
+
+        let index = read_index(&store_dir);
+        assert_eq!(index.releases.len(), 2);
+
+        let v1_entry = index
+            .releases
+            .iter()
+            .find(|release| release.version == v1 && release.rid == rid)
+            .expect("v1 release should remain for stable");
+        assert_eq!(v1_entry.channels, vec!["stable"]);
+
+        let v2_entry = index
+            .releases
+            .iter()
+            .find(|release| release.version == v2 && release.rid == rid)
+            .expect("v2 release should remain for test");
+        assert_eq!(v2_entry.channels, vec!["test"]);
+        assert!(
+            v2_entry.selected_delta().is_none(),
+            "compacted latest release should be full-only"
+        );
+
+        assert!(
+            store_dir.join(&v1_full_key).is_file(),
+            "stable baseline full should remain in storage"
+        );
+        assert!(
+            store_dir.join(&v2_full_key).is_file(),
+            "compaction should materialize the latest full artifact"
+        );
+        assert!(
+            !store_dir.join(&v2_delta_key).exists(),
+            "latest delta should be pruned after compaction"
+        );
+        assert_eq!(std::fs::read(store_dir.join(&v2_full_key)).unwrap(), v2_full);
     }
 }

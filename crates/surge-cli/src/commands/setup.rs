@@ -33,6 +33,7 @@ pub async fn execute(dir: &Path, no_start: bool) -> Result<()> {
     if let Err(e) = super::stop_supervisor(&install_root, &manifest.runtime.supervisor_id).await {
         logline::warn(&format!("Could not stop supervisor: {e}"));
     }
+    stop_running_app(&install_root, &manifest.runtime.main_exe);
 
     let package = resolve_package(dir, &manifest).await?;
 
@@ -114,6 +115,41 @@ async fn resolve_package(dir: &Path, manifest: &InstallerManifest) -> Result<Res
 
 fn build_storage_config_from_manifest(manifest: &InstallerManifest) -> Result<surge_core::context::StorageConfig> {
     surge_core::storage_config::build_storage_config_from_installer_manifest(manifest)
+}
+
+/// Kill any running process whose executable lives in the app directory.
+/// This catches orphaned app processes that outlived their supervisor.
+fn stop_running_app(install_root: &Path, main_exe: &str) {
+    let main_exe = main_exe.trim();
+    if main_exe.is_empty() {
+        return;
+    }
+
+    let exe_path = install_root.join("app").join(main_exe);
+    let exe_str = exe_path.to_string_lossy();
+
+    #[cfg(unix)]
+    {
+        // Use pkill to kill processes matching the exact exe path
+        let status = std::process::Command::new("pkill")
+            .args(["-f", &exe_str])
+            .status();
+        match status {
+            Ok(s) if s.success() => {
+                logline::info(&format!("Stopped running app process '{main_exe}'."));
+                // Give it a moment to exit
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            _ => {}
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/IM", main_exe, "/F"])
+            .status();
+    }
 }
 
 fn file_size_label(path: &Path) -> String {

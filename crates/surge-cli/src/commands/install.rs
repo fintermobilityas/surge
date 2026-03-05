@@ -1370,11 +1370,11 @@ async fn stream_file_to_tailscale_node_with_command(node: &str, local_file: &Pat
 }
 
 async fn check_remote_version(ssh_node: &str, install_dir: &str, expected_version: &str) -> bool {
-    let install_dir_q = shell_single_quote(install_dir);
     let probe = format!(
-        r#"cat "$HOME/.local/share/{install_dir_q}/app/.surge/runtime.yml" 2>/dev/null | grep -oP '^version:\s*\K\S+' || echo none"#,
+        "cat \"$HOME/.local/share/{}/app/.surge/runtime.yml\" 2>/dev/null | grep -oP '^version:\\s*\\K\\S+' || echo none",
+        install_dir.replace('\'', ""),
     );
-    let command = format!("sh -lc {}", shell_single_quote(&probe));
+    let command = format!("sh -c {}", shell_single_quote(&probe));
     match run_tailscale_capture(&["ssh", ssh_node, command.as_str()]).await {
         Ok(output) => output.trim() == expected_version,
         Err(_) => false,

@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1772544120522,
+  "lastUpdate": 1772691149581,
   "repoUrl": "https://github.com/fintermobilityas/surge",
   "entries": {
     "Surge (small)": [
@@ -569,6 +569,118 @@ window.BENCHMARK_DATA = {
           {
             "name": "Installer (offline)",
             "value": 21.672328,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "dependabot[bot]",
+            "username": "dependabot[bot]",
+            "email": "49699333+dependabot[bot]@users.noreply.github.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "8eeeb30b2987b3ebb438b5222c59f95062c618d6",
+          "message": "build(deps): bump resvg from 0.45.1 to 0.47.0 (#12)\n\nBumps [resvg](https://github.com/linebender/resvg) from 0.45.1 to 0.47.0.\n- [Release notes](https://github.com/linebender/resvg/releases)\n- [Changelog](https://github.com/linebender/resvg/blob/main/CHANGELOG.md)\n- [Commits](https://github.com/linebender/resvg/compare/v0.45.1...v0.47.0)\n\n---\nupdated-dependencies:\n- dependency-name: resvg\n  dependency-version: 0.47.0\n  dependency-type: direct:production\n  update-type: version-update:semver-minor\n...\n\nSigned-off-by: dependabot[bot] <support@github.com>\nCo-authored-by: dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>",
+          "timestamp": "2026-03-05T05:36:21Z",
+          "url": "https://github.com/fintermobilityas/surge/commit/8eeeb30b2987b3ebb438b5222c59f95062c618d6"
+        },
+        "date": 1772691149248,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "Archive create (zstd=1)",
+            "value": 18.682991,
+            "unit": "ms"
+          },
+          {
+            "name": "Archive create (zstd=3)",
+            "value": 18.475889,
+            "unit": "ms"
+          },
+          {
+            "name": "Archive extract",
+            "value": 30.820783000000002,
+            "unit": "ms"
+          },
+          {
+            "name": "SHA-256 (in-memory)",
+            "value": 8.847359,
+            "unit": "ms"
+          },
+          {
+            "name": "SHA-256 (file)",
+            "value": 10.587258,
+            "unit": "ms"
+          },
+          {
+            "name": "Zstd compress (level=1)",
+            "value": 8.309977,
+            "unit": "ms"
+          },
+          {
+            "name": "Zstd compress (level=3)",
+            "value": 5.93637,
+            "unit": "ms"
+          },
+          {
+            "name": "Zstd decompress",
+            "value": 1.8310469999999999,
+            "unit": "ms"
+          },
+          {
+            "name": "bsdiff",
+            "value": 687.9800740000001,
+            "unit": "ms"
+          },
+          {
+            "name": "bspatch",
+            "value": 52.370406,
+            "unit": "ms"
+          },
+          {
+            "name": "chunked bsdiff",
+            "value": 686.022751,
+            "unit": "ms"
+          },
+          {
+            "name": "chunked bspatch",
+            "value": 50.342272,
+            "unit": "ms"
+          },
+          {
+            "name": "Full package build",
+            "value": 17.798986,
+            "unit": "ms"
+          },
+          {
+            "name": "Delta package build",
+            "value": 673.824048,
+            "unit": "ms"
+          },
+          {
+            "name": "Apply 1 delta",
+            "value": 51.952004,
+            "unit": "ms"
+          },
+          {
+            "name": "Apply 5x deltas",
+            "value": 256.328756,
+            "unit": "ms"
+          },
+          {
+            "name": "Installer (online)",
+            "value": 0.071819,
+            "unit": "ms"
+          },
+          {
+            "name": "Installer (offline)",
+            "value": 24.559902,
             "unit": "ms"
           }
         ]

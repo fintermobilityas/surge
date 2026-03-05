@@ -337,6 +337,7 @@ pub async fn execute(
 
     match &install_target {
         InstallTarget::Local => {
+            stop_running_supervisor(&app_id, release).await?;
             let install_root = install_package_locally(&app_id, release, &local_package)?;
             let active_app_dir = install_root.join("app");
             let install_profile = release_install_profile(&app_id, release);
@@ -737,6 +738,72 @@ fn release_install_profile<'a>(app_id: &'a str, release: &'a ReleaseEntry) -> In
     )
 }
 
+async fn stop_running_supervisor(app_id: &str, release: &ReleaseEntry) -> Result<()> {
+    let supervisor_id = release.supervisor_id.trim();
+    if supervisor_id.is_empty() {
+        return Ok(());
+    }
+
+    let install_root =
+        surge_core::platform::paths::default_install_root(app_id, &release.install_directory)?;
+    if !install_root.is_dir() {
+        return Ok(());
+    }
+
+    let pid_file = install_root.join(format!(".surge-supervisor-{supervisor_id}.pid"));
+    if !pid_file.is_file() {
+        return Ok(());
+    }
+
+    let pid_str = tokio::fs::read_to_string(&pid_file)
+        .await
+        .map_err(|e| SurgeError::Config(format!("Failed to read supervisor PID file: {e}")))?;
+    let pid: u32 = pid_str
+        .trim()
+        .parse()
+        .map_err(|e| SurgeError::Config(format!("Invalid PID in supervisor PID file: {e}")))?;
+
+    logline::info(&format!(
+        "Stopping supervisor '{supervisor_id}' (pid {pid}) before install..."
+    ));
+
+    terminate_process(pid, supervisor_id).await?;
+
+    // Wait for the PID file to disappear (supervisor cleans it up on exit).
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    while pid_file.exists() {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(SurgeError::Platform(format!(
+                "Timed out waiting for supervisor '{supervisor_id}' to exit"
+            )));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    logline::success("Supervisor stopped.");
+    Ok(())
+}
+
+async fn terminate_process(pid: u32, label: &str) -> Result<()> {
+    let output = Command::new(if cfg!(unix) { "kill" } else { "taskkill" })
+        .args(if cfg!(unix) {
+            vec![pid.to_string()]
+        } else {
+            vec!["/PID".to_string(), pid.to_string()]
+        })
+        .output()
+        .await
+        .map_err(|e| SurgeError::Platform(format!("Failed to send terminate signal to '{label}' (pid {pid}): {e}")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(SurgeError::Platform(format!(
+            "Failed to stop '{label}' (pid {pid}): {stderr}"
+        )));
+    }
+
+    Ok(())
+}
 
 fn install_package_locally(app_id: &str, release: &ReleaseEntry, package_path: &Path) -> Result<std::path::PathBuf> {
     let profile = release_install_profile(app_id, release);

@@ -42,7 +42,7 @@ futures-util = "0.3"
 indicatif = "0.18"
 tempfile = "3"
 uuid = { version = "1", features = ["v4"] }
-which = "7"
+which = "8"
 eframe = { version = "0.33", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
 egui = "0.33"
 image = { version = "0.25", default-features = false, features = ["png"] }

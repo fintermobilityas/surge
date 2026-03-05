@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1772691149581,
+  "lastUpdate": 1772691160045,
   "repoUrl": "https://github.com/fintermobilityas/surge",
   "entries": {
     "Surge (small)": [
@@ -1597,6 +1597,118 @@ window.BENCHMARK_DATA = {
           {
             "name": "Installer (offline)",
             "value": 84.36698,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "dependabot[bot]",
+            "username": "dependabot[bot]",
+            "email": "49699333+dependabot[bot]@users.noreply.github.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "8eeeb30b2987b3ebb438b5222c59f95062c618d6",
+          "message": "build(deps): bump resvg from 0.45.1 to 0.47.0 (#12)\n\nBumps [resvg](https://github.com/linebender/resvg) from 0.45.1 to 0.47.0.\n- [Release notes](https://github.com/linebender/resvg/releases)\n- [Changelog](https://github.com/linebender/resvg/blob/main/CHANGELOG.md)\n- [Commits](https://github.com/linebender/resvg/compare/v0.45.1...v0.47.0)\n\n---\nupdated-dependencies:\n- dependency-name: resvg\n  dependency-version: 0.47.0\n  dependency-type: direct:production\n  update-type: version-update:semver-minor\n...\n\nSigned-off-by: dependabot[bot] <support@github.com>\nCo-authored-by: dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>",
+          "timestamp": "2026-03-05T05:36:21Z",
+          "url": "https://github.com/fintermobilityas/surge/commit/8eeeb30b2987b3ebb438b5222c59f95062c618d6"
+        },
+        "date": 1772691159212,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "Archive create (zstd=1)",
+            "value": 46.027039,
+            "unit": "ms"
+          },
+          {
+            "name": "Archive create (zstd=3)",
+            "value": 62.481664,
+            "unit": "ms"
+          },
+          {
+            "name": "Archive extract",
+            "value": 75.774302,
+            "unit": "ms"
+          },
+          {
+            "name": "SHA-256 (in-memory)",
+            "value": 39.3868,
+            "unit": "ms"
+          },
+          {
+            "name": "SHA-256 (file)",
+            "value": 44.13778,
+            "unit": "ms"
+          },
+          {
+            "name": "Zstd compress (level=1)",
+            "value": 24.606418,
+            "unit": "ms"
+          },
+          {
+            "name": "Zstd compress (level=3)",
+            "value": 26.655092,
+            "unit": "ms"
+          },
+          {
+            "name": "Zstd decompress",
+            "value": 12.55057,
+            "unit": "ms"
+          },
+          {
+            "name": "bsdiff",
+            "value": 4039.6013149999994,
+            "unit": "ms"
+          },
+          {
+            "name": "bspatch",
+            "value": 240.309318,
+            "unit": "ms"
+          },
+          {
+            "name": "chunked bsdiff",
+            "value": 3981.6331950000003,
+            "unit": "ms"
+          },
+          {
+            "name": "chunked bspatch",
+            "value": 243.02364500000002,
+            "unit": "ms"
+          },
+          {
+            "name": "Full package build",
+            "value": 62.958479999999994,
+            "unit": "ms"
+          },
+          {
+            "name": "Delta package build",
+            "value": 4088.2721350000006,
+            "unit": "ms"
+          },
+          {
+            "name": "Apply 1 delta",
+            "value": 246.761445,
+            "unit": "ms"
+          },
+          {
+            "name": "Apply 5x deltas",
+            "value": 1232.5804039999998,
+            "unit": "ms"
+          },
+          {
+            "name": "Installer (online)",
+            "value": 0.08187299999999999,
+            "unit": "ms"
+          },
+          {
+            "name": "Installer (offline)",
+            "value": 87.859049,
             "unit": "ms"
           }
         ]

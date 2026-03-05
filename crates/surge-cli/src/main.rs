@@ -244,6 +244,13 @@ enum Commands {
         no_start: bool,
     },
 
+    /// Print SHA-256 hash of a file
+    #[command(name = "sha256")]
+    Sha256 {
+        /// File to hash
+        file: PathBuf,
+    },
+
     /// Install packages using a selected transport method
     Install {
         /// Install method (defaults to backend)
@@ -600,6 +607,12 @@ async fn run(cli: Cli) -> surge_core::error::Result<()> {
         }
 
         Commands::Setup { dir, no_start } => commands::setup::execute(&dir, no_start).await,
+
+        Commands::Sha256 { file } => {
+            let hash = surge_core::crypto::sha256::sha256_hex_file(&file)?;
+            println!("{hash}");
+            Ok(())
+        }
 
         Commands::Install {
             method,

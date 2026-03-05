@@ -1162,10 +1162,11 @@ async fn check_remote_file_hash(ssh_node: &str, filename: &str, expected_sha256:
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or(filename);
+    let quoted = shell_single_quote(file_name);
+
+    // Try the remote surge binary first (cross-platform), then sha256sum as fallback.
     let probe = format!(
-        "sha256sum ~/Downloads/{} 2>/dev/null || sha256sum ~/{} 2>/dev/null || echo notfound",
-        shell_single_quote(file_name),
-        shell_single_quote(file_name),
+        r#"F=""; if [ -f "$HOME/Downloads/{quoted}" ]; then F="$HOME/Downloads/{quoted}"; elif [ -f "$HOME/{quoted}" ]; then F="$HOME/{quoted}"; fi; [ -n "$F" ] && {{ "$HOME/.surge/bin/surge" sha256 "$F" 2>/dev/null || sha256sum "$F" 2>/dev/null || echo notfound; }} || echo notfound"#,
     );
     let command = format!("sh -lc {}", shell_single_quote(&probe));
     match run_tailscale_capture(&["ssh", ssh_node, command.as_str()]).await {

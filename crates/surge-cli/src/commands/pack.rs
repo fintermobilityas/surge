@@ -695,7 +695,7 @@ pub(crate) fn set_surge_installer_ui_launcher_override_for_test(path: &Path) {
     });
 }
 
-fn find_installer_launcher_for_rid(rid: &str, override_path: Option<&Path>) -> Result<PathBuf> {
+pub(crate) fn find_installer_launcher_for_rid(rid: &str, override_path: Option<&Path>) -> Result<PathBuf> {
     find_launcher_for_rid(
         rid,
         override_path,
@@ -779,7 +779,7 @@ fn find_launcher_for_rid(
     )))
 }
 
-fn find_surge_binary_for_rid(rid: &str) -> Result<PathBuf> {
+pub(crate) fn find_surge_binary_for_rid(rid: &str) -> Result<PathBuf> {
     ensure_host_compatible_rid(rid)?;
     if let Ok(path) = std::env::var("SURGE_INSTALLER_BINARY") {
         let candidate = PathBuf::from(path);
@@ -817,7 +817,7 @@ fn find_surge_binary_for_rid(rid: &str) -> Result<PathBuf> {
     Ok(current_exe)
 }
 
-fn surge_binary_name_for_rid(rid: &str) -> &'static str {
+pub(crate) fn surge_binary_name_for_rid(rid: &str) -> &'static str {
     if rid.starts_with("win-") || rid.starts_with("windows-") {
         "surge.exe"
     } else {

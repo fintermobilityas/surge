@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode};
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use thiserror::Error;
 
 #[derive(Parser)]
@@ -13,25 +13,41 @@ use thiserror::Error;
     about = "Process supervisor for the Surge update framework"
 )]
 struct Cli {
-    /// Unique supervisor identifier
-    #[arg(long)]
-    supervisor_id: String,
+    #[command(subcommand)]
+    command: Commands,
+}
 
-    /// Application install directory
-    #[arg(long)]
-    install_dir: PathBuf,
+#[derive(Subcommand)]
+enum Commands {
+    /// Supervise a child process with crash-restart and signal handling
+    Run {
+        /// Unique supervisor identifier
+        #[arg(long)]
+        id: String,
 
-    /// Path to the application executable
-    #[arg(long)]
-    exe_path: PathBuf,
+        /// Application install directory
+        #[arg(long)]
+        dir: PathBuf,
 
-    /// Arguments to pass to the child process
-    #[arg(trailing_var_arg = true)]
-    args: Vec<String>,
+        /// Path to the application executable
+        #[arg(long)]
+        exe: PathBuf,
 
-    /// Enable verbose logging
-    #[arg(long, short = 'v')]
-    verbose: bool,
+        /// Arguments to pass to the child process
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+
+        /// Enable verbose logging
+        #[arg(long, short = 'v')]
+        verbose: bool,
+    },
+
+    /// Print SHA-256 hash of a file
+    #[command(name = "sha256")]
+    Sha256 {
+        /// File to hash
+        file: PathBuf,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -56,55 +72,66 @@ fn init_tracing(verbose: bool) {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    init_tracing(cli.verbose);
 
-    if let Err(e) = run(&cli) {
-        tracing::error!("{e}");
-        return ExitCode::FAILURE;
+    match cli.command {
+        Commands::Run {
+            id,
+            dir,
+            exe,
+            args,
+            verbose,
+        } => {
+            init_tracing(verbose);
+            if let Err(e) = run_supervisor(&id, &dir, &exe, &args) {
+                tracing::error!("{e}");
+                return ExitCode::FAILURE;
+            }
+            ExitCode::SUCCESS
+        }
+        Commands::Sha256 { file } => match surge_core::crypto::sha256::sha256_hex_file(&file) {
+            Ok(hash) => {
+                println!("{hash}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::FAILURE
+            }
+        },
     }
-
-    ExitCode::SUCCESS
 }
 
-fn run(cli: &Cli) -> Result<(), SupervisorError> {
+fn run_supervisor(
+    supervisor_id: &str,
+    install_dir: &Path,
+    exe_path: &Path,
+    args: &[String],
+) -> Result<(), SupervisorError> {
     tracing::info!(
-        "Surge supervisor '{}' starting, exe: {}",
-        cli.supervisor_id,
-        cli.exe_path.display()
+        "Surge supervisor '{supervisor_id}' starting, exe: {}",
+        exe_path.display()
     );
 
-    if !cli.exe_path.is_file() {
-        return Err(SupervisorError::ExecutableNotFound(cli.exe_path.display().to_string()));
+    if !exe_path.is_file() {
+        return Err(SupervisorError::ExecutableNotFound(exe_path.display().to_string()));
     }
 
-    // Write PID file
-    let pid_file = cli
-        .install_dir
-        .join(format!(".surge-supervisor-{}.pid", cli.supervisor_id));
-    let stop_file = cli
-        .install_dir
-        .join(format!(".surge-supervisor-{}.stop", cli.supervisor_id));
+    let pid_file = install_dir.join(format!(".surge-supervisor-{supervisor_id}.pid"));
+    let stop_file = install_dir.join(format!(".surge-supervisor-{supervisor_id}.stop"));
 
     if stop_file.exists() {
         let _ = std::fs::remove_file(&stop_file);
     }
     write_pid_file(&pid_file)?;
 
-    // Install signal handlers
     let shutdown = install_signal_handlers();
 
     // Separate one-shot lifecycle args (--surge-*) from regular args.
     // On the first child start, all args are passed. After that, lifecycle
     // args are drained so crash-restarts don't re-fire lifecycle callbacks.
-    let mut lifecycle_args: Vec<String> = cli.args.iter().filter(|a| a.starts_with("--surge-")).cloned().collect();
-    let regular_args: Vec<String> = cli
-        .args
-        .iter()
-        .filter(|a| !a.starts_with("--surge-"))
-        .cloned()
-        .collect();
+    let mut lifecycle_args: Vec<String> = args.iter().filter(|a| a.starts_with("--surge-")).cloned().collect();
+    let regular_args: Vec<String> = args.iter().filter(|a| !a.starts_with("--surge-")).cloned().collect();
 
-    // Main supervision loop
     loop {
         if shutdown.load(std::sync::atomic::Ordering::Acquire) || stop_file.exists() {
             tracing::info!("Shutdown signal received, exiting supervisor loop");
@@ -114,10 +141,10 @@ fn run(cli: &Cli) -> Result<(), SupervisorError> {
         let mut child_args = regular_args.clone();
         child_args.append(&mut lifecycle_args);
 
-        tracing::info!("Starting child process: {}", cli.exe_path.display());
+        tracing::info!("Starting child process: {}", exe_path.display());
 
-        let mut child = Command::new(&cli.exe_path)
-            .current_dir(&cli.install_dir)
+        let mut child = Command::new(exe_path)
+            .current_dir(install_dir)
             .args(&child_args)
             .spawn()?;
 
@@ -149,7 +176,6 @@ fn run(cli: &Cli) -> Result<(), SupervisorError> {
         std::thread::sleep(std::time::Duration::from_secs(2));
     }
 
-    // Clean up PID file
     if pid_file.exists() {
         let _ = std::fs::remove_file(&pid_file);
     }
@@ -157,7 +183,7 @@ fn run(cli: &Cli) -> Result<(), SupervisorError> {
         let _ = std::fs::remove_file(&stop_file);
     }
 
-    tracing::info!("Supervisor '{}' exiting", cli.supervisor_id);
+    tracing::info!("Supervisor '{supervisor_id}' exiting");
     Ok(())
 }
 
@@ -229,7 +255,6 @@ fn terminate_child_process(child: &mut Child) -> Result<(), SupervisorError> {
     Ok(())
 }
 
-/// Install signal handlers and return a shared shutdown flag.
 fn install_signal_handlers() -> std::sync::Arc<std::sync::atomic::AtomicBool> {
     let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -241,7 +266,6 @@ fn install_signal_handlers() -> std::sync::Arc<std::sync::atomic::AtomicBool> {
             let mut sigset = SigSet::empty();
             sigset.add(Signal::SIGTERM);
             sigset.add(Signal::SIGINT);
-            // Block these signals in this thread so we can wait for them
             let _ = sigset.thread_block();
             match sigset.wait() {
                 Ok(sig) => {
@@ -266,9 +290,7 @@ fn install_signal_handlers() -> std::sync::Arc<std::sync::atomic::AtomicBool> {
 
 #[cfg(windows)]
 fn ctrlc_handler(shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>) {
-    // On Windows, use a simple thread-based approach for Ctrl-C
     std::thread::spawn(move || {
-        // This is a simplified handler; production code would use SetConsoleCtrlHandler
         loop {
             std::thread::sleep(std::time::Duration::from_millis(100));
             if shutdown.load(std::sync::atomic::Ordering::Acquire) {

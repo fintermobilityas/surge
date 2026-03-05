@@ -358,7 +358,7 @@ fn build_startup_entry_linux(
         let exe = escape_desktop_value(&exe_path.to_string_lossy());
         let root = escape_desktop_value(&install_root.to_string_lossy());
         let sid = escape_desktop_value(supervisor_id);
-        format!("Exec=\"{sup}\" --supervisor-id {sid} --install-dir \"{root}\" --exe-path \"{exe}\"")
+        format!("Exec=\"{sup}\" run --id {sid} --dir \"{root}\" --exe \"{exe}\"")
     };
 
     format!(
@@ -422,7 +422,7 @@ fn install_shortcuts_windows(
             if matches!(location, ShortcutLocation::Startup) && !supervisor_id.trim().is_empty() {
                 let supervisor_path = install_root.join("app").join("surge-supervisor.exe");
                 let args = format!(
-                    "--supervisor-id {} --install-dir \"{}\" --exe-path \"{}\"",
+                    "run --id {} --dir \"{}\" --exe \"{}\"",
                     supervisor_id,
                     install_root.display(),
                     exe_path.display()
@@ -649,7 +649,7 @@ fn create_launch_agent_plist_supervisor(
     let sid = escape_xml(supervisor_id);
 
     let plist = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n  <key>Label</key>\n  <string>{label_xml}</string>\n  <key>ProgramArguments</key>\n  <array>\n    <string>{sup}</string>\n    <string>--supervisor-id</string>\n    <string>{sid}</string>\n    <string>--install-dir</string>\n    <string>{root}</string>\n    <string>--exe-path</string>\n    <string>{exe}</string>\n  </array>\n  <key>RunAtLoad</key>\n  <true/>\n</dict>\n</plist>\n"
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n  <key>Label</key>\n  <string>{label_xml}</string>\n  <key>ProgramArguments</key>\n  <array>\n    <string>{sup}</string>\n    <string>run</string>\n    <string>--id</string>\n    <string>{sid}</string>\n    <string>--dir</string>\n    <string>{root}</string>\n    <string>--exe</string>\n    <string>{exe}</string>\n  </array>\n  <key>RunAtLoad</key>\n  <true/>\n</dict>\n</plist>\n"
     );
 
     crate::platform::fs::write_file_atomic(path, plist.as_bytes())
@@ -840,7 +840,7 @@ mod tests {
             "startup entry should reference supervisor: {content}"
         );
         assert!(
-            content.contains("--supervisor-id my-supervisor-id"),
+            content.contains("--id my-supervisor-id"),
             "startup entry should contain supervisor id: {content}"
         );
     }

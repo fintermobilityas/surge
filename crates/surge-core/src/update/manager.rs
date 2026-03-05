@@ -719,11 +719,12 @@ impl UpdateManager {
                 let install_dir_str = self.install_dir.to_string_lossy();
                 let exe_path_str = exe_path.to_string_lossy();
                 let args: Vec<&str> = vec![
-                    "--supervisor-id",
+                    "run",
+                    "--id",
                     &latest.supervisor_id,
-                    "--install-dir",
+                    "--dir",
                     &install_dir_str,
-                    "--exe-path",
+                    "--exe",
                     &exe_path_str,
                     "--",
                     &surge_updated_arg,

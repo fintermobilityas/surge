@@ -364,29 +364,32 @@ pub async fn execute(
             ssh_target,
             file_target,
         } => {
-            if check_remote_file_hash(ssh_target, full_filename, &release.full_sha256).await {
-                logline::success(&format!(
-                    "Package '{}' already present on node '{file_target}', skipping transfer.",
-                    Path::new(full_filename).file_name().unwrap_or_default().to_string_lossy(),
-                ));
-            } else {
-                let copy_method = copy_file_to_tailscale_node(file_target, ssh_target, &local_package).await?;
-                match copy_method {
-                    TailscaleCopyMethod::Taildrop => logline::success(&format!(
-                        "Copied '{}' to node '{}' via tailscale file sharing.",
-                        local_package.display(),
-                        file_target
-                    )),
-                    TailscaleCopyMethod::SshStream => logline::success(&format!(
-                        "Copied '{}' to node '{}' via tailscale ssh stream fallback.",
-                        local_package.display(),
-                        file_target
-                    )),
+            logline::info("Building offline installer for remote deployment...");
+            let installer_path = build_offline_installer_for_tailscale(
+                &manifest, &app_id, &selected_rid, release, &channel, &storage_config, &local_package,
+            )?;
+            let installer_size = std::fs::metadata(&installer_path).map(|m| m.len()).unwrap_or(0);
+            logline::info(&format!(
+                "Transferring installer to '{file_target}' ({})...",
+                crate::formatters::format_bytes(installer_size),
+            ));
+            stream_file_to_tailscale_node_with_command(
+                ssh_target,
+                &installer_path,
+                "cat > /tmp/.surge-installer && chmod +x /tmp/.surge-installer",
+            )
+            .await?;
+
+            let no_start_flag = if no_start { " --no-start" } else { "" };
+            let run_cmd = format!("/tmp/.surge-installer{no_start_flag} && rm -f /tmp/.surge-installer");
+            let ssh_command = format!("sh -lc {}", shell_single_quote(&run_cmd));
+            let output = run_tailscale_capture(&["ssh", ssh_target, ssh_command.as_str()]).await?;
+            for line in output.lines() {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    logline::subtle(&format!("remote: {trimmed}"));
                 }
             }
-
-            install_package_on_tailscale_node(ssh_target, &app_id, release, &channel, &storage_config, no_start)
-                .await?;
             logline::success(&format!("Installed '{app_id}' on tailscale node '{file_target}'."));
         }
     }
@@ -1304,6 +1307,75 @@ fn sanitize_remote_path_component(raw: &str) -> String {
         sanitized.push_str("install");
     }
     sanitized
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_offline_installer_for_tailscale(
+    manifest: &SurgeManifest,
+    app_id: &str,
+    rid: &str,
+    release: &ReleaseEntry,
+    channel: &str,
+    storage_config: &surge_core::context::StorageConfig,
+    full_package_path: &Path,
+) -> Result<std::path::PathBuf> {
+    let (_app, target) = manifest
+        .find_app_with_target(app_id, rid)
+        .ok_or_else(|| SurgeError::Config(format!("App '{app_id}' with RID '{rid}' not found in manifest")))?;
+
+    let launch_env = RemoteLaunchEnvironment::default();
+    let installer_manifest = build_remote_installer_manifest(app_id, release, channel, storage_config, &launch_env);
+    let installer_yaml = serde_yaml::to_string(&installer_manifest)
+        .map_err(|e| SurgeError::Config(format!("Failed to serialize installer manifest: {e}")))?;
+
+    let full_filename = full_package_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .ok_or_else(|| SurgeError::Config("Full package path has no filename".to_string()))?;
+
+    let staging_dir = tempfile::tempdir()
+        .map_err(|e| SurgeError::Platform(format!("Failed to create staging directory: {e}")))?;
+    let staging = staging_dir.path();
+
+    std::fs::write(staging.join("installer.yml"), installer_yaml.as_bytes())?;
+
+    let surge_binary = super::pack::find_surge_binary_for_rid(rid)?;
+    let surge_name = super::pack::surge_binary_name_for_rid(rid);
+    std::fs::copy(&surge_binary, staging.join(surge_name))?;
+
+    let payload_dir = staging.join("payload");
+    std::fs::create_dir_all(&payload_dir)?;
+    std::fs::copy(full_package_path, payload_dir.join(&full_filename))?;
+
+    let icon = target.icon.trim();
+    if !icon.is_empty() {
+        let icon_source = full_package_path.parent().unwrap_or(Path::new(".")).join(icon);
+        if icon_source.is_file() {
+            let assets_dir = staging.join("assets");
+            std::fs::create_dir_all(&assets_dir)?;
+            if let Some(filename) = icon_source.file_name() {
+                std::fs::copy(&icon_source, assets_dir.join(filename))?;
+            }
+        }
+    }
+
+    let payload_archive = tempfile::NamedTempFile::new()
+        .map_err(|e| SurgeError::Platform(format!("Failed to create payload temp file: {e}")))?;
+    let mut packer = surge_core::archive::packer::ArchivePacker::new(
+        surge_core::config::constants::DEFAULT_ZSTD_LEVEL,
+    )?;
+    packer.add_directory(staging, "")?;
+    packer.finalize_to_file(payload_archive.path())?;
+
+    let launcher = super::pack::find_installer_launcher_for_rid(rid, None)?;
+    let installer_path = staging_dir.path().join("surge-offline-installer");
+    surge_core::installer_bundle::write_embedded_installer(&launcher, payload_archive.path(), &installer_path)?;
+    surge_core::platform::fs::make_executable(&installer_path)?;
+
+    // Keep the tempdir alive until the process exits
+    std::mem::forget(staging_dir);
+
+    Ok(installer_path)
 }
 
 async fn install_package_on_tailscale_node(

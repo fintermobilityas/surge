@@ -341,11 +341,12 @@ fn spawn_installed_application(
         let install_root_str = install_root.to_string_lossy();
         let exe_path_str = exe_path.to_string_lossy();
         let mut args: Vec<&str> = vec![
-            "--supervisor-id",
+            "run",
+            "--id",
             supervisor_id,
-            "--install-dir",
+            "--dir",
             &install_root_str,
-            "--exe-path",
+            "--exe",
             &exe_path_str,
         ];
         if !app_args.is_empty() {

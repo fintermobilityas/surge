@@ -125,12 +125,13 @@ fn stop_running_app(install_root: &Path, main_exe: &str) {
         return;
     }
 
+    let exe_path = install_root.join("app").join(main_exe);
+    let exe_name = exe_path.to_string_lossy();
+
     #[cfg(unix)]
     {
-        let exe_path = install_root.join("app").join(main_exe);
-        let exe_str = exe_path.to_string_lossy();
         let status = std::process::Command::new("pkill")
-            .args(["-f", &*exe_str])
+            .args(["-f", &*exe_name])
             .status();
         if matches!(status, Ok(s) if s.success()) {
             logline::info(&format!("Stopped running app process '{main_exe}'."));
@@ -141,9 +142,11 @@ fn stop_running_app(install_root: &Path, main_exe: &str) {
     #[cfg(windows)]
     {
         let _ = std::process::Command::new("taskkill")
-            .args(["/IM", main_exe, "/F"])
+            .args(["/F", "/FI", &format!("IMAGENAME eq {main_exe}")])
             .status();
     }
+
+    let _ = &exe_name;
 }
 
 fn file_size_label(path: &Path) -> String {

@@ -125,22 +125,16 @@ fn stop_running_app(install_root: &Path, main_exe: &str) {
         return;
     }
 
-    let exe_path = install_root.join("app").join(main_exe);
-    let exe_str = exe_path.to_string_lossy();
-
     #[cfg(unix)]
     {
-        // Use pkill to kill processes matching the exact exe path
+        let exe_path = install_root.join("app").join(main_exe);
+        let exe_str = exe_path.to_string_lossy();
         let status = std::process::Command::new("pkill")
-            .args(["-f", &exe_str])
+            .args(["-f", &*exe_str])
             .status();
-        match status {
-            Ok(s) if s.success() => {
-                logline::info(&format!("Stopped running app process '{main_exe}'."));
-                // Give it a moment to exit
-                std::thread::sleep(std::time::Duration::from_millis(500));
-            }
-            _ => {}
+        if matches!(status, Ok(s) if s.success()) {
+            logline::info(&format!("Stopped running app process '{main_exe}'."));
+            std::thread::sleep(std::time::Duration::from_millis(500));
         }
     }
 

@@ -30,7 +30,9 @@ pub async fn execute(dir: &Path, no_start: bool) -> Result<()> {
 
     let install_root = default_install_root(&manifest.app_id, &manifest.runtime.install_directory)?;
 
-    super::stop_supervisor(&install_root, &manifest.runtime.supervisor_id).await?;
+    if let Err(e) = super::stop_supervisor(&install_root, &manifest.runtime.supervisor_id).await {
+        logline::warn(&format!("Could not stop supervisor: {e}"));
+    }
 
     let package = resolve_package(dir, &manifest).await?;
 

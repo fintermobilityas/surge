@@ -11,87 +11,12 @@ pub mod push;
 pub mod restore;
 pub mod setup;
 
-use surge_core::config::manifest::SurgeManifest;
-use surge_core::error::{Result, SurgeError};
 pub(crate) use surge_core::storage_config::{
     append_prefix, build_app_scoped_storage_config, build_app_scoped_storage_context, parse_storage_provider,
 };
 
-pub(crate) fn resolve_app_id(manifest: &SurgeManifest, requested_app_id: Option<&str>) -> Result<String> {
-    if let Some(app_id) = requested_app_id.map(str::trim).filter(|value| !value.is_empty()) {
-        return Ok(app_id.to_string());
-    }
-
-    let app_ids = manifest.app_ids();
-    match app_ids.as_slice() {
-        [single] => Ok(single.clone()),
-        [] => Err(SurgeError::Config(
-            "Manifest has no apps. Provide --app-id explicitly.".to_string(),
-        )),
-        _ => Err(SurgeError::Config(format!(
-            "Manifest contains multiple apps ({}). Provide --app-id.",
-            app_ids.join(", ")
-        ))),
-    }
-}
-
-pub(crate) fn resolve_app_id_with_rid_hint(
-    manifest: &SurgeManifest,
-    requested_app_id: Option<&str>,
-    requested_rid: Option<&str>,
-) -> Result<String> {
-    if let Some(app_id) = requested_app_id.map(str::trim).filter(|value| !value.is_empty()) {
-        return Ok(app_id.to_string());
-    }
-
-    let requested_rid = requested_rid.map(str::trim).filter(|value| !value.is_empty());
-    if let Some(rid) = requested_rid {
-        let mut candidates: Vec<String> = manifest
-            .app_ids()
-            .into_iter()
-            .filter(|app_id| manifest.target_rids(app_id).iter().any(|target_rid| target_rid == rid))
-            .collect();
-        candidates.sort();
-        candidates.dedup();
-
-        return match candidates.as_slice() {
-            [single] => Ok(single.clone()),
-            [] => {
-                if manifest.apps.len() > 1 {
-                    Err(SurgeError::Config(format!(
-                        "No app in manifest defines target RID '{rid}'. Provide --app-id."
-                    )))
-                } else {
-                    resolve_app_id(manifest, None)
-                }
-            }
-            _ => Err(SurgeError::Config(format!(
-                "RID '{rid}' matches multiple apps ({}). Provide --app-id.",
-                candidates.join(", ")
-            ))),
-        };
-    }
-
-    resolve_app_id(manifest, None)
-}
-
-pub(crate) fn resolve_rid(manifest: &SurgeManifest, app_id: &str, requested_rid: Option<&str>) -> Result<String> {
-    if let Some(rid) = requested_rid.map(str::trim).filter(|value| !value.is_empty()) {
-        return Ok(rid.to_string());
-    }
-
-    let rids = manifest.target_rids(app_id);
-    match rids.as_slice() {
-        [single] => Ok(single.clone()),
-        [] => Err(SurgeError::Config(format!(
-            "App '{app_id}' has no targets. Provide --rid explicitly."
-        ))),
-        _ => Err(SurgeError::Config(format!(
-            "App '{app_id}' has multiple targets ({}). Provide --rid.",
-            rids.join(", ")
-        ))),
-    }
-}
+#[allow(unused_imports)]
+pub(crate) use crate::prompts::{resolve_app_id, resolve_app_id_with_rid_hint, resolve_rid};
 
 #[cfg(test)]
 mod tests {

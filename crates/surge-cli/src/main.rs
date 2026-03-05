@@ -8,6 +8,7 @@ use std::time::Instant;
 mod commands;
 mod formatters;
 mod logline;
+mod prompts;
 mod ui;
 
 #[derive(Parser)]

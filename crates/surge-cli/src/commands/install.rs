@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::logline;
+use crate::prompts;
 use indicatif::{ProgressBar, ProgressStyle};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
@@ -526,10 +527,8 @@ fn prompt_install_selection(
         if app_id.is_empty() || app_ids.iter().any(|existing: &String| existing == app_id) {
             continue;
         }
-        let name = app.effective_name();
-        let label = format_app_selection_label(&name, app_id);
         app_ids.push(app_id.to_string());
-        app_labels.push(label);
+        app_labels.push(prompts::format_app_label(manifest, app_id));
     }
 
     if app_ids.is_empty() {
@@ -563,42 +562,7 @@ fn prompt_install_selection(
 }
 
 fn prompt_choice_index(prompt: &str, options: &[String], default_index: usize) -> Result<usize> {
-    if options.is_empty() {
-        return Err(SurgeError::Config(format!(
-            "No options available for prompt '{prompt}'."
-        )));
-    }
-
-    let default_index = default_index.min(options.len().saturating_sub(1));
-
-    dialoguer::Select::with_theme(&dialoguer::theme::ColorfulTheme::default())
-        .with_prompt(prompt)
-        .items(options)
-        .default(default_index)
-        .interact()
-        .map_err(|e| SurgeError::Config(format!("Selection failed: {e}")))
-}
-
-fn format_app_selection_label(name: &str, app_id: &str) -> String {
-    let trimmed_name = name.trim();
-    if trimmed_name.is_empty() || trimmed_name == app_id {
-        return app_id.to_string();
-    }
-
-    if let Some(suffix) = app_id_suffix_for_name(trimmed_name, app_id) {
-        return format!("{trimmed_name} [{suffix}]");
-    }
-
-    format!("{trimmed_name} ({app_id})")
-}
-
-fn app_id_suffix_for_name<'a>(name: &str, app_id: &'a str) -> Option<&'a str> {
-    let (prefix, suffix) = app_id.split_once('-')?;
-    let suffix = suffix.trim();
-    if suffix.is_empty() || !prefix.trim().eq_ignore_ascii_case(name) {
-        return None;
-    }
-    Some(suffix)
+    prompts::select(prompt, options, default_index)
 }
 
 fn resolve_install_target_selection(
@@ -635,11 +599,12 @@ fn resolve_install_target_selection(
 }
 
 fn format_target_option_label(option: &AppInstallTargetOption) -> String {
-    let os = option.os.trim();
-    if os.is_empty() || os == "unknown" || infer_os_from_rid(&option.rid).as_deref() == Some(os) {
-        return option.rid.clone();
+    let rid_parts: Vec<&str> = option.rid.split('-').collect();
+    if rid_parts.len() >= 2 {
+        format!("{}/{}", rid_parts[0], rid_parts[1])
+    } else {
+        option.rid.clone()
     }
-    format!("{} ({os})", option.rid)
 }
 
 fn collect_target_options_for_app(manifest: &SurgeManifest, app_id: &str) -> Result<Vec<AppInstallTargetOption>> {
@@ -2057,18 +2022,6 @@ apps:
     }
 
     #[test]
-    fn format_app_selection_label_collapses_duplicate_prefix() {
-        let label = format_app_selection_label("youpark", "youpark-ubuntu24.04-linux-x64-cpu");
-        assert_eq!(label, "youpark [ubuntu24.04-linux-x64-cpu]");
-    }
-
-    #[test]
-    fn format_app_selection_label_keeps_non_prefixed_id() {
-        let label = format_app_selection_label("youpark", "custom-build-id");
-        assert_eq!(label, "youpark (custom-build-id)");
-    }
-
-    #[test]
     fn resolve_install_target_selection_auto_selects_single_option() {
         let selected = resolve_install_target_selection(
             &[AppInstallTargetOption {
@@ -2103,21 +2056,21 @@ apps:
     }
 
     #[test]
-    fn format_target_option_label_omits_redundant_os() {
+    fn format_target_option_label_uses_os_arch_format() {
         let label = format_target_option_label(&AppInstallTargetOption {
             os: "linux".to_string(),
             rid: "linux-x64".to_string(),
         });
-        assert_eq!(label, "linux-x64");
+        assert_eq!(label, "linux/x64");
     }
 
     #[test]
-    fn format_target_option_label_shows_non_inferable_os() {
+    fn format_target_option_label_single_segment_rid() {
         let label = format_target_option_label(&AppInstallTargetOption {
             os: "linux".to_string(),
-            rid: "custom-rid".to_string(),
+            rid: "custom".to_string(),
         });
-        assert_eq!(label, "custom-rid (linux)");
+        assert_eq!(label, "custom");
     }
 
     #[test]

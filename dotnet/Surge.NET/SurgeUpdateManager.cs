@@ -95,14 +95,36 @@ namespace Surge
             if (string.IsNullOrWhiteSpace(channel))
                 throw new ArgumentException("Channel cannot be empty.", nameof(channel));
 
-            int result = NativeMethods.UpdateManagerSetChannel(_nativeMgr, channel);
+            var normalizedChannel = channel.Trim();
+            int result = NativeMethods.UpdateManagerSetChannel(_nativeMgr, normalizedChannel);
             if (result != 0)
             {
                 var errorMsg = GetLastError();
                 throw new SurgeException(result, errorMsg ?? "Failed to set update channel.");
             }
 
-            _channel = channel;
+            try
+            {
+                SurgeApp.PersistCurrentChannel(normalizedChannel);
+            }
+            catch (Exception ex)
+            {
+                int rollbackResult = NativeMethods.UpdateManagerSetChannel(_nativeMgr, _channel);
+                if (rollbackResult != 0)
+                {
+                    var rollbackError = GetLastError();
+                    throw new InvalidOperationException(
+                        $"Failed to persist selected update channel '{normalizedChannel}', and rollback to '{_channel}' also failed." +
+                        (string.IsNullOrWhiteSpace(rollbackError) ? "" : $" {rollbackError}"),
+                        ex);
+                }
+
+                throw new InvalidOperationException(
+                    $"Failed to persist selected update channel '{normalizedChannel}'.",
+                    ex);
+            }
+
+            _channel = normalizedChannel;
         }
 
         /// <summary>
@@ -265,7 +287,8 @@ namespace Surge
                                 Id = SurgeApp.Current?.Id ?? "",
                                 Version = latestRelease.Version,
                                 Channel = latestRelease.Channel,
-                                InstallDirectory = SurgeApp.Current?.InstallDirectory ?? ""
+                                InstallDirectory = SurgeApp.Current?.InstallDirectory ?? "",
+                                SupervisorId = SurgeApp.Current?.SupervisorId ?? ""
                             };
                         }
                         catch (SurgeException)

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 
@@ -186,9 +187,14 @@ namespace Surge
             if (current == null)
                 return false;
 
+            _ = StopSupervisor();
+            _ = environment;
+
             var exePath = GetCurrentExePath();
-            var workingDir = WorkingDirectory;
-            var supervisorId = current.Id + "-supervisor";
+            var installDir = current.InstallDirectory;
+            var supervisorId = ResolveSupervisorId(current);
+            if (string.IsNullOrWhiteSpace(installDir) || string.IsNullOrWhiteSpace(supervisorId))
+                return false;
 
             var actualArgs = restartArguments ?? Array.Empty<string>();
             var argPtrs = new IntPtr[actualArgs.Length];
@@ -216,7 +222,7 @@ namespace Surge
                 {
                     int result = NativeMethods.SupervisorStart(
                         exePath,
-                        workingDir,
+                        installDir,
                         supervisorId,
                         actualArgs.Length,
                         argvPtr);
@@ -252,7 +258,15 @@ namespace Surge
         public static bool StopSupervisor()
         {
             var current = Current;
-            if (current == null || !current.IsSupervisorRunning)
+            if (current == null)
+                return false;
+
+            var supervisorId = ResolveSupervisorId(current);
+            if (string.IsNullOrWhiteSpace(current.InstallDirectory) || string.IsNullOrWhiteSpace(supervisorId))
+                return false;
+
+            int result = NativeMethods.SupervisorStop(current.InstallDirectory, supervisorId);
+            if (result != 0)
                 return false;
 
             current.IsSupervisorRunning = false;
@@ -262,12 +276,52 @@ namespace Surge
         private static SurgeAppInfo? LoadCurrentApp()
         {
             var assemblyDir = GetWorkingDirectory();
-            var surgeDir = Path.Combine(assemblyDir, ".surge");
-            var runtimeManifestPath = Path.Combine(surgeDir, "runtime.yml");
-            var legacyManifestPath = Path.Combine(surgeDir, "surge.yml");
+            var (runtimeManifestPath, legacyManifestPath) = GetRuntimeManifestPaths(assemblyDir);
 
             return TryLoadCurrentAppFromManifest(runtimeManifestPath, assemblyDir)
                 ?? TryLoadCurrentAppFromManifest(legacyManifestPath, assemblyDir);
+        }
+
+        internal static void PersistCurrentChannel(string channel)
+        {
+            var current = Current;
+            if (current == null)
+                throw new InvalidOperationException("Cannot persist Surge channel: no current app info is available.");
+
+            var normalizedChannel = channel.Trim();
+            if (string.IsNullOrWhiteSpace(normalizedChannel))
+                throw new ArgumentException("Channel cannot be empty.", nameof(channel));
+
+            var assemblyDir = GetWorkingDirectory();
+            var (runtimeManifestPath, legacyManifestPath) = GetRuntimeManifestPaths(assemblyDir);
+            string? updatedManifest = null;
+            var updatedAnyManifest = false;
+
+            foreach (var manifestPath in new[] { runtimeManifestPath, legacyManifestPath })
+            {
+                if (!File.Exists(manifestPath))
+                    continue;
+
+                var manifest = File.ReadAllText(manifestPath);
+                var updated = UpsertChannelInManifest(manifest, normalizedChannel);
+                File.WriteAllText(manifestPath, updated);
+                updatedManifest ??= updated;
+                updatedAnyManifest = true;
+            }
+
+            if (!updatedAnyManifest || updatedManifest == null)
+                throw new FileNotFoundException("Unable to persist Surge channel because no runtime manifest was found.");
+
+            if (!File.Exists(runtimeManifestPath))
+                File.WriteAllText(runtimeManifestPath, updatedManifest);
+
+            if (!File.Exists(legacyManifestPath))
+                File.WriteAllText(legacyManifestPath, updatedManifest);
+
+            lock (_lock)
+            {
+                _current = CloneWithChannel(current, normalizedChannel);
+            }
         }
 
         private static SurgeAppInfo? TryLoadCurrentAppFromManifest(string manifestPath, string assemblyDir)
@@ -281,6 +335,7 @@ namespace Surge
                 string? version = null;
                 string? channel = null;
                 string? installDir = null;
+                string? supervisorId = null;
                 string? storageProvider = null;
                 string? storageBucket = null;
                 string? storageRegion = null;
@@ -301,6 +356,12 @@ namespace Surge
                         channel = trimmed.Substring(8).Trim().Trim('"');
                     else if (trimmed.StartsWith("installDirectory:", StringComparison.Ordinal))
                         installDir = trimmed.Substring(17).Trim().Trim('"');
+                    else if (trimmed.StartsWith("supervisorId:", StringComparison.Ordinal))
+                        supervisorId = trimmed.Substring(13).Trim().Trim('"');
+                    else if (trimmed.StartsWith("supervisorid:", StringComparison.OrdinalIgnoreCase))
+                        supervisorId = trimmed.Substring(13).Trim().Trim('"');
+                    else if (trimmed.StartsWith("supervisor_id:", StringComparison.Ordinal))
+                        supervisorId = trimmed.Substring(14).Trim().Trim('"');
                     else if (trimmed.StartsWith("provider:", StringComparison.Ordinal))
                         storageProvider = trimmed.Substring(9).Trim().Trim('"');
                     else if (trimmed.StartsWith("bucket:", StringComparison.Ordinal))
@@ -321,6 +382,7 @@ namespace Surge
                     Version = version ?? "0.0.0",
                     Channel = channel ?? "stable",
                     InstallDirectory = ResolveInstallDirectory(resolvedAppId, installDir, assemblyDir),
+                    SupervisorId = supervisorId ?? "",
                     StorageProvider = storageProvider ?? "filesystem",
                     StorageBucket = storageBucket ?? "",
                     StorageRegion = storageRegion ?? "",
@@ -338,9 +400,86 @@ namespace Surge
             return AppContext.BaseDirectory;
         }
 
+        internal static string ResolveCurrentExePath(string? processPath, string? mainModulePath, string[] commandLineArgs)
+        {
+            if (!string.IsNullOrWhiteSpace(processPath))
+                return processPath!;
+
+            if (!string.IsNullOrWhiteSpace(mainModulePath))
+                return mainModulePath!;
+
+            return commandLineArgs.Length == 0 ? "" : commandLineArgs[0];
+        }
+
         private static string GetCurrentExePath()
         {
-            return Environment.GetCommandLineArgs()[0];
+#if NET10_0_OR_GREATER
+            var processPath = Environment.ProcessPath;
+#else
+            string? processPath = null;
+#endif
+
+            string? mainModulePath = null;
+            try
+            {
+                using var process = Process.GetCurrentProcess();
+                mainModulePath = process.MainModule?.FileName;
+            }
+            catch
+            {
+                // Ignore platform/process inspection failures and fall back to argv[0].
+            }
+
+            return ResolveCurrentExePath(processPath, mainModulePath, Environment.GetCommandLineArgs());
+        }
+
+        internal static string UpsertChannelInManifest(string manifest, string channel)
+        {
+            var normalizedChannel = channel.Trim();
+            if (string.IsNullOrWhiteSpace(normalizedChannel))
+                throw new ArgumentException("Channel cannot be empty.", nameof(channel));
+
+            var lines = manifest.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n');
+            var foundChannel = false;
+
+            for (int i = 0; i < lines.Length; i++)
+            {
+                var line = lines[i];
+                var trimmed = line.TrimStart();
+                if (!trimmed.StartsWith("channel:", StringComparison.Ordinal))
+                    continue;
+
+                var prefixLength = line.Length - trimmed.Length;
+#if NETSTANDARD2_0
+                lines[i] = line.Substring(0, prefixLength) + "channel: " + normalizedChannel;
+#else
+                lines[i] = string.Concat(line.AsSpan(0, prefixLength), "channel: ", normalizedChannel);
+#endif
+                foundChannel = true;
+                break;
+            }
+
+            var updatedLines = new List<string>(lines.Length + (foundChannel ? 0 : 1));
+            foreach (var line in lines)
+            {
+                if (updatedLines.Count == lines.Length - 1 && line.Length == 0)
+                    continue;
+
+                updatedLines.Add(line);
+            }
+
+            if (!foundChannel)
+                updatedLines.Add("channel: " + normalizedChannel);
+
+            return string.Join(Environment.NewLine, updatedLines) + Environment.NewLine;
+        }
+
+        private static string ResolveSupervisorId(SurgeAppInfo appInfo)
+        {
+            if (!string.IsNullOrWhiteSpace(appInfo.SupervisorId))
+                return appInfo.SupervisorId;
+
+            return string.IsNullOrWhiteSpace(appInfo.Id) ? "" : appInfo.Id + "-supervisor";
         }
 
         private static string ResolveInstallDirectory(string appId, string? installDirectoryName, string fallbackDirectory)
@@ -360,6 +499,31 @@ namespace Surge
                 return Path.Combine(fallbackDirectory, targetDirectoryName);
 
             return Path.Combine(localAppData, targetDirectoryName);
+        }
+
+        private static (string runtimeManifestPath, string legacyManifestPath) GetRuntimeManifestPaths(string assemblyDir)
+        {
+            var surgeDir = Path.Combine(assemblyDir, ".surge");
+            return (
+                Path.Combine(surgeDir, "runtime.yml"),
+                Path.Combine(surgeDir, "surge.yml"));
+        }
+
+        private static SurgeAppInfo CloneWithChannel(SurgeAppInfo current, string channel)
+        {
+            return new SurgeAppInfo
+            {
+                Id = current.Id,
+                Version = current.Version,
+                Channel = channel,
+                InstallDirectory = current.InstallDirectory,
+                SupervisorId = current.SupervisorId,
+                StorageProvider = current.StorageProvider,
+                StorageBucket = current.StorageBucket,
+                StorageRegion = current.StorageRegion,
+                StorageEndpoint = current.StorageEndpoint,
+                IsSupervisorRunning = current.IsSupervisorRunning
+            };
         }
 
         private static string MarshalUtf8(IntPtr ptr)

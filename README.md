@@ -372,10 +372,13 @@ It handles graceful shutdown on SIGTERM/SIGINT (Unix) and Ctrl+C (Windows).
 Hook into first-run, post-install, and post-update events:
 
 ```csharp
-SurgeApp.ProcessEvents(args,
+if (SurgeApp.ProcessEvents(args,
     onFirstRun: v => ShowWelcomeScreen(),
     onInstalled: v => RunMigrations(),
-    onUpdated: v => ShowChangelogFor(v));
+    onUpdated: v => ShowChangelogFor(v)))
+{
+    return;
+}
 ```
 
 ### Installer generation

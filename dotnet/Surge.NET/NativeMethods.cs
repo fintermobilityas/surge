@@ -191,10 +191,13 @@ namespace Surge
         [LibraryImport(LibName, EntryPoint = "surge_supervisor_start", StringMarshalling = StringMarshalling.Utf8)]
         internal static partial int SupervisorStart(
             string exePath,
-            string workingDir,
+            string installDir,
             string supervisorId,
             int argc,
             IntPtr argv);
+
+        [LibraryImport(LibName, EntryPoint = "surge_supervisor_stop", StringMarshalling = StringMarshalling.Utf8)]
+        internal static partial int SupervisorStop(string installDir, string supervisorId);
 
         // --- Lifecycle events ---
 
@@ -347,10 +350,13 @@ namespace Surge
         [DllImport(LibName, EntryPoint = "surge_supervisor_start", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
         internal static extern int SupervisorStart(
             string exePath,
-            string workingDir,
+            string installDir,
             string supervisorId,
             int argc,
             IntPtr argv);
+
+        [DllImport(LibName, EntryPoint = "surge_supervisor_stop", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
+        internal static extern int SupervisorStop(string installDir, string supervisorId);
 
         // --- Lifecycle events ---
 

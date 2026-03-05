@@ -5,6 +5,8 @@ namespace Surge.Tests
 {
     public class SurgeAppTests
     {
+        private static readonly string[] FallbackCommandLineArgs = { "/opt/fallback" };
+
         [Fact]
         public void Version_ReturnsExpectedVersion()
         {
@@ -52,6 +54,44 @@ namespace Surge.Tests
             // Without a current app, StopSupervisor should return false
             Assert.False(SurgeApp.StopSupervisor());
         }
+
+        [Fact]
+        public void ResolveCurrentExePath_PrefersProcessPathThenMainModuleThenCommandLine()
+        {
+            Assert.Equal(
+                "/opt/demoapp",
+                SurgeApp.ResolveCurrentExePath("/opt/demoapp", "/opt/demoapp.dll", FallbackCommandLineArgs));
+
+            Assert.Equal(
+                "/opt/demoapp",
+                SurgeApp.ResolveCurrentExePath(null, "/opt/demoapp", FallbackCommandLineArgs));
+
+            Assert.Equal(
+                "/opt/fallback",
+                SurgeApp.ResolveCurrentExePath(null, null, FallbackCommandLineArgs));
+        }
+
+        [Fact]
+        public void UpsertChannelInManifest_ReplacesExistingChannel()
+        {
+            const string manifest = "id: demoapp\nversion: 1.0.0\nchannel: production\n";
+
+            var updated = SurgeApp.UpsertChannelInManifest(manifest, "test");
+
+            Assert.Contains("channel: test", updated);
+            Assert.DoesNotContain("channel: production", updated);
+        }
+
+        [Fact]
+        public void UpsertChannelInManifest_AppendsMissingChannel()
+        {
+            const string manifest = "id: demoapp\nversion: 1.0.0\n";
+
+            var updated = SurgeApp.UpsertChannelInManifest(manifest, "production");
+
+            Assert.Contains("channel: production", updated);
+            Assert.EndsWith("channel: production" + Environment.NewLine, updated);
+        }
     }
 
     public class SurgeAppInfoTests
@@ -64,6 +104,7 @@ namespace Surge.Tests
             Assert.Equal("", info.Version);
             Assert.Equal("", info.Channel);
             Assert.Equal("", info.InstallDirectory);
+            Assert.Equal("", info.SupervisorId);
             Assert.Equal("", info.StorageProvider);
             Assert.Equal("", info.StorageBucket);
             Assert.Equal("", info.StorageRegion);
@@ -80,6 +121,7 @@ namespace Surge.Tests
                 Version = "1.2.3",
                 Channel = "stable",
                 InstallDirectory = "/opt/myapp",
+                SupervisorId = "myapp-supervisor",
                 StorageProvider = "filesystem",
                 StorageBucket = "/tmp/releases",
                 StorageRegion = "us-east-1",
@@ -90,6 +132,7 @@ namespace Surge.Tests
             Assert.Equal("1.2.3", info.Version);
             Assert.Equal("stable", info.Channel);
             Assert.Equal("/opt/myapp", info.InstallDirectory);
+            Assert.Equal("myapp-supervisor", info.SupervisorId);
             Assert.Equal("filesystem", info.StorageProvider);
             Assert.Equal("/tmp/releases", info.StorageBucket);
             Assert.Equal("us-east-1", info.StorageRegion);

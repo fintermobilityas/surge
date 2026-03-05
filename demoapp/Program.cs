@@ -11,6 +11,9 @@ internal static class Program
     {
         Console.WriteLine($"Surge Demo App v{SurgeApp.Version}");
         Console.WriteLine($"Working Directory: {SurgeApp.WorkingDirectory}");
+        var holdOpen = args.Contains("--demo-hold", StringComparer.Ordinal);
+        var stopSupervisorAndExit = args.Contains("--demo-stop-supervisor-and-exit", StringComparer.Ordinal);
+        var channelOverride = TryGetOptionValue(args, "--demo-channel");
 
         var appInfo = SurgeApp.Current;
         if (appInfo != null)
@@ -28,13 +31,17 @@ internal static class Program
         }
 
         // Process lifecycle events
-        SurgeApp.ProcessEvents(args,
+        if (SurgeApp.ProcessEvents(args,
             onFirstRun: version => Console.WriteLine($"[Event] First run! Version: {version}"),
             onInstalled: version => Console.WriteLine($"[Event] Installed! Version: {version}"),
-            onUpdated: version => Console.WriteLine($"[Event] Updated to version: {version}"));
+            onUpdated: version => Console.WriteLine($"[Event] Updated to version: {version}")))
+        {
+            return 0;
+        }
 
         // Start supervisor for automatic restarts
-        if (SurgeApp.StartSupervisor())
+        var supervisorRestartArgs = BuildSupervisorRestartArgs(holdOpen, channelOverride);
+        if (SurgeApp.StartSupervisor(supervisorRestartArgs))
         {
             Console.WriteLine("[Supervisor] Started successfully.");
         }
@@ -55,6 +62,15 @@ internal static class Program
         try
         {
             using var updateManager = new SurgeUpdateManager();
+            if (!string.IsNullOrWhiteSpace(channelOverride))
+            {
+                updateManager.SetChannel(channelOverride);
+                Console.WriteLine($"[Update] Using override channel '{updateManager.Channel}'.");
+            }
+            else
+            {
+                Console.WriteLine($"[Update] Using runtime channel '{updateManager.Channel}'.");
+            }
 
             var progressSource = new SurgeProgressSource
             {
@@ -117,7 +133,64 @@ internal static class Program
             return 1;
         }
 
+        if (stopSupervisorAndExit)
+        {
+            Console.WriteLine($"[Supervisor] Stop requested: {SurgeApp.StopSupervisor()}");
+            return 0;
+        }
+
+        if (holdOpen)
+        {
+            Console.WriteLine("[Demo] Holding process open. Press Ctrl+C to exit.");
+            try
+            {
+                await Task.Delay(Timeout.Infinite, cts.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                Console.WriteLine("[Demo] Hold cancelled.");
+            }
+        }
+
         return 0;
+    }
+
+    private static string[]? BuildSupervisorRestartArgs(bool holdOpen, string? channelOverride)
+    {
+        string[]? restartArgs = null;
+
+        if (holdOpen)
+        {
+            restartArgs = string.IsNullOrWhiteSpace(channelOverride)
+                ? new[] { "--demo-hold" }
+                : new[] { "--demo-hold", "--demo-channel", channelOverride };
+        }
+        else if (!string.IsNullOrWhiteSpace(channelOverride))
+        {
+            restartArgs = new[] { "--demo-channel", channelOverride };
+        }
+
+        return restartArgs;
+    }
+
+    private static string? TryGetOptionValue(string[] args, string optionName)
+    {
+        for (int i = 0; i < args.Length; i++)
+        {
+            if (!string.Equals(args[i], optionName, StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            if (i + 1 >= args.Length || args[i + 1].StartsWith("--", StringComparison.Ordinal))
+            {
+                return null;
+            }
+
+            return args[i + 1];
+        }
+
+        return null;
     }
 
     private static string FormatBytes(long bytes)

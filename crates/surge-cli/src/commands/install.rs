@@ -1,12 +1,11 @@
 use std::collections::BTreeSet;
-use std::io::{IsTerminal, Write};
+use std::io::IsTerminal;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::logline;
-use crate::ui::UiTheme;
 use indicatif::{ProgressBar, ProgressStyle};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
@@ -569,40 +568,14 @@ fn prompt_choice_index(prompt: &str, options: &[String], default_index: usize) -
         )));
     }
 
-    let theme = UiTheme::global();
     let default_index = default_index.min(options.len().saturating_sub(1));
 
-    loop {
-        println!("{}", theme.title(prompt));
-        let width = options.len().to_string().len();
-        for (index, option) in options.iter().enumerate() {
-            let marker = if index == default_index { "*" } else { " " };
-            println!("  {marker} {:>width$}. {option}", index + 1, width = width);
-        }
-
-        print!("{}", theme.blue(&format!("Enter choice [{}]: ", default_index + 1)));
-        std::io::stdout()
-            .flush()
-            .map_err(|e| SurgeError::Config(format!("Failed to flush stdout: {e}")))?;
-
-        let mut input = String::new();
-        std::io::stdin()
-            .read_line(&mut input)
-            .map_err(|e| SurgeError::Config(format!("Failed to read input: {e}")))?;
-
-        let value = input.trim();
-        if value.is_empty() {
-            return Ok(default_index);
-        }
-
-        match value.parse::<usize>() {
-            Ok(choice) if (1..=options.len()).contains(&choice) => return Ok(choice - 1),
-            _ => logline::warn(&format!(
-                "Invalid choice '{value}'. Enter a number between 1 and {}.",
-                options.len()
-            )),
-        }
-    }
+    dialoguer::Select::with_theme(&dialoguer::theme::ColorfulTheme::default())
+        .with_prompt(prompt)
+        .items(options)
+        .default(default_index)
+        .interact()
+        .map_err(|e| SurgeError::Config(format!("Selection failed: {e}")))
 }
 
 fn format_app_selection_label(name: &str, app_id: &str) -> String {

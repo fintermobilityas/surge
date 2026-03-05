@@ -67,6 +67,8 @@ struct RuntimeManifestFile<'a> {
     channel: &'a str,
     #[serde(rename = "installDirectory")]
     install_directory: &'a str,
+    #[serde(rename = "supervisorId", skip_serializing_if = "str::is_empty")]
+    supervisor_id: &'a str,
     provider: &'a str,
     bucket: &'a str,
     #[serde(skip_serializing_if = "str::is_empty")]
@@ -135,6 +137,7 @@ pub fn write_runtime_manifest(
         version: metadata.version.trim(),
         channel: metadata.channel.trim(),
         install_directory: profile.install_directory.trim(),
+        supervisor_id: profile.supervisor_id.trim(),
         provider: metadata.storage_provider.trim(),
         bucket: metadata.storage_bucket.trim(),
         region: metadata.storage_region.trim(),
@@ -440,7 +443,7 @@ mod tests {
             "Demo App",
             "demo",
             "demo-install",
-            "",
+            "demo-supervisor",
             "",
             &shortcuts,
             &environment,
@@ -456,6 +459,7 @@ mod tests {
         assert!(raw.contains("version: 1.2.3"));
         assert!(raw.contains("channel: test"));
         assert!(raw.contains("installDirectory: demo-install"));
+        assert!(raw.contains("supervisorId: demo-supervisor"));
         assert!(raw.contains("provider: azure"));
         assert!(raw.contains("bucket: demo-bucket"));
         assert!(raw.contains("endpoint: https://example.invalid"));

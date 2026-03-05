@@ -370,16 +370,25 @@ SURGE_API surge_result SURGE_CALL surge_lock_release(surge_context* ctx, const c
 /* -------------------------------------------------------------------------- */
 
 /**
- * Start a supervised process.
- * @param exe_path      Path to the executable.
- * @param working_dir   Working directory for the child process.
+ * Start a supervisor that watches the current process and restarts the app
+ * after it exits.
+ * @param exe_path      Path to the executable to relaunch.
+ * @param install_dir   Root install directory used for supervisor state files.
  * @param supervisor_id Identifier for this supervisor instance.
- * @param argc          Argument count for the child process.
- * @param argv          Argument array for the child process.
+ * @param argc          Argument count for restart arguments.
+ * @param argv          Argument array for restart arguments.
  * @return SURGE_OK on success.
  */
-SURGE_API surge_result SURGE_CALL surge_supervisor_start(const char* exe_path, const char* working_dir,
+SURGE_API surge_result SURGE_CALL surge_supervisor_start(const char* exe_path, const char* install_dir,
                                                          const char* supervisor_id, int argc, const char** argv);
+
+/**
+ * Stop a running supervisor watcher.
+ * @param install_dir   Root install directory used for supervisor state files.
+ * @param supervisor_id Identifier for this supervisor instance.
+ * @return SURGE_OK on success.
+ */
+SURGE_API surge_result SURGE_CALL surge_supervisor_stop(const char* install_dir, const char* supervisor_id);
 
 /* -------------------------------------------------------------------------- */
 /*  Lifecycle events                                                          */

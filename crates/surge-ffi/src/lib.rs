@@ -3,13 +3,15 @@
 //! C API (`cdylib`) for the Surge update framework.
 //!
 //! This crate produces `libsurge.so` / `surge.dll` / `libsurge.dylib` and
-//! exports every function declared in `surge_api.h`.  All 29 public symbols
+//! exports every function declared in `surge_api.h`.  All public symbols
 //! use `#[no_mangle] pub unsafe extern "C"` and catch panics at the boundary.
 
 mod handles;
 mod utils;
 
+use std::collections::BTreeMap;
 use std::ffi::{CStr, c_char, c_int, c_void};
+use std::path::Path;
 use std::ptr;
 use std::sync::{Arc, Mutex};
 
@@ -17,7 +19,7 @@ use surge_core::context::{Context, ResourceBudget, StorageProvider};
 use surge_core::diff::wrapper::{bsdiff_buffers, bspatch_buffers};
 use surge_core::lock::mutex::DistributedMutex;
 use surge_core::pack::builder::PackBuilder;
-use surge_core::supervisor::supervisor::Supervisor;
+use surge_core::supervisor::state::{supervisor_pid_file, supervisor_stop_file, write_restart_args};
 use surge_core::update::manager::{ProgressInfo, UpdateManager};
 
 use crate::handles::{
@@ -1216,37 +1218,119 @@ pub unsafe extern "C" fn surge_lock_release(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn surge_supervisor_start(
     exe_path: *const c_char,
-    working_dir: *const c_char,
+    install_dir: *const c_char,
     supervisor_id: *const c_char,
     argc: c_int,
     argv: *const *const c_char,
 ) -> i32 {
     catch_ffi(std::panic::AssertUnwindSafe(|| {
-        if exe_path.is_null() || working_dir.is_null() || supervisor_id.is_null() {
+        if exe_path.is_null() || install_dir.is_null() || supervisor_id.is_null() {
             return SURGE_ERROR;
         }
 
         // SAFETY: pointer inputs satisfy this API's FFI contract.
-        let (exe_s, wd_s, sup_id, args_owned) = unsafe {
+        let (exe_s, install_dir_s, sup_id, args_owned) = unsafe {
             (
                 cstr_to_string(exe_path),
-                cstr_to_string(working_dir),
+                cstr_to_string(install_dir),
                 cstr_to_string(supervisor_id),
                 collect_argv(argc, argv),
             )
         };
-        // Collect argv into a Vec<&str>.
-        let args: Vec<&str> = args_owned.iter().map(String::as_str).collect();
+        if exe_s.trim().is_empty() || install_dir_s.trim().is_empty() || sup_id.trim().is_empty() {
+            return SURGE_ERROR;
+        }
 
-        let mut supervisor = Supervisor::new(&sup_id, &wd_s);
+        let install_dir = Path::new(&install_dir_s);
+        let exe = Path::new(&exe_s);
+        let supervisor_path = exe
+            .parent()
+            .unwrap_or(install_dir)
+            .join(surge_core::platform::process::supervisor_binary_name());
+        if !supervisor_path.is_file() {
+            tracing::error!(
+                "supervisor_start failed: supervisor binary not found at {}",
+                supervisor_path.display()
+            );
+            return SURGE_ERROR;
+        }
 
-        match supervisor.start(&exe_s, &wd_s, &args) {
-            Ok(()) => SURGE_OK,
+        if let Err(e) = write_restart_args(install_dir, &sup_id, &args_owned) {
+            tracing::error!("supervisor_start failed: {e}");
+            return SURGE_ERROR;
+        }
+
+        let pid = surge_core::platform::process::current_pid().to_string();
+        let mut args: Vec<&str> = vec![
+            "watch",
+            "--id",
+            &sup_id,
+            "--dir",
+            &install_dir_s,
+            "--pid",
+            &pid,
+            "--exe",
+            &exe_s,
+        ];
+        if !args_owned.is_empty() {
+            args.push("--");
+            args.extend(args_owned.iter().map(String::as_str));
+        }
+
+        match surge_core::platform::process::spawn_detached(
+            &supervisor_path,
+            &args,
+            Some(install_dir),
+            &BTreeMap::new(),
+        ) {
+            Ok(_) => SURGE_OK,
             Err(e) => {
                 tracing::error!("supervisor_start failed: {e}");
                 SURGE_ERROR
             }
         }
+    }))
+}
+
+/// Stop a supervised process watcher.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn surge_supervisor_stop(install_dir: *const c_char, supervisor_id: *const c_char) -> i32 {
+    catch_ffi(std::panic::AssertUnwindSafe(|| {
+        if install_dir.is_null() || supervisor_id.is_null() {
+            return SURGE_ERROR;
+        }
+
+        // SAFETY: pointer inputs satisfy this API's FFI contract.
+        let (install_dir_s, sup_id) = unsafe { (cstr_to_string(install_dir), cstr_to_string(supervisor_id)) };
+        if install_dir_s.trim().is_empty() || sup_id.trim().is_empty() {
+            return SURGE_ERROR;
+        }
+
+        let install_dir = Path::new(&install_dir_s);
+        let pid_file = supervisor_pid_file(install_dir, &sup_id);
+        if !pid_file.is_file() {
+            return SURGE_ERROR;
+        }
+
+        let stop_file = supervisor_stop_file(install_dir, &sup_id);
+        if let Err(e) = std::fs::write(&stop_file, b"surge-stop") {
+            tracing::error!("supervisor_stop failed: {e}");
+            return SURGE_ERROR;
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while pid_file.exists() {
+            if std::time::Instant::now() >= deadline {
+                tracing::error!(
+                    "supervisor_stop failed: timed out waiting for supervisor '{}' to exit",
+                    sup_id
+                );
+                return SURGE_ERROR;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let _ = std::fs::remove_file(&stop_file);
+        SURGE_OK
     }))
 }
 

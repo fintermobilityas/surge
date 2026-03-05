@@ -4,6 +4,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode};
 
 use clap::{Parser, Subcommand};
+use surge_core::supervisor::state::{supervisor_pid_file, supervisor_stop_file};
+#[cfg(windows)]
+use sysinfo::{Pid, ProcessesToUpdate, System};
 use thiserror::Error;
 
 #[derive(Parser)]
@@ -34,6 +37,33 @@ enum Commands {
         exe: PathBuf,
 
         /// Arguments to pass to the child process
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+
+        /// Enable verbose logging
+        #[arg(long, short = 'v')]
+        verbose: bool,
+    },
+
+    /// Watch an already-running process and relaunch the app after it exits
+    Watch {
+        /// Unique supervisor identifier
+        #[arg(long)]
+        id: String,
+
+        /// Application install directory
+        #[arg(long)]
+        dir: PathBuf,
+
+        /// PID of the currently running application process
+        #[arg(long)]
+        pid: u32,
+
+        /// Path to the application executable
+        #[arg(long)]
+        exe: PathBuf,
+
+        /// Arguments to pass when launching the replacement child process
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
 
@@ -82,7 +112,22 @@ fn main() -> ExitCode {
             verbose,
         } => {
             init_tracing(verbose);
-            if let Err(e) = run_supervisor(&id, &dir, &exe, &args) {
+            if let Err(e) = run_supervisor(&id, &dir, &exe, &args, None) {
+                tracing::error!("{e}");
+                return ExitCode::FAILURE;
+            }
+            ExitCode::SUCCESS
+        }
+        Commands::Watch {
+            id,
+            dir,
+            pid,
+            exe,
+            args,
+            verbose,
+        } => {
+            init_tracing(verbose);
+            if let Err(e) = run_supervisor(&id, &dir, &exe, &args, Some(pid)) {
                 tracing::error!("{e}");
                 return ExitCode::FAILURE;
             }
@@ -106,6 +151,7 @@ fn run_supervisor(
     install_dir: &Path,
     exe_path: &Path,
     args: &[String],
+    watched_pid: Option<u32>,
 ) -> Result<(), SupervisorError> {
     tracing::info!(
         "Surge supervisor '{supervisor_id}' starting, exe: {}",
@@ -116,8 +162,8 @@ fn run_supervisor(
         return Err(SupervisorError::ExecutableNotFound(exe_path.display().to_string()));
     }
 
-    let pid_file = install_dir.join(format!(".surge-supervisor-{supervisor_id}.pid"));
-    let stop_file = install_dir.join(format!(".surge-supervisor-{supervisor_id}.stop"));
+    let pid_file = supervisor_pid_file(install_dir, supervisor_id);
+    let stop_file = supervisor_stop_file(install_dir, supervisor_id);
 
     if stop_file.exists() {
         let _ = std::fs::remove_file(&stop_file);
@@ -131,11 +177,30 @@ fn run_supervisor(
     // args are drained so crash-restarts don't re-fire lifecycle callbacks.
     let mut lifecycle_args: Vec<String> = args.iter().filter(|a| a.starts_with("--surge-")).cloned().collect();
     let regular_args: Vec<String> = args.iter().filter(|a| !a.starts_with("--surge-")).cloned().collect();
+    let mut watched_pid = watched_pid;
 
     loop {
         if shutdown.load(std::sync::atomic::Ordering::Acquire) || stop_file.exists() {
             tracing::info!("Shutdown signal received, exiting supervisor loop");
             break;
+        }
+
+        if let Some(pid) = watched_pid.take() {
+            tracing::info!("Watching running process PID {pid} before relaunch");
+            match wait_for_pid_or_stop(pid, &shutdown, &stop_file) {
+                WaitOutcome::ObservedProcessExited => {
+                    tracing::info!("Observed process PID {pid} exited, starting replacement child");
+                }
+                WaitOutcome::StopRequested => {
+                    tracing::info!("Stop requested, exiting supervisor loop and leaving watched process running");
+                    break;
+                }
+                WaitOutcome::ShutdownRequested => {
+                    tracing::info!("Shutdown signal received, supervisor loop is exiting");
+                    break;
+                }
+                WaitOutcome::Exited(_) => unreachable!(),
+            }
         }
 
         let mut child_args = regular_args.clone();
@@ -152,6 +217,7 @@ fn run_supervisor(
 
         let status = match wait_for_child_or_stop(&mut child, &shutdown, &stop_file)? {
             WaitOutcome::Exited(status) => status,
+            WaitOutcome::ObservedProcessExited => unreachable!(),
             WaitOutcome::StopRequested => {
                 tracing::info!("Stop requested, exiting supervisor loop and leaving child running");
                 break;
@@ -196,8 +262,31 @@ fn write_pid_file(path: &Path) -> Result<(), SupervisorError> {
 
 enum WaitOutcome {
     Exited(std::process::ExitStatus),
+    ObservedProcessExited,
     StopRequested,
     ShutdownRequested,
+}
+
+fn wait_for_pid_or_stop(
+    pid: u32,
+    shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    stop_file: &Path,
+) -> WaitOutcome {
+    loop {
+        if shutdown.load(std::sync::atomic::Ordering::Acquire) {
+            return WaitOutcome::ShutdownRequested;
+        }
+
+        if stop_file.exists() {
+            return WaitOutcome::StopRequested;
+        }
+
+        if !is_process_running(pid) {
+            return WaitOutcome::ObservedProcessExited;
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 fn wait_for_child_or_stop(
@@ -253,6 +342,27 @@ fn terminate_child_process(child: &mut Child) -> Result<(), SupervisorError> {
     let _ = child.kill();
     let _ = child.wait();
     Ok(())
+}
+
+#[cfg(unix)]
+fn is_process_running(pid: u32) -> bool {
+    use nix::errno::Errno;
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+
+    let Ok(raw_pid) = i32::try_from(pid) else {
+        return false;
+    };
+
+    matches!(kill(Pid::from_raw(raw_pid), None), Ok(()) | Err(Errno::EPERM))
+}
+
+#[cfg(windows)]
+fn is_process_running(pid: u32) -> bool {
+    let watched_pid = Pid::from_u32(pid);
+    let mut system = System::new();
+    let _ = system.refresh_processes(ProcessesToUpdate::Some(&[watched_pid]), true);
+    system.process(watched_pid).is_some()
 }
 
 fn install_signal_handlers() -> std::sync::Arc<std::sync::atomic::AtomicBool> {

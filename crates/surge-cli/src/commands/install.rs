@@ -358,33 +358,45 @@ pub async fn execute(
             ssh_target,
             file_target,
         } => {
-            logline::info("Building offline installer for remote deployment...");
-            let installer_path = build_offline_installer_for_tailscale(
-                &manifest, &app_id, &selected_rid, release, &channel, &storage_config, &local_package,
-            )?;
-            let installer_size = std::fs::metadata(&installer_path).map(|m| m.len()).unwrap_or(0);
-            logline::info(&format!(
-                "Transferring installer to '{file_target}' ({})...",
-                crate::formatters::format_bytes(installer_size),
-            ));
-            stream_file_to_tailscale_node_with_command(
-                ssh_target,
-                &installer_path,
-                "cat > /tmp/.surge-installer && chmod +x /tmp/.surge-installer",
-            )
-            .await?;
+            let install_dir = if release.install_directory.trim().is_empty() {
+                &app_id
+            } else {
+                release.install_directory.trim()
+            };
+            if check_remote_version(ssh_target, install_dir, &release.version).await {
+                logline::success(&format!(
+                    "'{app_id}' v{} is already installed on '{file_target}', skipping.",
+                    release.version,
+                ));
+            } else {
+                logline::info("Building offline installer for remote deployment...");
+                let installer_path = build_offline_installer_for_tailscale(
+                    &manifest, &app_id, &selected_rid, release, &channel, &storage_config, &local_package,
+                )?;
+                let installer_size = std::fs::metadata(&installer_path).map(|m| m.len()).unwrap_or(0);
+                logline::info(&format!(
+                    "Transferring installer to '{file_target}' ({})...",
+                    crate::formatters::format_bytes(installer_size),
+                ));
+                stream_file_to_tailscale_node_with_command(
+                    ssh_target,
+                    &installer_path,
+                    "cat > /tmp/.surge-installer && chmod +x /tmp/.surge-installer",
+                )
+                .await?;
 
-            let no_start_flag = if no_start { " --no-start" } else { "" };
-            let run_cmd = format!("/tmp/.surge-installer{no_start_flag} && rm -f /tmp/.surge-installer");
-            let ssh_command = format!("sh -lc {}", shell_single_quote(&run_cmd));
-            let output = run_tailscale_capture(&["ssh", ssh_target, ssh_command.as_str()]).await?;
-            for line in output.lines() {
-                let trimmed = line.trim();
-                if !trimmed.is_empty() {
-                    logline::subtle(&format!("remote: {trimmed}"));
+                let no_start_flag = if no_start { " --no-start" } else { "" };
+                let run_cmd = format!("/tmp/.surge-installer{no_start_flag} && rm -f /tmp/.surge-installer");
+                let ssh_command = format!("sh -lc {}", shell_single_quote(&run_cmd));
+                let output = run_tailscale_capture(&["ssh", ssh_target, ssh_command.as_str()]).await?;
+                for line in output.lines() {
+                    let trimmed = line.trim();
+                    if !trimmed.is_empty() {
+                        logline::subtle(&format!("remote: {trimmed}"));
+                    }
                 }
+                logline::success(&format!("Installed '{app_id}' on tailscale node '{file_target}'."));
             }
-            logline::success(&format!("Installed '{app_id}' on tailscale node '{file_target}'."));
         }
     }
 
@@ -1152,7 +1164,7 @@ fn build_remote_installer_manifest(
         rid: release.rid.clone(),
         version: release.version.clone(),
         channel: channel.to_string(),
-        generated_utc: chrono::Utc::now().to_rfc3339(),
+        generated_utc: release.created_utc.clone(),
         headless_default_if_no_display: true,
         release_index_key: RELEASES_FILE_COMPRESSED.to_string(),
         storage: InstallerStorage {
@@ -1355,6 +1367,18 @@ async fn stream_file_to_tailscale_node_with_command(node: &str, local_file: &Pat
     }
 
     Ok(())
+}
+
+async fn check_remote_version(ssh_node: &str, install_dir: &str, expected_version: &str) -> bool {
+    let install_dir_q = shell_single_quote(install_dir);
+    let probe = format!(
+        r#"cat "$HOME/.local/share/{install_dir_q}/app/.surge/runtime.yml" 2>/dev/null | grep -oP '^version:\s*\K\S+' || echo none"#,
+    );
+    let command = format!("sh -lc {}", shell_single_quote(&probe));
+    match run_tailscale_capture(&["ssh", ssh_node, command.as_str()]).await {
+        Ok(output) => output.trim() == expected_version,
+        Err(_) => false,
+    }
 }
 
 async fn run_tailscale_capture(args: &[&str]) -> Result<String> {

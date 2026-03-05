@@ -15,7 +15,7 @@ use surge_core::config::constants::RELEASES_FILE_COMPRESSED;
 use surge_core::config::installer::{
     InstallerManifest, InstallerRelease, InstallerRuntime, InstallerStorage, InstallerUi,
 };
-use surge_core::config::manifest::{ShortcutLocation, SurgeManifest};
+use surge_core::config::manifest::SurgeManifest;
 use surge_core::error::{Result, SurgeError};
 use surge_core::install::{self as core_install, InstallProfile};
 use surge_core::releases::artifact_cache::{CacheFetchOutcome, fetch_or_reuse_file};
@@ -92,12 +92,6 @@ enum ArchiveAcquisition {
     ReusedLocal,
     Downloaded,
     Reconstructed,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TailscaleCopyMethod {
-    Taildrop,
-    SshStream,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1061,47 +1055,6 @@ fn parse_rid_signature(rid: &str) -> Option<RidSignature> {
     Some(RidSignature { os, arch, has_gpu_hint })
 }
 
-fn parse_remote_launch_environment(raw: &str) -> RemoteLaunchEnvironment {
-    let mut environment = RemoteLaunchEnvironment::default();
-    for line in raw.lines() {
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        let value = value.trim();
-        if value.is_empty() {
-            continue;
-        }
-        match key.trim() {
-            "display" => environment.display = Some(value.to_string()),
-            "xauthority" => environment.xauthority = Some(value.to_string()),
-            "dbus" => environment.dbus_session_bus_address = Some(value.to_string()),
-            _ => {}
-        }
-    }
-    environment
-}
-
-fn release_requires_display(release: &ReleaseEntry) -> bool {
-    release
-        .shortcuts
-        .iter()
-        .any(|shortcut| matches!(shortcut, ShortcutLocation::Desktop | ShortcutLocation::StartMenu))
-}
-
-async fn detect_remote_launch_environment(node: &str) -> Result<RemoteLaunchEnvironment> {
-    let probe = r#"uid=$(id -u 2>/dev/null || echo ''); display="${DISPLAY:-}"; if [ -z "$display" ] && [ -S /tmp/.X11-unix/X0 ]; then display=':0'; fi; if [ -z "$display" ] && [ -S /tmp/.X11-unix/X1 ]; then display=':1'; fi; xauthority=''; if [ -f "$HOME/.Xauthority" ]; then xauthority="$HOME/.Xauthority"; elif [ -n "$uid" ] && [ -f "/run/user/$uid/gdm/Xauthority" ]; then xauthority="/run/user/$uid/gdm/Xauthority"; fi; dbus="${DBUS_SESSION_BUS_ADDRESS:-}"; if [ -z "$dbus" ] && [ -n "$uid" ] && [ -S "/run/user/$uid/bus" ]; then dbus="unix:path=/run/user/$uid/bus"; fi; printf 'display=%s\nxauthority=%s\ndbus=%s\n' "$display" "$xauthority" "$dbus""#;
-    let command = format!("sh -lc {}", shell_single_quote(probe));
-    match run_tailscale_capture(&["ssh", node, command.as_str()]).await {
-        Ok(output) => Ok(parse_remote_launch_environment(&output)),
-        Err(e) => {
-            logline::warn(&format!(
-                "Failed to probe remote display/session environment for '{node}': {e}. Continuing without display overrides."
-            ));
-            Ok(RemoteLaunchEnvironment::default())
-        }
-    }
-}
-
 fn derive_base_rid(profile: &RuntimeProfile) -> Option<String> {
     let os = normalize_os(&profile.os)?;
     let arch = normalize_arch(&profile.arch)?;
@@ -1153,68 +1106,6 @@ fn build_rid_candidates(base_rid: &str, nvidia_gpu: bool) -> Vec<String> {
     }
 
     candidates
-}
-
-async fn check_remote_file_hash(ssh_node: &str, filename: &str, expected_sha256: &str) -> bool {
-    let expected = expected_sha256.trim();
-    if expected.is_empty() {
-        return false;
-    }
-
-    let file_name = Path::new(filename)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(filename);
-    let quoted = shell_single_quote(file_name);
-
-    // Try the remote surge binary first (cross-platform), then sha256sum as fallback.
-    let probe = format!(
-        r#"F=""; if [ -f "$HOME/Downloads/{quoted}" ]; then F="$HOME/Downloads/{quoted}"; elif [ -f "$HOME/{quoted}" ]; then F="$HOME/{quoted}"; fi; [ -n "$F" ] && {{ "$HOME/.surge/bin/surge" sha256 "$F" 2>/dev/null || sha256sum "$F" 2>/dev/null || echo notfound; }} || echo notfound"#,
-    );
-    let command = format!("sh -lc {}", shell_single_quote(&probe));
-    match run_tailscale_capture(&["ssh", ssh_node, command.as_str()]).await {
-        Ok(output) => output
-            .split_whitespace()
-            .next()
-            .is_some_and(|hash| hash.eq_ignore_ascii_case(expected)),
-        Err(_) => false,
-    }
-}
-
-async fn copy_file_to_tailscale_node(
-    file_node: &str,
-    ssh_node: &str,
-    local_file: &Path,
-) -> Result<TailscaleCopyMethod> {
-    let source = local_file.display().to_string();
-    let target = format!("{file_node}:");
-    let args = ["file", "cp", source.as_str(), target.as_str()];
-    let taildrop_spinner = make_spinner("Copying package via Taildrop");
-    if taildrop_spinner.is_none() {
-        logline::subtle("Copying package via Taildrop...");
-    }
-    let taildrop_result = run_tailscale_capture(&args).await;
-    if let Some(spinner) = taildrop_spinner {
-        spinner.finish_and_clear();
-    }
-
-    match taildrop_result {
-        Ok(_) => Ok(TailscaleCopyMethod::Taildrop),
-        Err(err) if is_taildrop_capability_error(&err) => {
-            logline::warn(&format!(
-                "Taildrop unavailable for '{file_node}' ({err}). Falling back to tailscale ssh stream copy."
-            ));
-            stream_file_to_tailscale_node(ssh_node, local_file).await?;
-            Ok(TailscaleCopyMethod::SshStream)
-        }
-        Err(err) => Err(err),
-    }
-}
-
-fn is_taildrop_capability_error(err: &SurgeError) -> bool {
-    let message = err.to_string().to_ascii_lowercase();
-    message.contains("missing required taildrop capability")
-        || (message.contains("cannot send files") && message.contains("tailscale file cp"))
 }
 
 fn shell_single_quote(raw: &str) -> String {
@@ -1292,23 +1183,6 @@ fn build_remote_installer_manifest(
     }
 }
 
-fn sanitize_remote_path_component(raw: &str) -> String {
-    let mut sanitized: String = raw
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if sanitized.is_empty() {
-        sanitized.push_str("install");
-    }
-    sanitized
-}
-
 #[allow(clippy::too_many_arguments)]
 fn build_offline_installer_for_tailscale(
     manifest: &SurgeManifest,
@@ -1376,106 +1250,6 @@ fn build_offline_installer_for_tailscale(
     std::mem::forget(staging_dir);
 
     Ok(installer_path)
-}
-
-async fn install_package_on_tailscale_node(
-    ssh_node: &str,
-    app_id: &str,
-    release: &ReleaseEntry,
-    channel: &str,
-    storage_config: &surge_core::context::StorageConfig,
-    no_start: bool,
-) -> Result<()> {
-    let launch_environment = detect_remote_launch_environment(ssh_node).await?;
-    let has_display = launch_environment
-        .display
-        .as_deref()
-        .is_some_and(|value| !value.is_empty());
-    let inferred_gui_app = release_requires_display(release);
-    let should_skip_start_for_display = inferred_gui_app && !has_display;
-    if should_skip_start_for_display {
-        logline::warn("Remote node has no detectable display session; skipping auto-start for GUI app.");
-    }
-    let effective_no_start = no_start || should_skip_start_for_display;
-
-    let surge_binary = std::env::current_exe().map_err(|e| {
-        SurgeError::Platform(format!(
-            "Failed to resolve local surge executable for remote setup: {e}"
-        ))
-    })?;
-    copy_surge_binary_to_tailscale_node(ssh_node, &surge_binary).await?;
-
-    let full_filename = release.full_filename.trim();
-    if full_filename.is_empty() {
-        return Err(SurgeError::Config(format!(
-            "Release '{}' has no full package filename for tailscale setup.",
-            release.version
-        )));
-    }
-
-    let installer_manifest =
-        build_remote_installer_manifest(app_id, release, channel, storage_config, &launch_environment);
-    let installer_yaml = serde_yaml::to_string(&installer_manifest).map_err(|e| {
-        SurgeError::Config(format!(
-            "Failed to serialize installer manifest for tailscale setup: {e}"
-        ))
-    })?;
-
-    let app_component = sanitize_remote_path_component(app_id);
-    let version_component = sanitize_remote_path_component(&release.version);
-    let no_start_flag = if effective_no_start { "--no-start " } else { "" };
-    let remote_script = format!(
-        r#"set -eu
-FULL={full_filename}
-STAGE="$HOME/.surge/remote-install/{app_component}-{version_component}"
-rm -rf "$STAGE"
-mkdir -p "$STAGE/payload"
-PAYLOAD=""
-if [ -f "$HOME/Downloads/$FULL" ]; then
-  PAYLOAD="$HOME/Downloads/$FULL"
-elif [ -f "$HOME/$FULL" ]; then
-  PAYLOAD="$HOME/$FULL"
-else
-  PAYLOAD="$(find "$HOME" -maxdepth 4 -type f -name "$FULL" -print -quit 2>/dev/null || true)"
-fi
-if [ -z "$PAYLOAD" ]; then
-  echo "Could not locate transferred package '$FULL' on remote node." >&2
-  exit 1
-fi
-ln -sf "$PAYLOAD" "$STAGE/payload/$FULL"
-cat > "$STAGE/installer.yml" <<'SURGE_INSTALLER_YAML'
-{installer_yaml}SURGE_INSTALLER_YAML
-"$HOME/.surge/bin/surge" setup {no_start_flag}"$STAGE"
-"#,
-        full_filename = shell_single_quote(full_filename),
-    );
-    let ssh_command = format!("sh -lc {}", shell_single_quote(&remote_script));
-    let output = run_tailscale_capture(&["ssh", ssh_node, ssh_command.as_str()]).await?;
-    for line in output.lines() {
-        let trimmed = line.trim();
-        if !trimmed.is_empty() {
-            logline::subtle(&format!("remote: {trimmed}"));
-        }
-    }
-    Ok(())
-}
-
-async fn copy_surge_binary_to_tailscale_node(node: &str, local_binary: &Path) -> Result<()> {
-    let remote_command = "mkdir -p ~/.surge/bin && cat > ~/.surge/bin/surge && chmod +x ~/.surge/bin/surge";
-    stream_file_to_tailscale_node_with_command(node, local_binary, remote_command).await
-}
-
-async fn stream_file_to_tailscale_node(node: &str, local_file: &Path) -> Result<()> {
-    let file_name = local_file
-        .file_name()
-        .and_then(|value| value.to_str())
-        .ok_or_else(|| SurgeError::Platform(format!("Invalid package filename '{}'", local_file.display())))?;
-
-    let remote_command = format!(
-        "mkdir -p ~/Downloads && cat > ~/Downloads/{}",
-        shell_single_quote(file_name)
-    );
-    stream_file_to_tailscale_node_with_command(node, local_file, &remote_command).await
 }
 
 async fn stream_file_to_tailscale_node_with_command(node: &str, local_file: &Path, remote_command: &str) -> Result<()> {
@@ -1659,28 +1433,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_remote_launch_environment_extracts_known_keys() {
-        let raw = "display=:0\nxauthority=/run/user/1000/gdm/Xauthority\ndbus=unix:path=/run/user/1000/bus\n";
-        let env = parse_remote_launch_environment(raw);
-        assert_eq!(env.display.as_deref(), Some(":0"));
-        assert_eq!(env.xauthority.as_deref(), Some("/run/user/1000/gdm/Xauthority"));
-        assert_eq!(
-            env.dbus_session_bus_address.as_deref(),
-            Some("unix:path=/run/user/1000/bus")
-        );
-    }
-
-    #[test]
-    fn release_requires_display_when_desktop_shortcut_exists() {
-        let desktop_release = release("1.0.0", "test", "linux-x64", "desktop-full.tar.zst");
-        assert!(release_requires_display(&desktop_release));
-
-        let mut headless_release = release("1.0.1", "test", "linux-x64", "headless-full.tar.zst");
-        headless_release.shortcuts = vec![ShortcutLocation::Startup];
-        assert!(!release_requires_display(&headless_release));
-    }
-
-    #[test]
     fn resolve_targets_plain_node_without_user() {
         let (ssh_target, file_target) = resolve_tailscale_targets("edge-node", None).expect("targets");
         assert_eq!(ssh_target, "edge-node");
@@ -1699,15 +1451,6 @@ mod tests {
         let (ssh_target, file_target) = resolve_tailscale_targets("alice@edge-node", Some("ignored")).expect("targets");
         assert_eq!(ssh_target, "alice@edge-node");
         assert_eq!(file_target, "edge-node");
-    }
-
-    #[test]
-    fn taildrop_capability_error_is_detected() {
-        let err = SurgeError::Platform(
-            "Command failed: tailscale file cp package.tar.zst node:: cannot send files: missing required Taildrop capability"
-                .to_string(),
-        );
-        assert!(is_taildrop_capability_error(&err));
     }
 
     #[test]

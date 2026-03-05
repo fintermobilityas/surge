@@ -30,6 +30,8 @@ pub async fn execute(dir: &Path, no_start: bool) -> Result<()> {
 
     let install_root = default_install_root(&manifest.app_id, &manifest.runtime.install_directory)?;
 
+    super::stop_supervisor(&install_root, &manifest.runtime.supervisor_id).await?;
+
     let package = resolve_package(dir, &manifest).await?;
 
     let profile = InstallProfile::from_installer_manifest(&manifest, &manifest.runtime.shortcuts);

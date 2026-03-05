@@ -177,16 +177,13 @@ pub async fn execute(
                 )
             }
         }
-        InstallTarget::Tailscale { ssh_target, .. } => {
+        InstallTarget::Tailscale { .. } => {
             let selected_rid = if let Some(requested_rid) = selected_rid {
                 requested_rid.to_string()
             } else {
                 super::resolve_rid(&manifest, &app_id, None)?
             };
             ensure_supported_tailscale_rid(&selected_rid)?;
-            logline::info(&format!(
-                "Remote RID auto-detection is disabled; using selected RID '{selected_rid}' for node '{ssh_target}'."
-            ));
             (vec![selected_rid], None)
         }
     };
@@ -367,18 +364,25 @@ pub async fn execute(
             ssh_target,
             file_target,
         } => {
-            let copy_method = copy_file_to_tailscale_node(file_target, ssh_target, &local_package).await?;
-            match copy_method {
-                TailscaleCopyMethod::Taildrop => logline::success(&format!(
-                    "Copied '{}' to node '{}' via tailscale file sharing.",
-                    local_package.display(),
-                    file_target
-                )),
-                TailscaleCopyMethod::SshStream => logline::success(&format!(
-                    "Copied '{}' to node '{}' via tailscale ssh stream fallback.",
-                    local_package.display(),
-                    file_target
-                )),
+            if check_remote_file_hash(ssh_target, full_filename, &release.full_sha256).await {
+                logline::success(&format!(
+                    "Package '{}' already present on node '{file_target}', skipping transfer.",
+                    Path::new(full_filename).file_name().unwrap_or_default().to_string_lossy(),
+                ));
+            } else {
+                let copy_method = copy_file_to_tailscale_node(file_target, ssh_target, &local_package).await?;
+                match copy_method {
+                    TailscaleCopyMethod::Taildrop => logline::success(&format!(
+                        "Copied '{}' to node '{}' via tailscale file sharing.",
+                        local_package.display(),
+                        file_target
+                    )),
+                    TailscaleCopyMethod::SshStream => logline::success(&format!(
+                        "Copied '{}' to node '{}' via tailscale ssh stream fallback.",
+                        local_package.display(),
+                        file_target
+                    )),
+                }
             }
 
             install_package_on_tailscale_node(ssh_target, &app_id, release, &channel, &storage_config, no_start)
@@ -711,63 +715,7 @@ async fn stop_running_supervisor(app_id: &str, release: &ReleaseEntry) -> Result
 
     let install_root =
         surge_core::platform::paths::default_install_root(app_id, &release.install_directory)?;
-    if !install_root.is_dir() {
-        return Ok(());
-    }
-
-    let pid_file = install_root.join(format!(".surge-supervisor-{supervisor_id}.pid"));
-    if !pid_file.is_file() {
-        return Ok(());
-    }
-
-    let pid_str = tokio::fs::read_to_string(&pid_file)
-        .await
-        .map_err(|e| SurgeError::Config(format!("Failed to read supervisor PID file: {e}")))?;
-    let pid: u32 = pid_str
-        .trim()
-        .parse()
-        .map_err(|e| SurgeError::Config(format!("Invalid PID in supervisor PID file: {e}")))?;
-
-    logline::info(&format!(
-        "Stopping supervisor '{supervisor_id}' (pid {pid}) before install..."
-    ));
-
-    terminate_process(pid, supervisor_id).await?;
-
-    // Wait for the PID file to disappear (supervisor cleans it up on exit).
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
-    while pid_file.exists() {
-        if tokio::time::Instant::now() >= deadline {
-            return Err(SurgeError::Platform(format!(
-                "Timed out waiting for supervisor '{supervisor_id}' to exit"
-            )));
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-
-    logline::success("Supervisor stopped.");
-    Ok(())
-}
-
-async fn terminate_process(pid: u32, label: &str) -> Result<()> {
-    let output = Command::new(if cfg!(unix) { "kill" } else { "taskkill" })
-        .args(if cfg!(unix) {
-            vec![pid.to_string()]
-        } else {
-            vec!["/PID".to_string(), pid.to_string()]
-        })
-        .output()
-        .await
-        .map_err(|e| SurgeError::Platform(format!("Failed to send terminate signal to '{label}' (pid {pid}): {e}")))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(SurgeError::Platform(format!(
-            "Failed to stop '{label}' (pid {pid}): {stderr}"
-        )));
-    }
-
-    Ok(())
+    super::stop_supervisor(&install_root, supervisor_id).await
 }
 
 fn install_package_locally(app_id: &str, release: &ReleaseEntry, package_path: &Path) -> Result<std::path::PathBuf> {
@@ -1202,6 +1150,31 @@ fn build_rid_candidates(base_rid: &str, nvidia_gpu: bool) -> Vec<String> {
     }
 
     candidates
+}
+
+async fn check_remote_file_hash(ssh_node: &str, filename: &str, expected_sha256: &str) -> bool {
+    let expected = expected_sha256.trim();
+    if expected.is_empty() {
+        return false;
+    }
+
+    let file_name = Path::new(filename)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(filename);
+    let probe = format!(
+        "sha256sum ~/Downloads/{} 2>/dev/null || sha256sum ~/{} 2>/dev/null || echo notfound",
+        shell_single_quote(file_name),
+        shell_single_quote(file_name),
+    );
+    let command = format!("sh -lc {}", shell_single_quote(&probe));
+    match run_tailscale_capture(&["ssh", ssh_node, command.as_str()]).await {
+        Ok(output) => output
+            .split_whitespace()
+            .next()
+            .is_some_and(|hash| hash.eq_ignore_ascii_case(expected)),
+        Err(_) => false,
+    }
 }
 
 async fn copy_file_to_tailscale_node(

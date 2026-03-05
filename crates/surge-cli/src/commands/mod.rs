@@ -18,6 +18,68 @@ pub(crate) use surge_core::storage_config::{
 #[allow(unused_imports)]
 pub(crate) use crate::prompts::{resolve_app_id, resolve_app_id_with_rid_hint, resolve_rid};
 
+use surge_core::error::{Result, SurgeError};
+
+/// Stop a running supervisor by sending SIGTERM (or taskkill on Windows) and
+/// waiting for its PID file to disappear. No-op if the supervisor is not running.
+pub(crate) async fn stop_supervisor(install_dir: &std::path::Path, supervisor_id: &str) -> Result<()> {
+    let supervisor_id = supervisor_id.trim();
+    if supervisor_id.is_empty() {
+        return Ok(());
+    }
+
+    if !install_dir.is_dir() {
+        return Ok(());
+    }
+
+    let pid_file = install_dir.join(format!(".surge-supervisor-{supervisor_id}.pid"));
+    if !pid_file.is_file() {
+        return Ok(());
+    }
+
+    let pid_str = tokio::fs::read_to_string(&pid_file)
+        .await
+        .map_err(|e| SurgeError::Config(format!("Failed to read supervisor PID file: {e}")))?;
+    let pid: u32 = pid_str
+        .trim()
+        .parse()
+        .map_err(|e| SurgeError::Config(format!("Invalid PID in supervisor PID file: {e}")))?;
+
+    crate::logline::info(&format!(
+        "Stopping supervisor '{supervisor_id}' (pid {pid}) before install..."
+    ));
+
+    let output = tokio::process::Command::new(if cfg!(unix) { "kill" } else { "taskkill" })
+        .args(if cfg!(unix) {
+            vec![pid.to_string()]
+        } else {
+            vec!["/PID".to_string(), pid.to_string()]
+        })
+        .output()
+        .await
+        .map_err(|e| SurgeError::Platform(format!("Failed to send terminate signal to supervisor (pid {pid}): {e}")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(SurgeError::Platform(format!(
+            "Failed to stop supervisor '{supervisor_id}' (pid {pid}): {stderr}"
+        )));
+    }
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    while pid_file.exists() {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(SurgeError::Platform(format!(
+                "Timed out waiting for supervisor '{supervisor_id}' to exit"
+            )));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    crate::logline::success("Supervisor stopped.");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;

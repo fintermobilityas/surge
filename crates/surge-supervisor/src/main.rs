@@ -124,9 +124,13 @@ fn run(cli: &Cli) -> Result<(), SupervisorError> {
         tracing::info!("Child process started with PID {}", child.id());
 
         let status = match wait_for_child_or_stop(&mut child, &shutdown, &stop_file)? {
-            Some(status) => status,
-            None => {
-                tracing::info!("Stop requested, child terminated and supervisor loop is exiting");
+            WaitOutcome::Exited(status) => status,
+            WaitOutcome::StopRequested => {
+                tracing::info!("Stop requested, exiting supervisor loop and leaving child running");
+                break;
+            }
+            WaitOutcome::ShutdownRequested => {
+                tracing::info!("Shutdown signal received, child terminated and supervisor loop is exiting");
                 break;
             }
         };
@@ -164,19 +168,29 @@ fn write_pid_file(path: &Path) -> Result<(), SupervisorError> {
     Ok(())
 }
 
+enum WaitOutcome {
+    Exited(std::process::ExitStatus),
+    StopRequested,
+    ShutdownRequested,
+}
+
 fn wait_for_child_or_stop(
     child: &mut Child,
     shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     stop_file: &Path,
-) -> Result<Option<std::process::ExitStatus>, SupervisorError> {
+) -> Result<WaitOutcome, SupervisorError> {
     loop {
-        if shutdown.load(std::sync::atomic::Ordering::Acquire) || stop_file.exists() {
+        if shutdown.load(std::sync::atomic::Ordering::Acquire) {
             terminate_child_process(child)?;
-            return Ok(None);
+            return Ok(WaitOutcome::ShutdownRequested);
+        }
+
+        if stop_file.exists() {
+            return Ok(WaitOutcome::StopRequested);
         }
 
         if let Some(status) = child.try_wait()? {
-            return Ok(Some(status));
+            return Ok(WaitOutcome::Exited(status));
         }
 
         std::thread::sleep(std::time::Duration::from_millis(100));

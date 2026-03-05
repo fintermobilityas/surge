@@ -261,9 +261,9 @@ enum Commands {
         #[arg(long)]
         node: Option<String>,
 
-        /// SSH user account used for remote profile detection (tailscale method)
-        #[arg(long)]
-        ssh_user: Option<String>,
+        /// Node user account used for tailscale SSH login (tailscale method)
+        #[arg(long = "node-user", alias = "ssh-user")]
+        node_user: Option<String>,
 
         #[command(flatten)]
         options: InstallOptions,
@@ -299,7 +299,7 @@ enum LockAction {
 enum InstallMethod {
     /// Resolve a release from configured backend and download it locally
     Backend,
-    /// Detect remote RID via Tailscale, resolve release by channel, and transfer package
+    /// Install to a tailscale node using an explicit/selected RID and transfer package
     #[value(alias = "ssh")]
     Tailscale,
 }
@@ -318,7 +318,7 @@ struct InstallOptions {
     #[arg(long)]
     channel: Option<String>,
 
-    /// Override RID detection with an explicit RID
+    /// Explicit target RID (required when app has multiple targets and no interactive selection)
     #[arg(long)]
     rid: Option<String>,
 
@@ -609,16 +609,16 @@ async fn run(cli: Cli) -> surge_core::error::Result<()> {
             tailscale,
             target,
             node,
-            ssh_user,
+            node_user,
             options,
         } => {
             let method = if tailscale { InstallMethod::Tailscale } else { method };
             let node = node.or(target);
             let node = match method {
                 InstallMethod::Backend => {
-                    if node.is_some() || ssh_user.is_some() {
+                    if node.is_some() || node_user.is_some() {
                         return Err(surge_core::error::SurgeError::Config(
-                            "--node/--ssh-user require 'tailscale' install method".to_string(),
+                            "--node/--node-user require 'tailscale' install method".to_string(),
                         ));
                     }
                     None
@@ -634,7 +634,7 @@ async fn run(cli: Cli) -> surge_core::error::Result<()> {
                 &manifest_path,
                 &options.application_manifest,
                 node,
-                ssh_user.as_deref(),
+                node_user.as_deref(),
                 options.app_id.as_deref(),
                 options.channel.as_deref(),
                 options.rid.as_deref(),

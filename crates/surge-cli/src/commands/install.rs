@@ -8,6 +8,7 @@ use std::time::Instant;
 use crate::logline;
 use crate::ui::UiTheme;
 use indicatif::{ProgressBar, ProgressStyle};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
 use surge_core::config::constants::RELEASES_FILE_COMPRESSED;
@@ -46,15 +47,26 @@ impl RuntimeProfile {
     }
 }
 
-fn ensure_supported_tailscale_profile(profile: &RuntimeProfile) -> Result<()> {
-    if normalize_os(&profile.os) == Some("linux") {
-        return Ok(());
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RidSignature {
+    os: &'static str,
+    arch: &'static str,
+    has_gpu_hint: bool,
+}
 
-    Err(SurgeError::Config(format!(
-        "Tailscale install currently supports Linux targets only. Detected remote profile: os='{}', arch='{}'.",
-        profile.os, profile.arch
-    )))
+fn ensure_supported_tailscale_rid(rid: &str) -> Result<()> {
+    match infer_os_from_rid(rid) {
+        Some(os) if os == "linux" => Ok(()),
+        Some(os) => Err(SurgeError::Config(format!(
+            "Tailscale install currently supports Linux targets only. Selected RID '{rid}' targets '{os}'."
+        ))),
+        None => {
+            logline::warn(&format!(
+                "Unable to infer OS from selected RID '{rid}'. Tailscale install supports Linux targets only; verify this RID is Linux-compatible."
+            ));
+            Ok(())
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -105,7 +117,7 @@ pub async fn execute(
     manifest_path: &Path,
     application_manifest_path: &Path,
     node: Option<&str>,
-    ssh_user: Option<&str>,
+    node_user: Option<&str>,
     app_id: Option<&str>,
     channel: Option<&str>,
     rid: Option<&str>,
@@ -132,7 +144,7 @@ pub async fn execute(
 
     let install_target = match node.map(str::trim).filter(|value| !value.is_empty()) {
         Some(node) => {
-            let (ssh_target, file_target) = resolve_tailscale_targets(node, ssh_user)?;
+            let (ssh_target, file_target) = resolve_tailscale_targets(node, node_user)?;
             InstallTarget::Tailscale {
                 ssh_target,
                 file_target,
@@ -146,29 +158,37 @@ pub async fn execute(
         .map(|selection| selection.rid.as_str())
         .or_else(|| rid.map(str::trim).filter(|value| !value.is_empty()));
 
-    let remote_profile = match &install_target {
-        InstallTarget::Local => None,
-        InstallTarget::Tailscale { ssh_target, .. } => {
-            let profile = detect_remote_profile(ssh_target).await?;
-            ensure_supported_tailscale_profile(&profile)?;
-            Some(profile)
+    let (rid_candidates, profile) = match &install_target {
+        InstallTarget::Local => {
+            let detected = detect_local_profile();
+            if let Some(requested_rid) = selected_rid {
+                warn_if_local_rid_looks_incompatible(requested_rid, &detected);
+                (vec![requested_rid.to_string()], Some(detected))
+            } else {
+                let base_rid = derive_base_rid(&detected).ok_or_else(|| {
+                    SurgeError::Platform(format!(
+                        "Unable to map profile to a RID (os='{}', arch='{}'). Use --rid to override.",
+                        detected.os, detected.arch
+                    ))
+                })?;
+                (
+                    build_rid_candidates(&base_rid, detected.has_nvidia_gpu()),
+                    Some(detected),
+                )
+            }
         }
-    };
-
-    let (rid_candidates, profile) = if let Some(requested_rid) = selected_rid {
-        (vec![requested_rid.to_string()], remote_profile)
-    } else {
-        let detected = remote_profile.unwrap_or_else(detect_local_profile);
-        let base_rid = derive_base_rid(&detected).ok_or_else(|| {
-            SurgeError::Platform(format!(
-                "Unable to map profile to a RID (os='{}', arch='{}'). Use --rid to override.",
-                detected.os, detected.arch
-            ))
-        })?;
-        (
-            build_rid_candidates(&base_rid, detected.has_nvidia_gpu()),
-            Some(detected),
-        )
+        InstallTarget::Tailscale { ssh_target, .. } => {
+            let selected_rid = if let Some(requested_rid) = selected_rid {
+                requested_rid.to_string()
+            } else {
+                super::resolve_rid(&manifest, &app_id, None)?
+            };
+            ensure_supported_tailscale_rid(&selected_rid)?;
+            logline::info(&format!(
+                "Remote RID auto-detection is disabled; using selected RID '{selected_rid}' for node '{ssh_target}'."
+            ));
+            (vec![selected_rid], None)
+        }
     };
 
     let storage_config = build_storage_config_with_overrides(&manifest, &app_id, overrides)?;
@@ -507,11 +527,7 @@ fn prompt_install_selection(
             continue;
         }
         let name = app.effective_name();
-        let label = if name == app_id {
-            app_id.to_string()
-        } else {
-            format!("{name} ({app_id})")
-        };
+        let label = format_app_selection_label(&name, app_id);
         app_ids.push(app_id.to_string());
         app_labels.push(label);
     }
@@ -537,38 +553,12 @@ fn prompt_install_selection(
         )));
     }
 
-    let mut os_values = Vec::new();
-    for option in &target_options {
-        if !os_values.iter().any(|existing: &String| existing == &option.os) {
-            os_values.push(option.os.clone());
-        }
-    }
-
-    let requested_os = requested_rid.and_then(infer_os_from_rid);
-    let default_os_index = requested_os
-        .as_deref()
-        .and_then(|os| os_values.iter().position(|candidate| candidate == os))
-        .unwrap_or(0);
-    let selected_os_index = prompt_choice_index("Select operating system", &os_values, default_os_index)?;
-    let selected_os = os_values[selected_os_index].clone();
-
-    let rid_values: Vec<String> = target_options
-        .iter()
-        .filter(|option| option.os == selected_os)
-        .map(|option| option.rid.clone())
-        .collect();
-    let default_rid_index = requested_rid
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .and_then(|requested| rid_values.iter().position(|candidate| candidate == requested))
-        .unwrap_or(0);
-    let selected_rid_index = prompt_choice_index("Select RID", &rid_values, default_rid_index)?;
-    let selected_rid = rid_values[selected_rid_index].clone();
+    let selected_target = resolve_install_target_selection(&target_options, requested_rid)?;
 
     Ok(InstallSelection {
         app_id: selected_app_id,
-        os: selected_os,
-        rid: selected_rid,
+        os: selected_target.os,
+        rid: selected_target.rid,
     })
 }
 
@@ -584,8 +574,10 @@ fn prompt_choice_index(prompt: &str, options: &[String], default_index: usize) -
 
     loop {
         println!("{}", theme.title(prompt));
+        let width = options.len().to_string().len();
         for (index, option) in options.iter().enumerate() {
-            println!("  {}. {}", index + 1, option);
+            let marker = if index == default_index { "*" } else { " " };
+            println!("  {marker} {:>width$}. {option}", index + 1, width = width);
         }
 
         print!("{}", theme.blue(&format!("Enter choice [{}]: ", default_index + 1)));
@@ -611,6 +603,69 @@ fn prompt_choice_index(prompt: &str, options: &[String], default_index: usize) -
             )),
         }
     }
+}
+
+fn format_app_selection_label(name: &str, app_id: &str) -> String {
+    let trimmed_name = name.trim();
+    if trimmed_name.is_empty() || trimmed_name == app_id {
+        return app_id.to_string();
+    }
+
+    if let Some(suffix) = app_id_suffix_for_name(trimmed_name, app_id) {
+        return format!("{trimmed_name} [{suffix}]");
+    }
+
+    format!("{trimmed_name} ({app_id})")
+}
+
+fn app_id_suffix_for_name<'a>(name: &str, app_id: &'a str) -> Option<&'a str> {
+    let (prefix, suffix) = app_id.split_once('-')?;
+    let suffix = suffix.trim();
+    if suffix.is_empty() || !prefix.trim().eq_ignore_ascii_case(name) {
+        return None;
+    }
+    Some(suffix)
+}
+
+fn resolve_install_target_selection(
+    target_options: &[AppInstallTargetOption],
+    requested_rid: Option<&str>,
+) -> Result<AppInstallTargetOption> {
+    if target_options.is_empty() {
+        return Err(SurgeError::Config(
+            "App has no target options. Add at least one target to the manifest.".to_string(),
+        ));
+    }
+
+    if target_options.len() == 1 {
+        return Ok(target_options[0].clone());
+    }
+
+    let requested_rid = requested_rid.map(str::trim).filter(|value| !value.is_empty());
+    if let Some(requested_rid) = requested_rid {
+        let mut matching = target_options.iter().filter(|option| option.rid == requested_rid);
+        if let (Some(selected), None) = (matching.next(), matching.next()) {
+            return Ok(selected.clone());
+        }
+    }
+
+    let labels = target_options
+        .iter()
+        .map(format_target_option_label)
+        .collect::<Vec<_>>();
+    let default_index = requested_rid
+        .and_then(|rid| target_options.iter().position(|option| option.rid == rid))
+        .unwrap_or(0);
+    let selected_index = prompt_choice_index("Select target", &labels, default_index)?;
+    Ok(target_options[selected_index].clone())
+}
+
+fn format_target_option_label(option: &AppInstallTargetOption) -> String {
+    let os = option.os.trim();
+    if os.is_empty() || os == "unknown" || infer_os_from_rid(&option.rid).as_deref() == Some(os) {
+        return option.rid.clone();
+    }
+    format!("{} ({os})", option.rid)
 }
 
 fn collect_target_options_for_app(manifest: &SurgeManifest, app_id: &str) -> Result<Vec<AppInstallTargetOption>> {
@@ -665,7 +720,7 @@ fn infer_os_from_rid(rid: &str) -> Option<String> {
     Some(normalized.to_string())
 }
 
-fn resolve_tailscale_targets(node: &str, ssh_user: Option<&str>) -> Result<(String, String)> {
+fn resolve_tailscale_targets(node: &str, node_user: Option<&str>) -> Result<(String, String)> {
     let node = node.trim();
     if node.is_empty() {
         return Err(SurgeError::Config(
@@ -682,7 +737,7 @@ fn resolve_tailscale_targets(node: &str, ssh_user: Option<&str>) -> Result<(Stri
         return Ok((node.to_string(), host_part.to_string()));
     }
 
-    if let Some(user) = ssh_user.map(str::trim).filter(|value| !value.is_empty()) {
+    if let Some(user) = node_user.map(str::trim).filter(|value| !value.is_empty()) {
         Ok((format!("{user}@{node}"), node.to_string()))
     } else {
         Ok((node.to_string(), node.to_string()))
@@ -708,6 +763,7 @@ fn release_install_profile<'a>(app_id: &'a str, release: &'a ReleaseEntry) -> In
         &release.environment,
     )
 }
+
 
 fn install_package_locally(app_id: &str, release: &ReleaseEntry, package_path: &Path) -> Result<std::path::PathBuf> {
     let profile = release_install_profile(app_id, release);
@@ -994,65 +1050,59 @@ fn has_local_nvidia_gpu() -> bool {
         .unwrap_or(false)
 }
 
-async fn detect_remote_profile(node: &str) -> Result<RuntimeProfile> {
-    let unix_probe = r#"os=$(uname -s 2>/dev/null || echo unknown); arch=$(uname -m 2>/dev/null || echo unknown); gpu=none; if command -v nvidia-smi >/dev/null 2>&1; then gpu=nvidia; fi; printf "os=%s\narch=%s\ngpu=%s\n" "$os" "$arch" "$gpu""#;
-    let unix_probe_command = format!("sh -lc {}", shell_single_quote(unix_probe));
-    let unix_failure = match run_tailscale_capture(&["ssh", node, unix_probe_command.as_str()]).await {
-        Ok(stdout) => {
-            if let Some(profile) = parse_remote_profile(&stdout) {
-                return Ok(profile);
-            }
-            "profile probe succeeded but output was not parseable".to_string()
-        }
-        Err(unix_err) => unix_err.to_string(),
-    };
-
-    let windows_probe = "$os='Windows'; $arch=[System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString(); $gpu='none'; if (Get-CimInstance Win32_VideoController | Where-Object { $_.Name -match 'NVIDIA' } | Select-Object -First 1) { $gpu='nvidia' }; Write-Output \"os=$os\"; Write-Output \"arch=$arch\"; Write-Output \"gpu=$gpu\"";
-    match run_tailscale_capture(&[
-        "ssh",
-        node,
-        "powershell",
-        "-NoProfile",
-        "-NonInteractive",
-        "-Command",
-        windows_probe,
-    ])
-    .await
-    {
-        Ok(stdout) => parse_remote_profile(&stdout).ok_or_else(|| {
-            SurgeError::Platform(format!(
-                "Unable to parse remote profile from node '{node}' (unix probe failed: {unix_failure}). Use --rid to override."
-            ))
-        }),
-        Err(windows_err) => Err(SurgeError::Platform(format!(
-            "Unable to detect remote profile for '{node}'. Unix probe failed ({unix_failure}) and Windows probe failed ({windows_err}). Use --rid to override."
-        ))),
+fn warn_if_local_rid_looks_incompatible(rid: &str, profile: &RuntimeProfile) {
+    for warning in local_rid_incompatibility_warnings(rid, profile) {
+        logline::warn(&warning);
     }
 }
 
-fn parse_remote_profile(raw: &str) -> Option<RuntimeProfile> {
-    let mut os = String::new();
-    let mut arch = String::new();
-    let mut gpu = String::from("none");
+fn local_rid_incompatibility_warnings(rid: &str, profile: &RuntimeProfile) -> Vec<String> {
+    let Some(selected) = parse_rid_signature(rid) else {
+        return Vec::new();
+    };
+    let Some(local_os) = normalize_os(&profile.os) else {
+        return Vec::new();
+    };
+    let Some(local_arch) = normalize_arch(&profile.arch) else {
+        return Vec::new();
+    };
 
-    for line in raw.lines() {
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        let value = value.trim();
-        match key.trim() {
-            "os" => os = value.to_string(),
-            "arch" => arch = value.to_string(),
-            "gpu" => gpu = value.to_string(),
-            _ => {}
-        }
+    let mut warnings = Vec::new();
+    if selected.os != local_os {
+        warnings.push(format!(
+            "Selected RID '{rid}' targets OS '{}', but local host OS appears '{}'.",
+            selected.os, local_os
+        ));
     }
-
-    if os.is_empty() || arch.is_empty() {
-        return None;
+    if selected.arch != local_arch {
+        warnings.push(format!(
+            "Selected RID '{rid}' targets architecture '{}', but local host architecture appears '{}'.",
+            selected.arch, local_arch
+        ));
     }
+    if selected.has_gpu_hint && !profile.has_nvidia_gpu() {
+        warnings.push(format!(
+            "Selected RID '{rid}' implies GPU acceleration, but no local NVIDIA GPU was detected."
+        ));
+    }
+    warnings
+}
 
-    Some(RuntimeProfile { os, arch, gpu })
+fn parse_rid_signature(rid: &str) -> Option<RidSignature> {
+    let mut parts = rid.trim().split('-');
+    let raw_os = parts.next()?.trim().to_ascii_lowercase();
+    let os = match raw_os.as_str() {
+        "linux" => "linux",
+        "win" | "windows" => "win",
+        "osx" | "macos" | "darwin" => "osx",
+        _ => normalize_os(raw_os.as_str())?,
+    };
+    let arch = normalize_arch(parts.next()?)?;
+    let has_gpu_hint = parts.any(|part| {
+        let part = part.trim().to_ascii_lowercase();
+        part == "cuda" || part == "nvidia" || part == "gpu"
+    });
+    Some(RidSignature { os, arch, has_gpu_hint })
 }
 
 fn parse_remote_launch_environment(raw: &str) -> RemoteLaunchEnvironment {
@@ -1157,7 +1207,16 @@ async fn copy_file_to_tailscale_node(
     let source = local_file.display().to_string();
     let target = format!("{file_node}:");
     let args = ["file", "cp", source.as_str(), target.as_str()];
-    match run_tailscale_capture(&args).await {
+    let taildrop_spinner = make_spinner("Copying package via Taildrop");
+    if taildrop_spinner.is_none() {
+        logline::subtle("Copying package via Taildrop...");
+    }
+    let taildrop_result = run_tailscale_capture(&args).await;
+    if let Some(spinner) = taildrop_spinner {
+        spinner.finish_and_clear();
+    }
+
+    match taildrop_result {
         Ok(_) => Ok(TailscaleCopyMethod::Taildrop),
         Err(err) if is_taildrop_capability_error(&err) => {
             logline::warn(&format!(
@@ -1382,20 +1441,83 @@ async fn stream_file_to_tailscale_node_with_command(node: &str, local_file: &Pat
         .await
         .map_err(|e| SurgeError::Platform(format!("Failed to open '{}' for transfer: {e}", local_file.display())))?;
 
+    let transfer_total_bytes = tokio::fs::metadata(local_file).await.map_or(0, |meta| meta.len());
+    let transfer_message = format!("Streaming '{}' to '{node}'", local_file.display());
+    let transfer_bar = if transfer_total_bytes > 0 {
+        make_progress_bar(&transfer_message, transfer_total_bytes)
+    } else {
+        make_spinner(&transfer_message)
+    };
+    let mut last_transfer_log = Instant::now();
+
     let mut child_stdin = child
         .stdin
         .take()
         .ok_or_else(|| SurgeError::Platform("Failed to capture tailscale ssh stdin".to_string()))?;
 
-    tokio::io::copy(&mut local_reader, &mut child_stdin)
-        .await
-        .map_err(|e| SurgeError::Platform(format!("Failed to stream '{}' to '{node}': {e}", local_file.display())))?;
+    let mut transferred_bytes = 0_u64;
+    let mut buffer = vec![0_u8; 128 * 1024];
+    loop {
+        let read_bytes = local_reader.read(&mut buffer).await.map_err(|e| {
+            SurgeError::Platform(format!("Failed to read '{}' for transfer: {e}", local_file.display()))
+        })?;
+        if read_bytes == 0 {
+            break;
+        }
+        child_stdin.write_all(&buffer[..read_bytes]).await.map_err(|e| {
+            SurgeError::Platform(format!("Failed to stream '{}' to '{node}': {e}", local_file.display()))
+        })?;
+        transferred_bytes = transferred_bytes.saturating_add(u64::try_from(read_bytes).unwrap_or(0));
+
+        if let Some(bar) = transfer_bar.as_ref() {
+            if transfer_total_bytes > 0 {
+                bar.set_position(transferred_bytes);
+            } else {
+                bar.tick();
+                bar.set_message(format!("{transfer_message} ({transferred_bytes} bytes transferred)"));
+            }
+        } else if last_transfer_log.elapsed() >= std::time::Duration::from_secs(5) {
+            if transfer_total_bytes > 0 {
+                let pct = (transferred_bytes as f64 / transfer_total_bytes as f64) * 100.0;
+                logline::subtle(&format!(
+                    "Streaming package to '{node}'... {transferred_bytes}/{transfer_total_bytes} bytes ({pct:.0}%)"
+                ));
+            } else {
+                logline::subtle(&format!(
+                    "Streaming package to '{node}'... {transferred_bytes} bytes transferred"
+                ));
+            }
+            last_transfer_log = Instant::now();
+        }
+    }
+
+    child_stdin.flush().await.map_err(|e| {
+        SurgeError::Platform(format!(
+            "Failed to flush transfer stream to '{node}' for '{}': {e}",
+            local_file.display()
+        ))
+    })?;
     drop(child_stdin);
 
-    let output = child
-        .wait_with_output()
-        .await
-        .map_err(|e| SurgeError::Platform(format!("Failed to wait for tailscale ssh stream copy: {e}")))?;
+    if let Some(bar) = &transfer_bar {
+        bar.finish_and_clear();
+    } else {
+        logline::subtle(&format!(
+            "Completed stream upload to '{node}' ({transferred_bytes} bytes)."
+        ));
+    }
+
+    let finalize_spinner = make_spinner("Waiting for remote copy confirmation");
+    if finalize_spinner.is_none() {
+        logline::subtle("Waiting for remote copy confirmation...");
+    }
+
+    let output = child.wait_with_output().await;
+    if let Some(spinner) = finalize_spinner {
+        spinner.finish_and_clear();
+    }
+    let output =
+        output.map_err(|e| SurgeError::Platform(format!("Failed to wait for tailscale ssh stream copy: {e}")))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -1471,32 +1593,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_profile_output() {
-        let raw = "os=Linux\narch=x86_64\ngpu=nvidia\n";
-        let profile = parse_remote_profile(raw).expect("profile should parse");
-        assert_eq!(profile.os, "Linux");
-        assert_eq!(profile.arch, "x86_64");
-        assert!(profile.has_nvidia_gpu());
+    fn ensure_supported_tailscale_rid_accepts_linux() {
+        assert!(ensure_supported_tailscale_rid("linux-x64").is_ok());
+        assert!(ensure_supported_tailscale_rid("linux-arm64-cuda").is_ok());
     }
 
     #[test]
-    fn ensure_supported_tailscale_profile_accepts_linux() {
-        let linux = RuntimeProfile {
-            os: "Linux".to_string(),
-            arch: "x86_64".to_string(),
-            gpu: "none".to_string(),
-        };
-        assert!(ensure_supported_tailscale_profile(&linux).is_ok());
-    }
-
-    #[test]
-    fn ensure_supported_tailscale_profile_rejects_windows() {
-        let windows = RuntimeProfile {
-            os: "Windows".to_string(),
-            arch: "x86_64".to_string(),
-            gpu: "none".to_string(),
-        };
-        let err = ensure_supported_tailscale_profile(&windows).expect_err("windows should be rejected");
+    fn ensure_supported_tailscale_rid_rejects_windows() {
+        let err = ensure_supported_tailscale_rid("win-x64").expect_err("windows should be rejected");
         assert!(
             err.to_string().contains("supports Linux targets only"),
             "unexpected error: {err}"
@@ -1533,7 +1637,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_targets_plain_node_with_ssh_user() {
+    fn resolve_targets_plain_node_with_node_user() {
         let (ssh_target, file_target) = resolve_tailscale_targets("edge-node", Some("operator")).expect("targets");
         assert_eq!(ssh_target, "operator@edge-node");
         assert_eq!(file_target, "edge-node");
@@ -1750,13 +1854,33 @@ apps:
     }
 
     #[test]
-    fn parse_profile_output_crlf() {
-        let raw = "os=Windows\r\narch=AMD64\r\ngpu=none\r\n";
-        let profile = parse_remote_profile(raw).expect("profile should parse");
-        assert_eq!(profile.os, "Windows");
-        assert_eq!(profile.arch, "AMD64");
-        assert!(!profile.has_nvidia_gpu());
-        assert_eq!(derive_base_rid(&profile), Some("win-x64".to_string()));
+    fn parse_rid_signature_extracts_os_arch_and_gpu_hint() {
+        let signature = parse_rid_signature("linux-x64-cuda").expect("rid signature should parse");
+        assert_eq!(signature.os, "linux");
+        assert_eq!(signature.arch, "x64");
+        assert!(signature.has_gpu_hint);
+    }
+
+    #[test]
+    fn local_rid_incompatibility_warnings_detect_os_arch_and_gpu_mismatch() {
+        let local_profile = RuntimeProfile {
+            os: "linux".to_string(),
+            arch: "arm64".to_string(),
+            gpu: "none".to_string(),
+        };
+        let warnings = local_rid_incompatibility_warnings("win-x64-cuda", &local_profile);
+        assert_eq!(warnings.len(), 3);
+        assert!(warnings.iter().any(|warning| warning.contains("targets OS 'win'")));
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("targets architecture 'x64'"))
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("implies GPU acceleration"))
+        );
     }
 
     #[test]
@@ -1890,6 +2014,70 @@ apps:
             os: "linux".to_string(),
             rid: "linux-x64".to_string(),
         }));
+    }
+
+    #[test]
+    fn format_app_selection_label_collapses_duplicate_prefix() {
+        let label = format_app_selection_label("youpark", "youpark-ubuntu24.04-linux-x64-cpu");
+        assert_eq!(label, "youpark [ubuntu24.04-linux-x64-cpu]");
+    }
+
+    #[test]
+    fn format_app_selection_label_keeps_non_prefixed_id() {
+        let label = format_app_selection_label("youpark", "custom-build-id");
+        assert_eq!(label, "youpark (custom-build-id)");
+    }
+
+    #[test]
+    fn resolve_install_target_selection_auto_selects_single_option() {
+        let selected = resolve_install_target_selection(
+            &[AppInstallTargetOption {
+                os: "linux".to_string(),
+                rid: "linux-x64".to_string(),
+            }],
+            None,
+        )
+        .expect("single target should be selected");
+        assert_eq!(selected.rid, "linux-x64");
+        assert_eq!(selected.os, "linux");
+    }
+
+    #[test]
+    fn resolve_install_target_selection_uses_requested_rid_when_unique() {
+        let selected = resolve_install_target_selection(
+            &[
+                AppInstallTargetOption {
+                    os: "linux".to_string(),
+                    rid: "linux-x64".to_string(),
+                },
+                AppInstallTargetOption {
+                    os: "linux".to_string(),
+                    rid: "linux-arm64".to_string(),
+                },
+            ],
+            Some("linux-arm64"),
+        )
+        .expect("requested rid should select target");
+        assert_eq!(selected.rid, "linux-arm64");
+        assert_eq!(selected.os, "linux");
+    }
+
+    #[test]
+    fn format_target_option_label_omits_redundant_os() {
+        let label = format_target_option_label(&AppInstallTargetOption {
+            os: "linux".to_string(),
+            rid: "linux-x64".to_string(),
+        });
+        assert_eq!(label, "linux-x64");
+    }
+
+    #[test]
+    fn format_target_option_label_shows_non_inferable_os() {
+        let label = format_target_option_label(&AppInstallTargetOption {
+            os: "linux".to_string(),
+            rid: "custom-rid".to_string(),
+        });
+        assert_eq!(label, "custom-rid (linux)");
     }
 
     #[test]

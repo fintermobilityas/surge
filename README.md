@@ -129,7 +129,7 @@ Install to a remote node on your tailnet:
 ```bash
 surge install tailscale \
   --node my-node \
-  --ssh-user operator \
+  --node-user operator \
   --channel stable
 ```
 
@@ -139,7 +139,7 @@ This command:
 - downloads it locally and sends it with `tailscale file cp`.
 
 Use `--plan-only` to preview selection without transfer, or `--rid` to force a specific RID. If your tailnet
-requires explicit SSH identity, pass `--ssh-user <account>` (or set `--node <account>@<node>` directly).
+requires explicit SSH identity, pass `--node-user <account>` (or set `--node <account>@<node>` directly).
 
 ### 4. Add update checking to your app
 

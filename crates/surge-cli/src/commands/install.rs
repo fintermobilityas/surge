@@ -371,7 +371,13 @@ pub async fn execute(
             } else {
                 logline::info("Building offline installer for remote deployment...");
                 let installer_path = build_offline_installer_for_tailscale(
-                    &manifest, &app_id, &selected_rid, release, &channel, &storage_config, &local_package,
+                    &manifest,
+                    &app_id,
+                    &selected_rid,
+                    release,
+                    &channel,
+                    &storage_config,
+                    &local_package,
                 )?;
                 let installer_size = std::fs::metadata(&installer_path).map(|m| m.len()).unwrap_or(0);
                 logline::info(&format!(
@@ -722,8 +728,7 @@ async fn stop_running_supervisor(app_id: &str, release: &ReleaseEntry) -> Result
         return Ok(());
     }
 
-    let install_root =
-        surge_core::platform::paths::default_install_root(app_id, &release.install_directory)?;
+    let install_root = surge_core::platform::paths::default_install_root(app_id, &release.install_directory)?;
     super::stop_supervisor(&install_root, supervisor_id).await
 }
 
@@ -1219,8 +1224,8 @@ fn build_offline_installer_for_tailscale(
         .map(|n| n.to_string_lossy().to_string())
         .ok_or_else(|| SurgeError::Config("Full package path has no filename".to_string()))?;
 
-    let staging_dir = tempfile::tempdir()
-        .map_err(|e| SurgeError::Platform(format!("Failed to create staging directory: {e}")))?;
+    let staging_dir =
+        tempfile::tempdir().map_err(|e| SurgeError::Platform(format!("Failed to create staging directory: {e}")))?;
     let staging = staging_dir.path();
 
     std::fs::write(staging.join("installer.yml"), installer_yaml.as_bytes())?;
@@ -1247,9 +1252,8 @@ fn build_offline_installer_for_tailscale(
 
     let payload_archive = tempfile::NamedTempFile::new()
         .map_err(|e| SurgeError::Platform(format!("Failed to create payload temp file: {e}")))?;
-    let mut packer = surge_core::archive::packer::ArchivePacker::new(
-        surge_core::config::constants::DEFAULT_ZSTD_LEVEL,
-    )?;
+    let mut packer =
+        surge_core::archive::packer::ArchivePacker::new(surge_core::config::constants::DEFAULT_ZSTD_LEVEL)?;
     packer.add_directory(staging, "")?;
     packer.finalize_to_file(payload_archive.path())?;
 

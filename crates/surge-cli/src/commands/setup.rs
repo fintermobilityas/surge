@@ -130,9 +130,7 @@ fn stop_running_app(install_root: &Path, main_exe: &str) {
 
     #[cfg(unix)]
     {
-        let status = std::process::Command::new("pkill")
-            .args(["-f", &*exe_name])
-            .status();
+        let status = std::process::Command::new("pkill").args(["-f", &*exe_name]).status();
         if matches!(status, Ok(s) if s.success()) {
             logline::info(&format!("Stopped running app process '{main_exe}'."));
             std::thread::sleep(std::time::Duration::from_millis(500));

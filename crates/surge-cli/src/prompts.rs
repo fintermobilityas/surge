@@ -34,10 +34,7 @@ pub(crate) fn is_interactive() -> bool {
 }
 
 /// Resolve app ID, prompting interactively when the manifest has multiple apps.
-pub(crate) fn resolve_app_id(
-    manifest: &SurgeManifest,
-    requested: Option<&str>,
-) -> Result<String> {
+pub(crate) fn resolve_app_id(manifest: &SurgeManifest, requested: Option<&str>) -> Result<String> {
     if let Some(app_id) = requested.map(str::trim).filter(|v| !v.is_empty()) {
         return Ok(app_id.to_string());
     }
@@ -119,11 +116,7 @@ pub(crate) fn resolve_app_id_with_rid_hint(
 }
 
 /// Resolve RID, prompting interactively when the app has multiple targets.
-pub(crate) fn resolve_rid(
-    manifest: &SurgeManifest,
-    app_id: &str,
-    requested: Option<&str>,
-) -> Result<String> {
+pub(crate) fn resolve_rid(manifest: &SurgeManifest, app_id: &str, requested: Option<&str>) -> Result<String> {
     if let Some(rid) = requested.map(str::trim).filter(|v| !v.is_empty()) {
         return Ok(rid.to_string());
     }
@@ -241,7 +234,8 @@ mod tests {
 
     #[test]
     fn format_app_label_includes_distro_and_variant() {
-        let m = parse(br"schema: 2
+        let m = parse(
+            br"schema: 2
 storage: { provider: filesystem, bucket: /tmp }
 channels: [{ name: stable }]
 apps:
@@ -254,14 +248,16 @@ apps:
       - rid: linux-x64
         distro: ubuntu24.04
         variant: cuda
-");
+",
+        );
         let label = format_app_label(&m, "youpark-ubuntu24.04-linux-x64-cpu");
         assert_eq!(label, "youpark · linux/x64 · ubuntu24.04 · cpu");
     }
 
     #[test]
     fn format_app_label_omits_empty_variant() {
-        let m = parse(br"schema: 2
+        let m = parse(
+            br"schema: 2
 storage: { provider: filesystem, bucket: /tmp }
 channels: [{ name: stable }]
 apps:
@@ -272,28 +268,32 @@ apps:
         distro: jetpack5.0
       - rid: linux-arm64
         distro: jetpack4.6
-");
+",
+        );
         let label = format_app_label(&m, "youpark-jetpack5.0-linux-arm64");
         assert_eq!(label, "youpark · linux/arm64 · jetpack5.0");
     }
 
     #[test]
     fn format_app_label_falls_back_to_app_id() {
-        let m = parse(br"schema: 2
+        let m = parse(
+            br"schema: 2
 storage: { provider: filesystem, bucket: /tmp }
 channels: [{ name: stable }]
 apps:
   - id: simple-app
     targets:
       - rid: linux-x64
-");
+",
+        );
         let label = format_app_label(&m, "simple-app");
         assert_eq!(label, "simple-app · linux/x64");
     }
 
     #[test]
     fn format_rid_label_includes_distro_and_variant() {
-        let m = parse(br"schema: 2
+        let m = parse(
+            br"schema: 2
 storage: { provider: filesystem, bucket: /tmp }
 channels: [{ name: stable }]
 apps:
@@ -302,23 +302,25 @@ apps:
       - rid: linux-x64
         distro: ubuntu24.04
         variant: cuda
-");
+",
+        );
         let label = format_rid_label(&m, "myapp", "linux-x64");
         assert_eq!(label, "linux/x64 · ubuntu24.04 · cuda");
     }
 
     #[test]
     fn format_rid_label_plain_rid() {
-        let m = parse(br"schema: 2
+        let m = parse(
+            br"schema: 2
 storage: { provider: filesystem, bucket: /tmp }
 channels: [{ name: stable }]
 apps:
   - id: myapp
     targets:
       - rid: linux-arm64
-");
+",
+        );
         let label = format_rid_label(&m, "myapp", "linux-arm64");
         assert_eq!(label, "linux/arm64");
     }
-
 }

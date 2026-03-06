@@ -123,6 +123,8 @@ jobs:
             artifact_path: |
               target/release/libsurge.so
               target/release/surge
+              target/release/surge-installer
+              target/release/surge-installer-ui
               target/release/surge-supervisor
           - os: windows-latest
             name: Windows x64
@@ -132,6 +134,8 @@ jobs:
               target/release/surge.dll
               target/release/surge.dll.lib
               target/release/surge.exe
+              target/release/surge-installer.exe
+              target/release/surge-installer-ui.exe
               target/release/surge-supervisor.exe
           - os: macos-latest
             name: macOS
@@ -140,6 +144,8 @@ jobs:
             artifact_path: |
               target/release/libsurge.dylib
               target/release/surge
+              target/release/surge-installer
+              target/release/surge-installer-ui
               target/release/surge-supervisor
     steps:
       - uses: actions/checkout@v6
@@ -304,6 +310,18 @@ jobs:
             fi
             if [ "${attempt}" -eq 10 ]; then
               echo "Failed to publish surge-installer after waiting for surge-core to sync in registry."
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
+      - name: Publish surge-installer-ui to Cloudsmith Cargo registry
+        run: |
+          for attempt in $(seq 1 10); do
+            if cargo publish -p surge-installer-ui --registry surge --allow-dirty; then
+              exit 0
+            fi
+            if [ "${attempt}" -eq 10 ]; then
+              echo "Failed to publish surge-installer-ui after waiting for surge-core to sync in registry."
               exit 1
             fi
             sleep $((attempt * 5))

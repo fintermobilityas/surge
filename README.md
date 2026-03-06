@@ -41,6 +41,10 @@ Building that yourself means solving a dozen hard problems: hosting an update se
 
 You need two things: somewhere to store your releases and the `surge` CLI.
 
+If you are wiring Surge into CI, prefer the official release bundle for your platform. It includes the full publishing
+toolchain (`surge`, `surge-supervisor`, `surge-installer`, `surge-installer-ui`, and the native runtime) so pack/push
+jobs do not have to assemble it from multiple crates.
+
 ### 1. Initialize your project
 
 ```bash

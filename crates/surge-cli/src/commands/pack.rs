@@ -888,7 +888,7 @@ fn find_launcher_for_rid(
     }
 
     Err(SurgeError::Pack(format!(
-        "{not_found_label} '{launcher_name}' not found. Build '{build_binary}' and place it next to surge, add it to PATH, or set {env_var}."
+        "{not_found_label} '{launcher_name}' not found. Use the official Surge release bundle for this platform, place '{build_binary}' next to surge, add it to PATH, or set {env_var}."
     )))
 }
 

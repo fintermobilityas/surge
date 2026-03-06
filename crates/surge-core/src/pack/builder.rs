@@ -531,7 +531,7 @@ fn find_supervisor_binary(name: &str) -> Result<PathBuf> {
         }
     }
     Err(SurgeError::Pack(format!(
-        "Supervisor binary '{name}' is required (supervisor_id is configured) but was not found next to the surge binary"
+        "Supervisor binary '{name}' is required (supervisor_id is configured) but was not found next to the surge binary. Use the official Surge release bundle for this platform or place '{name}' next to surge."
     )))
 }
 

@@ -3,7 +3,10 @@
 use std::ffi::c_void;
 use std::mem::MaybeUninit;
 
-use crate::diff::bsdiff_sys::*;
+use crate::diff::bsdiff_sys::{
+    BSDIFF_MODE_READ, BSDIFF_MODE_WRITE, BSDIFF_SUCCESS, BsdiffCtx, BsdiffPatchPacker, BsdiffStream, bsdiff,
+    bsdiff_close_patch_packer, bsdiff_close_stream, bsdiff_open_bz2_patch_packer, bsdiff_open_memory_stream, bspatch,
+};
 use crate::error::{Result, SurgeError};
 
 struct StreamHandle {
@@ -45,7 +48,7 @@ impl StreamHandle {
         let mut buf_ptr: *const c_void = std::ptr::null();
         let mut buf_size: usize = 0;
         // SAFETY: Callback comes from initialized C stream and pointers are valid outputs.
-        let rc = unsafe { get_buffer(self.inner.state, &mut buf_ptr, &mut buf_size) };
+        let rc = unsafe { get_buffer(self.inner.state, &raw mut buf_ptr, &raw mut buf_size) };
         if rc != BSDIFF_SUCCESS {
             return Err(SurgeError::Diff(format!("Failed to get {label} buffer: {rc}")));
         }
@@ -71,7 +74,7 @@ impl Drop for StreamHandle {
     fn drop(&mut self) {
         if self.owned {
             // SAFETY: `inner` is an initialized bsdiff stream that this handle owns.
-            unsafe { bsdiff_close_stream(&mut self.inner) };
+            unsafe { bsdiff_close_stream(&raw mut self.inner) };
         }
     }
 }
@@ -106,7 +109,7 @@ impl PackerHandle {
 impl Drop for PackerHandle {
     fn drop(&mut self) {
         // SAFETY: `inner` is an initialized packer and this handle owns it.
-        unsafe { bsdiff_close_patch_packer(&mut self.inner) };
+        unsafe { bsdiff_close_patch_packer(&raw mut self.inner) };
     }
 }
 
@@ -126,7 +129,7 @@ pub fn bsdiff_buffers(older: &[u8], newer: &[u8]) -> Result<Vec<u8>> {
     let mut ctx = new_ctx();
 
     // SAFETY: All pointers reference initialized C-ABI structs valid for the call duration.
-    let rc = unsafe { bsdiff(&mut ctx, old_stream.as_mut(), new_stream.as_mut(), packer.as_mut()) };
+    let rc = unsafe { bsdiff(&raw mut ctx, old_stream.as_mut(), new_stream.as_mut(), packer.as_mut()) };
     if rc != BSDIFF_SUCCESS {
         return Err(SurgeError::Diff(format!("bsdiff failed: {rc}")));
     }
@@ -143,7 +146,7 @@ pub fn bspatch_buffers(older: &[u8], patch: &[u8]) -> Result<Vec<u8>> {
     let mut ctx = new_ctx();
 
     // SAFETY: All pointers reference initialized C-ABI structs valid for the call duration.
-    let rc = unsafe { bspatch(&mut ctx, old_stream.as_mut(), new_stream.as_mut(), packer.as_mut()) };
+    let rc = unsafe { bspatch(&raw mut ctx, old_stream.as_mut(), new_stream.as_mut(), packer.as_mut()) };
     if rc != BSDIFF_SUCCESS {
         return Err(SurgeError::Diff(format!("bspatch failed: {rc}")));
     }

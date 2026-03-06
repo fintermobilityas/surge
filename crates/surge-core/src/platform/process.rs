@@ -34,7 +34,9 @@ impl ProcessHandle {
     pub fn terminate(&self) -> Result<()> {
         use nix::sys::signal::{Signal, kill};
         use nix::unistd::Pid;
-        kill(Pid::from_raw(self.child.id() as i32), Signal::SIGTERM)
+        let pid = i32::try_from(self.child.id())
+            .map_err(|_| SurgeError::Platform("Process id exceeds platform signal limits".to_string()))?;
+        kill(Pid::from_raw(pid), Signal::SIGTERM)
             .map_err(|e| SurgeError::Platform(format!("Failed to send SIGTERM: {e}")))?;
         Ok(())
     }

@@ -55,7 +55,7 @@ impl Default for ProcessInfo {
 
 #[allow(dead_code)]
 pub struct Supervisor {
-    supervisor_id: String,
+    id: String,
     install_dir: PathBuf,
     info: ProcessInfo,
     handle: Option<ProcessHandle>,
@@ -64,7 +64,7 @@ pub struct Supervisor {
 impl Supervisor {
     pub fn new(supervisor_id: &str, install_dir: &str) -> Self {
         Self {
-            supervisor_id: supervisor_id.to_string(),
+            id: supervisor_id.to_string(),
             install_dir: PathBuf::from(install_dir),
             info: ProcessInfo::default(),
             handle: None,
@@ -81,7 +81,7 @@ impl Supervisor {
         self.info.working_dir = PathBuf::from(working_dir);
 
         info!(
-            supervisor_id = %self.supervisor_id,
+            supervisor_id = %self.id,
             exe = %exe_path,
             "Starting supervised process"
         );
@@ -101,9 +101,7 @@ impl Supervisor {
 
     /// Sends SIGTERM and waits up to `timeout_ms` before force-killing.
     pub fn stop(&mut self, timeout_ms: u64) -> Result<()> {
-        let handle = if let Some(h) = self.handle.as_mut() {
-            h
-        } else {
+        let Some(handle) = self.handle.as_mut() else {
             self.info.state = ProcessState::Stopped;
             return Ok(());
         };
@@ -117,7 +115,7 @@ impl Supervisor {
         self.info.state = ProcessState::Stopping;
 
         info!(
-            supervisor_id = %self.supervisor_id,
+            supervisor_id = %self.id,
             pid = self.info.pid,
             "Stopping supervised process"
         );
@@ -157,7 +155,7 @@ impl Supervisor {
         let args = new_args.unwrap_or(&default_args);
 
         info!(
-            supervisor_id = %self.supervisor_id,
+            supervisor_id = %self.id,
             exe = %exe_path,
             "Restarting supervised process"
         );
@@ -178,7 +176,7 @@ impl Supervisor {
             if self.info.state == ProcessState::Running {
                 self.info.state = ProcessState::Crashed;
                 warn!(
-                    supervisor_id = %self.supervisor_id,
+                    supervisor_id = %self.id,
                     pid = self.info.pid,
                     "Supervised process crashed"
                 );

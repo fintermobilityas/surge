@@ -418,7 +418,7 @@ impl StorageBackend for GitHubReleasesBackend {
             .and_then(|m| all_entries.iter().position(|entry| entry.key.as_str() > m))
             .unwrap_or_else(|| if marker.is_some() { all_entries.len() } else { 0 });
 
-        let max = max_keys.max(0) as usize;
+        let max = usize::try_from(max_keys.max(0)).unwrap_or(0);
         let entries: Vec<ListEntry> = all_entries.iter().skip(start_idx).take(max).cloned().collect();
         let is_truncated = start_idx + entries.len() < all_entries.len();
         let next_marker = if is_truncated {

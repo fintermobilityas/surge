@@ -205,7 +205,10 @@ impl AzureBlobBackend {
             let mut sorted_params = query_params.to_vec();
             sorted_params.sort_by(|a, b| a.0.cmp(&b.0));
             for (k, v) in &sorted_params {
-                canonicalized_resource.push_str(&format!("\n{k}:{v}"));
+                canonicalized_resource.push('\n');
+                canonicalized_resource.push_str(k);
+                canonicalized_resource.push(':');
+                canonicalized_resource.push_str(v);
             }
         }
 

@@ -38,6 +38,10 @@ impl FilesystemBackend {
     }
 }
 
+fn i64_size_from_u64(size: u64) -> Result<i64> {
+    i64::try_from(size).map_err(|_| SurgeError::Storage(format!("Object size exceeds i64 range: {size}")))
+}
+
 #[async_trait]
 impl StorageBackend for FilesystemBackend {
     async fn put_object(&self, key: &str, data: &[u8], _content_type: &str) -> Result<()> {
@@ -64,7 +68,7 @@ impl StorageBackend for FilesystemBackend {
         }
         let meta = tokio::fs::metadata(&path).await?;
         Ok(ObjectInfo {
-            size: meta.len() as i64,
+            size: i64_size_from_u64(meta.len())?,
             etag: String::new(),
             content_type: String::new(),
         })
@@ -99,7 +103,7 @@ impl StorageBackend for FilesystemBackend {
             .and_then(|m| all_entries.iter().position(|entry| entry.key.as_str() > m))
             .unwrap_or_else(|| if marker.is_some() { all_entries.len() } else { 0 });
 
-        let max = max_keys.max(0) as usize;
+        let max = usize::try_from(max_keys.max(0)).unwrap_or(0);
         let entries: Vec<ListEntry> = all_entries.iter().skip(start_idx).take(max).cloned().collect();
         let is_truncated = start_idx + entries.len() < all_entries.len();
         let next_marker = if is_truncated {
@@ -144,7 +148,7 @@ fn collect_entries_recursive(base: &Path, path: &Path, out: &mut Vec<ListEntry>)
         let key = rel.to_string_lossy().replace('\\', "/");
         out.push(ListEntry {
             key,
-            size: metadata.len() as i64,
+            size: i64_size_from_u64(metadata.len())?,
         });
         return Ok(());
     }

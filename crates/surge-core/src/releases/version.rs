@@ -40,9 +40,8 @@ pub fn compare_versions(a: &str, b: &str) -> Ordering {
     for i in 0..max_len {
         let va = parts_a.get(i).copied().unwrap_or(0);
         let vb = parts_b.get(i).copied().unwrap_or(0);
-        match va.cmp(&vb) {
-            Ordering::Equal => continue,
-            other => return other,
+        if va != vb {
+            return va.cmp(&vb);
         }
     }
 

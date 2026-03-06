@@ -176,7 +176,7 @@ impl PackBuilder {
 
         // Step 1: Build full package
         report(0);
-        let full_artifact = self.build_full_package().await?;
+        let full_artifact = self.build_full_package()?;
         self.artifacts.push(full_artifact);
         report(1);
 
@@ -210,7 +210,7 @@ impl PackBuilder {
             return Err(SurgeError::Pack("No artifacts to push. Run build() first.".to_string()));
         }
 
-        let total = self.artifacts.len() as i32 + 1; // artifacts + index update
+        let total = i32::try_from(self.artifacts.len()).unwrap_or(i32::MAX - 1) + 1; // artifacts + index update
         let report = |step: i32| {
             if let Some(cb) = progress {
                 cb(step, total);
@@ -228,7 +228,7 @@ impl PackBuilder {
                 .put_object(&artifact.filename, artifact.bytes(), "application/octet-stream")
                 .await?;
 
-            report(i as i32 + 1);
+            report(i32::try_from(i).unwrap_or(i32::MAX - 1) + 1);
         }
 
         // Update the release index
@@ -260,7 +260,7 @@ impl PackBuilder {
     }
 
     /// Build the full tar.zst package.
-    async fn build_full_package(&mut self) -> Result<PackageArtifact> {
+    fn build_full_package(&mut self) -> Result<PackageArtifact> {
         let budget = self.ctx.resource_budget();
         let filename = format!("{}-{}-{}-full.tar.zst", self.app_id, self.version, self.rid);
 
@@ -303,9 +303,8 @@ impl PackBuilder {
         };
         let index = decompress_release_index(&data)?;
 
-        let previous_release = match find_previous_release_for_rid(&index, &self.rid, &self.version) {
-            Some(release) => release,
-            None => return Ok(None),
+        let Some(previous_release) = find_previous_release_for_rid(&index, &self.rid, &self.version) else {
+            return Ok(None);
         };
 
         let prev_data =
@@ -538,6 +537,8 @@ fn find_supervisor_binary(name: &str) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::cast_possible_wrap)]
+
     use super::*;
     use crate::archive::packer::ArchivePacker;
     use crate::config::constants::{DEFAULT_ZSTD_LEVEL, RELEASES_FILE_COMPRESSED};

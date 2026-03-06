@@ -292,13 +292,33 @@ fn serialize_patch(
 
     buf.extend_from_slice(MAGIC);
     buf.push(VERSION);
-    buf.extend_from_slice(&(chunk_size as u64).to_le_bytes());
-    buf.extend_from_slice(&(old_size as u64).to_le_bytes());
-    buf.extend_from_slice(&(new_size as u64).to_le_bytes());
-    buf.extend_from_slice(&(chunks.len() as u32).to_le_bytes());
+    buf.extend_from_slice(
+        &u64::try_from(chunk_size)
+            .map_err(|_| SurgeError::Diff("chunk size exceeds supported patch format".into()))?
+            .to_le_bytes(),
+    );
+    buf.extend_from_slice(
+        &u64::try_from(old_size)
+            .map_err(|_| SurgeError::Diff("old size exceeds supported patch format".into()))?
+            .to_le_bytes(),
+    );
+    buf.extend_from_slice(
+        &u64::try_from(new_size)
+            .map_err(|_| SurgeError::Diff("new size exceeds supported patch format".into()))?
+            .to_le_bytes(),
+    );
+    buf.extend_from_slice(
+        &u32::try_from(chunks.len())
+            .map_err(|_| SurgeError::Diff("chunk count exceeds supported patch format".into()))?
+            .to_le_bytes(),
+    );
 
     for (_, patch) in chunks {
-        buf.extend_from_slice(&(patch.len() as u64).to_le_bytes());
+        buf.extend_from_slice(
+            &u64::try_from(patch.len())
+                .map_err(|_| SurgeError::Diff("patch chunk exceeds supported patch format".into()))?
+                .to_le_bytes(),
+        );
         buf.extend_from_slice(patch);
     }
 
@@ -335,10 +355,14 @@ fn deserialize_patch(data: &[u8]) -> Result<(usize, usize, usize, Vec<&[u8]>)> {
         )));
     }
 
-    let chunk_size = read_u64_le(data, 5)? as usize;
-    let old_size = read_u64_le(data, 13)? as usize;
-    let new_size = read_u64_le(data, 21)? as usize;
-    let num_chunks = read_u32_le(data, 29)? as usize;
+    let chunk_size = usize::try_from(read_u64_le(data, 5)?)
+        .map_err(|_| SurgeError::Diff("chunk size exceeds platform limits".into()))?;
+    let old_size = usize::try_from(read_u64_le(data, 13)?)
+        .map_err(|_| SurgeError::Diff("old size exceeds platform limits".into()))?;
+    let new_size = usize::try_from(read_u64_le(data, 21)?)
+        .map_err(|_| SurgeError::Diff("new size exceeds platform limits".into()))?;
+    let num_chunks = usize::try_from(read_u32_le(data, 29)?)
+        .map_err(|_| SurgeError::Diff("chunk count exceeds platform limits".into()))?;
 
     let mut offset = header_size;
     let mut chunks = Vec::with_capacity(num_chunks);
@@ -347,7 +371,8 @@ fn deserialize_patch(data: &[u8]) -> Result<(usize, usize, usize, Vec<&[u8]>)> {
         if offset + 8 > data.len() {
             return Err(SurgeError::Diff("patch truncated at chunk length".into()));
         }
-        let patch_len = read_u64_le(data, offset)? as usize;
+        let patch_len = usize::try_from(read_u64_le(data, offset)?)
+            .map_err(|_| SurgeError::Diff("patch chunk length exceeds platform limits".into()))?;
         offset += 8;
 
         if offset + patch_len > data.len() {

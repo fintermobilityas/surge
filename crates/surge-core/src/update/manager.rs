@@ -99,6 +99,7 @@ fn phase_total_percent(phase_start: i32, phase_span: i32, phase_percent: i32) ->
     phase_start + phase_percent.clamp(0, 100) * phase_span / 100
 }
 
+#[allow(clippy::cast_precision_loss)]
 fn average_speed_bytes_per_sec(bytes_done: u64, started_at: Instant) -> f64 {
     let elapsed = started_at.elapsed().as_secs_f64();
     if elapsed > 0.0 {
@@ -106,6 +107,13 @@ fn average_speed_bytes_per_sec(bytes_done: u64, started_at: Instant) -> f64 {
     } else {
         0.0
     }
+}
+
+#[derive(Debug, Clone)]
+struct ArtifactDownload {
+    key: String,
+    sha256: String,
+    size: i64,
 }
 
 #[derive(Debug)]
@@ -413,6 +421,8 @@ impl UpdateManager {
     where
         F: Fn(ProgressInfo) + Send + Sync,
     {
+        const DOWNLOAD_CONCURRENCY: usize = 4;
+
         self.ctx.check_cancelled()?;
         let progress = progress.map(Arc::new);
 
@@ -455,13 +465,6 @@ impl UpdateManager {
             },
         );
 
-        #[derive(Debug, Clone)]
-        struct ArtifactDownload {
-            key: String,
-            sha256: String,
-            size: i64,
-        }
-
         let artifact_cache_dir = self.install_dir.join(".surge-cache").join("artifacts");
         tokio::fs::create_dir_all(&artifact_cache_dir).await?;
 
@@ -499,7 +502,6 @@ impl UpdateManager {
         let storage = self.storage.as_ref();
         let staging_dir_ref = &staging_dir;
         let cache_dir_ref = &artifact_cache_dir;
-        const DOWNLOAD_CONCURRENCY: usize = 4;
 
         let download_progress_state = Arc::new(Mutex::new(DownloadProgressState::new()));
         let mut download_stream = stream::iter(artifacts.into_iter())
@@ -1319,6 +1321,8 @@ fn validate_relative_persistent_asset_path(raw: &str) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::cast_possible_wrap)]
+
     use super::*;
     use crate::archive::packer::ArchivePacker;
     use crate::config::constants::DEFAULT_ZSTD_LEVEL;
@@ -1385,7 +1389,7 @@ mod tests {
         let p = ProgressInfo::default();
         assert_eq!(p.phase, 0);
         assert_eq!(p.total_percent, 0);
-        assert_eq!(p.speed_bytes_per_sec, 0.0);
+        assert!(p.speed_bytes_per_sec.abs() < f64::EPSILON);
     }
 
     #[test]

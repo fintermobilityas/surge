@@ -68,12 +68,12 @@ pub fn copy_directory(src: &Path, dst: &Path) -> Result<()> {
     for entry in fs::read_dir(src)? {
         let entry = entry?;
         let ty = entry.file_type()?;
-        let dest = dst.join(entry.file_name());
+        let target_path = dst.join(entry.file_name());
 
         if ty.is_dir() {
-            copy_directory(&entry.path(), &dest)?;
+            copy_directory(&entry.path(), &target_path)?;
         } else {
-            fs::copy(entry.path(), &dest)?;
+            fs::copy(entry.path(), &target_path)?;
         }
     }
 

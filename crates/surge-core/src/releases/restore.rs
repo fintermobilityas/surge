@@ -267,19 +267,15 @@ pub async fn restore_full_archive_for_version_with_options(
                 report_progress(items_done, bytes_done);
             }
 
-            let patch = match decode_delta_patch(delta_compressed.as_slice(), delta) {
-                Ok(data) => data,
-                Err(_) => {
-                    chain_valid = false;
-                    break;
-                }
+            let Ok(patch) = decode_delta_patch(delta_compressed.as_slice(), delta) else {
+                chain_valid = false;
+                break;
             };
-            candidate = match apply_delta_patch(&candidate, &patch, delta) {
-                Ok(bytes) => bytes,
-                Err(_) => {
-                    chain_valid = false;
-                    break;
-                }
+            candidate = if let Ok(bytes) = apply_delta_patch(&candidate, &patch, delta) {
+                bytes
+            } else {
+                chain_valid = false;
+                break;
             };
             if verify_expected_sha256(
                 &release.full_sha256,
@@ -477,6 +473,8 @@ async fn restore_artifacts_exist(storage: &dyn StorageBackend, specs: &[RestoreA
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::cast_possible_wrap)]
+
     use super::*;
     use crate::diff::chunked::{ChunkedDiffOptions, chunked_bsdiff};
     use crate::diff::wrapper::bsdiff_buffers;

@@ -67,7 +67,7 @@ impl DownloadManager {
         self.ctx.check_cancelled()?;
 
         let budget = self.ctx.resource_budget();
-        let max_concurrent = budget.max_concurrent_downloads.max(1) as usize;
+        let max_concurrent = usize::try_from(budget.max_concurrent_downloads.max(1)).unwrap_or(1);
         let semaphore = Arc::new(Semaphore::new(max_concurrent));
 
         let files_total = requests.len() as u64;
@@ -209,7 +209,7 @@ async fn download_single_file(
     if let Some(cb) = progress {
         let elapsed = start_time.elapsed().as_secs_f64();
         let done = total_bytes_done.load(Ordering::Relaxed);
-        let speed = if elapsed > 0.0 { done as f64 / elapsed } else { 0.0 };
+        let speed = speed_bytes_per_sec(done, elapsed);
 
         cb(DownloadProgress {
             total_bytes_done: done,
@@ -227,6 +227,15 @@ async fn download_single_file(
         bytes_downloaded,
         sha256,
         error_message: String::new(),
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn speed_bytes_per_sec(bytes_done: u64, elapsed_secs: f64) -> f64 {
+    if elapsed_secs > 0.0 {
+        bytes_done as f64 / elapsed_secs
+    } else {
+        0.0
     }
 }
 

@@ -40,12 +40,6 @@ pub struct PackageArtifact {
     bytes: Vec<u8>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct BundledArtifact {
-    source: PathBuf,
-    archive_name: String,
-}
-
 impl PackageArtifact {
     #[must_use]
     pub fn bytes(&self) -> &[u8] {
@@ -280,9 +274,7 @@ impl PackBuilder {
             }
         }
 
-        if let Some(native_runtime) = resolve_surge_dotnet_native_runtime_bundle(&self.artifacts_dir, &self.rid)? {
-            packer.add_file(&native_runtime.source, &native_runtime.archive_name)?;
-        }
+        validate_surge_dotnet_native_runtime_bundle(&self.artifacts_dir, &self.rid)?;
 
         let archive_bytes = packer.finalize()?;
         let sha256 = sha256_hex(&archive_bytes);
@@ -479,39 +471,18 @@ fn chunked_diff_options(budget: &ResourceBudget, older_len: usize, newer_len: us
     }
 }
 
-fn resolve_surge_dotnet_native_runtime_bundle(artifacts_path: &Path, rid: &str) -> Result<Option<BundledArtifact>> {
-    let search_roots = surge_toolchain_search_roots(rid);
-    resolve_surge_dotnet_native_runtime_bundle_with_roots(artifacts_path, rid, &search_roots)
-}
-
-fn resolve_surge_dotnet_native_runtime_bundle_with_roots(
-    artifacts_path: &Path,
-    rid: &str,
-    search_roots: &[PathBuf],
-) -> Result<Option<BundledArtifact>> {
+fn validate_surge_dotnet_native_runtime_bundle(artifacts_path: &Path, rid: &str) -> Result<()> {
     if !artifacts_path.join("Surge.NET.dll").is_file() {
-        return Ok(None);
+        return Ok(());
     }
 
     let candidates = native_library_candidates_for_rid(rid);
     if candidates.iter().any(|name| artifacts_path.join(name).is_file()) {
-        return Ok(None);
-    }
-
-    for root in search_roots {
-        for candidate in &candidates {
-            let source = root.join(candidate);
-            if source.is_file() {
-                return Ok(Some(BundledArtifact {
-                    source,
-                    archive_name: (*candidate).to_string(),
-                }));
-            }
-        }
+        return Ok(());
     }
 
     Err(SurgeError::Pack(format!(
-        "Surge.NET.dll found in artifacts, but no native Surge runtime library for RID '{rid}' was found in the artifacts or next to an installed surge toolchain. Expected one of: {}. Use the official Surge release bundle for this platform or place the native runtime next to surge.",
+        "Surge.NET.dll found in artifacts, but no native Surge runtime library for RID '{rid}' was found in the artifacts being packaged. Expected one of: {}. Bundle the native runtime into the build output so pack stays hermetic and does not depend on the host toolchain.",
         candidates.join(", ")
     )))
 }
@@ -533,37 +504,9 @@ fn native_library_candidates_for_rid(rid: &str) -> Vec<&'static str> {
     }
 }
 
-fn surge_toolchain_search_roots(rid: &str) -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-
-    if let Ok(current_exe) = std::env::current_exe()
-        && let Some(parent) = current_exe.parent()
-    {
-        roots.push(parent.to_path_buf());
-    }
-
-    let surge_name = surge_binary_name_for_rid(rid);
-    if let Some(path_env) = std::env::var_os("PATH") {
-        for path_dir in std::env::split_paths(&path_env) {
-            if path_dir.join(surge_name).is_file() && !roots.iter().any(|existing| existing == &path_dir) {
-                roots.push(path_dir);
-            }
-        }
-    }
-
-    roots
-}
-
 /// Extract OS name from a RID string (e.g., "linux-x64" -> "linux").
 fn detect_os_from_rid(rid: &str) -> String {
     rid.split('-').next().unwrap_or("unknown").to_string()
-}
-
-fn surge_binary_name_for_rid(rid: &str) -> &'static str {
-    match rid.split('-').next().unwrap_or_default() {
-        "win" | "windows" => "surge.exe",
-        _ => "surge",
-    }
 }
 
 fn supervisor_binary_name() -> &'static str {
@@ -653,12 +596,12 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_surge_dotnet_native_runtime_bundle_requires_matching_native_lib() {
+    fn test_validate_surge_dotnet_native_runtime_bundle_requires_matching_native_lib() {
         let tmp = tempfile::tempdir().expect("tempdir should be created");
         let artifacts = tmp.path();
         std::fs::write(artifacts.join("Surge.NET.dll"), b"managed").expect("managed dll should be written");
 
-        let err = resolve_surge_dotnet_native_runtime_bundle_with_roots(artifacts, "linux-x64", &[])
+        let err = validate_surge_dotnet_native_runtime_bundle(artifacts, "linux-x64")
             .expect_err("validation should fail without native library");
         assert!(
             err.to_string().contains("Surge.NET.dll found in artifacts"),
@@ -667,33 +610,26 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_surge_dotnet_native_runtime_bundle_accepts_matching_native_lib() {
+    fn test_validate_surge_dotnet_native_runtime_bundle_accepts_matching_native_lib() {
         let tmp = tempfile::tempdir().expect("tempdir should be created");
         let artifacts = tmp.path();
         std::fs::write(artifacts.join("Surge.NET.dll"), b"managed").expect("managed dll should be written");
         std::fs::write(artifacts.join("libsurge.so"), b"native").expect("native lib should be written");
 
-        let bundled = resolve_surge_dotnet_native_runtime_bundle_with_roots(artifacts, "linux-x64", &[])
+        validate_surge_dotnet_native_runtime_bundle(artifacts, "linux-x64")
             .expect("validation should pass with native library");
-        assert!(bundled.is_none(), "existing artifact should not be rebundled");
     }
 
     #[test]
-    fn test_resolve_surge_dotnet_native_runtime_bundle_uses_toolchain_runtime_when_missing_from_artifacts() {
+    fn test_validate_surge_dotnet_native_runtime_bundle_rejects_toolchain_fallback() {
         let tmp = tempfile::tempdir().expect("tempdir should be created");
         let artifacts = tmp.path().join("artifacts");
-        let toolchain = tmp.path().join("toolchain");
         std::fs::create_dir_all(&artifacts).expect("artifacts dir should be created");
-        std::fs::create_dir_all(&toolchain).expect("toolchain dir should be created");
         std::fs::write(artifacts.join("Surge.NET.dll"), b"managed").expect("managed dll should be written");
-        let bundled_path = toolchain.join("libsurge.so");
-        std::fs::write(&bundled_path, b"native").expect("native lib should be written");
 
-        let bundled = resolve_surge_dotnet_native_runtime_bundle_with_roots(&artifacts, "linux-x64", &[toolchain])
-            .expect("toolchain runtime should be accepted")
-            .expect("missing runtime should be bundled");
-        assert_eq!(bundled.source, bundled_path);
-        assert_eq!(bundled.archive_name, "libsurge.so");
+        let err = validate_surge_dotnet_native_runtime_bundle(&artifacts, "linux-x64")
+            .expect_err("validation should require the runtime in artifacts");
+        assert!(err.to_string().contains("pack stays hermetic"));
     }
 
     #[tokio::test]

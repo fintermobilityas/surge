@@ -929,7 +929,20 @@ fn pack_build_phase_message(step_done: i32, step_count: i32) -> String {
 }
 
 fn configure_context(manifest: &SurgeManifest, app_id: &str) -> Result<Context> {
-    super::build_app_scoped_storage_context(manifest, app_id)
+    const PACK_ZSTD_LEVEL: i32 = 3;
+    const PACK_MAX_MEMORY_BYTES: i64 = 256 * 1024 * 1024;
+
+    let ctx = super::build_app_scoped_storage_context(manifest, app_id)?;
+    let mut budget = ctx.resource_budget();
+    let available_threads = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1);
+
+    budget.max_threads = i32::try_from(available_threads).unwrap_or(i32::MAX);
+    budget.max_memory_bytes = PACK_MAX_MEMORY_BYTES;
+    budget.zstd_compression_level = PACK_ZSTD_LEVEL;
+    ctx.set_resource_budget(budget);
+    Ok(ctx)
 }
 
 #[cfg(test)]

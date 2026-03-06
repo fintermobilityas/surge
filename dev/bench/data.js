@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1772777490253,
+  "lastUpdate": 1772777494950,
   "repoUrl": "https://github.com/fintermobilityas/surge",
   "entries": {
     "Surge (small)": [
@@ -1363,6 +1363,118 @@ window.BENCHMARK_DATA = {
           {
             "name": "Installer (offline)",
             "value": 157.07174300000003,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Peter Rekdal Khan-Sunde",
+            "username": "peters",
+            "email": "peter.sunde@gmail.com"
+          },
+          "committer": {
+            "name": "Peter Rekdal Khan-Sunde",
+            "username": "peters",
+            "email": "peter.sunde@gmail.com"
+          },
+          "id": "e725b87ab82aa1bfe36b53b5ea7bb390c29be5ae",
+          "message": "style(cli): apply rustfmt to helper code",
+          "timestamp": "2026-03-05T22:09:09Z",
+          "url": "https://github.com/fintermobilityas/surge/commit/e725b87ab82aa1bfe36b53b5ea7bb390c29be5ae"
+        },
+        "date": 1772777494508,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "Archive create (zstd=1)",
+            "value": 79.03569300000001,
+            "unit": "ms"
+          },
+          {
+            "name": "Archive create (zstd=3)",
+            "value": 106.799285,
+            "unit": "ms"
+          },
+          {
+            "name": "Archive extract",
+            "value": 138.24129499999998,
+            "unit": "ms"
+          },
+          {
+            "name": "SHA-256 (in-memory)",
+            "value": 86.520219,
+            "unit": "ms"
+          },
+          {
+            "name": "SHA-256 (file)",
+            "value": 86.83184800000001,
+            "unit": "ms"
+          },
+          {
+            "name": "Zstd compress (level=1)",
+            "value": 42.423359,
+            "unit": "ms"
+          },
+          {
+            "name": "Zstd compress (level=3)",
+            "value": 49.408598999999995,
+            "unit": "ms"
+          },
+          {
+            "name": "Zstd decompress",
+            "value": 21.805075,
+            "unit": "ms"
+          },
+          {
+            "name": "bsdiff",
+            "value": 8413.766651,
+            "unit": "ms"
+          },
+          {
+            "name": "bspatch",
+            "value": 461.653602,
+            "unit": "ms"
+          },
+          {
+            "name": "chunked bsdiff",
+            "value": 4499.425674,
+            "unit": "ms"
+          },
+          {
+            "name": "chunked bspatch",
+            "value": 262.790008,
+            "unit": "ms"
+          },
+          {
+            "name": "Full package build",
+            "value": 106.988466,
+            "unit": "ms"
+          },
+          {
+            "name": "Delta package build",
+            "value": 4515.601756,
+            "unit": "ms"
+          },
+          {
+            "name": "Apply 1 delta",
+            "value": 264.87306900000004,
+            "unit": "ms"
+          },
+          {
+            "name": "Apply 5x deltas",
+            "value": 1318.68008,
+            "unit": "ms"
+          },
+          {
+            "name": "Installer (online)",
+            "value": 0.08304500000000001,
+            "unit": "ms"
+          },
+          {
+            "name": "Installer (offline)",
+            "value": 158.841734,
             "unit": "ms"
           }
         ]

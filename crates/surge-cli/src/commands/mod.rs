@@ -31,11 +31,10 @@ pub(crate) fn ensure_mutating_storage_access(config: &StorageConfig, action: &st
 
     match provider {
         StorageProvider::Filesystem => Ok(()),
-        StorageProvider::S3 if access_present && secret_present => Ok(()),
+        StorageProvider::S3 | StorageProvider::AzureBlob if access_present && secret_present => Ok(()),
         StorageProvider::S3 => Err(SurgeError::Config(format!(
             "Cannot {action}: S3 write access requires AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY"
         ))),
-        StorageProvider::AzureBlob if access_present && secret_present => Ok(()),
         StorageProvider::AzureBlob => Err(SurgeError::Config(format!(
             "Cannot {action}: Azure Blob write access requires AZURE_STORAGE_ACCOUNT_NAME and AZURE_STORAGE_ACCOUNT_KEY"
         ))),

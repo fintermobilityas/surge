@@ -75,8 +75,9 @@ fn compare_prerelease_identifiers(a: &[PrereleaseIdentifier<'_>], b: &[Prereleas
                     return ordering;
                 }
             }
-            (Some(PrereleaseIdentifier::Numeric(_)), Some(PrereleaseIdentifier::Text(_)))
-            | (None, Some(_)) => return Ordering::Less,
+            (Some(PrereleaseIdentifier::Numeric(_)), Some(PrereleaseIdentifier::Text(_))) | (None, Some(_)) => {
+                return Ordering::Less;
+            }
             (Some(PrereleaseIdentifier::Text(_)), Some(PrereleaseIdentifier::Numeric(_))) => {
                 return Ordering::Greater;
             }

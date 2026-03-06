@@ -1,13 +1,14 @@
 //! Update manager: check for updates, download, verify, and apply them.
 
+use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use futures_util::stream::{self, StreamExt};
 use tracing::{debug, info, warn};
 
-use crate::archive::extractor::extract_file_to;
+use crate::archive::extractor::extract_file_to_with_progress;
 use crate::config::constants::RELEASES_FILE_COMPRESSED;
 use crate::context::Context;
 use crate::crypto::sha256::{sha256_hex, sha256_hex_file};
@@ -61,6 +62,95 @@ impl Default for ProgressInfo {
             items_done: 0,
             items_total: 0,
             speed_bytes_per_sec: 0.0,
+        }
+    }
+}
+
+fn emit_progress<F>(progress: Option<&Arc<F>>, progress_info: ProgressInfo)
+where
+    F: Fn(ProgressInfo) + Send + Sync,
+{
+    if let Some(cb) = progress {
+        cb(progress_info);
+    }
+}
+
+fn clamp_progress_percent(done: i64, total: i64) -> i32 {
+    if total > 0 {
+        ((done.saturating_mul(100)) / total).clamp(0, 100) as i32
+    } else {
+        0
+    }
+}
+
+fn clamp_progress_percent_u64(done: u64, total: u64) -> i32 {
+    if total > 0 {
+        ((done.saturating_mul(100)) / total).clamp(0, 100) as i32
+    } else {
+        0
+    }
+}
+
+fn saturating_i64_from_u64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn phase_total_percent(phase_start: i32, phase_span: i32, phase_percent: i32) -> i32 {
+    phase_start + phase_percent.clamp(0, 100) * phase_span / 100
+}
+
+fn average_speed_bytes_per_sec(bytes_done: u64, started_at: Instant) -> f64 {
+    let elapsed = started_at.elapsed().as_secs_f64();
+    if elapsed > 0.0 {
+        bytes_done as f64 / elapsed
+    } else {
+        0.0
+    }
+}
+
+#[derive(Debug)]
+struct DownloadProgressState {
+    started_at: Instant,
+    bytes_by_artifact: BTreeMap<String, u64>,
+    bytes_done: u64,
+    items_done: i64,
+}
+
+impl DownloadProgressState {
+    fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            bytes_by_artifact: BTreeMap::new(),
+            bytes_done: 0,
+            items_done: 0,
+        }
+    }
+
+    fn observe_artifact_bytes(&mut self, key: &str, done: u64) {
+        let previous = self.bytes_by_artifact.insert(key.to_string(), done).unwrap_or(0);
+        self.bytes_done = self.bytes_done.saturating_add(done.saturating_sub(previous));
+    }
+
+    fn finish_artifact(&mut self, key: &str, total: u64) {
+        self.observe_artifact_bytes(key, total);
+        self.items_done = self.items_done.saturating_add(1);
+    }
+
+    fn snapshot(&self, total_bytes: u64, total_items: i64) -> ProgressInfo {
+        let phase_percent = if total_bytes > 0 {
+            clamp_progress_percent_u64(self.bytes_done, total_bytes)
+        } else {
+            clamp_progress_percent(self.items_done, total_items.max(1))
+        };
+        ProgressInfo {
+            phase: 2,
+            phase_percent,
+            total_percent: 10 + phase_percent * 30 / 100,
+            bytes_done: saturating_i64_from_u64(self.bytes_done),
+            bytes_total: saturating_i64_from_u64(total_bytes),
+            items_done: self.items_done,
+            items_total: total_items,
+            speed_bytes_per_sec: average_speed_bytes_per_sec(self.bytes_done, self.started_at),
         }
     }
 }
@@ -316,39 +406,25 @@ impl UpdateManager {
     /// 1. Check - validate update info and prepare
     /// 2. Download - fetch update packages from storage
     /// 3. Verify - verify SHA-256 hashes of downloaded files
-    /// 4. Extract - extract the downloaded archive
-    /// 5. Apply delta - apply binary diffs if using delta updates
+    /// 4. Extract - extract the final archive into the install tree
+    /// 5. Apply delta - rebuild the final archive when using delta updates
     /// 6. Finalize - move files into place, clean up
     pub async fn download_and_apply<F>(&self, info: &UpdateInfo, progress: Option<F>) -> Result<()>
     where
         F: Fn(ProgressInfo) + Send + Sync,
     {
         self.ctx.check_cancelled()?;
-
-        let report = |phase: i32,
-                      phase_pct: i32,
-                      total_pct: i32,
-                      bytes_done: i64,
-                      bytes_total: i64,
-                      items_done: i64,
-                      items_total: i64| {
-            if let Some(ref cb) = progress {
-                cb(ProgressInfo {
-                    phase,
-                    phase_percent: phase_pct,
-                    total_percent: total_pct,
-                    bytes_done,
-                    bytes_total,
-                    items_done,
-                    items_total,
-                    ..ProgressInfo::default()
-                });
-            }
-        };
+        let progress = progress.map(Arc::new);
 
         // Phase 1: Check
         info!(version = %info.latest_version, "Starting update");
-        report(1, 0, 0, 0, 0, 0, 0);
+        emit_progress(
+            progress.as_ref(),
+            ProgressInfo {
+                phase: 1,
+                ..ProgressInfo::default()
+            },
+        );
 
         if info.apply_releases.is_empty() {
             return Err(SurgeError::Update("No releases to apply".to_string()));
@@ -357,10 +433,27 @@ impl UpdateManager {
         let staging_dir = self.install_dir.join(".surge-staging");
         tokio::fs::create_dir_all(&staging_dir).await?;
 
-        report(1, 100, 5, 0, 0, 0, 0);
+        emit_progress(
+            progress.as_ref(),
+            ProgressInfo {
+                phase: 1,
+                phase_percent: 100,
+                total_percent: 5,
+                ..ProgressInfo::default()
+            },
+        );
 
         // Phase 2: Download
-        report(2, 0, 10, 0, 0, 0, 0);
+        emit_progress(
+            progress.as_ref(),
+            ProgressInfo {
+                phase: 2,
+                total_percent: 10,
+                bytes_total: info.download_size.max(0),
+                items_total: i64::try_from(info.apply_releases.len()).unwrap_or(i64::MAX),
+                ..ProgressInfo::default()
+            },
+        );
 
         #[derive(Debug, Clone)]
         struct ArtifactDownload {
@@ -401,26 +494,48 @@ impl UpdateManager {
         let total_bytes = artifacts
             .iter()
             .fold(0i64, |acc, artifact| acc.saturating_add(artifact.size.max(0)));
+        let total_bytes_u64 = u64::try_from(total_bytes).unwrap_or(u64::MAX);
 
         let storage = self.storage.as_ref();
         let staging_dir_ref = &staging_dir;
         let cache_dir_ref = &artifact_cache_dir;
         const DOWNLOAD_CONCURRENCY: usize = 4;
 
-        let mut items_done = 0i64;
-        let mut bytes_done = 0i64;
+        let download_progress_state = Arc::new(Mutex::new(DownloadProgressState::new()));
         let mut download_stream = stream::iter(artifacts.into_iter())
-            .map(|artifact| async move {
-                let cache_path = cache_path_for_key(cache_dir_ref, &artifact.key)?;
-                let outcome = fetch_or_reuse_file(storage, &artifact.key, &cache_path, &artifact.sha256, None).await?;
+            .map(|artifact| {
+                let download_progress_state = Arc::clone(&download_progress_state);
+                let progress = progress.clone();
+                async move {
+                    let cache_path = cache_path_for_key(cache_dir_ref, &artifact.key)?;
+                    let artifact_key_for_progress = artifact.key.clone();
+                    let progress_callback = move |done: u64, _total: u64| {
+                        let snapshot = {
+                            let mut state = download_progress_state
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            state.observe_artifact_bytes(&artifact_key_for_progress, done);
+                            state.snapshot(total_bytes_u64, total_items)
+                        };
+                        emit_progress(progress.as_ref(), snapshot);
+                    };
+                    let outcome = fetch_or_reuse_file(
+                        storage,
+                        &artifact.key,
+                        &cache_path,
+                        &artifact.sha256,
+                        Some(&progress_callback),
+                    )
+                    .await?;
 
-                let stage_path = staging_dir_ref.join(&artifact.key);
-                if let Some(parent) = stage_path.parent() {
-                    tokio::fs::create_dir_all(parent).await?;
+                    let stage_path = staging_dir_ref.join(&artifact.key);
+                    if let Some(parent) = stage_path.parent() {
+                        tokio::fs::create_dir_all(parent).await?;
+                    }
+                    tokio::fs::copy(&cache_path, &stage_path).await?;
+
+                    Ok::<(ArtifactDownload, CacheFetchOutcome), SurgeError>((artifact, outcome))
                 }
-                tokio::fs::copy(&cache_path, &stage_path).await?;
-
-                Ok::<(ArtifactDownload, CacheFetchOutcome), SurgeError>((artifact, outcome))
             })
             .buffer_unordered(DOWNLOAD_CONCURRENCY);
 
@@ -430,28 +545,45 @@ impl UpdateManager {
 
             debug!(key = %artifact.key, ?outcome, "Prepared artifact for update application");
 
-            items_done = items_done.saturating_add(1);
-            bytes_done = bytes_done.saturating_add(artifact.size.max(0));
-            let phase_pct = if total_bytes > 0 {
-                ((bytes_done.saturating_mul(100)) / total_bytes).clamp(0, 100) as i32
-            } else {
-                ((items_done.saturating_mul(100)) / total_items.max(1)).clamp(0, 100) as i32
+            let snapshot = {
+                let mut state = download_progress_state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.finish_artifact(&artifact.key, u64::try_from(artifact.size.max(0)).unwrap_or(u64::MAX));
+                state.snapshot(total_bytes_u64, total_items)
             };
-            report(
-                2,
-                phase_pct,
-                10 + phase_pct * 30 / 100,
-                bytes_done,
-                total_bytes,
-                items_done,
-                total_items,
-            );
+            emit_progress(progress.as_ref(), snapshot);
         }
 
-        report(2, 100, 40, total_bytes, total_bytes, total_items, total_items);
+        emit_progress(
+            progress.as_ref(),
+            ProgressInfo {
+                phase: 2,
+                phase_percent: 100,
+                total_percent: 40,
+                bytes_done: total_bytes,
+                bytes_total: total_bytes,
+                items_done: total_items,
+                items_total: total_items,
+                speed_bytes_per_sec: {
+                    let state = download_progress_state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    average_speed_bytes_per_sec(state.bytes_done, state.started_at)
+                },
+            },
+        );
 
         // Phase 3: Verify
-        report(3, 0, 45, 0, 0, 0, 0);
+        emit_progress(
+            progress.as_ref(),
+            ProgressInfo {
+                phase: 3,
+                total_percent: 45,
+                items_total: total_items,
+                ..ProgressInfo::default()
+            },
+        );
 
         if matches!(info.apply_strategy, ApplyStrategy::Delta) {
             for release in &info.apply_releases {
@@ -485,15 +617,42 @@ impl UpdateManager {
             }
         }
 
-        report(3, 100, 55, 0, 0, 0, 0);
-
-        // Phase 4: Extract
-        report(4, 0, 60, 0, 0, 0, 0);
+        emit_progress(
+            progress.as_ref(),
+            ProgressInfo {
+                phase: 3,
+                phase_percent: 100,
+                total_percent: 55,
+                items_done: total_items,
+                items_total: total_items,
+                ..ProgressInfo::default()
+            },
+        );
 
         let extract_dir = staging_dir.join("extracted");
         tokio::fs::create_dir_all(&extract_dir).await?;
 
         if matches!(info.apply_strategy, ApplyStrategy::Delta) {
+            // Phase 5: Apply delta
+            let apply_delta_started_at = Instant::now();
+            let apply_delta_total_items = i64::try_from(info.apply_releases.len()).unwrap_or(i64::MAX);
+            let apply_delta_total_bytes = info
+                .apply_releases
+                .iter()
+                .filter_map(ReleaseEntry::selected_delta)
+                .fold(0i64, |acc, delta| acc.saturating_add(delta.size.max(0)));
+
+            emit_progress(
+                progress.as_ref(),
+                ProgressInfo {
+                    phase: 5,
+                    total_percent: 60,
+                    bytes_total: apply_delta_total_bytes,
+                    items_total: apply_delta_total_items,
+                    ..ProgressInfo::default()
+                },
+            );
+
             // Restore the current full archive (direct or reconstructed from
             // earlier full + deltas), then apply the downloaded delta chain.
             let index = if let Some(cached) = &self.cached_index {
@@ -521,6 +680,8 @@ impl UpdateManager {
                 ))
             })?;
 
+            let mut apply_delta_items_done = 0i64;
+            let mut apply_delta_bytes_done = 0i64;
             for release in &info.apply_releases {
                 self.ctx.check_cancelled()?;
 
@@ -554,33 +715,165 @@ impl UpdateManager {
                         )));
                     }
                 }
+
+                apply_delta_items_done = apply_delta_items_done.saturating_add(1);
+                apply_delta_bytes_done = apply_delta_bytes_done.saturating_add(delta.size.max(0));
+                let phase_percent = clamp_progress_percent(apply_delta_items_done, apply_delta_total_items.max(1));
+                emit_progress(
+                    progress.as_ref(),
+                    ProgressInfo {
+                        phase: 5,
+                        phase_percent,
+                        total_percent: phase_total_percent(60, 20, phase_percent),
+                        bytes_done: apply_delta_bytes_done,
+                        bytes_total: apply_delta_total_bytes,
+                        items_done: apply_delta_items_done,
+                        items_total: apply_delta_total_items,
+                        speed_bytes_per_sec: average_speed_bytes_per_sec(
+                            u64::try_from(apply_delta_bytes_done.max(0)).unwrap_or(u64::MAX),
+                            apply_delta_started_at,
+                        ),
+                    },
+                );
             }
+
+            emit_progress(
+                progress.as_ref(),
+                ProgressInfo {
+                    phase: 5,
+                    phase_percent: 100,
+                    total_percent: 80,
+                    bytes_done: apply_delta_total_bytes,
+                    bytes_total: apply_delta_total_bytes,
+                    items_done: apply_delta_total_items,
+                    items_total: apply_delta_total_items,
+                    speed_bytes_per_sec: average_speed_bytes_per_sec(
+                        u64::try_from(apply_delta_total_bytes.max(0)).unwrap_or(u64::MAX),
+                        apply_delta_started_at,
+                    ),
+                },
+            );
 
             let rebuilt_archive_path = staging_dir.join("rebuilt-full.tar.zst");
             tokio::fs::write(&rebuilt_archive_path, &rebuilt_archive).await?;
-            extract_file_to(&rebuilt_archive_path, &extract_dir)?;
+            // Phase 4: Extract the rebuilt archive into place.
+            emit_progress(
+                progress.as_ref(),
+                ProgressInfo {
+                    phase: 4,
+                    total_percent: 80,
+                    ..ProgressInfo::default()
+                },
+            );
+            let extract_started_at = Instant::now();
+            let progress_for_extract = progress.clone();
+            let extract_progress = move |items_done: u64, items_total: u64, bytes_done: u64, bytes_total: u64| {
+                let phase_percent = if bytes_total > 0 {
+                    clamp_progress_percent_u64(bytes_done, bytes_total)
+                } else {
+                    clamp_progress_percent_u64(items_done, items_total)
+                };
+                emit_progress(
+                    progress_for_extract.as_ref(),
+                    ProgressInfo {
+                        phase: 4,
+                        phase_percent,
+                        total_percent: phase_total_percent(80, 10, phase_percent),
+                        bytes_done: saturating_i64_from_u64(bytes_done),
+                        bytes_total: saturating_i64_from_u64(bytes_total),
+                        items_done: saturating_i64_from_u64(items_done),
+                        items_total: saturating_i64_from_u64(items_total),
+                        speed_bytes_per_sec: average_speed_bytes_per_sec(bytes_done, extract_started_at),
+                    },
+                );
+            };
+            extract_file_to_with_progress(&rebuilt_archive_path, &extract_dir, Some(&extract_progress))?;
+            emit_progress(
+                progress.as_ref(),
+                ProgressInfo {
+                    phase: 4,
+                    phase_percent: 100,
+                    total_percent: 90,
+                    ..ProgressInfo::default()
+                },
+            );
         } else {
+            // Phase 4: Extract
+            emit_progress(
+                progress.as_ref(),
+                ProgressInfo {
+                    phase: 4,
+                    total_percent: 60,
+                    ..ProgressInfo::default()
+                },
+            );
+            let extract_started_at = Instant::now();
+            let progress_for_extract = progress.clone();
+            let extract_progress = move |items_done: u64, items_total: u64, bytes_done: u64, bytes_total: u64| {
+                let phase_percent = if bytes_total > 0 {
+                    clamp_progress_percent_u64(bytes_done, bytes_total)
+                } else {
+                    clamp_progress_percent_u64(items_done, items_total)
+                };
+                emit_progress(
+                    progress_for_extract.as_ref(),
+                    ProgressInfo {
+                        phase: 4,
+                        phase_percent,
+                        total_percent: phase_total_percent(60, 15, phase_percent),
+                        bytes_done: saturating_i64_from_u64(bytes_done),
+                        bytes_total: saturating_i64_from_u64(bytes_total),
+                        items_done: saturating_i64_from_u64(items_done),
+                        items_total: saturating_i64_from_u64(items_total),
+                        speed_bytes_per_sec: average_speed_bytes_per_sec(bytes_done, extract_started_at),
+                    },
+                );
+            };
             let latest = info
                 .apply_releases
                 .last()
                 .ok_or_else(|| SurgeError::Update("No latest release".to_string()))?;
             let archive_path = staging_dir.join(&latest.full_filename);
-            extract_file_to(&archive_path, &extract_dir)?;
+            extract_file_to_with_progress(&archive_path, &extract_dir, Some(&extract_progress))?;
+            emit_progress(
+                progress.as_ref(),
+                ProgressInfo {
+                    phase: 4,
+                    phase_percent: 100,
+                    total_percent: 75,
+                    ..ProgressInfo::default()
+                },
+            );
+
+            // Phase 5: Apply delta (if applicable)
+            emit_progress(
+                progress.as_ref(),
+                ProgressInfo {
+                    phase: 5,
+                    total_percent: 80,
+                    ..ProgressInfo::default()
+                },
+            );
+            emit_progress(
+                progress.as_ref(),
+                ProgressInfo {
+                    phase: 5,
+                    phase_percent: 100,
+                    total_percent: 85,
+                    ..ProgressInfo::default()
+                },
+            );
         }
-
-        report(4, 100, 75, 0, 0, 0, 0);
-
-        // Phase 5: Apply delta (if applicable)
-        report(5, 0, 80, 0, 0, 0, 0);
-
-        if matches!(info.apply_strategy, ApplyStrategy::Delta) {
-            debug!("Delta chain was restored and applied during extraction");
-        }
-
-        report(5, 100, 85, 0, 0, 0, 0);
 
         // Phase 6: Finalize
-        report(6, 0, 90, 0, 0, 0, 0);
+        emit_progress(
+            progress.as_ref(),
+            ProgressInfo {
+                phase: 6,
+                total_percent: 90,
+                ..ProgressInfo::default()
+            },
+        );
         let latest = info
             .apply_releases
             .last()
@@ -719,7 +1012,15 @@ impl UpdateManager {
             restart_supervisor_after_update(&self.install_dir, &active_app_dir, latest);
         }
 
-        report(6, 100, 100, 0, 0, 0, 0);
+        emit_progress(
+            progress.as_ref(),
+            ProgressInfo {
+                phase: 6,
+                phase_percent: 100,
+                total_percent: 100,
+                ..ProgressInfo::default()
+            },
+        );
 
         info!(
             version = %info.latest_version,
@@ -1065,6 +1366,18 @@ mod tests {
         let rid = current_rid();
         let raw = rid.split('-').next().unwrap_or_default();
         normalize_os_label(raw)
+    }
+
+    fn pseudo_random_bytes(len: usize) -> Vec<u8> {
+        let mut state = 0x1234_5678_9abc_def0_u64;
+        let mut bytes = Vec::with_capacity(len);
+        for _ in 0..len {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            bytes.push((state & 0xff) as u8);
+        }
+        bytes
     }
 
     #[test]
@@ -1550,6 +1863,337 @@ mod tests {
         assert!(installed_file.exists());
         assert_eq!(std::fs::read_to_string(installed_file).unwrap(), "installed payload");
         assert!(runtime_manifest.is_file());
+    }
+
+    #[tokio::test]
+    async fn test_download_and_apply_reports_incremental_progress_for_full_update() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("store");
+        let install_root = tmp.path().join("install");
+        std::fs::create_dir_all(&store_root).unwrap();
+        std::fs::create_dir_all(&install_root).unwrap();
+
+        let rid = current_rid();
+        let full_filename = format!("test-app-1.1.0-{rid}-full.tar.zst");
+        let full_path = store_root.join(&full_filename);
+
+        let mut packer = ArchivePacker::new(3).unwrap();
+        for index in 0..3 {
+            let payload = pseudo_random_bytes(196_608 + (index * 4_096));
+            packer
+                .add_buffer(&format!("payload-{index}.bin"), &payload, 0o644)
+                .unwrap();
+        }
+        packer.finalize_to_file(&full_path).unwrap();
+
+        let full_size = std::fs::metadata(&full_path).unwrap().len() as i64;
+        let full_sha256 = sha256_hex_file(&full_path).unwrap();
+
+        let index = ReleaseIndex {
+            app_id: "test-app".to_string(),
+            releases: vec![ReleaseEntry {
+                version: "1.1.0".to_string(),
+                channels: vec!["stable".to_string()],
+                os: current_os_label_for_tests(),
+                rid: rid.clone(),
+                is_genesis: true,
+                full_filename: full_filename.clone(),
+                full_size,
+                full_sha256,
+                deltas: Vec::new(),
+                preferred_delta_id: String::new(),
+                created_utc: chrono::Utc::now().to_rfc3339(),
+                release_notes: String::new(),
+                name: String::new(),
+                main_exe: "test-app".to_string(),
+                install_directory: "test-app".to_string(),
+                supervisor_id: String::new(),
+                icon: String::new(),
+                shortcuts: Vec::new(),
+                persistent_assets: Vec::new(),
+                installers: Vec::new(),
+                environment: std::collections::BTreeMap::new(),
+            }],
+            ..ReleaseIndex::default()
+        };
+
+        let compressed = compress_release_index(&index, DEFAULT_ZSTD_LEVEL).unwrap();
+        std::fs::write(store_root.join(RELEASES_FILE_COMPRESSED), compressed).unwrap();
+
+        let ctx = Arc::new(Context::new());
+        ctx.set_storage(
+            StorageProvider::Filesystem,
+            store_root.to_str().unwrap(),
+            "",
+            "",
+            "",
+            "",
+        );
+
+        let mut manager =
+            UpdateManager::new(ctx, "test-app", "1.0.0", "stable", install_root.to_str().unwrap()).unwrap();
+        let info = manager.check_for_updates().await.unwrap().unwrap();
+
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observed_for_progress = Arc::clone(&observed);
+
+        manager
+            .download_and_apply(
+                &info,
+                Some(move |progress: ProgressInfo| {
+                    observed_for_progress
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(progress);
+                }),
+            )
+            .await
+            .unwrap();
+
+        let observed = observed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+
+        let initial_download = observed
+            .iter()
+            .find(|progress| progress.phase == 2 && progress.total_percent == 10)
+            .expect("expected initial download progress");
+        assert_eq!(initial_download.bytes_total, full_size);
+
+        assert!(observed.iter().any(|progress| {
+            progress.phase == 2 && progress.phase_percent > 0 && progress.phase_percent < 100 && progress.bytes_done > 0
+        }));
+        assert!(
+            observed
+                .iter()
+                .any(|progress| progress.phase == 2 && progress.speed_bytes_per_sec > 0.0)
+        );
+        assert!(observed.iter().any(|progress| {
+            progress.phase == 4
+                && progress.phase_percent > 0
+                && progress.phase_percent < 100
+                && progress.items_done > 0
+                && progress.items_total >= 3
+        }));
+
+        let final_progress = observed.last().expect("expected final progress");
+        assert_eq!(final_progress.phase, 6);
+        assert_eq!(final_progress.total_percent, 100);
+    }
+
+    #[tokio::test]
+    async fn test_download_and_apply_reports_incremental_progress_for_delta_chain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("store");
+        let install_root = tmp.path().join("install");
+        std::fs::create_dir_all(&store_root).unwrap();
+        std::fs::create_dir_all(&install_root).unwrap();
+
+        let rid = current_rid();
+        let os = current_os_label_for_tests();
+
+        let mut packer_v1 = ArchivePacker::new(3).unwrap();
+        packer_v1.add_buffer("payload.txt", b"v1 payload", 0o644).unwrap();
+        let full_v1 = packer_v1.finalize().unwrap();
+
+        let mut packer_v2 = ArchivePacker::new(3).unwrap();
+        packer_v2.add_buffer("payload.txt", b"v2 payload", 0o644).unwrap();
+        let full_v2 = packer_v2.finalize().unwrap();
+
+        let mut packer_v3 = ArchivePacker::new(3).unwrap();
+        packer_v3.add_buffer("payload.txt", b"v3 payload", 0o644).unwrap();
+        let full_v3 = packer_v3.finalize().unwrap();
+
+        let mut packer_v4 = ArchivePacker::new(3).unwrap();
+        packer_v4.add_buffer("payload.txt", b"v4 payload", 0o644).unwrap();
+        let full_v4 = packer_v4.finalize().unwrap();
+
+        let patch_v2 = bsdiff_buffers(&full_v1, &full_v2).unwrap();
+        let delta_v2 = zstd::encode_all(patch_v2.as_slice(), 3).unwrap();
+        let patch_v3 = bsdiff_buffers(&full_v2, &full_v3).unwrap();
+        let delta_v3 = zstd::encode_all(patch_v3.as_slice(), 3).unwrap();
+        let patch_v4 = bsdiff_buffers(&full_v3, &full_v4).unwrap();
+        let delta_v4 = zstd::encode_all(patch_v4.as_slice(), 3).unwrap();
+
+        let full_v1_name = format!("test-app-1.0.0-{rid}-full.tar.zst");
+        let full_v2_name = format!("test-app-1.1.0-{rid}-full.tar.zst");
+        let full_v3_name = format!("test-app-1.2.0-{rid}-full.tar.zst");
+        let full_v4_name = format!("test-app-1.3.0-{rid}-full.tar.zst");
+        let delta_v2_name = format!("test-app-1.1.0-{rid}-delta.tar.zst");
+        let delta_v3_name = format!("test-app-1.2.0-{rid}-delta.tar.zst");
+        let delta_v4_name = format!("test-app-1.3.0-{rid}-delta.tar.zst");
+
+        std::fs::write(store_root.join(&full_v1_name), &full_v1).unwrap();
+        std::fs::write(store_root.join(&delta_v2_name), &delta_v2).unwrap();
+        std::fs::write(store_root.join(&delta_v3_name), &delta_v3).unwrap();
+        std::fs::write(store_root.join(&delta_v4_name), &delta_v4).unwrap();
+
+        let index = ReleaseIndex {
+            app_id: "test-app".to_string(),
+            releases: vec![
+                ReleaseEntry {
+                    version: "1.0.0".to_string(),
+                    channels: vec!["stable".to_string()],
+                    os: os.clone(),
+                    rid: rid.clone(),
+                    is_genesis: true,
+                    full_filename: full_v1_name.clone(),
+                    full_size: full_v1.len() as i64,
+                    full_sha256: sha256_hex(&full_v1),
+                    deltas: Vec::new(),
+                    preferred_delta_id: String::new(),
+                    created_utc: chrono::Utc::now().to_rfc3339(),
+                    release_notes: String::new(),
+                    name: String::new(),
+                    main_exe: "test-app".to_string(),
+                    install_directory: "test-app".to_string(),
+                    supervisor_id: String::new(),
+                    icon: String::new(),
+                    shortcuts: Vec::new(),
+                    persistent_assets: Vec::new(),
+                    installers: Vec::new(),
+                    environment: std::collections::BTreeMap::new(),
+                },
+                ReleaseEntry {
+                    version: "1.1.0".to_string(),
+                    channels: vec!["stable".to_string()],
+                    os: os.clone(),
+                    rid: rid.clone(),
+                    is_genesis: false,
+                    full_filename: full_v2_name.clone(),
+                    full_size: full_v2.len() as i64,
+                    full_sha256: sha256_hex(&full_v2),
+                    deltas: vec![DeltaArtifact::bsdiff_zstd(
+                        "primary",
+                        "1.0.0",
+                        &delta_v2_name,
+                        delta_v2.len() as i64,
+                        &sha256_hex(&delta_v2),
+                    )],
+                    preferred_delta_id: "primary".to_string(),
+                    created_utc: chrono::Utc::now().to_rfc3339(),
+                    release_notes: String::new(),
+                    name: String::new(),
+                    main_exe: "test-app".to_string(),
+                    install_directory: "test-app".to_string(),
+                    supervisor_id: String::new(),
+                    icon: String::new(),
+                    shortcuts: Vec::new(),
+                    persistent_assets: Vec::new(),
+                    installers: Vec::new(),
+                    environment: std::collections::BTreeMap::new(),
+                },
+                ReleaseEntry {
+                    version: "1.2.0".to_string(),
+                    channels: vec!["stable".to_string()],
+                    os: os.clone(),
+                    rid: rid.clone(),
+                    is_genesis: false,
+                    full_filename: full_v3_name.clone(),
+                    full_size: full_v3.len() as i64,
+                    full_sha256: sha256_hex(&full_v3),
+                    deltas: vec![DeltaArtifact::bsdiff_zstd(
+                        "primary",
+                        "1.1.0",
+                        &delta_v3_name,
+                        delta_v3.len() as i64,
+                        &sha256_hex(&delta_v3),
+                    )],
+                    preferred_delta_id: "primary".to_string(),
+                    created_utc: chrono::Utc::now().to_rfc3339(),
+                    release_notes: String::new(),
+                    name: String::new(),
+                    main_exe: "test-app".to_string(),
+                    install_directory: "test-app".to_string(),
+                    supervisor_id: String::new(),
+                    icon: String::new(),
+                    shortcuts: Vec::new(),
+                    persistent_assets: Vec::new(),
+                    installers: Vec::new(),
+                    environment: std::collections::BTreeMap::new(),
+                },
+                ReleaseEntry {
+                    version: "1.3.0".to_string(),
+                    channels: vec!["stable".to_string()],
+                    os,
+                    rid: rid.clone(),
+                    is_genesis: false,
+                    full_filename: full_v4_name,
+                    full_size: full_v4.len() as i64,
+                    full_sha256: sha256_hex(&full_v4),
+                    deltas: vec![DeltaArtifact::bsdiff_zstd(
+                        "primary",
+                        "1.2.0",
+                        &delta_v4_name,
+                        delta_v4.len() as i64,
+                        &sha256_hex(&delta_v4),
+                    )],
+                    preferred_delta_id: "primary".to_string(),
+                    created_utc: chrono::Utc::now().to_rfc3339(),
+                    release_notes: String::new(),
+                    name: String::new(),
+                    main_exe: "test-app".to_string(),
+                    install_directory: "test-app".to_string(),
+                    supervisor_id: String::new(),
+                    icon: String::new(),
+                    shortcuts: Vec::new(),
+                    persistent_assets: Vec::new(),
+                    installers: Vec::new(),
+                    environment: std::collections::BTreeMap::new(),
+                },
+            ],
+            ..ReleaseIndex::default()
+        };
+
+        let compressed = compress_release_index(&index, DEFAULT_ZSTD_LEVEL).unwrap();
+        std::fs::write(store_root.join(RELEASES_FILE_COMPRESSED), compressed).unwrap();
+
+        let ctx = Arc::new(Context::new());
+        ctx.set_storage(
+            StorageProvider::Filesystem,
+            store_root.to_str().unwrap(),
+            "",
+            "",
+            "",
+            "",
+        );
+
+        let mut manager =
+            UpdateManager::new(ctx, "test-app", "1.0.0", "stable", install_root.to_str().unwrap()).unwrap();
+        let info = manager.check_for_updates().await.unwrap().unwrap();
+        assert_eq!(info.apply_strategy, ApplyStrategy::Delta);
+
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observed_for_progress = Arc::clone(&observed);
+        manager
+            .download_and_apply(
+                &info,
+                Some(move |progress: ProgressInfo| {
+                    observed_for_progress
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(progress);
+                }),
+            )
+            .await
+            .unwrap();
+
+        let observed = observed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+
+        assert!(observed.iter().any(|progress| {
+            progress.phase == 5
+                && progress.phase_percent > 0
+                && progress.phase_percent < 100
+                && progress.items_done > 0
+                && progress.items_done < progress.items_total
+        }));
+
+        let installed = std::fs::read_to_string(install_root.join("app").join("payload.txt")).unwrap();
+        assert_eq!(installed, "v4 payload");
     }
 
     #[tokio::test]

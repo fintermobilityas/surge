@@ -1,4 +1,4 @@
-use crate::diff::chunked::chunked_bspatch;
+use crate::diff::chunked::{ChunkedDiffOptions, chunked_bspatch};
 use crate::diff::wrapper::bspatch_buffers;
 use crate::error::{Result, SurgeError};
 use crate::releases::manifest::{
@@ -48,7 +48,7 @@ pub fn apply_delta_patch(older: &[u8], patch: &[u8], delta: &DeltaArtifact) -> R
         return bspatch_buffers(older, patch);
     }
     if patch_format.eq_ignore_ascii_case(PATCH_FORMAT_CHUNKED_BSDIFF_V1) {
-        return chunked_bspatch(older, patch, &Default::default());
+        return chunked_bspatch(older, patch, &ChunkedDiffOptions::default());
     }
 
     Err(SurgeError::Update(format!(

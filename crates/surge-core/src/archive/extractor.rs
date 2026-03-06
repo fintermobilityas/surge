@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Result, SurgeError};
 
-pub type ExtractProgress = dyn Fn(u64, u64, u64, u64);
+pub type ExtractProgress<'a> = dyn Fn(u64, u64, u64, u64) + 'a;
 
-pub fn extract_to(data: &[u8], dest_dir: &Path, progress: Option<&ExtractProgress>) -> Result<()> {
+pub fn extract_to(data: &[u8], dest_dir: &Path, progress: Option<&ExtractProgress<'_>>) -> Result<()> {
     std::fs::create_dir_all(dest_dir)?;
 
     let decoder =
@@ -127,6 +127,15 @@ pub fn read_entry(data: &[u8], entry_path: &str) -> Result<Vec<u8>> {
 pub fn extract_file_to(archive_path: &Path, dest_dir: &Path) -> Result<()> {
     let data = std::fs::read(archive_path)?;
     extract_to(&data, dest_dir, None)
+}
+
+pub fn extract_file_to_with_progress(
+    archive_path: &Path,
+    dest_dir: &Path,
+    progress: Option<&ExtractProgress<'_>>,
+) -> Result<()> {
+    let data = std::fs::read(archive_path)?;
+    extract_to(&data, dest_dir, progress)
 }
 
 #[cfg(test)]

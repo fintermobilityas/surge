@@ -27,7 +27,11 @@ pub fn atomic_rename(from: &Path, to: &Path) -> Result<()> {
 }
 
 /// Copy a file with progress reporting.
-pub fn copy_file_with_progress(src: &Path, dst: &Path, progress: Option<&dyn Fn(u64, u64)>) -> Result<u64> {
+pub fn copy_file_with_progress(
+    src: &Path,
+    dst: &Path,
+    progress: Option<&(dyn Fn(u64, u64) + Send + Sync)>,
+) -> Result<u64> {
     use std::io::{Read, Write};
 
     let mut reader = fs::File::open(src)?;

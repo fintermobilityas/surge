@@ -401,7 +401,7 @@ fn verify_expected_sha256(expected: &str, data: &[u8], context: &str) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diff::chunked::chunked_bsdiff;
+    use crate::diff::chunked::{ChunkedDiffOptions, chunked_bsdiff};
     use crate::diff::wrapper::bsdiff_buffers;
     use crate::releases::manifest::{DeltaArtifact, ReleaseEntry};
     use crate::storage::filesystem::FilesystemBackend;
@@ -551,8 +551,8 @@ mod tests {
         let full_v2 = b"full-v2-with-extra-data".to_vec();
         let full_v3 = b"full-v3-with-even-more-extra-data".to_vec();
 
-        let patch_v2 = chunked_bsdiff(&full_v1, &full_v2, &Default::default()).unwrap();
-        let patch_v3 = chunked_bsdiff(&full_v2, &full_v3, &Default::default()).unwrap();
+        let patch_v2 = chunked_bsdiff(&full_v1, &full_v2, &ChunkedDiffOptions::default()).unwrap();
+        let patch_v3 = chunked_bsdiff(&full_v2, &full_v3, &ChunkedDiffOptions::default()).unwrap();
         let delta_v2 = zstd::encode_all(patch_v2.as_slice(), 3).unwrap();
         let delta_v3 = zstd::encode_all(patch_v3.as_slice(), 3).unwrap();
 

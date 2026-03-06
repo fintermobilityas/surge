@@ -14,7 +14,7 @@ use crate::context::StorageConfig;
 use crate::crypto::hmac_sha256::hmac_sha256;
 use crate::crypto::sha256::sha256_hex;
 use crate::error::{Result, SurgeError};
-use crate::storage::{ListEntry, ListResult, ObjectInfo, StorageBackend, TransferProgress};
+use crate::storage::{ListEntry, ListResult, ObjectInfo, StorageBackend, TransferProgress, download_response_to_file};
 
 /// Characters that must NOT be percent-encoded in URI paths.
 const URI_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'.').remove(b'_').remove(b'~');
@@ -618,24 +618,52 @@ impl StorageBackend for GcsBackend {
         }
     }
 
-    async fn download_to_file(&self, key: &str, dest: &Path, progress: Option<&TransferProgress>) -> Result<()> {
-        let data = self.get_object(key).await?;
-        let total = data.len() as u64;
+    async fn download_to_file(&self, key: &str, dest: &Path, progress: Option<&TransferProgress<'_>>) -> Result<()> {
+        let full_key = self.full_key(key);
 
-        if let Some(parent) = dest.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        tokio::fs::write(dest, &data).await?;
+        let resp = match &self.auth {
+            AuthMode::Anonymous | AuthMode::Hmac { .. } => {
+                let url = self.xml_object_url(&full_key);
+                let mut req = self.client.get(&url);
+                if let AuthMode::Hmac { access_key, secret_key } = &self.auth {
+                    let payload_hash = sha256_hex(b"");
+                    let canonical_uri = format!("/{}/{}", self.bucket, Self::encode_uri_path(&full_key));
+                    let headers =
+                        self.hmac_sign_request("GET", &canonical_uri, "", &payload_hash, access_key, secret_key);
+                    for (name, value) in &headers {
+                        req = req.header(name.as_str(), value.as_str());
+                    }
+                } else {
+                    req = req.header("Host", self.xml_host());
+                }
+                req.send().await?
+            }
+            AuthMode::OAuth2 { token } => {
+                let url = self.json_object_url(&full_key);
+                let bearer = token.read().await.clone();
 
-        if let Some(cb) = progress {
-            cb(total, total);
+                self.client
+                    .get(&url)
+                    .query(&[("alt", "media")])
+                    .header("Authorization", format!("Bearer {bearer}"))
+                    .send()
+                    .await?
+            }
+        };
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Self::check_response_status(status, &full_key, &body);
         }
+
+        download_response_to_file(resp, dest, progress).await?;
 
         debug!(key = %self.full_key(key), dest = %dest.display(), "GCS download completed");
         Ok(())
     }
 
-    async fn upload_from_file(&self, key: &str, src: &Path, progress: Option<&TransferProgress>) -> Result<()> {
+    async fn upload_from_file(&self, key: &str, src: &Path, progress: Option<&TransferProgress<'_>>) -> Result<()> {
         self.require_credentials("upload")?;
         let data = tokio::fs::read(src).await?;
         let total = data.len() as u64;

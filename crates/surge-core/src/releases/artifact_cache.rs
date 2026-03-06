@@ -46,7 +46,7 @@ pub async fn fetch_or_reuse_file(
     key: &str,
     destination: &Path,
     expected_sha256: &str,
-    progress: Option<&TransferProgress>,
+    progress: Option<&TransferProgress<'_>>,
 ) -> Result<CacheFetchOutcome> {
     let expected = expected_sha256.trim();
     let had_local = destination.is_file();

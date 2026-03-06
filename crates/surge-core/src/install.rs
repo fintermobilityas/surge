@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use crate::archive::extractor::extract_file_to;
+use crate::archive::extractor::extract_file_to_with_progress;
 use crate::config::installer::InstallerManifest;
 use crate::config::manifest::ShortcutLocation;
 use crate::context::StorageProvider;
@@ -15,6 +15,31 @@ use crate::platform::shortcuts::install_shortcuts;
 
 pub const RUNTIME_MANIFEST_RELATIVE_PATH: &str = ".surge/runtime.yml";
 pub const LEGACY_RUNTIME_MANIFEST_RELATIVE_PATH: &str = ".surge/surge.yml";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallProgressStage {
+    Extract,
+    Activate,
+    Shortcuts,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InstallProgress {
+    pub stage: InstallProgressStage,
+    pub phase_percent: i32,
+    pub bytes_done: i64,
+    pub bytes_total: i64,
+    pub items_done: i64,
+    pub items_total: i64,
+}
+
+pub type InstallProgressCallback<'a> = dyn Fn(InstallProgress) + Send + Sync + 'a;
+
+fn emit_install_progress(progress: Option<&InstallProgressCallback<'_>>, snapshot: InstallProgress) {
+    if let Some(cb) = progress {
+        cb(snapshot);
+    }
+}
 
 /// Shared profile for installing a package locally, usable from both
 /// `surge install` (via `ReleaseEntry`) and `surge setup` (via `InstallerRuntime`).
@@ -197,6 +222,16 @@ pub fn install_package_locally_at_root(
     package_path: &Path,
     install_root: &Path,
 ) -> Result<()> {
+    install_package_locally_at_root_with_progress(profile, package_path, install_root, None)
+}
+
+/// Extract a package into `install_root/app` with atomic swap, then create shortcuts.
+pub fn install_package_locally_at_root_with_progress(
+    profile: &InstallProfile<'_>,
+    package_path: &Path,
+    install_root: &Path,
+    progress: Option<&InstallProgressCallback<'_>>,
+) -> Result<()> {
     std::fs::create_dir_all(install_root)?;
 
     let active_app_dir = install_root.join("app");
@@ -210,8 +245,61 @@ pub fn install_package_locally_at_root(
         std::fs::remove_dir_all(&previous_app_dir)?;
     }
 
-    extract_file_to(package_path, &next_app_dir)?;
+    emit_install_progress(
+        progress,
+        InstallProgress {
+            stage: InstallProgressStage::Extract,
+            phase_percent: 0,
+            bytes_done: 0,
+            bytes_total: 0,
+            items_done: 0,
+            items_total: 0,
+        },
+    );
+    let extract_progress = |items_done: u64, items_total: u64, bytes_done: u64, bytes_total: u64| {
+        let phase_percent = if bytes_total > 0 {
+            ((bytes_done.saturating_mul(100)) / bytes_total).clamp(0, 100) as i32
+        } else if items_total > 0 {
+            ((items_done.saturating_mul(100)) / items_total).clamp(0, 100) as i32
+        } else {
+            0
+        };
+        emit_install_progress(
+            progress,
+            InstallProgress {
+                stage: InstallProgressStage::Extract,
+                phase_percent,
+                bytes_done: i64::try_from(bytes_done).unwrap_or(i64::MAX),
+                bytes_total: i64::try_from(bytes_total).unwrap_or(i64::MAX),
+                items_done: i64::try_from(items_done).unwrap_or(i64::MAX),
+                items_total: i64::try_from(items_total).unwrap_or(i64::MAX),
+            },
+        );
+    };
+    extract_file_to_with_progress(package_path, &next_app_dir, Some(&extract_progress))?;
+    emit_install_progress(
+        progress,
+        InstallProgress {
+            stage: InstallProgressStage::Extract,
+            phase_percent: 100,
+            bytes_done: 0,
+            bytes_total: 0,
+            items_done: 0,
+            items_total: 0,
+        },
+    );
 
+    emit_install_progress(
+        progress,
+        InstallProgress {
+            stage: InstallProgressStage::Activate,
+            phase_percent: 0,
+            bytes_done: 0,
+            bytes_total: 0,
+            items_done: 0,
+            items_total: 0,
+        },
+    );
     if active_app_dir.is_dir() {
         std::fs::rename(&active_app_dir, &previous_app_dir)?;
     }
@@ -222,8 +310,30 @@ pub fn install_package_locally_at_root(
         }
         return Err(SurgeError::Io(rename_err));
     }
+    emit_install_progress(
+        progress,
+        InstallProgress {
+            stage: InstallProgressStage::Activate,
+            phase_percent: 100,
+            bytes_done: 0,
+            bytes_total: 0,
+            items_done: 0,
+            items_total: 0,
+        },
+    );
 
     if !profile.shortcuts.is_empty() {
+        emit_install_progress(
+            progress,
+            InstallProgress {
+                stage: InstallProgressStage::Shortcuts,
+                phase_percent: 0,
+                bytes_done: 0,
+                bytes_total: 0,
+                items_done: 0,
+                items_total: 0,
+            },
+        );
         let main_exe = profile.main_exe.trim();
         if main_exe.is_empty() {
             return Err(SurgeError::Config(format!(
@@ -241,6 +351,17 @@ pub fn install_package_locally_at_root(
             profile.shortcuts,
             profile.environment,
         )?;
+        emit_install_progress(
+            progress,
+            InstallProgress {
+                stage: InstallProgressStage::Shortcuts,
+                phase_percent: 100,
+                bytes_done: 0,
+                bytes_total: 0,
+                items_done: i64::try_from(profile.shortcuts.len()).unwrap_or(i64::MAX),
+                items_total: i64::try_from(profile.shortcuts.len()).unwrap_or(i64::MAX),
+            },
+        );
     }
 
     if previous_app_dir.is_dir() {

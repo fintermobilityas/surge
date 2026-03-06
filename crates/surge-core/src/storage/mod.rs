@@ -7,6 +7,9 @@ pub mod s3;
 use crate::context::{StorageConfig, StorageProvider};
 use crate::error::{Result, SurgeError};
 use async_trait::async_trait;
+use futures_util::StreamExt;
+use reqwest::Response;
+use tokio::io::AsyncWriteExt;
 
 /// Metadata about a stored object.
 #[derive(Debug, Clone, Default)]
@@ -32,7 +35,44 @@ pub struct ListResult {
 }
 
 /// Progress callback for upload/download: (bytes_done, bytes_total).
-pub type TransferProgress = dyn Fn(u64, u64) + Send + Sync;
+pub type TransferProgress<'a> = dyn Fn(u64, u64) + Send + Sync + 'a;
+
+pub(crate) async fn download_response_to_file(
+    response: Response,
+    dest: &std::path::Path,
+    progress: Option<&TransferProgress<'_>>,
+) -> Result<()> {
+    let total = response.content_length().unwrap_or(0);
+
+    if let Some(parent) = dest.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+
+    let mut file = tokio::fs::File::create(dest).await?;
+    let mut done = 0u64;
+    let mut reported = false;
+    let mut stream = response.bytes_stream();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        file.write_all(&chunk).await?;
+        done = done.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+        if let Some(cb) = progress {
+            cb(done, total.max(done));
+            reported = true;
+        }
+    }
+
+    file.flush().await?;
+
+    if let Some(cb) = progress
+        && (!reported || done < total)
+    {
+        cb(done, total.max(done));
+    }
+
+    Ok(())
+}
 
 /// Abstract storage backend interface.
 #[async_trait]
@@ -57,7 +97,7 @@ pub trait StorageBackend: Send + Sync {
         &self,
         key: &str,
         dest: &std::path::Path,
-        progress: Option<&TransferProgress>,
+        progress: Option<&TransferProgress<'_>>,
     ) -> Result<()>;
 
     /// Upload a file to storage.
@@ -65,7 +105,7 @@ pub trait StorageBackend: Send + Sync {
         &self,
         key: &str,
         src: &std::path::Path,
-        progress: Option<&TransferProgress>,
+        progress: Option<&TransferProgress<'_>>,
     ) -> Result<()>;
 }
 

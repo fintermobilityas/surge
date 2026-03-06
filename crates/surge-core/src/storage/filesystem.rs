@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Result, SurgeError};
+use crate::platform::fs::copy_file_with_progress;
 use crate::storage::{ListEntry, ListResult, ObjectInfo, StorageBackend, TransferProgress};
 
 /// Local filesystem storage backend.
@@ -114,20 +115,16 @@ impl StorageBackend for FilesystemBackend {
         })
     }
 
-    async fn download_to_file(&self, key: &str, dest: &Path, progress: Option<&TransferProgress>) -> Result<()> {
-        let data = self.get_object(key).await?;
-        let total = data.len() as u64;
-        if let Some(parent) = dest.parent() {
-            tokio::fs::create_dir_all(parent).await?;
+    async fn download_to_file(&self, key: &str, dest: &Path, progress: Option<&TransferProgress<'_>>) -> Result<()> {
+        let source = self.resolve_key(key);
+        if !source.exists() {
+            return Err(SurgeError::NotFound(format!("Object not found: {key}")));
         }
-        tokio::fs::write(dest, &data).await?;
-        if let Some(cb) = progress {
-            cb(total, total);
-        }
+        copy_file_with_progress(&source, dest, progress)?;
         Ok(())
     }
 
-    async fn upload_from_file(&self, key: &str, src: &Path, progress: Option<&TransferProgress>) -> Result<()> {
+    async fn upload_from_file(&self, key: &str, src: &Path, progress: Option<&TransferProgress<'_>>) -> Result<()> {
         let data = tokio::fs::read(src).await?;
         let total = data.len() as u64;
         self.put_object(key, &data, "application/octet-stream").await?;

@@ -12,7 +12,7 @@ use tracing::{debug, trace};
 use crate::context::StorageConfig;
 use crate::crypto::hmac_sha256::hmac_sha256;
 use crate::error::{Result, SurgeError};
-use crate::storage::{ListEntry, ListResult, ObjectInfo, StorageBackend, TransferProgress};
+use crate::storage::{ListEntry, ListResult, ObjectInfo, StorageBackend, TransferProgress, download_response_to_file};
 
 /// Azure Blob Storage REST API version.
 const AZURE_API_VERSION: &str = "2024-08-04";
@@ -438,7 +438,7 @@ impl StorageBackend for AzureBlobBackend {
         parse_azure_list_blobs_xml(&body)
     }
 
-    async fn download_to_file(&self, key: &str, dest: &Path, progress: Option<&TransferProgress>) -> Result<()> {
+    async fn download_to_file(&self, key: &str, dest: &Path, progress: Option<&TransferProgress<'_>>) -> Result<()> {
         let full_key = self.full_key(key);
         let url = self.blob_url(&full_key);
 
@@ -453,27 +453,18 @@ impl StorageBackend for AzureBlobBackend {
 
         let resp = req.send().await?;
         let status = resp.status();
-        let total = resp.content_length().unwrap_or(0);
-        let bytes = resp.bytes().await?;
         if !status.is_success() {
-            let body = String::from_utf8_lossy(&bytes).to_string();
-            Self::check_response_status(status, &full_key, &body)?;
+            let body = resp.text().await.unwrap_or_default();
+            return Self::check_response_status(status, &full_key, &body);
         }
 
-        if let Some(parent) = dest.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        tokio::fs::write(dest, &bytes).await?;
-
-        if let Some(cb) = progress {
-            cb(bytes.len() as u64, total.max(bytes.len() as u64));
-        }
+        download_response_to_file(resp, dest, progress).await?;
 
         debug!(key = %full_key, dest = %dest.display(), "Azure download completed");
         Ok(())
     }
 
-    async fn upload_from_file(&self, key: &str, src: &Path, progress: Option<&TransferProgress>) -> Result<()> {
+    async fn upload_from_file(&self, key: &str, src: &Path, progress: Option<&TransferProgress<'_>>) -> Result<()> {
         self.require_credentials("upload")?;
         let data = tokio::fs::read(src).await?;
         let total = data.len() as u64;

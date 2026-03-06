@@ -13,7 +13,7 @@ use std::path::Path;
 
 use crate::context::StorageConfig;
 use crate::error::{Result, SurgeError};
-use crate::storage::{ListEntry, ListResult, ObjectInfo, StorageBackend, TransferProgress};
+use crate::storage::{ListEntry, ListResult, ObjectInfo, StorageBackend, TransferProgress, download_response_to_file};
 
 const DEFAULT_GITHUB_API_BASE: &str = "https://api.github.com";
 const DEFAULT_RELEASE_TAG: &str = "surge";
@@ -434,23 +434,37 @@ impl StorageBackend for GitHubReleasesBackend {
         })
     }
 
-    async fn download_to_file(&self, key: &str, dest: &Path, progress: Option<&TransferProgress>) -> Result<()> {
-        let data = self.get_object(key).await?;
-        let total = data.len() as u64;
+    async fn download_to_file(&self, key: &str, dest: &Path, progress: Option<&TransferProgress<'_>>) -> Result<()> {
+        let full_key = self.full_key(key);
+        let asset = self.find_asset_by_full_key(&full_key).await?;
 
-        if let Some(parent) = dest.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        tokio::fs::write(dest, &data).await?;
+        let url = self.api_url(&format!(
+            "repos/{}/{}/releases/assets/{}",
+            self.owner, self.repo, asset.id
+        ));
+        let req = self.apply_binary_headers(self.client.get(url));
 
-        if let Some(cb) = progress {
-            cb(total, total);
+        let resp = req.send().await?;
+        let status = resp.status();
+        if status == StatusCode::NOT_FOUND {
+            return Err(SurgeError::NotFound(format!(
+                "GitHub release asset not found: {full_key}"
+            )));
         }
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            let message = Self::parse_api_error_message(&body);
+            return Err(SurgeError::Storage(format!(
+                "GitHub API download asset failed (HTTP {status}): {message}"
+            )));
+        }
+
+        download_response_to_file(resp, dest, progress).await?;
 
         Ok(())
     }
 
-    async fn upload_from_file(&self, key: &str, src: &Path, progress: Option<&TransferProgress>) -> Result<()> {
+    async fn upload_from_file(&self, key: &str, src: &Path, progress: Option<&TransferProgress<'_>>) -> Result<()> {
         let data = tokio::fs::read(src).await?;
         let total = data.len() as u64;
         let full_key = self.full_key(key);

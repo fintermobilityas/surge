@@ -715,7 +715,7 @@ fn load_app_icon(staging_dir: &Path, icon_name: &str) -> Option<egui::IconData> 
 }
 
 fn default_surge_icon() -> egui::IconData {
-    decode_icon(include_bytes!("../../../assets/logo.svg"), Some("svg")).unwrap_or_default()
+    decode_icon(include_bytes!("../assets/logo.svg"), Some("svg")).unwrap_or_default()
 }
 
 fn decode_icon(bytes: &[u8], extension: Option<&str>) -> Option<egui::IconData> {

@@ -4,10 +4,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use crate::crypto::sha256::sha256_hex;
-use crate::diff::wrapper::bspatch_buffers;
 use crate::error::{Result, SurgeError};
 use crate::releases::artifact_cache::{cache_path_for_key, fetch_or_reuse_file};
-use crate::releases::manifest::{DeltaArtifact, ReleaseEntry, ReleaseIndex};
+use crate::releases::delta::{apply_delta_patch, decode_delta_patch, is_supported_delta};
+use crate::releases::manifest::{ReleaseEntry, ReleaseIndex};
 use crate::releases::version::compare_versions;
 use crate::storage::StorageBackend;
 use futures_util::stream::{self, StreamExt};
@@ -383,48 +383,6 @@ fn extend_required_artifacts_for_sorted_releases(releases: &[&ReleaseEntry], req
     }
 }
 
-fn normalized_or_default<'a>(value: &'a str, default: &'a str) -> &'a str {
-    let trimmed = value.trim();
-    if trimmed.is_empty() { default } else { trimmed }
-}
-
-fn is_supported_delta(delta: &DeltaArtifact) -> bool {
-    let algorithm = normalized_or_default(&delta.algorithm, crate::releases::manifest::DIFF_ALGORITHM_BSDIFF);
-    let patch_format = normalized_or_default(&delta.patch_format, crate::releases::manifest::PATCH_FORMAT_BSDIFF4);
-    let compression = normalized_or_default(&delta.compression, crate::releases::manifest::COMPRESSION_ZSTD);
-
-    algorithm.eq_ignore_ascii_case(crate::releases::manifest::DIFF_ALGORITHM_BSDIFF)
-        && patch_format.eq_ignore_ascii_case(crate::releases::manifest::PATCH_FORMAT_BSDIFF4)
-        && compression.eq_ignore_ascii_case(crate::releases::manifest::COMPRESSION_ZSTD)
-}
-
-fn decode_delta_patch(data: &[u8], delta: &DeltaArtifact) -> Result<Vec<u8>> {
-    let compression = normalized_or_default(&delta.compression, crate::releases::manifest::COMPRESSION_ZSTD);
-    if compression.eq_ignore_ascii_case(crate::releases::manifest::COMPRESSION_ZSTD) {
-        return zstd::decode_all(data).map_err(|e| SurgeError::Archive(format!("{e}")));
-    }
-    Err(SurgeError::Update(format!(
-        "Unsupported delta compression '{}'",
-        delta.compression
-    )))
-}
-
-fn apply_delta_patch(older: &[u8], patch: &[u8], delta: &DeltaArtifact) -> Result<Vec<u8>> {
-    let algorithm = normalized_or_default(&delta.algorithm, crate::releases::manifest::DIFF_ALGORITHM_BSDIFF);
-    let patch_format = normalized_or_default(&delta.patch_format, crate::releases::manifest::PATCH_FORMAT_BSDIFF4);
-
-    if algorithm.eq_ignore_ascii_case(crate::releases::manifest::DIFF_ALGORITHM_BSDIFF)
-        && patch_format.eq_ignore_ascii_case(crate::releases::manifest::PATCH_FORMAT_BSDIFF4)
-    {
-        return bspatch_buffers(older, patch);
-    }
-
-    Err(SurgeError::Update(format!(
-        "Unsupported delta algorithm/format '{}/{}'",
-        delta.algorithm, delta.patch_format
-    )))
-}
-
 fn verify_expected_sha256(expected: &str, data: &[u8], context: &str) -> Result<()> {
     let expected = expected.trim();
     if expected.is_empty() {
@@ -443,8 +401,9 @@ fn verify_expected_sha256(expected: &str, data: &[u8], context: &str) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diff::chunked::chunked_bsdiff;
     use crate::diff::wrapper::bsdiff_buffers;
-    use crate::releases::manifest::ReleaseEntry;
+    use crate::releases::manifest::{DeltaArtifact, ReleaseEntry};
     use crate::storage::filesystem::FilesystemBackend;
 
     fn make_entry(version: &str) -> ReleaseEntry {
@@ -549,6 +508,71 @@ mod tests {
         let mut v3 = make_entry("1.2.0");
         v3.full_sha256 = sha256_hex(&full_v3);
         v3.set_primary_delta(Some(DeltaArtifact::bsdiff_zstd(
+            "primary",
+            "1.1.0",
+            "demo-1.2.0-linux-x64-delta.tar.zst",
+            delta_v3.len() as i64,
+            &sha256_hex(&delta_v3),
+        )));
+
+        backend
+            .put_object(&v1.full_filename, &full_v1, "application/octet-stream")
+            .await
+            .unwrap();
+        let v2_delta_key = v2.selected_delta().expect("v2 should have delta descriptor").filename;
+        let v3_delta_key = v3.selected_delta().expect("v3 should have delta descriptor").filename;
+        backend
+            .put_object(&v2_delta_key, &delta_v2, "application/octet-stream")
+            .await
+            .unwrap();
+        backend
+            .put_object(&v3_delta_key, &delta_v3, "application/octet-stream")
+            .await
+            .unwrap();
+
+        let index = ReleaseIndex {
+            app_id: "demo".to_string(),
+            releases: vec![v1, v2, v3],
+            ..ReleaseIndex::default()
+        };
+
+        let restored = restore_full_archive_for_version(&backend, &index, "linux-x64", "1.2.0")
+            .await
+            .unwrap();
+        assert_eq!(restored, full_v3);
+    }
+
+    #[tokio::test]
+    async fn test_restore_full_archive_rebuilds_from_chunked_deltas_when_direct_full_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = FilesystemBackend::new(tmp.path().to_str().unwrap(), "");
+
+        let full_v1 = b"full-v1".to_vec();
+        let full_v2 = b"full-v2-with-extra-data".to_vec();
+        let full_v3 = b"full-v3-with-even-more-extra-data".to_vec();
+
+        let patch_v2 = chunked_bsdiff(&full_v1, &full_v2, &Default::default()).unwrap();
+        let patch_v3 = chunked_bsdiff(&full_v2, &full_v3, &Default::default()).unwrap();
+        let delta_v2 = zstd::encode_all(patch_v2.as_slice(), 3).unwrap();
+        let delta_v3 = zstd::encode_all(patch_v3.as_slice(), 3).unwrap();
+
+        let mut v1 = make_entry("1.0.0");
+        v1.set_primary_delta(None);
+        v1.full_sha256 = sha256_hex(&full_v1);
+
+        let mut v2 = make_entry("1.1.0");
+        v2.full_sha256 = sha256_hex(&full_v2);
+        v2.set_primary_delta(Some(DeltaArtifact::chunked_bsdiff_zstd(
+            "primary",
+            "1.0.0",
+            "demo-1.1.0-linux-x64-delta.tar.zst",
+            delta_v2.len() as i64,
+            &sha256_hex(&delta_v2),
+        )));
+
+        let mut v3 = make_entry("1.2.0");
+        v3.full_sha256 = sha256_hex(&full_v3);
+        v3.set_primary_delta(Some(DeltaArtifact::chunked_bsdiff_zstd(
             "primary",
             "1.1.0",
             "demo-1.2.0-linux-x64-delta.tar.zst",

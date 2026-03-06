@@ -125,12 +125,9 @@ pub async fn execute(
     build_running.store(false, Ordering::Relaxed);
     let _ = heartbeat.join();
 
+    let artifact_paths = builder.write_artifacts_to(output_dir)?;
     let mut artifact_count = 0usize;
-    for artifact in builder.artifacts() {
-        let dest = output_dir.join(&artifact.filename);
-        if artifact.path != dest {
-            std::fs::copy(&artifact.path, &dest)?;
-        }
+    for dest in &artifact_paths {
         artifact_count += 1;
         logline::subtle(&format!("  Created {} ({})", dest.display(), file_size_label(&dest)));
     }
@@ -510,7 +507,7 @@ fn build_installers_with_launcher(
                 delta_patch_format: if delta_filename.is_empty() {
                     String::new()
                 } else {
-                    surge_core::releases::manifest::PATCH_FORMAT_BSDIFF4.to_string()
+                    surge_core::releases::manifest::PATCH_FORMAT_CHUNKED_BSDIFF_V1.to_string()
                 },
                 delta_compression: if delta_filename.is_empty() {
                     String::new()

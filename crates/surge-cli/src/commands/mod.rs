@@ -92,12 +92,13 @@ mod tests {
     use surge_core::archive::extractor::{list_entries_from_bytes, read_entry};
     use surge_core::config::constants::{DEFAULT_ZSTD_LEVEL, RELEASES_FILE_COMPRESSED};
     use surge_core::config::manifest::{ShortcutLocation, SurgeManifest};
+    use surge_core::diff::chunked::chunked_bsdiff;
     use surge_core::diff::wrapper::bsdiff_buffers;
     use surge_core::installer_bundle::read_embedded_payload;
     use surge_core::platform::detect::current_rid;
     use surge_core::platform::fs::make_executable;
     use surge_core::releases::manifest::{
-        ReleaseEntry, ReleaseIndex, compress_release_index, decompress_release_index,
+        PATCH_FORMAT_CHUNKED_BSDIFF_V1, ReleaseEntry, ReleaseIndex, compress_release_index, decompress_release_index,
     };
 
     fn write_manifest(path: &Path, store_dir: &Path, app_id: &str, rid: &str) {
@@ -580,6 +581,52 @@ apps:
             v2_entry.selected_delta().expect("v2 should include delta").filename,
             v2_delta_key
         );
+    }
+
+    #[tokio::test]
+    async fn test_push_records_chunked_delta_patch_format() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_dir = tmp.path().join("store");
+        let packages_dir = tmp.path().join("packages");
+        let manifest_path = tmp.path().join("surge.yml");
+        let rid = current_rid();
+        let app_id = "chunked-push-app";
+        let v1 = "1.0.0";
+        let v2 = "1.0.1";
+
+        std::fs::create_dir_all(&store_dir).unwrap();
+        std::fs::create_dir_all(&packages_dir).unwrap();
+        write_manifest(&manifest_path, &store_dir, app_id, &rid);
+
+        let v1_full_key = format!("{app_id}-{v1}-{rid}-full.tar.zst");
+        let v2_full_key = format!("{app_id}-{v2}-{rid}-full.tar.zst");
+        let v2_delta_key = format!("{app_id}-{v2}-{rid}-delta.tar.zst");
+
+        let v1_full = b"full-v1".to_vec();
+        let v2_full = b"full-v2-but-different".to_vec();
+        let v2_patch = chunked_bsdiff(&v1_full, &v2_full, &Default::default()).unwrap();
+        let v2_delta = zstd::encode_all(v2_patch.as_slice(), 3).unwrap();
+
+        std::fs::write(packages_dir.join(&v1_full_key), &v1_full).unwrap();
+        super::push::execute(&manifest_path, Some(app_id), v1, Some(&rid), "stable", &packages_dir)
+            .await
+            .unwrap();
+
+        std::fs::write(packages_dir.join(&v2_full_key), &v2_full).unwrap();
+        std::fs::write(packages_dir.join(&v2_delta_key), &v2_delta).unwrap();
+        super::push::execute(&manifest_path, Some(app_id), v2, Some(&rid), "stable", &packages_dir)
+            .await
+            .unwrap();
+
+        let index = read_index(&store_dir);
+        let v2_entry = index
+            .releases
+            .iter()
+            .find(|release| release.version == v2 && release.rid == rid)
+            .expect("v2 release should exist in index");
+        let delta = v2_entry.selected_delta().expect("v2 should include delta");
+        assert_eq!(delta.filename, v2_delta_key);
+        assert_eq!(delta.patch_format, PATCH_FORMAT_CHUNKED_BSDIFF_V1);
     }
 
     #[tokio::test]

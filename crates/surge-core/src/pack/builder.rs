@@ -9,12 +9,14 @@ use tracing::{debug, info, warn};
 use crate::archive::packer::ArchivePacker;
 use crate::config::constants::{RELEASES_FILE_COMPRESSED, SCHEMA_VERSION};
 use crate::config::manifest::{ShortcutLocation, SurgeManifest};
-use crate::context::Context;
-use crate::crypto::sha256::sha256_hex_file;
-use crate::diff::wrapper::bsdiff_buffers;
+use crate::context::{Context, ResourceBudget};
+use crate::crypto::sha256::sha256_hex;
+use crate::diff::chunked::{ChunkedDiffOptions, DEFAULT_CHUNK_SIZE, chunked_bsdiff};
 use crate::error::{Result, SurgeError};
+use crate::platform::fs::write_file_atomic;
 use crate::releases::manifest::{
-    DeltaArtifact, ReleaseEntry, ReleaseIndex, compress_release_index, decompress_release_index,
+    DeltaArtifact, PATCH_FORMAT_CHUNKED_BSDIFF_V1, ReleaseEntry, ReleaseIndex, compress_release_index,
+    decompress_release_index,
 };
 use crate::releases::restore::{find_previous_release_for_rid, restore_full_archive_for_version};
 use crate::storage::{StorageBackend, create_storage_backend};
@@ -22,8 +24,6 @@ use crate::storage::{StorageBackend, create_storage_backend};
 /// A built package artifact ready for upload.
 #[derive(Debug, Clone)]
 pub struct PackageArtifact {
-    /// Local path to the artifact file.
-    pub path: PathBuf,
     /// Filename used in storage.
     pub filename: String,
     /// File size in bytes.
@@ -34,6 +34,16 @@ pub struct PackageArtifact {
     pub is_delta: bool,
     /// Source version for delta packages, empty for full packages.
     pub from_version: String,
+    /// Delta patch format identifier, empty for full packages.
+    pub patch_format: String,
+    bytes: Vec<u8>,
+}
+
+impl PackageArtifact {
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 
 /// Builds full and delta release packages from application artifacts.
@@ -140,7 +150,7 @@ impl PackBuilder {
     ///
     /// Creates a tar.zst archive of the artifacts directory as the full package.
     /// If a previous version exists in storage, also creates a delta package
-    /// using bsdiff.
+    /// using chunked bsdiff.
     ///
     /// The optional `progress` callback receives `(items_done, items_total)`.
     pub async fn build(&mut self, progress: Option<&dyn Fn(i32, i32)>) -> Result<()> {
@@ -211,7 +221,7 @@ impl PackBuilder {
 
             debug!(filename = %artifact.filename, "Uploading artifact");
             self.storage
-                .upload_from_file(&artifact.filename, &artifact.path, None)
+                .put_object(&artifact.filename, artifact.bytes(), "application/octet-stream")
                 .await?;
 
             report(i as i32 + 1);
@@ -231,13 +241,24 @@ impl PackBuilder {
         &self.artifacts
     }
 
+    /// Write built artifacts to `output_dir`.
+    pub fn write_artifacts_to(&self, output_dir: &Path) -> Result<Vec<PathBuf>> {
+        std::fs::create_dir_all(output_dir)?;
+
+        self.artifacts
+            .iter()
+            .map(|artifact| {
+                let path = output_dir.join(&artifact.filename);
+                write_file_atomic(&path, artifact.bytes())?;
+                Ok(path)
+            })
+            .collect()
+    }
+
     /// Build the full tar.zst package.
-    async fn build_full_package(&self) -> Result<PackageArtifact> {
+    async fn build_full_package(&mut self) -> Result<PackageArtifact> {
         let budget = self.ctx.resource_budget();
         let filename = format!("{}-{}-{}-full.tar.zst", self.app_id, self.version, self.rid);
-
-        let output_dir = self.artifacts_dir.parent().unwrap_or(Path::new("."));
-        let output_path = output_dir.join(&filename);
 
         let mut packer = ArchivePacker::new(budget.zstd_compression_level)?;
         packer.add_directory(&self.artifacts_dir, "")?;
@@ -251,18 +272,19 @@ impl PackBuilder {
             }
         }
 
-        packer.finalize_to_file(&output_path)?;
-
-        let sha256 = sha256_hex_file(&output_path)?;
-        let size = std::fs::metadata(&output_path)?.len() as i64;
+        let archive_bytes = packer.finalize()?;
+        let sha256 = sha256_hex(&archive_bytes);
+        let size = i64::try_from(archive_bytes.len())
+            .map_err(|_| SurgeError::Archive(format!("Archive is too large: {} bytes", archive_bytes.len())))?;
 
         Ok(PackageArtifact {
-            path: output_path,
             filename,
             size,
             sha256,
             is_delta: false,
             from_version: String::new(),
+            patch_format: String::new(),
+            bytes: archive_bytes,
         })
     }
 
@@ -285,36 +307,33 @@ impl PackBuilder {
         let prev_data =
             restore_full_archive_for_version(self.storage.as_ref(), &index, &self.rid, &previous_release.version)
                 .await?;
-        let full_artifact = self
+        let new_data = self
             .artifacts
             .iter()
             .find(|a| !a.is_delta)
+            .map(PackageArtifact::bytes)
             .ok_or_else(|| SurgeError::Pack("Full package not yet built".to_string()))?;
-        let new_data = std::fs::read(&full_artifact.path)?;
 
-        // Compute bsdiff
-        let patch = bsdiff_buffers(&prev_data, &new_data)?;
+        let budget = self.ctx.resource_budget();
+        let diff_options = chunked_diff_options(&budget, prev_data.len(), new_data.len());
+        let patch = chunked_bsdiff(&prev_data, new_data, &diff_options)?;
 
         let delta_filename = format!("{}-{}-{}-delta.tar.zst", self.app_id, self.version, self.rid);
-        let output_dir = self.artifacts_dir.parent().unwrap_or(Path::new("."));
-        let delta_path = output_dir.join(&delta_filename);
-
-        // Compress the delta with zstd
-        let budget = self.ctx.resource_budget();
         let compressed = zstd::encode_all(patch.as_slice(), budget.zstd_compression_level)
             .map_err(|e| SurgeError::Archive(format!("Failed to compress delta: {e}")))?;
-        std::fs::write(&delta_path, &compressed)?;
 
-        let sha256 = sha256_hex_file(&delta_path)?;
-        let size = std::fs::metadata(&delta_path)?.len() as i64;
+        let sha256 = sha256_hex(&compressed);
+        let size = i64::try_from(compressed.len())
+            .map_err(|_| SurgeError::Archive(format!("Delta is too large: {} bytes", compressed.len())))?;
 
         Ok(Some(PackageArtifact {
-            path: delta_path,
             filename: delta_filename,
             size,
             sha256,
             is_delta: true,
             from_version: previous_release.version.clone(),
+            patch_format: PATCH_FORMAT_CHUNKED_BSDIFF_V1.to_string(),
+            bytes: compressed,
         }))
     }
 
@@ -362,13 +381,26 @@ impl PackBuilder {
         };
         let mut entry = entry;
         let primary_delta = delta.map(|artifact| {
-            DeltaArtifact::bsdiff_zstd(
-                "primary",
-                &artifact.from_version,
-                &artifact.filename,
-                artifact.size,
-                &artifact.sha256,
-            )
+            if artifact
+                .patch_format
+                .eq_ignore_ascii_case(PATCH_FORMAT_CHUNKED_BSDIFF_V1)
+            {
+                DeltaArtifact::chunked_bsdiff_zstd(
+                    "primary",
+                    &artifact.from_version,
+                    &artifact.filename,
+                    artifact.size,
+                    &artifact.sha256,
+                )
+            } else {
+                DeltaArtifact::bsdiff_zstd(
+                    "primary",
+                    &artifact.from_version,
+                    &artifact.filename,
+                    artifact.size,
+                    &artifact.sha256,
+                )
+            }
         });
         entry.set_primary_delta(primary_delta);
 
@@ -387,6 +419,42 @@ impl PackBuilder {
             .await?;
 
         Ok(())
+    }
+}
+
+fn chunked_diff_options(budget: &ResourceBudget, older_len: usize, newer_len: usize) -> ChunkedDiffOptions {
+    const MIN_CHUNK_SIZE: usize = 4 * 1024 * 1024;
+    const BYTES_PER_THREAD_FACTOR: usize = 12;
+
+    let requested_threads = usize::try_from(budget.max_threads).ok().unwrap_or(0);
+    let planning_threads = if requested_threads == 0 {
+        std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1)
+    } else {
+        requested_threads
+    };
+    let archive_len = older_len.max(newer_len).max(1);
+
+    let mut chunk_size = DEFAULT_CHUNK_SIZE.min(archive_len);
+    if let Ok(memory_budget) = usize::try_from(budget.max_memory_bytes)
+        && memory_budget > 0
+    {
+        let per_thread_budget = memory_budget / planning_threads.max(1);
+        let budget_chunk_size = per_thread_budget / BYTES_PER_THREAD_FACTOR;
+        chunk_size = chunk_size.min(budget_chunk_size.max(MIN_CHUNK_SIZE));
+    }
+    chunk_size = chunk_size.clamp(1, archive_len.max(MIN_CHUNK_SIZE));
+
+    let chunk_count = archive_len.div_ceil(chunk_size).max(1);
+
+    ChunkedDiffOptions {
+        chunk_size,
+        max_threads: if requested_threads == 0 {
+            0
+        } else {
+            requested_threads.min(chunk_count)
+        },
     }
 }
 
@@ -461,6 +529,7 @@ mod tests {
     use crate::config::constants::{DEFAULT_ZSTD_LEVEL, RELEASES_FILE_COMPRESSED};
     use crate::context::StorageProvider;
     use crate::crypto::sha256::sha256_hex;
+    use crate::diff::wrapper::bsdiff_buffers;
     use crate::platform::detect::current_rid;
     use crate::releases::manifest::{ReleaseEntry, ReleaseIndex, compress_release_index};
 
@@ -482,15 +551,17 @@ mod tests {
     #[test]
     fn test_package_artifact_creation() {
         let artifact = PackageArtifact {
-            path: PathBuf::from("/tmp/test.tar.zst"),
             filename: "test.tar.zst".to_string(),
             size: 1024,
             sha256: "abc123".to_string(),
             is_delta: false,
             from_version: String::new(),
+            patch_format: String::new(),
+            bytes: b"test".to_vec(),
         };
         assert!(!artifact.is_delta);
         assert_eq!(artifact.size, 1024);
+        assert_eq!(artifact.bytes(), b"test");
     }
 
     #[test]

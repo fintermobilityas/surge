@@ -1,4 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 use std::time::Instant;
 
@@ -8,9 +10,11 @@ use crate::ui::UiTheme;
 use surge_core::config::constants::{DEFAULT_ZSTD_LEVEL, RELEASES_FILE_COMPRESSED, SCHEMA_VERSION};
 use surge_core::config::manifest::{ShortcutLocation, SurgeManifest};
 use surge_core::crypto::sha256::sha256_hex_file;
+use surge_core::diff::chunked::has_magic_prefix;
 use surge_core::error::{Result, SurgeError};
 use surge_core::releases::manifest::{
-    DeltaArtifact, ReleaseEntry, ReleaseIndex, compress_release_index, decompress_release_index,
+    DeltaArtifact, PATCH_FORMAT_BSDIFF4, PATCH_FORMAT_CHUNKED_BSDIFF_V1, ReleaseEntry, ReleaseIndex,
+    compress_release_index, decompress_release_index,
 };
 use surge_core::releases::restore::required_artifacts_for_index;
 use surge_core::releases::version::compare_versions;
@@ -113,17 +117,19 @@ pub async fn execute(
         logline::info("Skipping full package upload: existing full baseline found for RID; publishing delta only.");
     }
 
-    let (delta_filename, delta_size, delta_sha256, delta_uploaded) = if delta_available {
+    let (delta_filename, delta_size, delta_sha256, delta_patch_format, delta_uploaded) = if delta_available {
         backend.upload_from_file(&delta_filename, &delta_archive, None).await?;
         let delta_size = std::fs::metadata(&delta_archive)?.len() as i64;
+        let delta_sha256 = sha256_hex_file(&delta_archive)?;
+        let delta_patch_format = infer_delta_patch_format(&delta_archive)?;
         uploaded_bytes_progress = uploaded_bytes_progress.saturating_add(delta_size.max(0) as u64);
         logline::subtle(&format!(
             "      {}",
             format_byte_progress(uploaded_bytes_progress, total_upload_bytes, "uploaded")
         ));
-        (delta_filename, delta_size, sha256_hex_file(&delta_archive)?, true)
+        (delta_filename, delta_size, delta_sha256, delta_patch_format, true)
     } else {
-        (String::new(), 0, String::new(), false)
+        (String::new(), 0, String::new(), String::new(), false)
     };
     print_stage_done(
         theme,
@@ -151,6 +157,7 @@ pub async fn execute(
         delta_filename,
         delta_size,
         delta_sha256,
+        delta_patch_format,
         name,
         main_exe,
         install_directory,
@@ -226,6 +233,7 @@ async fn update_release_index(
     delta_filename: String,
     delta_size: i64,
     delta_sha256: String,
+    delta_patch_format: String,
     name: String,
     main_exe: String,
     install_directory: String,
@@ -301,6 +309,14 @@ async fn update_release_index(
     };
     let primary_delta = if delta_filename.trim().is_empty() {
         None
+    } else if delta_patch_format.eq_ignore_ascii_case(PATCH_FORMAT_CHUNKED_BSDIFF_V1) {
+        Some(DeltaArtifact::chunked_bsdiff_zstd(
+            "primary",
+            "",
+            &delta_filename,
+            delta_size,
+            &delta_sha256,
+        ))
     } else {
         Some(DeltaArtifact::bsdiff_zstd(
             "primary",
@@ -363,6 +379,23 @@ async fn prune_redundant_artifacts(backend: &dyn StorageBackend, index: &Release
 
 fn detect_os_from_rid(rid: &str) -> String {
     rid.split('-').next().unwrap_or("unknown").to_string()
+}
+
+fn infer_delta_patch_format(delta_archive: &Path) -> Result<String> {
+    let file = File::open(delta_archive)?;
+    let mut decoder = match zstd::stream::read::Decoder::new(file) {
+        Ok(decoder) => decoder,
+        Err(_) => return Ok(PATCH_FORMAT_BSDIFF4.to_string()),
+    };
+    let mut prefix = [0u8; 4];
+    let bytes_read = match decoder.read(&mut prefix) {
+        Ok(bytes_read) => bytes_read,
+        Err(_) => return Ok(PATCH_FORMAT_BSDIFF4.to_string()),
+    };
+    if bytes_read == prefix.len() && has_magic_prefix(&prefix) {
+        return Ok(PATCH_FORMAT_CHUNKED_BSDIFF_V1.to_string());
+    }
+    Ok(PATCH_FORMAT_BSDIFF4.to_string())
 }
 
 fn print_stage(theme: UiTheme, stage: usize, total: usize, text: &str) {

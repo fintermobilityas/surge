@@ -9,6 +9,7 @@ use crate::releases::version::compare_versions;
 
 pub const DIFF_ALGORITHM_BSDIFF: &str = "bsdiff";
 pub const PATCH_FORMAT_BSDIFF4: &str = "bsdiff4";
+pub const PATCH_FORMAT_CHUNKED_BSDIFF_V1: &str = "chunked-bsdiff-v1";
 pub const COMPRESSION_ZSTD: &str = "zstd";
 
 /// A single delta artifact descriptor.
@@ -33,19 +34,29 @@ pub struct DeltaArtifact {
 }
 
 impl DeltaArtifact {
-    /// Build a descriptor for the current default delta format (bsdiff + zstd).
-    #[must_use]
-    pub fn bsdiff_zstd(id: &str, from_version: &str, filename: &str, size: i64, sha256: &str) -> Self {
+    fn with_format(id: &str, from_version: &str, patch_format: &str, filename: &str, size: i64, sha256: &str) -> Self {
         Self {
             id: id.to_string(),
             from_version: from_version.to_string(),
             algorithm: DIFF_ALGORITHM_BSDIFF.to_string(),
-            patch_format: PATCH_FORMAT_BSDIFF4.to_string(),
+            patch_format: patch_format.to_string(),
             compression: COMPRESSION_ZSTD.to_string(),
             filename: filename.to_string(),
             size,
             sha256: sha256.to_string(),
         }
+    }
+
+    /// Build a descriptor for the classic bsdiff + zstd delta format.
+    #[must_use]
+    pub fn bsdiff_zstd(id: &str, from_version: &str, filename: &str, size: i64, sha256: &str) -> Self {
+        Self::with_format(id, from_version, PATCH_FORMAT_BSDIFF4, filename, size, sha256)
+    }
+
+    /// Build a descriptor for the chunked bsdiff + zstd delta format.
+    #[must_use]
+    pub fn chunked_bsdiff_zstd(id: &str, from_version: &str, filename: &str, size: i64, sha256: &str) -> Self {
+        Self::with_format(id, from_version, PATCH_FORMAT_CHUNKED_BSDIFF_V1, filename, size, sha256)
     }
 }
 

@@ -21,6 +21,12 @@ const VERSION: u8 = 1;
 /// Default chunk size: 64 MiB.
 pub const DEFAULT_CHUNK_SIZE: usize = 64 * 1024 * 1024;
 
+/// Returns whether `data` starts with the chunked patch magic bytes.
+#[must_use]
+pub fn has_magic_prefix(data: &[u8]) -> bool {
+    data.starts_with(MAGIC)
+}
+
 /// Options for chunked diff/patch operations.
 pub struct ChunkedDiffOptions {
     /// Size of each chunk in bytes. Both files are split at these boundaries.
@@ -188,7 +194,11 @@ pub fn chunked_bspatch(older: &[u8], patch: &[u8], opts: &ChunkedDiffOptions) ->
     }
 
     let num_chunks = chunk_patches.len();
-    let num_threads = opts.effective_threads();
+    let thread_opts = ChunkedDiffOptions {
+        chunk_size,
+        max_threads: opts.max_threads,
+    };
+    let num_threads = thread_opts.effective_threads();
 
     let work_counter = AtomicUsize::new(0);
     let results: Mutex<Vec<(usize, Vec<u8>)>> = Mutex::new(Vec::with_capacity(num_chunks));

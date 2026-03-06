@@ -11,7 +11,6 @@ use crate::archive::extractor::extract_file_to;
 use crate::config::constants::RELEASES_FILE_COMPRESSED;
 use crate::context::Context;
 use crate::crypto::sha256::{sha256_hex, sha256_hex_file};
-use crate::diff::wrapper::bspatch_buffers;
 use crate::error::{Result, SurgeError};
 use crate::install::{InstallProfile, RuntimeManifestMetadata, storage_provider_manifest_name, write_runtime_manifest};
 use crate::platform::detect::current_rid;
@@ -19,8 +18,9 @@ use crate::platform::fs::{atomic_rename, copy_directory};
 use crate::platform::process::{current_pid, spawn_detached, spawn_process, supervisor_binary_name};
 use crate::platform::shortcuts::install_shortcuts;
 use crate::releases::artifact_cache::{CacheFetchOutcome, cache_path_for_key, fetch_or_reuse_file};
+use crate::releases::delta::{apply_delta_patch, decode_delta_patch, is_supported_delta};
 use crate::releases::manifest::{
-    DeltaArtifact, ReleaseEntry, ReleaseIndex, decompress_release_index, get_delta_chain, get_releases_newer_than,
+    ReleaseEntry, ReleaseIndex, decompress_release_index, get_delta_chain, get_releases_newer_than,
 };
 use crate::releases::restore::{RestoreOptions, restore_full_archive_for_version_with_options};
 use crate::releases::version::compare_versions;
@@ -745,48 +745,6 @@ fn normalize_os_label(raw: &str) -> String {
         "linux" => "linux".to_string(),
         other => other.to_string(),
     }
-}
-
-fn normalized_or_default<'a>(value: &'a str, default: &'a str) -> &'a str {
-    let trimmed = value.trim();
-    if trimmed.is_empty() { default } else { trimmed }
-}
-
-fn is_supported_delta(delta: &DeltaArtifact) -> bool {
-    let algorithm = normalized_or_default(&delta.algorithm, crate::releases::manifest::DIFF_ALGORITHM_BSDIFF);
-    let patch_format = normalized_or_default(&delta.patch_format, crate::releases::manifest::PATCH_FORMAT_BSDIFF4);
-    let compression = normalized_or_default(&delta.compression, crate::releases::manifest::COMPRESSION_ZSTD);
-
-    algorithm.eq_ignore_ascii_case(crate::releases::manifest::DIFF_ALGORITHM_BSDIFF)
-        && patch_format.eq_ignore_ascii_case(crate::releases::manifest::PATCH_FORMAT_BSDIFF4)
-        && compression.eq_ignore_ascii_case(crate::releases::manifest::COMPRESSION_ZSTD)
-}
-
-fn decode_delta_patch(data: &[u8], delta: &DeltaArtifact) -> Result<Vec<u8>> {
-    let compression = normalized_or_default(&delta.compression, crate::releases::manifest::COMPRESSION_ZSTD);
-    if compression.eq_ignore_ascii_case(crate::releases::manifest::COMPRESSION_ZSTD) {
-        return zstd::decode_all(data).map_err(|e| SurgeError::Archive(format!("{e}")));
-    }
-    Err(SurgeError::Update(format!(
-        "Unsupported delta compression '{}'",
-        delta.compression
-    )))
-}
-
-fn apply_delta_patch(older: &[u8], patch: &[u8], delta: &DeltaArtifact) -> Result<Vec<u8>> {
-    let algorithm = normalized_or_default(&delta.algorithm, crate::releases::manifest::DIFF_ALGORITHM_BSDIFF);
-    let patch_format = normalized_or_default(&delta.patch_format, crate::releases::manifest::PATCH_FORMAT_BSDIFF4);
-
-    if algorithm.eq_ignore_ascii_case(crate::releases::manifest::DIFF_ALGORITHM_BSDIFF)
-        && patch_format.eq_ignore_ascii_case(crate::releases::manifest::PATCH_FORMAT_BSDIFF4)
-    {
-        return bspatch_buffers(older, patch);
-    }
-
-    Err(SurgeError::Update(format!(
-        "Unsupported delta algorithm/format '{}/{}'",
-        delta.algorithm, delta.patch_format
-    )))
 }
 
 fn find_previous_app_dir(install_dir: &Path, current_version: &str) -> Option<PathBuf> {

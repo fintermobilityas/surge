@@ -622,7 +622,14 @@ fn build_installers_with_launcher(
                 delta_patch_format: if delta_filename.is_empty() {
                     String::new()
                 } else {
-                    surge_core::releases::manifest::PATCH_FORMAT_CHUNKED_BSDIFF_V1.to_string()
+                    match manifest.effective_pack_policy().delta_strategy {
+                        surge_core::config::manifest::PackDeltaStrategy::ArchiveChunkedBsdiff => {
+                            surge_core::releases::manifest::PATCH_FORMAT_CHUNKED_BSDIFF_ARCHIVE_V2.to_string()
+                        }
+                        surge_core::config::manifest::PackDeltaStrategy::ArchiveBsdiff => {
+                            surge_core::releases::manifest::PATCH_FORMAT_BSDIFF4_ARCHIVE_V2.to_string()
+                        }
+                    }
                 },
                 delta_compression: if delta_filename.is_empty() {
                     String::new()

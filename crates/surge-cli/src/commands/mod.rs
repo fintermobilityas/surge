@@ -119,6 +119,7 @@ mod tests {
     use std::path::Path;
 
     use surge_core::archive::extractor::{list_entries_from_bytes, read_entry};
+    use surge_core::archive::packer::ArchivePacker;
     use surge_core::config::constants::{DEFAULT_ZSTD_LEVEL, RELEASES_FILE_COMPRESSED};
     use surge_core::config::manifest::{ShortcutLocation, SurgeManifest};
     use surge_core::context::{StorageConfig, StorageProvider};
@@ -127,8 +128,10 @@ mod tests {
     use surge_core::installer_bundle::read_embedded_payload;
     use surge_core::platform::detect::current_rid;
     use surge_core::platform::fs::make_executable;
+    use surge_core::releases::delta::build_archive_chunked_patch;
     use surge_core::releases::manifest::{
-        PATCH_FORMAT_CHUNKED_BSDIFF_V1, ReleaseEntry, ReleaseIndex, compress_release_index, decompress_release_index,
+        PATCH_FORMAT_CHUNKED_BSDIFF_ARCHIVE_V2, PATCH_FORMAT_CHUNKED_BSDIFF_V1, ReleaseEntry, ReleaseIndex,
+        compress_release_index, decompress_release_index,
     };
 
     fn write_manifest(path: &Path, store_dir: &Path, app_id: &str, rid: &str) {
@@ -693,6 +696,68 @@ apps:
         let delta = v2_entry.selected_delta().expect("v2 should include delta");
         assert_eq!(delta.filename, v2_delta_key);
         assert_eq!(delta.patch_format, PATCH_FORMAT_CHUNKED_BSDIFF_V1);
+    }
+
+    #[tokio::test]
+    async fn test_push_records_archive_chunked_delta_patch_format() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_dir = tmp.path().join("store");
+        let packages_dir = tmp.path().join("packages");
+        let manifest_path = tmp.path().join("surge.yml");
+        let rid = current_rid();
+        let app_id = "archive-chunked-push-app";
+        let v1 = "1.0.0";
+        let v2 = "1.0.1";
+
+        std::fs::create_dir_all(&store_dir).unwrap();
+        std::fs::create_dir_all(&packages_dir).unwrap();
+        write_manifest(&manifest_path, &store_dir, app_id, &rid);
+
+        let v1_full_key = format!("{app_id}-{v1}-{rid}-full.tar.zst");
+        let v2_full_key = format!("{app_id}-{v2}-{rid}-full.tar.zst");
+        let v2_delta_key = format!("{app_id}-{v2}-{rid}-delta.tar.zst");
+
+        let mut packer_v1 = ArchivePacker::new(7).unwrap();
+        packer_v1
+            .add_buffer("Program.cs", b"Console.WriteLine(\"v1\");\n", 0o644)
+            .unwrap();
+        packer_v1
+            .add_buffer("payload.bin", &vec![b'X'; 1024 * 1024], 0o644)
+            .unwrap();
+        let v1_full = packer_v1.finalize().unwrap();
+
+        let mut packer_v2 = ArchivePacker::new(7).unwrap();
+        packer_v2
+            .add_buffer("Program.cs", b"Console.WriteLine(\"v2\");\n", 0o644)
+            .unwrap();
+        packer_v2
+            .add_buffer("payload.bin", &vec![b'X'; 1024 * 1024], 0o644)
+            .unwrap();
+        let v2_full = packer_v2.finalize().unwrap();
+
+        let v2_patch = build_archive_chunked_patch(&v1_full, &v2_full, 7, &ChunkedDiffOptions::default()).unwrap();
+        let v2_delta = zstd::encode_all(v2_patch.as_slice(), 3).unwrap();
+
+        std::fs::write(packages_dir.join(&v1_full_key), &v1_full).unwrap();
+        super::push::execute(&manifest_path, Some(app_id), v1, Some(&rid), "stable", &packages_dir)
+            .await
+            .unwrap();
+
+        std::fs::write(packages_dir.join(&v2_full_key), &v2_full).unwrap();
+        std::fs::write(packages_dir.join(&v2_delta_key), &v2_delta).unwrap();
+        super::push::execute(&manifest_path, Some(app_id), v2, Some(&rid), "stable", &packages_dir)
+            .await
+            .unwrap();
+
+        let index = read_index(&store_dir);
+        let v2_entry = index
+            .releases
+            .iter()
+            .find(|release| release.version == v2 && release.rid == rid)
+            .expect("v2 release should exist in index");
+        let delta = v2_entry.selected_delta().expect("v2 should include delta");
+        assert_eq!(delta.filename, v2_delta_key);
+        assert_eq!(delta.patch_format, PATCH_FORMAT_CHUNKED_BSDIFF_ARCHIVE_V2);
     }
 
     #[tokio::test]

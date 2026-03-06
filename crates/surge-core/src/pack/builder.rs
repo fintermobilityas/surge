@@ -11,12 +11,12 @@ use crate::config::constants::{RELEASES_FILE_COMPRESSED, SCHEMA_VERSION};
 use crate::config::manifest::{PackDeltaStrategy, ShortcutLocation, SurgeManifest};
 use crate::context::{Context, ResourceBudget};
 use crate::crypto::sha256::sha256_hex;
-use crate::diff::chunked::{ChunkedDiffOptions, DEFAULT_CHUNK_SIZE, chunked_bsdiff};
-use crate::diff::wrapper::bsdiff_buffers;
+use crate::diff::chunked::{ChunkedDiffOptions, DEFAULT_CHUNK_SIZE};
 use crate::error::{Result, SurgeError};
 use crate::platform::fs::write_file_atomic;
+use crate::releases::delta::{build_archive_bsdiff_patch, build_archive_chunked_patch};
 use crate::releases::manifest::{
-    DeltaArtifact, PATCH_FORMAT_BSDIFF4, PATCH_FORMAT_CHUNKED_BSDIFF_V1, ReleaseEntry, ReleaseIndex,
+    DeltaArtifact, PATCH_FORMAT_BSDIFF4_ARCHIVE_V2, PATCH_FORMAT_CHUNKED_BSDIFF_ARCHIVE_V2, ReleaseEntry, ReleaseIndex,
     compress_release_index, decompress_release_index,
 };
 use crate::releases::restore::{find_previous_release_for_rid, restore_full_archive_for_version};
@@ -330,13 +330,14 @@ impl PackBuilder {
             PackDeltaStrategy::ArchiveChunkedBsdiff => {
                 let diff_options = chunked_diff_options(&budget, prev_data.len(), new_data.len());
                 (
-                    chunked_bsdiff(&prev_data, new_data, &diff_options)?,
-                    PATCH_FORMAT_CHUNKED_BSDIFF_V1.to_string(),
+                    build_archive_chunked_patch(&prev_data, new_data, budget.zstd_compression_level, &diff_options)?,
+                    PATCH_FORMAT_CHUNKED_BSDIFF_ARCHIVE_V2.to_string(),
                 )
             }
-            PackDeltaStrategy::ArchiveBsdiff => {
-                (bsdiff_buffers(&prev_data, new_data)?, PATCH_FORMAT_BSDIFF4.to_string())
-            }
+            PackDeltaStrategy::ArchiveBsdiff => (
+                build_archive_bsdiff_patch(&prev_data, new_data, budget.zstd_compression_level)?,
+                PATCH_FORMAT_BSDIFF4_ARCHIVE_V2.to_string(),
+            ),
         };
 
         let delta_filename = format!("{}-{}-{}-delta.tar.zst", self.app_id, self.version, self.rid);
@@ -404,7 +405,29 @@ impl PackBuilder {
         let primary_delta = delta.map(|artifact| {
             if artifact
                 .patch_format
-                .eq_ignore_ascii_case(PATCH_FORMAT_CHUNKED_BSDIFF_V1)
+                .eq_ignore_ascii_case(PATCH_FORMAT_CHUNKED_BSDIFF_ARCHIVE_V2)
+            {
+                DeltaArtifact::chunked_bsdiff_archive_zstd(
+                    "primary",
+                    &artifact.from_version,
+                    &artifact.filename,
+                    artifact.size,
+                    &artifact.sha256,
+                )
+            } else if artifact
+                .patch_format
+                .eq_ignore_ascii_case(PATCH_FORMAT_BSDIFF4_ARCHIVE_V2)
+            {
+                DeltaArtifact::bsdiff_archive_zstd(
+                    "primary",
+                    &artifact.from_version,
+                    &artifact.filename,
+                    artifact.size,
+                    &artifact.sha256,
+                )
+            } else if artifact
+                .patch_format
+                .eq_ignore_ascii_case(crate::releases::manifest::PATCH_FORMAT_CHUNKED_BSDIFF_V1)
             {
                 DeltaArtifact::chunked_bsdiff_zstd(
                     "primary",
@@ -662,6 +685,7 @@ mod tests {
     use crate::diff::wrapper::bsdiff_buffers;
     use crate::platform::detect::current_rid;
     use crate::releases::manifest::{ReleaseEntry, ReleaseIndex, compress_release_index};
+    use crate::releases::restore::restore_full_archive_for_version;
 
     #[test]
     fn test_detect_os_from_rid() {
@@ -765,6 +789,39 @@ mod tests {
         let err = resolve_surge_dotnet_native_runtime_bundle_with_host(&artifacts, "win-x64", "linux-x64", &[])
             .expect_err("cross-host runtime fallback should fail");
         assert!(err.to_string().contains("host-only"));
+    }
+
+    fn deterministic_payload(size: usize, version_marker: u8) -> Vec<u8> {
+        let mut state = 0x1234_5678_9abc_def0u64;
+        let mut payload = Vec::with_capacity(size);
+        for _ in 0..size {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            payload.push((state & 0xff) as u8);
+        }
+        if let Some(first) = payload.first_mut() {
+            *first = version_marker;
+        }
+        if payload.len() > 1 {
+            payload[1] = version_marker.wrapping_mul(3);
+        }
+        payload
+    }
+
+    fn write_demoapp_fixture_artifacts(source_root: &Path, dest: &Path, version_label: &str, marker: u8) {
+        std::fs::create_dir_all(dest).unwrap();
+        let mut program = std::fs::read_to_string(source_root.join("Program.cs")).unwrap();
+        program.push_str("\n// delta-version: ");
+        program.push_str(version_label);
+        program.push('\n');
+        std::fs::write(dest.join("Program.cs"), program).unwrap();
+        std::fs::copy(source_root.join("demoapp.csproj"), dest.join("demoapp.csproj")).unwrap();
+        std::fs::write(
+            dest.join("payload.bin"),
+            deterministic_payload(16 * 1024 * 1024, marker),
+        )
+        .unwrap();
     }
 
     #[tokio::test]
@@ -900,5 +957,142 @@ apps:
             .find(|artifact| artifact.is_delta)
             .expect("delta artifact should be produced");
         assert_eq!(delta.from_version, "1.1.0");
+    }
+
+    #[tokio::test]
+    async fn test_demoapp_fixture_multi_release_delta_is_smaller_than_legacy_compressed_archive_delta() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("store");
+        std::fs::create_dir_all(&store_root).unwrap();
+
+        let demoapp_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .unwrap()
+            .join("demoapp");
+        let artifacts_v1 = tmp.path().join("demoapp-v1");
+        let artifacts_v2 = tmp.path().join("demoapp-v2");
+        let artifacts_v3 = tmp.path().join("demoapp-v3");
+        write_demoapp_fixture_artifacts(&demoapp_root, &artifacts_v1, "1.0.0", 1);
+        write_demoapp_fixture_artifacts(&demoapp_root, &artifacts_v2, "1.1.0", 2);
+        write_demoapp_fixture_artifacts(&demoapp_root, &artifacts_v3, "1.2.0", 3);
+
+        let app_id = "demo";
+        let rid = current_rid();
+        let manifest_path = tmp.path().join("surge.yml");
+        let manifest_yaml = format!(
+            r"schema: 1
+storage:
+  provider: filesystem
+  bucket: {bucket}
+apps:
+  - id: {app_id}
+    name: Demo App
+    main_exe: demoapp
+    targets:
+      - rid: {rid}
+",
+            bucket = store_root.display()
+        );
+        std::fs::write(&manifest_path, manifest_yaml).unwrap();
+
+        let ctx = Arc::new(Context::new());
+        ctx.set_storage(
+            StorageProvider::Filesystem,
+            store_root.to_str().unwrap(),
+            "",
+            "",
+            "",
+            "",
+        );
+        let mut budget = ctx.resource_budget();
+        budget.zstd_compression_level = 7;
+        ctx.set_resource_budget(budget.clone());
+
+        let mut builder_v1 = PackBuilder::new(
+            Arc::clone(&ctx),
+            manifest_path.to_str().unwrap(),
+            app_id,
+            &rid,
+            "1.0.0",
+            artifacts_v1.to_str().unwrap(),
+        )
+        .unwrap();
+        builder_v1.build(None).await.unwrap();
+        let full_v1 = builder_v1
+            .artifacts()
+            .iter()
+            .find(|artifact| !artifact.is_delta)
+            .unwrap()
+            .clone();
+        builder_v1.push("stable", None).await.unwrap();
+
+        let mut builder_v2 = PackBuilder::new(
+            Arc::clone(&ctx),
+            manifest_path.to_str().unwrap(),
+            app_id,
+            &rid,
+            "1.1.0",
+            artifacts_v2.to_str().unwrap(),
+        )
+        .unwrap();
+        builder_v2.build(None).await.unwrap();
+        let full_v2 = builder_v2
+            .artifacts()
+            .iter()
+            .find(|artifact| !artifact.is_delta)
+            .unwrap()
+            .clone();
+        let delta_v2 = builder_v2
+            .artifacts()
+            .iter()
+            .find(|artifact| artifact.is_delta)
+            .unwrap()
+            .clone();
+        let legacy_patch_v2 =
+            crate::diff::chunked::chunked_bsdiff(full_v1.bytes(), full_v2.bytes(), &ChunkedDiffOptions::default())
+                .unwrap();
+        let legacy_delta_v2 = zstd::encode_all(legacy_patch_v2.as_slice(), budget.zstd_compression_level).unwrap();
+        assert_eq!(delta_v2.patch_format, PATCH_FORMAT_CHUNKED_BSDIFF_ARCHIVE_V2);
+        assert!(delta_v2.bytes().len() < legacy_delta_v2.len());
+        builder_v2.push("stable", None).await.unwrap();
+
+        let mut builder_v3 = PackBuilder::new(
+            Arc::clone(&ctx),
+            manifest_path.to_str().unwrap(),
+            app_id,
+            &rid,
+            "1.2.0",
+            artifacts_v3.to_str().unwrap(),
+        )
+        .unwrap();
+        builder_v3.build(None).await.unwrap();
+        let full_v3 = builder_v3
+            .artifacts()
+            .iter()
+            .find(|artifact| !artifact.is_delta)
+            .unwrap()
+            .clone();
+        let delta_v3 = builder_v3
+            .artifacts()
+            .iter()
+            .find(|artifact| artifact.is_delta)
+            .unwrap()
+            .clone();
+        let legacy_patch_v3 =
+            crate::diff::chunked::chunked_bsdiff(full_v2.bytes(), full_v3.bytes(), &ChunkedDiffOptions::default())
+                .unwrap();
+        let legacy_delta_v3 = zstd::encode_all(legacy_patch_v3.as_slice(), budget.zstd_compression_level).unwrap();
+        assert_eq!(delta_v3.patch_format, PATCH_FORMAT_CHUNKED_BSDIFF_ARCHIVE_V2);
+        assert!(delta_v3.bytes().len() < legacy_delta_v3.len());
+        builder_v3.push("stable", None).await.unwrap();
+
+        let index_bytes = std::fs::read(store_root.join(RELEASES_FILE_COMPRESSED)).unwrap();
+        let index = decompress_release_index(&index_bytes).unwrap();
+        let backend = crate::storage::filesystem::FilesystemBackend::new(store_root.to_str().unwrap(), "");
+        let restored = restore_full_archive_for_version(&backend, &index, &rid, "1.2.0")
+            .await
+            .unwrap();
+        assert_eq!(restored, full_v3.bytes());
     }
 }

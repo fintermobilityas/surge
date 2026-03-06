@@ -10,6 +10,8 @@ use crate::releases::version::compare_versions;
 pub const DIFF_ALGORITHM_BSDIFF: &str = "bsdiff";
 pub const PATCH_FORMAT_BSDIFF4: &str = "bsdiff4";
 pub const PATCH_FORMAT_CHUNKED_BSDIFF_V1: &str = "chunked-bsdiff-v1";
+pub const PATCH_FORMAT_BSDIFF4_ARCHIVE_V2: &str = "bsdiff4-archive-v2";
+pub const PATCH_FORMAT_CHUNKED_BSDIFF_ARCHIVE_V2: &str = "chunked-bsdiff-archive-v2";
 pub const COMPRESSION_ZSTD: &str = "zstd";
 
 /// A single delta artifact descriptor.
@@ -57,6 +59,32 @@ impl DeltaArtifact {
     #[must_use]
     pub fn chunked_bsdiff_zstd(id: &str, from_version: &str, filename: &str, size: i64, sha256: &str) -> Self {
         Self::with_format(id, from_version, PATCH_FORMAT_CHUNKED_BSDIFF_V1, filename, size, sha256)
+    }
+
+    /// Build a descriptor for the archive-aware bsdiff + zstd delta format.
+    #[must_use]
+    pub fn bsdiff_archive_zstd(id: &str, from_version: &str, filename: &str, size: i64, sha256: &str) -> Self {
+        Self::with_format(
+            id,
+            from_version,
+            PATCH_FORMAT_BSDIFF4_ARCHIVE_V2,
+            filename,
+            size,
+            sha256,
+        )
+    }
+
+    /// Build a descriptor for the archive-aware chunked bsdiff + zstd delta format.
+    #[must_use]
+    pub fn chunked_bsdiff_archive_zstd(id: &str, from_version: &str, filename: &str, size: i64, sha256: &str) -> Self {
+        Self::with_format(
+            id,
+            from_version,
+            PATCH_FORMAT_CHUNKED_BSDIFF_ARCHIVE_V2,
+            filename,
+            size,
+            sha256,
+        )
     }
 }
 

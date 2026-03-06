@@ -21,11 +21,11 @@ use crate::ui::UiTheme;
 use surge_core::config::constants::{DEFAULT_ZSTD_LEVEL, RELEASES_FILE_COMPRESSED, SCHEMA_VERSION};
 use surge_core::config::manifest::{ShortcutLocation, SurgeManifest};
 use surge_core::crypto::sha256::sha256_hex_file;
-use surge_core::diff::chunked::has_magic_prefix;
 use surge_core::error::{Result, SurgeError};
+use surge_core::releases::delta::patch_format_from_magic_prefix;
 use surge_core::releases::manifest::{
-    DeltaArtifact, PATCH_FORMAT_BSDIFF4, PATCH_FORMAT_CHUNKED_BSDIFF_V1, ReleaseEntry, ReleaseIndex,
-    compress_release_index, decompress_release_index,
+    DeltaArtifact, PATCH_FORMAT_BSDIFF4, PATCH_FORMAT_BSDIFF4_ARCHIVE_V2, PATCH_FORMAT_CHUNKED_BSDIFF_ARCHIVE_V2,
+    PATCH_FORMAT_CHUNKED_BSDIFF_V1, ReleaseEntry, ReleaseIndex, compress_release_index, decompress_release_index,
 };
 use surge_core::releases::restore::required_artifacts_for_index;
 use surge_core::releases::version::compare_versions;
@@ -320,6 +320,22 @@ async fn update_release_index(
     };
     let primary_delta = if delta_filename.trim().is_empty() {
         None
+    } else if delta_patch_format.eq_ignore_ascii_case(PATCH_FORMAT_CHUNKED_BSDIFF_ARCHIVE_V2) {
+        Some(DeltaArtifact::chunked_bsdiff_archive_zstd(
+            "primary",
+            "",
+            &delta_filename,
+            delta_size,
+            &delta_sha256,
+        ))
+    } else if delta_patch_format.eq_ignore_ascii_case(PATCH_FORMAT_BSDIFF4_ARCHIVE_V2) {
+        Some(DeltaArtifact::bsdiff_archive_zstd(
+            "primary",
+            "",
+            &delta_filename,
+            delta_size,
+            &delta_sha256,
+        ))
     } else if delta_patch_format.eq_ignore_ascii_case(PATCH_FORMAT_CHUNKED_BSDIFF_V1) {
         Some(DeltaArtifact::chunked_bsdiff_zstd(
             "primary",
@@ -403,8 +419,10 @@ fn infer_delta_patch_format(delta_archive: &Path) -> Result<String> {
         Ok(bytes_read) => bytes_read,
         Err(_) => return Ok(PATCH_FORMAT_BSDIFF4.to_string()),
     };
-    if bytes_read == prefix.len() && has_magic_prefix(&prefix) {
-        return Ok(PATCH_FORMAT_CHUNKED_BSDIFF_V1.to_string());
+    if bytes_read == prefix.len()
+        && let Some(patch_format) = patch_format_from_magic_prefix(&prefix)
+    {
+        return Ok(patch_format.to_string());
     }
     Ok(PATCH_FORMAT_BSDIFF4.to_string())
 }

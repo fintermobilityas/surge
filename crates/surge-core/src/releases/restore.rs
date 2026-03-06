@@ -476,6 +476,7 @@ mod tests {
     #![allow(clippy::cast_possible_wrap)]
 
     use super::*;
+    use crate::archive::packer::ArchivePacker;
     use crate::diff::chunked::{ChunkedDiffOptions, chunked_bsdiff};
     use crate::diff::wrapper::bsdiff_buffers;
     use crate::releases::manifest::{DeltaArtifact, ReleaseEntry};
@@ -653,6 +654,98 @@ mod tests {
             "demo-1.2.0-linux-x64-delta.tar.zst",
             delta_v3.len() as i64,
             &sha256_hex(&delta_v3),
+        )));
+
+        backend
+            .put_object(&v1.full_filename, &full_v1, "application/octet-stream")
+            .await
+            .unwrap();
+        let v2_delta_key = v2.selected_delta().expect("v2 should have delta descriptor").filename;
+        let v3_delta_key = v3.selected_delta().expect("v3 should have delta descriptor").filename;
+        backend
+            .put_object(&v2_delta_key, &delta_v2, "application/octet-stream")
+            .await
+            .unwrap();
+        backend
+            .put_object(&v3_delta_key, &delta_v3, "application/octet-stream")
+            .await
+            .unwrap();
+
+        let index = ReleaseIndex {
+            app_id: "demo".to_string(),
+            releases: vec![v1, v2, v3],
+            ..ReleaseIndex::default()
+        };
+
+        let restored = restore_full_archive_for_version(&backend, &index, "linux-x64", "1.2.0")
+            .await
+            .unwrap();
+        assert_eq!(restored, full_v3);
+    }
+
+    #[tokio::test]
+    async fn test_restore_full_archive_rebuilds_from_archive_chunked_deltas_when_direct_full_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = FilesystemBackend::new(tmp.path().to_str().unwrap(), "");
+
+        let mut packer_v1 = ArchivePacker::new(7).unwrap();
+        packer_v1
+            .add_buffer("Program.cs", b"Console.WriteLine(\"v1\");\n", 0o644)
+            .unwrap();
+        packer_v1
+            .add_buffer("payload.bin", &vec![b'A'; 1024 * 1024], 0o644)
+            .unwrap();
+        let full_v1 = packer_v1.finalize().unwrap();
+
+        let mut packer_v2 = ArchivePacker::new(7).unwrap();
+        packer_v2
+            .add_buffer("Program.cs", b"Console.WriteLine(\"v2\");\n", 0o644)
+            .unwrap();
+        packer_v2
+            .add_buffer("payload.bin", &vec![b'A'; 1024 * 1024], 0o644)
+            .unwrap();
+        let full_v2 = packer_v2.finalize().unwrap();
+
+        let mut packer_v3 = ArchivePacker::new(7).unwrap();
+        packer_v3
+            .add_buffer("Program.cs", b"Console.WriteLine(\"v3\");\n", 0o644)
+            .unwrap();
+        packer_v3
+            .add_buffer("payload.bin", &vec![b'A'; 1024 * 1024], 0o644)
+            .unwrap();
+        let full_v3 = packer_v3.finalize().unwrap();
+
+        let patch_v2 =
+            crate::releases::delta::build_archive_chunked_patch(&full_v1, &full_v2, 7, &ChunkedDiffOptions::default())
+                .unwrap();
+        let patch_v3 =
+            crate::releases::delta::build_archive_chunked_patch(&full_v2, &full_v3, 7, &ChunkedDiffOptions::default())
+                .unwrap();
+        let delta_v2 = zstd::encode_all(patch_v2.as_slice(), 3).unwrap();
+        let delta_v3 = zstd::encode_all(patch_v3.as_slice(), 3).unwrap();
+
+        let mut v1 = make_entry("1.0.0");
+        v1.set_primary_delta(None);
+        v1.full_sha256 = crate::crypto::sha256::sha256_hex(&full_v1);
+
+        let mut v2 = make_entry("1.1.0");
+        v2.full_sha256 = crate::crypto::sha256::sha256_hex(&full_v2);
+        v2.set_primary_delta(Some(DeltaArtifact::chunked_bsdiff_archive_zstd(
+            "primary",
+            "1.0.0",
+            "demo-1.1.0-linux-x64-delta.tar.zst",
+            delta_v2.len() as i64,
+            &crate::crypto::sha256::sha256_hex(&delta_v2),
+        )));
+
+        let mut v3 = make_entry("1.2.0");
+        v3.full_sha256 = crate::crypto::sha256::sha256_hex(&full_v3);
+        v3.set_primary_delta(Some(DeltaArtifact::chunked_bsdiff_archive_zstd(
+            "primary",
+            "1.1.0",
+            "demo-1.2.0-linux-x64-delta.tar.zst",
+            delta_v3.len() as i64,
+            &crate::crypto::sha256::sha256_hex(&delta_v3),
         )));
 
         backend

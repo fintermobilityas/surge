@@ -413,6 +413,18 @@ mod tests {
     }
 
     #[test]
+    fn test_get_releases_newer_than_treats_stable_as_newer_than_matching_prerelease() {
+        let index = make_index(vec![
+            make_entry("2859.0.0-prerelease.56", &["test"], true),
+            make_entry("2859.0.0", &["test"], false),
+        ]);
+
+        let newer = get_releases_newer_than(&index, "2859.0.0-prerelease.56", "test");
+        assert_eq!(newer.len(), 1);
+        assert_eq!(newer[0].version, "2859.0.0");
+    }
+
+    #[test]
     fn test_get_delta_chain_success() {
         let index = make_index(vec![
             make_entry("1.0.0", &["stable"], false),

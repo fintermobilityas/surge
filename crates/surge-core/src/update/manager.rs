@@ -1651,6 +1651,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_check_for_updates_treats_stable_as_newer_than_matching_prerelease() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("store");
+        std::fs::create_dir_all(&store_root).unwrap();
+
+        let rid = current_rid();
+        let os = current_os_label_for_tests();
+
+        let mut prerelease = make_entry("2859.0.0-prerelease.56", "test", &os, &rid);
+        prerelease.full_filename = format!("test-app-2859.0.0-prerelease.56-{rid}-full.tar.zst");
+        prerelease.set_primary_delta(None);
+        prerelease.is_genesis = true;
+
+        let mut stable = make_entry("2859.0.0", "test", &os, &rid);
+        stable.full_filename = format!("test-app-2859.0.0-{rid}-full.tar.zst");
+        stable.set_primary_delta(None);
+
+        let index = ReleaseIndex {
+            app_id: "test-app".to_string(),
+            releases: vec![prerelease, stable],
+            ..ReleaseIndex::default()
+        };
+
+        let compressed = compress_release_index(&index, DEFAULT_ZSTD_LEVEL).unwrap();
+        std::fs::write(store_root.join(RELEASES_FILE_COMPRESSED), compressed).unwrap();
+
+        let ctx = Arc::new(Context::new());
+        ctx.set_storage(
+            StorageProvider::Filesystem,
+            store_root.to_str().unwrap(),
+            "",
+            "",
+            "",
+            "",
+        );
+
+        let mut manager = UpdateManager::new(
+            ctx,
+            "test-app",
+            "2859.0.0-prerelease.56",
+            "test",
+            tmp.path().to_str().unwrap(),
+        )
+        .unwrap();
+
+        let info = manager.check_for_updates().await.unwrap().unwrap();
+        assert_eq!(info.latest_version, "2859.0.0");
+        assert_eq!(info.apply_strategy, ApplyStrategy::Full);
+        assert_eq!(info.apply_releases.len(), 1);
+        assert_eq!(info.apply_releases[0].version, "2859.0.0");
+    }
+
+    #[tokio::test]
     async fn test_check_for_updates_uses_descriptor_delta_chain() {
         let tmp = tempfile::tempdir().unwrap();
         let store_root = tmp.path().join("store");

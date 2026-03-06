@@ -93,7 +93,7 @@ mod tests {
     use surge_core::archive::extractor::{list_entries_from_bytes, read_entry};
     use surge_core::config::constants::{DEFAULT_ZSTD_LEVEL, RELEASES_FILE_COMPRESSED};
     use surge_core::config::manifest::{ShortcutLocation, SurgeManifest};
-    use surge_core::diff::chunked::chunked_bsdiff;
+    use surge_core::diff::chunked::{ChunkedDiffOptions, chunked_bsdiff};
     use surge_core::diff::wrapper::bsdiff_buffers;
     use surge_core::installer_bundle::read_embedded_payload;
     use surge_core::platform::detect::current_rid;
@@ -605,7 +605,7 @@ apps:
 
         let v1_full = b"full-v1".to_vec();
         let v2_full = b"full-v2-but-different".to_vec();
-        let v2_patch = chunked_bsdiff(&v1_full, &v2_full, &Default::default()).unwrap();
+        let v2_patch = chunked_bsdiff(&v1_full, &v2_full, &ChunkedDiffOptions::default()).unwrap();
         let v2_delta = zstd::encode_all(v2_patch.as_slice(), 3).unwrap();
 
         std::fs::write(packages_dir.join(&v1_full_key), &v1_full).unwrap();

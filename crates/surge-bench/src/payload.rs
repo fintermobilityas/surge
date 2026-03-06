@@ -285,9 +285,9 @@ fn append_filler_specs(rng: &mut Xorshift64, specs: &mut Vec<FileSpec>, scale: f
         let min_tail_bytes = files_left_after_this as u64;
         let max_for_this = remaining_bytes.saturating_sub(min_tail_bytes).max(1);
 
-        let preferred = if remaining_files % 29 == 0 {
+        let preferred = if remaining_files.is_multiple_of(29) {
             scale_size(320_000, scale)
-        } else if remaining_files % 11 == 0 {
+        } else if remaining_files.is_multiple_of(11) {
             scale_size(96_000, scale)
         } else {
             scale_size(48_000, scale)
@@ -301,11 +301,11 @@ fn append_filler_specs(rng: &mut Xorshift64, specs: &mut Vec<FileSpec>, scale: f
             size = remaining_bytes;
         }
 
-        let (name, pattern) = if remaining_files % 29 == 0 {
+        let (name, pattern) = if remaining_files.is_multiple_of(29) {
             (format!("generated-data-{remaining_files:03}.bin"), FilePattern::Binary)
-        } else if remaining_files % 11 == 0 {
+        } else if remaining_files.is_multiple_of(11) {
             (next_native_name(&mut native_idx), FilePattern::Binary)
-        } else if remaining_files % 7 == 0 {
+        } else if remaining_files.is_multiple_of(7) {
             (format!("generated-config-{remaining_files:03}.json"), FilePattern::Text)
         } else {
             (next_dll_name(&mut dll_idx), FilePattern::Binary)

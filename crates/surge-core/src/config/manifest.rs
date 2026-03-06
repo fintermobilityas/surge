@@ -459,8 +459,8 @@ impl SurgeManifest {
             }
             if !global_channels.insert(name.to_string()) {
                 return Err(SurgeError::Config(format!(
-                    "Duplicate top-level channel '{}'",
-                    channel.name
+                    "Duplicate top-level channel '{name}'",
+                    name = channel.name
                 )));
             }
         }
@@ -471,8 +471,7 @@ impl SurgeManifest {
                     && PackDeltaStrategy::parse(strategy).is_none()
                 {
                     return Err(SurgeError::Config(format!(
-                        "Unsupported pack delta strategy '{}'. Supported values: archive-chunked-bsdiff, archive-bsdiff",
-                        strategy
+                        "Unsupported pack delta strategy '{strategy}'. Supported values: archive-chunked-bsdiff, archive-bsdiff"
                     )));
                 }
                 if delta.max_chain_length == Some(0) {
@@ -487,8 +486,7 @@ impl SurgeManifest {
                     && PackCompressionFormat::parse(format).is_none()
                 {
                     return Err(SurgeError::Config(format!(
-                        "Unsupported pack compression format '{}'. Supported values: {}",
-                        format, COMPRESSION_ZSTD
+                        "Unsupported pack compression format '{format}'. Supported values: {COMPRESSION_ZSTD}"
                     )));
                 }
                 if let Some(level) = compression.level

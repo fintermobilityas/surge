@@ -144,7 +144,7 @@ pub async fn execute(
     let mut artifact_count = 0usize;
     for dest in &artifact_paths {
         artifact_count += 1;
-        logline::subtle(&format!("  Created {} ({})", dest.display(), file_size_label(&dest)));
+        logline::subtle(&format!("  Created {} ({})", dest.display(), file_size_label(dest)));
     }
     print_stage_done(
         theme,

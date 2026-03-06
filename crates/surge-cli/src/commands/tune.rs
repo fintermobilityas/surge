@@ -45,9 +45,10 @@ pub async fn execute_pack(
     let manifest = SurgeManifest::parse(&raw_manifest)?;
     let app_id = super::resolve_app_id_with_rid_hint(&manifest, app_id, rid)?;
     let rid = super::resolve_rid(&manifest, &app_id, rid)?;
-    let artifacts_dir = artifacts_dir
-        .map(PathBuf::from)
-        .unwrap_or_else(|| super::pack::default_artifacts_dir(manifest_path, &app_id, &rid, version));
+    let artifacts_dir = artifacts_dir.map_or_else(
+        || super::pack::default_artifacts_dir(manifest_path, &app_id, &rid, version),
+        PathBuf::from,
+    );
 
     if !artifacts_dir.is_dir() {
         return Err(SurgeError::Pack(format!(
@@ -131,8 +132,7 @@ fn build_candidates(zstd_levels: &[i32], delta_strategies: &[String]) -> Result<
     for raw in delta_strategies {
         let strategy = PackDeltaStrategy::parse(raw).ok_or_else(|| {
             SurgeError::Config(format!(
-                "Unsupported delta strategy '{}'. Supported values: archive-chunked-bsdiff, archive-bsdiff",
-                raw
+                "Unsupported delta strategy '{raw}'. Supported values: archive-chunked-bsdiff, archive-bsdiff"
             ))
         })?;
         if !strategies.contains(&strategy) {
@@ -191,8 +191,7 @@ async fn benchmark_candidate(
         .artifacts()
         .iter()
         .find(|artifact| !artifact.is_delta)
-        .map(|artifact| u64::try_from(artifact.size).ok().unwrap_or(0))
-        .unwrap_or(0);
+        .map_or(0, |artifact| u64::try_from(artifact.size).ok().unwrap_or(0));
     let delta_size = builder
         .artifacts()
         .iter()

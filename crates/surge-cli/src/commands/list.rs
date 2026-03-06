@@ -407,7 +407,7 @@ async fn fetch_release_index_for_app(manifest: &SurgeManifest, app_id: &str) -> 
                     return Ok(Some(index));
                 }
             }
-            Err(SurgeError::NotFound(_)) => continue,
+            Err(SurgeError::NotFound(_)) => {}
             Err(e) => return Err(e),
         }
     }

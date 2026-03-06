@@ -90,12 +90,9 @@ async fn compact_single(manifest: &SurgeManifest, app_id: &str, rid: &str, chann
         .max_by(|a, b| compare_versions(&a.version, &b.version))
         .map(|r| r.version.clone());
 
-    let latest_version = match latest_version {
-        Some(v) => v,
-        None => {
-            print_stage_done(theme, 2, TOTAL_STAGES, &format!("No releases on '{channel}', skipped"));
-            return Ok(());
-        }
+    let Some(latest_version) = latest_version else {
+        print_stage_done(theme, 2, TOTAL_STAGES, &format!("No releases on '{channel}', skipped"));
+        return Ok(());
     };
     print_stage_done(theme, 2, TOTAL_STAGES, &format!("v{latest_version}"));
 

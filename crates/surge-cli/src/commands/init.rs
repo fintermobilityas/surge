@@ -1,3 +1,5 @@
+#![allow(clippy::unused_async)]
+
 use crate::logline;
 use crate::ui::UiTheme;
 use std::collections::BTreeMap;

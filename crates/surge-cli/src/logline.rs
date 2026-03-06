@@ -88,26 +88,23 @@ fn emit_inner(level: Level, message: &str, stderr: bool) {
     let theme = UiTheme::global();
     let started_at = command_start();
 
-    match format_prefix(level, started_at) {
-        Some(prefix) => {
-            if message.is_empty() {
-                write_line(stderr, &prefix);
-                return;
-            }
-            for line in message.lines() {
-                let rendered = format!("{prefix} {line}");
-                write_line(stderr, &style_message(theme, level, &rendered));
-            }
+    if let Some(prefix) = format_prefix(level, started_at) {
+        if message.is_empty() {
+            write_line(stderr, &prefix);
+            return;
         }
-        None => {
-            // No prefix — emit lines as-is with styling only
-            if message.is_empty() {
-                write_line(stderr, "");
-                return;
-            }
-            for line in message.lines() {
-                write_line(stderr, &style_message(theme, level, line));
-            }
+        for line in message.lines() {
+            let rendered = format!("{prefix} {line}");
+            write_line(stderr, &style_message(theme, level, &rendered));
+        }
+    } else {
+        // No prefix — emit lines as-is with styling only
+        if message.is_empty() {
+            write_line(stderr, "");
+            return;
+        }
+        for line in message.lines() {
+            write_line(stderr, &style_message(theme, level, line));
         }
     }
 }

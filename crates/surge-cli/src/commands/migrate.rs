@@ -1,3 +1,5 @@
+#![allow(clippy::cast_sign_loss, clippy::too_many_lines)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Instant;

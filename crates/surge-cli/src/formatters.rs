@@ -1,3 +1,5 @@
+#![allow(clippy::cast_precision_loss, clippy::cast_sign_loss)]
+
 use std::time::Duration;
 
 pub(crate) fn format_duration(duration: Duration) -> String {

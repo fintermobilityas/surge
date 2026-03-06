@@ -178,10 +178,12 @@ pub(crate) fn format_app_label(manifest: &SurgeManifest, app_id: &str) -> String
 
     let mut label = format!("{display_name} · {os_arch}");
     if !distro.is_empty() {
-        label.push_str(&format!(" · {distro}"));
+        label.push_str(" · ");
+        label.push_str(distro);
     }
     if !variant.is_empty() {
-        label.push_str(&format!(" · {variant}"));
+        label.push_str(" · ");
+        label.push_str(variant);
     }
     label
 }
@@ -216,10 +218,12 @@ fn format_rid_label(manifest: &SurgeManifest, app_id: &str, rid: &str) -> String
 
     let mut label = os_arch;
     if !distro.is_empty() {
-        label.push_str(&format!(" · {distro}"));
+        label.push_str(" · ");
+        label.push_str(distro);
     }
     if !variant.is_empty() {
-        label.push_str(&format!(" · {variant}"));
+        label.push_str(" · ");
+        label.push_str(variant);
     }
     label
 }

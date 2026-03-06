@@ -1,3 +1,5 @@
+#![allow(clippy::cast_precision_loss, clippy::too_many_lines)]
+
 use std::collections::BTreeSet;
 use std::io::IsTerminal;
 use std::path::Path;
@@ -1408,6 +1410,8 @@ async fn run_tailscale_capture(args: &[&str]) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::cast_possible_wrap, clippy::similar_names)]
+
     use std::collections::BTreeMap;
 
     use super::*;

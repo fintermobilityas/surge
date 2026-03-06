@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_lines)]
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
@@ -1059,6 +1061,8 @@ pub(crate) fn configure_context(manifest: &SurgeManifest, app_id: &str) -> Resul
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::cast_possible_wrap)]
+
     use std::collections::BTreeMap;
 
     use super::*;

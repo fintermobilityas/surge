@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![allow(clippy::too_many_lines)]
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
@@ -40,7 +41,7 @@ enum Commands {
         #[arg(long)]
         name: Option<String>,
 
-        /// Storage provider (s3, azure, gcs, filesystem, github_releases)
+        /// Storage provider (s3, azure, gcs, filesystem, `github_releases`)
         #[arg(long)]
         provider: Option<String>,
 
@@ -388,7 +389,7 @@ struct InstallOptions {
     #[arg(long, default_value = ".surge/install-cache")]
     download_dir: PathBuf,
 
-    /// Override storage provider from application manifest (s3, azure, gcs, filesystem, github_releases)
+    /// Override storage provider from application manifest (s3, azure, gcs, filesystem, `github_releases`)
     #[arg(long)]
     provider: Option<String>,
 
@@ -450,7 +451,7 @@ fn main() -> ExitCode {
                     }
                 };
             }
-            return handle_parse_error(err);
+            return handle_parse_error(&err);
         }
     };
     logline::init_verbose(cli.verbose);
@@ -489,7 +490,7 @@ fn detect_installer_context() -> Option<PathBuf> {
     }
 }
 
-fn handle_parse_error(err: clap::Error) -> ExitCode {
+fn handle_parse_error(err: &clap::Error) -> ExitCode {
     let is_success = matches!(
         err.kind(),
         clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
@@ -741,9 +742,8 @@ mod tests {
 
     #[test]
     fn restore_package_file_requires_installers_flag() {
-        let err = match Cli::try_parse_from(["surge", "restore", "--package-file", "packages.txt"]) {
-            Ok(_) => panic!("package-file should require installers mode"),
-            Err(err) => err,
+        let Err(err) = Cli::try_parse_from(["surge", "restore", "--package-file", "packages.txt"]) else {
+            panic!("package-file should require installers mode");
         };
 
         assert!(err.to_string().contains("--installers"));

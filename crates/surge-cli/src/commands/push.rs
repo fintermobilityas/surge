@@ -1,3 +1,11 @@
+#![allow(
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::manual_let_else,
+    clippy::needless_continue,
+    clippy::too_many_lines
+)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::Read;

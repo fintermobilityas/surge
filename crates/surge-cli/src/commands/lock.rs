@@ -24,7 +24,7 @@ pub async fn acquire(manifest_path: &Path, name: &str, timeout: u32) -> Result<(
     ctx.set_lock_server(&lock_config.url);
 
     let mut mutex = DistributedMutex::new(ctx, name);
-    let acquired = mutex.try_acquire(timeout as i32).await?;
+    let acquired = mutex.try_acquire(i32::try_from(timeout).unwrap_or(i32::MAX)).await?;
     if !acquired {
         return Err(SurgeError::Lock(format!("Lock '{name}' is held by another process")));
     }

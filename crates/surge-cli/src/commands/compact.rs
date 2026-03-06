@@ -35,14 +35,36 @@ pub async fn execute(manifest_path: &Path, app_id: Option<&str>, rid: Option<&st
             })
             .collect()
     };
+    let mut prepared_targets = Vec::with_capacity(targets.len());
+    let mut preflight_errors = Vec::new();
+    for (app_id, rid) in &targets {
+        match super::build_app_scoped_storage_config(&manifest, app_id) {
+            Ok(storage_config) => {
+                if let Err(err) = super::ensure_mutating_storage_access(&storage_config, "compact releases") {
+                    preflight_errors.push(format!("{app_id}/{rid}: {err}"));
+                } else {
+                    prepared_targets.push((app_id.clone(), rid.clone(), storage_config));
+                }
+            }
+            Err(err) => preflight_errors.push(format!("{app_id}/{rid}: {err}")),
+        }
+    }
 
-    let total_targets = targets.len();
+    if !preflight_errors.is_empty() {
+        return Err(SurgeError::Storage(format!(
+            "{} target(s) cannot be compacted: {}",
+            preflight_errors.len(),
+            preflight_errors.join("; ")
+        )));
+    }
+
+    let total_targets = prepared_targets.len();
     logline::info(&format!("Compacting {total_targets} target(s) on channel '{channel}'"));
     logline::plain("");
 
     let mut errors = Vec::new();
-    for (app_id, rid) in &targets {
-        if let Err(e) = compact_single(&manifest, app_id, rid, channel).await {
+    for (app_id, rid, storage_config) in &prepared_targets {
+        if let Err(e) = compact_single(app_id, rid, channel, storage_config).await {
             logline::warn(&format!("  Failed {app_id}/{rid}: {e}"));
             errors.push(format!("{app_id}/{rid}: {e}"));
         }
@@ -61,15 +83,19 @@ pub async fn execute(manifest_path: &Path, app_id: Option<&str>, rid: Option<&st
     }
 }
 
-async fn compact_single(manifest: &SurgeManifest, app_id: &str, rid: &str, channel: &str) -> Result<()> {
+async fn compact_single(
+    app_id: &str,
+    rid: &str,
+    channel: &str,
+    storage_config: &surge_core::context::StorageConfig,
+) -> Result<()> {
     const TOTAL_STAGES: usize = 5;
 
     let theme = UiTheme::global();
     let started = Instant::now();
 
     print_stage(theme, 1, TOTAL_STAGES, &format!("{app_id}/{rid}"));
-    let storage_config = super::build_app_scoped_storage_config(manifest, app_id)?;
-    let backend = storage::create_storage_backend(&storage_config)?;
+    let backend = storage::create_storage_backend(storage_config)?;
 
     let mut index = match backend.get_object(RELEASES_FILE_COMPRESSED).await {
         Ok(data) => decompress_release_index(&data)?,

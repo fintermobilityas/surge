@@ -19,7 +19,36 @@ pub(crate) use surge_core::storage_config::{
 #[allow(unused_imports)]
 pub(crate) use crate::prompts::{resolve_app_id, resolve_app_id_with_rid_hint, resolve_rid};
 
+use surge_core::context::{StorageConfig, StorageProvider};
 use surge_core::error::{Result, SurgeError};
+
+pub(crate) fn ensure_mutating_storage_access(config: &StorageConfig, action: &str) -> Result<()> {
+    let provider = config
+        .provider
+        .ok_or_else(|| SurgeError::Config(format!("Cannot {action}: storage provider is not configured")))?;
+    let access_present = !config.access_key.trim().is_empty();
+    let secret_present = !config.secret_key.trim().is_empty();
+
+    match provider {
+        StorageProvider::Filesystem => Ok(()),
+        StorageProvider::S3 if access_present && secret_present => Ok(()),
+        StorageProvider::S3 => Err(SurgeError::Config(format!(
+            "Cannot {action}: S3 write access requires AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY"
+        ))),
+        StorageProvider::AzureBlob if access_present && secret_present => Ok(()),
+        StorageProvider::AzureBlob => Err(SurgeError::Config(format!(
+            "Cannot {action}: Azure Blob write access requires AZURE_STORAGE_ACCOUNT_NAME and AZURE_STORAGE_ACCOUNT_KEY"
+        ))),
+        StorageProvider::Gcs if secret_present => Ok(()),
+        StorageProvider::Gcs => Err(SurgeError::Config(format!(
+            "Cannot {action}: GCS write access requires GOOGLE_ACCESS_TOKEN or HMAC credentials"
+        ))),
+        StorageProvider::GitHubReleases if access_present || secret_present => Ok(()),
+        StorageProvider::GitHubReleases => Err(SurgeError::Config(format!(
+            "Cannot {action}: GitHub Releases write access requires GITHUB_TOKEN or GH_TOKEN"
+        ))),
+    }
+}
 
 /// Stop a running supervisor by sending SIGTERM (or taskkill on Windows) and
 /// waiting for its PID file to disappear. No-op if the supervisor is not running.
@@ -93,6 +122,7 @@ mod tests {
     use surge_core::archive::extractor::{list_entries_from_bytes, read_entry};
     use surge_core::config::constants::{DEFAULT_ZSTD_LEVEL, RELEASES_FILE_COMPRESSED};
     use surge_core::config::manifest::{ShortcutLocation, SurgeManifest};
+    use surge_core::context::{StorageConfig, StorageProvider};
     use surge_core::diff::chunked::{ChunkedDiffOptions, chunked_bsdiff};
     use surge_core::diff::wrapper::bsdiff_buffers;
     use surge_core::installer_bundle::read_embedded_payload;
@@ -307,6 +337,42 @@ apps:
         let creds = storage_credentials_from_lookup(StorageProvider::GitHubReleases, |key| env.get(key).cloned());
         assert!(creds.access_key.is_empty());
         assert_eq!(creds.secret_key, "ghp_test");
+    }
+
+    #[test]
+    fn test_ensure_mutating_storage_access_accepts_azure_account_and_key() {
+        let config = StorageConfig {
+            provider: Some(StorageProvider::AzureBlob),
+            access_key: "account".to_string(),
+            secret_key: "key".to_string(),
+            ..StorageConfig::default()
+        };
+
+        assert!(super::ensure_mutating_storage_access(&config, "compact releases").is_ok());
+    }
+
+    #[test]
+    fn test_ensure_mutating_storage_access_rejects_azure_without_key() {
+        let config = StorageConfig {
+            provider: Some(StorageProvider::AzureBlob),
+            access_key: "account".to_string(),
+            ..StorageConfig::default()
+        };
+
+        let err = super::ensure_mutating_storage_access(&config, "compact releases").unwrap_err();
+        assert!(err.to_string().contains("AZURE_STORAGE_ACCOUNT_NAME"));
+        assert!(err.to_string().contains("AZURE_STORAGE_ACCOUNT_KEY"));
+    }
+
+    #[test]
+    fn test_ensure_mutating_storage_access_accepts_gcs_oauth_token() {
+        let config = StorageConfig {
+            provider: Some(StorageProvider::Gcs),
+            secret_key: "ya29.token".to_string(),
+            ..StorageConfig::default()
+        };
+
+        assert!(super::ensure_mutating_storage_access(&config, "compact releases").is_ok());
     }
 
     #[test]

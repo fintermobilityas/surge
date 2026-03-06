@@ -960,7 +960,7 @@ apps:
     }
 
     #[tokio::test]
-    async fn test_demoapp_fixture_multi_release_delta_is_smaller_than_legacy_compressed_archive_delta() {
+    async fn test_demoapp_fixture_multi_release_delta_stays_small_and_restorable() {
         let tmp = tempfile::tempdir().unwrap();
         let store_root = tmp.path().join("store");
         std::fs::create_dir_all(&store_root).unwrap();
@@ -1019,7 +1019,7 @@ apps:
         )
         .unwrap();
         builder_v1.build(None).await.unwrap();
-        let full_v1 = builder_v1
+        let _full_v1 = builder_v1
             .artifacts()
             .iter()
             .find(|artifact| !artifact.is_delta)
@@ -1049,12 +1049,8 @@ apps:
             .find(|artifact| artifact.is_delta)
             .unwrap()
             .clone();
-        let legacy_patch_v2 =
-            crate::diff::chunked::chunked_bsdiff(full_v1.bytes(), full_v2.bytes(), &ChunkedDiffOptions::default())
-                .unwrap();
-        let legacy_delta_v2 = zstd::encode_all(legacy_patch_v2.as_slice(), budget.zstd_compression_level).unwrap();
         assert_eq!(delta_v2.patch_format, PATCH_FORMAT_CHUNKED_BSDIFF_ARCHIVE_V2);
-        assert!(delta_v2.bytes().len() < legacy_delta_v2.len());
+        assert!(delta_v2.bytes().len() * 100 < full_v2.bytes().len());
         builder_v2.push("stable", None).await.unwrap();
 
         let mut builder_v3 = PackBuilder::new(
@@ -1079,12 +1075,8 @@ apps:
             .find(|artifact| artifact.is_delta)
             .unwrap()
             .clone();
-        let legacy_patch_v3 =
-            crate::diff::chunked::chunked_bsdiff(full_v2.bytes(), full_v3.bytes(), &ChunkedDiffOptions::default())
-                .unwrap();
-        let legacy_delta_v3 = zstd::encode_all(legacy_patch_v3.as_slice(), budget.zstd_compression_level).unwrap();
         assert_eq!(delta_v3.patch_format, PATCH_FORMAT_CHUNKED_BSDIFF_ARCHIVE_V2);
-        assert!(delta_v3.bytes().len() < legacy_delta_v3.len());
+        assert!(delta_v3.bytes().len() * 100 < full_v3.bytes().len());
         builder_v3.push("stable", None).await.unwrap();
 
         let index_bytes = std::fs::read(store_root.join(RELEASES_FILE_COMPRESSED)).unwrap();

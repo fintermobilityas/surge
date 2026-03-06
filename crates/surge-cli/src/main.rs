@@ -232,6 +232,10 @@ enum Commands {
         #[arg(long, short = 'i')]
         installers: bool,
 
+        /// Write a cache-manifest file for the selected installer package and exit
+        #[arg(long, requires = "installers")]
+        package_file: Option<PathBuf>,
+
         /// Path to build artifacts directory (defaults to .surge/artifacts/<app>/<rid>/<version> with --installers)
         #[arg(long)]
         artifacts_dir: Option<PathBuf>,
@@ -646,6 +650,7 @@ async fn run(cli: Cli) -> surge_core::error::Result<()> {
             rid,
             version,
             installers,
+            package_file,
             artifacts_dir,
             packages_dir,
         } => {
@@ -657,6 +662,7 @@ async fn run(cli: Cli) -> surge_core::error::Result<()> {
                     rid.as_deref(),
                     artifacts_dir.as_deref(),
                     &packages_dir,
+                    package_file.as_deref(),
                 )
                 .await
             } else {
@@ -726,5 +732,20 @@ async fn run(cli: Cli) -> surge_core::error::Result<()> {
             )
             .await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restore_package_file_requires_installers_flag() {
+        let err = match Cli::try_parse_from(["surge", "restore", "--package-file", "packages.txt"]) {
+            Ok(_) => panic!("package-file should require installers mode"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("--installers"));
     }
 }

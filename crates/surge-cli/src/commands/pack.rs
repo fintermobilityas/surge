@@ -20,8 +20,23 @@ use surge_core::installer_bundle;
 use surge_core::pack::builder::PackBuilder;
 use surge_core::releases::artifact_cache::{CacheFetchOutcome, fetch_or_reuse_file};
 use surge_core::releases::manifest::{ReleaseEntry, ReleaseIndex, decompress_release_index};
+use surge_core::releases::restore::{
+    RestoreArtifactSpec, RestoreOptions, plan_full_archive_restore, restore_full_archive_for_version_with_options,
+};
 use surge_core::releases::version::compare_versions;
 use surge_core::storage::{self, StorageBackend};
+
+#[derive(Debug, Clone)]
+struct ResolvedInstallerPackage {
+    app_id: String,
+    rid: String,
+    default_channel: String,
+    selected_version: String,
+    full_key: String,
+    full_sha256: String,
+    local_full_name: String,
+    artifacts_dir: PathBuf,
+}
 
 /// Build release packages (full + delta) for a given app version and RID.
 pub async fn execute(
@@ -196,30 +211,213 @@ pub async fn execute_installers_only(
     rid: Option<&str>,
     artifacts_dir: Option<&Path>,
     output_dir: &Path,
+    package_file: Option<&Path>,
 ) -> Result<()> {
-    const TOTAL_STAGES: usize = 5;
-
     let theme = UiTheme::global();
     let started = Instant::now();
+    let total_stages = if package_file.is_some() { 4 } else { 5 };
 
-    print_stage(theme, 1, TOTAL_STAGES, "Resolving manifest and target");
+    print_stage(theme, 1, total_stages, "Resolving manifest and target");
     let manifest = SurgeManifest::from_file(manifest_path)?;
-    let app_id = super::resolve_app_id_with_rid_hint(&manifest, app_id, rid)?;
-    let rid = super::resolve_rid(&manifest, &app_id, rid)?;
-    let (app, target) = manifest
-        .find_app_with_target(&app_id, &rid)
-        .ok_or_else(|| SurgeError::Config(format!("No target {rid} found for app {app_id}")))?;
-    std::fs::create_dir_all(output_dir)?;
-    let default_channel = default_channel_for_app(&manifest, app);
+    let (backend, index, resolved) =
+        resolve_installer_package(&manifest, manifest_path, app_id, version, rid, artifacts_dir).await?;
     print_stage_done(
         theme,
         1,
-        TOTAL_STAGES,
-        &format!("Target: {app_id}/{rid} (channel: {default_channel})"),
+        total_stages,
+        &format!(
+            "Target: {}/{} (channel: {})",
+            resolved.app_id, resolved.rid, resolved.default_channel
+        ),
     );
 
-    print_stage(theme, 2, TOTAL_STAGES, "Resolving release for installer build");
-    let storage_config = super::build_app_scoped_storage_config(&manifest, &app_id)?;
+    print_stage(theme, 2, total_stages, "Resolving release for installer build");
+    print_stage_done(
+        theme,
+        2,
+        total_stages,
+        &format!("Selected release version {}", resolved.selected_version),
+    );
+
+    if let Some(package_file) = package_file {
+        print_stage(theme, 3, total_stages, "Writing package manifest");
+        let specs = plan_full_archive_restore(&*backend, &index, &resolved.rid, &resolved.selected_version).await?;
+        write_package_manifest(package_file, &specs)?;
+        print_stage_done(
+            theme,
+            3,
+            total_stages,
+            &format!("Wrote {} for {} artifact(s)", package_file.display(), specs.len()),
+        );
+        print_stage(theme, 4, total_stages, "Finalize restore-package summary");
+        print_stage_done(
+            theme,
+            4,
+            total_stages,
+            &format!("Completed in {}", format_duration(started.elapsed())),
+        );
+        return Ok(());
+    }
+
+    if !resolved.artifacts_dir.is_dir() {
+        logline::warn(&format!(
+            "Artifacts directory not found: {}; installers will be built without icon assets",
+            resolved.artifacts_dir.display()
+        ));
+    }
+
+    std::fs::create_dir_all(output_dir)?;
+    let (app, target) = manifest
+        .find_app_with_target(&resolved.app_id, &resolved.rid)
+        .ok_or_else(|| SurgeError::Config(format!("No target {} found for app {}", resolved.rid, resolved.app_id)))?;
+
+    let full_package_path = output_dir.join(&resolved.local_full_name);
+    print_stage(theme, 3, total_stages, "Ensuring full package is available");
+    match fetch_or_reuse_file(
+        &*backend,
+        &resolved.full_key,
+        &full_package_path,
+        &resolved.full_sha256,
+        None,
+    )
+    .await
+    {
+        Ok(CacheFetchOutcome::ReusedLocal) => {
+            print_stage_done(
+                theme,
+                3,
+                total_stages,
+                &format!(
+                    "Using local package {} ({})",
+                    full_package_path.display(),
+                    file_size_label(&full_package_path)
+                ),
+            );
+        }
+        Ok(CacheFetchOutcome::DownloadedFresh) => {
+            print_stage_done(
+                theme,
+                3,
+                total_stages,
+                &format!(
+                    "Downloaded {} ({})",
+                    full_package_path.display(),
+                    file_size_label(&full_package_path)
+                ),
+            );
+        }
+        Ok(CacheFetchOutcome::DownloadedAfterInvalidLocal) => {
+            logline::warn(&format!(
+                "Local package '{}' failed checksum verification; redownloaded.",
+                full_package_path.display()
+            ));
+            print_stage_done(
+                theme,
+                3,
+                total_stages,
+                &format!(
+                    "Downloaded {} ({})",
+                    full_package_path.display(),
+                    file_size_label(&full_package_path)
+                ),
+            );
+        }
+        Err(SurgeError::NotFound(_)) => {
+            let rebuilt = restore_full_archive_for_version_with_options(
+                &*backend,
+                &index,
+                &resolved.rid,
+                &resolved.selected_version,
+                RestoreOptions {
+                    cache_dir: Some(output_dir),
+                    progress: None,
+                },
+            )
+            .await?;
+            std::fs::write(&full_package_path, rebuilt)?;
+            print_stage_done(
+                theme,
+                3,
+                total_stages,
+                &format!(
+                    "Rebuilt {} from release graph ({})",
+                    full_package_path.display(),
+                    file_size_label(&full_package_path)
+                ),
+            );
+        }
+        Err(e) => return Err(e),
+    }
+
+    print_stage(
+        theme,
+        4,
+        total_stages,
+        &format!(
+            "Building installers for {} v{} ({})",
+            resolved.app_id, resolved.selected_version, resolved.rid
+        ),
+    );
+
+    let installer_paths = build_installers(
+        &manifest,
+        app,
+        &target,
+        &resolved.app_id,
+        &resolved.rid,
+        &resolved.selected_version,
+        manifest_path.parent().unwrap_or_else(|| Path::new(".")),
+        &resolved.artifacts_dir,
+        output_dir,
+        &full_package_path,
+    )?;
+    if installer_paths.is_empty() {
+        print_stage_done(
+            theme,
+            4,
+            total_stages,
+            &format!(
+                "No installers configured for {}/{}. Configure `installers: [online]` or `installers: [offline]` in the manifest.",
+                resolved.app_id, resolved.rid
+            ),
+        );
+        return Ok(());
+    }
+    for installer in &installer_paths {
+        logline::subtle(&format!(
+            "  Created {} ({})",
+            installer.display(),
+            file_size_label(installer)
+        ));
+    }
+
+    print_stage_done(theme, 4, total_stages, "Installer bundles created");
+    print_stage(theme, 5, total_stages, "Finalize restore-installers summary");
+    print_stage_done(
+        theme,
+        5,
+        total_stages,
+        &format!("Completed in {}", format_duration(started.elapsed())),
+    );
+
+    Ok(())
+}
+
+async fn resolve_installer_package(
+    manifest: &SurgeManifest,
+    manifest_path: &Path,
+    app_id: Option<&str>,
+    version: Option<&str>,
+    rid: Option<&str>,
+    artifacts_dir: Option<&Path>,
+) -> Result<(Box<dyn StorageBackend>, ReleaseIndex, ResolvedInstallerPackage)> {
+    let app_id = super::resolve_app_id_with_rid_hint(manifest, app_id, rid)?;
+    let rid = super::resolve_rid(manifest, &app_id, rid)?;
+    let (app, _) = manifest
+        .find_app_with_target(&app_id, &rid)
+        .ok_or_else(|| SurgeError::Config(format!("No target {rid} found for app {app_id}")))?;
+    let default_channel = default_channel_for_app(manifest, app);
+    let storage_config = super::build_app_scoped_storage_config(manifest, &app_id)?;
     let backend = storage::create_storage_backend(&storage_config)?;
     let index = fetch_release_index(&*backend).await?;
     if !index.app_id.is_empty() && index.app_id != app_id {
@@ -238,7 +436,6 @@ pub async fn execute_installers_only(
                 version.map_or_else(String::new, |v| format!(" and version '{v}'"))
             ))
         })?;
-    let selected_version = selected_release.version.clone();
     let full_key = selected_release.full_filename.trim();
     if full_key.is_empty() {
         return Err(SurgeError::Pack(format!(
@@ -246,128 +443,44 @@ pub async fn execute_installers_only(
             selected_release.version, app_id, rid
         )));
     }
-    print_stage_done(
-        theme,
-        2,
-        TOTAL_STAGES,
-        &format!("Selected release version {selected_version}"),
-    );
-
-    let artifacts_dir = artifacts_dir.map_or_else(
-        || default_artifacts_dir(manifest_path, &app_id, &rid, &selected_version),
-        PathBuf::from,
-    );
-    if !artifacts_dir.is_dir() {
-        logline::warn(&format!(
-            "Artifacts directory not found: {}; installers will be built without icon assets",
-            artifacts_dir.display()
-        ));
-    }
-
     let local_full_name = Path::new(full_key)
         .file_name()
-        .map(std::ffi::OsStr::to_os_string)
-        .ok_or_else(|| SurgeError::Pack(format!("Invalid full package key: {full_key}")))?;
-    let full_package_path = output_dir.join(local_full_name);
-    print_stage(theme, 3, TOTAL_STAGES, "Ensuring full package is available");
-    match fetch_or_reuse_file(
-        &*backend,
-        full_key,
-        &full_package_path,
-        &selected_release.full_sha256,
-        None,
-    )
-    .await?
-    {
-        CacheFetchOutcome::ReusedLocal => {
-            print_stage_done(
-                theme,
-                3,
-                TOTAL_STAGES,
-                &format!(
-                    "Using local package {} ({})",
-                    full_package_path.display(),
-                    file_size_label(&full_package_path)
-                ),
-            );
-        }
-        CacheFetchOutcome::DownloadedFresh => {
-            print_stage_done(
-                theme,
-                3,
-                TOTAL_STAGES,
-                &format!(
-                    "Downloaded {} ({})",
-                    full_package_path.display(),
-                    file_size_label(&full_package_path)
-                ),
-            );
-        }
-        CacheFetchOutcome::DownloadedAfterInvalidLocal => {
-            logline::warn(&format!(
-                "Local package '{}' failed checksum verification; redownloaded.",
-                full_package_path.display()
-            ));
-            print_stage_done(
-                theme,
-                3,
-                TOTAL_STAGES,
-                &format!(
-                    "Downloaded {} ({})",
-                    full_package_path.display(),
-                    file_size_label(&full_package_path)
-                ),
-            );
-        }
-    }
-
-    print_stage(
-        theme,
-        4,
-        TOTAL_STAGES,
-        &format!("Building installers for {app_id} v{selected_version} ({rid})"),
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or_else(|| SurgeError::Pack(format!("Invalid full package key: {full_key}")))?
+        .to_string();
+    let artifacts_dir = artifacts_dir.map_or_else(
+        || default_artifacts_dir(manifest_path, &app_id, &rid, &selected_release.version),
+        PathBuf::from,
     );
 
-    let installer_paths = build_installers(
-        &manifest,
-        app,
-        &target,
-        &app_id,
-        &rid,
-        &selected_version,
-        manifest_path.parent().unwrap_or_else(|| Path::new(".")),
-        &artifacts_dir,
-        output_dir,
-        &full_package_path,
-    )?;
-    if installer_paths.is_empty() {
-        print_stage_done(
-            theme,
-            4,
-            TOTAL_STAGES,
-            &format!(
-                "No installers configured for {app_id}/{rid}. Configure `installers: [online]` or `installers: [offline]` in the manifest."
-            ),
-        );
-        return Ok(());
-    }
-    for installer in &installer_paths {
-        logline::subtle(&format!(
-            "  Created {} ({})",
-            installer.display(),
-            file_size_label(installer)
-        ));
-    }
+    Ok((
+        backend,
+        index,
+        ResolvedInstallerPackage {
+            app_id,
+            rid,
+            default_channel,
+            selected_version: selected_release.version.clone(),
+            full_key: full_key.to_string(),
+            full_sha256: selected_release.full_sha256.clone(),
+            local_full_name,
+            artifacts_dir,
+        },
+    ))
+}
 
-    print_stage_done(theme, 4, TOTAL_STAGES, "Installer bundles created");
-    print_stage(theme, 5, TOTAL_STAGES, "Finalize restore-installers summary");
-    print_stage_done(
-        theme,
-        5,
-        TOTAL_STAGES,
-        &format!("Completed in {}", format_duration(started.elapsed())),
-    );
-
+fn write_package_manifest(path: &Path, specs: &[RestoreArtifactSpec]) -> Result<()> {
+    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut manifest = String::new();
+    for spec in specs {
+        manifest.push_str(spec.sha256.trim());
+        manifest.push(' ');
+        manifest.push_str(spec.key.trim());
+        manifest.push('\n');
+    }
+    std::fs::write(path, manifest)?;
     Ok(())
 }
 
@@ -951,6 +1064,7 @@ mod tests {
     use super::*;
     use surge_core::config::constants::DEFAULT_ZSTD_LEVEL;
     use surge_core::crypto::sha256::sha256_hex;
+    use surge_core::diff::wrapper::bsdiff_buffers;
     use surge_core::installer_bundle::read_embedded_payload;
     use surge_core::platform::detect::current_rid;
     use surge_core::platform::fs::make_executable;
@@ -1084,6 +1198,7 @@ apps:
             Some(&rid),
             Some(&artifacts_dir),
             &packages_dir,
+            None,
         )
         .await
         .expect("installer generation should succeed");
@@ -1118,7 +1233,7 @@ apps:
     }
 
     #[tokio::test]
-    async fn execute_installers_only_defaults_to_latest_and_restores_missing_full_package() {
+    async fn execute_installers_only_rebuilds_missing_direct_full_from_deltas() {
         let tmp = tempfile::tempdir().expect("temp dir should be created");
 
         let store_dir = tmp.path().join("store");
@@ -1144,32 +1259,67 @@ apps:
         std::fs::create_dir_all(&default_artifacts).expect("default artifacts dir should be created");
         std::fs::write(default_artifacts.join("icon.png"), b"icon").expect("icon should be written");
 
+        let previous_full_bytes = b"previous full package bytes".to_vec();
+        let latest_full_bytes = b"latest full package bytes".to_vec();
+        let latest_patch =
+            bsdiff_buffers(&previous_full_bytes, &latest_full_bytes).expect("delta patch should be created");
+        let latest_delta = zstd::encode_all(latest_patch.as_slice(), 3).expect("delta should be compressed");
+
         let previous_full = format!("{app_id}-{previous_version}-{rid}-full.tar.zst");
         let latest_full = format!("{app_id}-{latest_version}-{rid}-full.tar.zst");
+        let latest_delta_key = format!("{app_id}-{latest_version}-{rid}-delta.tar.zst");
+        let mut latest_release = make_release(
+            latest_version,
+            "stable",
+            &rid,
+            &latest_full,
+            &sha256_hex(&latest_full_bytes),
+        );
+        latest_release.set_primary_delta(Some(surge_core::releases::manifest::DeltaArtifact::bsdiff_zstd(
+            "primary",
+            previous_version,
+            &latest_delta_key,
+            latest_delta.len() as i64,
+            &sha256_hex(&latest_delta),
+        )));
         write_release_index(
             &store_dir,
             app_id,
             vec![
-                make_release(previous_version, "stable", &rid, &previous_full, ""),
                 make_release(
-                    latest_version,
+                    previous_version,
                     "stable",
                     &rid,
-                    &latest_full,
-                    &sha256_hex(b"latest full package bytes"),
+                    &previous_full,
+                    &sha256_hex(&previous_full_bytes),
                 ),
+                latest_release,
             ],
         );
-        std::fs::write(store_dir.join(&latest_full), b"latest full package bytes")
-            .expect("latest full package should be written to store");
+        std::fs::write(store_dir.join(&previous_full), &previous_full_bytes)
+            .expect("previous full package should be written to store");
+        std::fs::write(store_dir.join(&latest_delta_key), &latest_delta)
+            .expect("latest delta package should be written to store");
 
-        execute_installers_only(&manifest_path, Some(app_id), None, Some(&rid), None, &packages_dir)
-            .await
-            .expect("installer generation should succeed");
+        execute_installers_only(
+            &manifest_path,
+            Some(app_id),
+            None,
+            Some(&rid),
+            None,
+            &packages_dir,
+            None,
+        )
+        .await
+        .expect("installer generation should succeed");
 
         assert!(
             packages_dir.join(&latest_full).is_file(),
-            "missing full package should be restored from storage"
+            "missing direct full package should be rebuilt from stored deltas"
+        );
+        assert_eq!(
+            std::fs::read(packages_dir.join(&latest_full)).expect("rebuilt full package should be readable"),
+            latest_full_bytes
         );
         let installers_dir = packages_dir
             .parent()
@@ -1180,6 +1330,143 @@ apps:
         let installer_ext = if rid.starts_with("win-") { "exe" } else { "bin" };
         let offline = installers_dir.join(format!("Setup-{rid}-{app_id}-stable-offline.{installer_ext}"));
         assert!(offline.exists());
+    }
+
+    #[tokio::test]
+    async fn execute_installers_only_writes_package_manifest_without_downloading_or_building() {
+        let tmp = tempfile::tempdir().expect("temp dir should be created");
+
+        let store_dir = tmp.path().join("store");
+        let manifest_path = tmp.path().join("surge.yml");
+        let packages_dir = tmp.path().join("packages");
+        let package_file = tmp.path().join("cache").join("packages.txt");
+        let app_id = "installer-app";
+        let rid = current_rid();
+        let version = "2.2.0";
+
+        std::fs::create_dir_all(&store_dir).expect("store dir should be created");
+        std::fs::create_dir_all(&packages_dir).expect("packages dir should be created");
+        write_manifest(&manifest_path, &store_dir, app_id, &rid);
+
+        let full_name = format!("{app_id}-{version}-{rid}-full.tar.zst");
+        let full_sha256 = sha256_hex(b"package bytes for cache manifest");
+        write_release_index(
+            &store_dir,
+            app_id,
+            vec![make_release(version, "stable", &rid, &full_name, &full_sha256)],
+        );
+        std::fs::write(store_dir.join(&full_name), b"package bytes for cache manifest")
+            .expect("full package should be written to store");
+
+        execute_installers_only(
+            &manifest_path,
+            Some(app_id),
+            Some(version),
+            Some(&rid),
+            None,
+            &packages_dir,
+            Some(&package_file),
+        )
+        .await
+        .expect("package manifest generation should succeed");
+
+        assert_eq!(
+            std::fs::read_to_string(&package_file).expect("package manifest should be readable"),
+            format!("{full_sha256} {full_name}\n")
+        );
+        assert!(
+            !packages_dir.join(&full_name).exists(),
+            "package manifest generation should not download the full package"
+        );
+        assert!(
+            !packages_dir
+                .parent()
+                .expect("parent should exist")
+                .join("installers")
+                .exists(),
+            "package manifest generation should not build installers"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_installers_only_package_manifest_includes_delta_chain_when_direct_full_is_missing() {
+        let tmp = tempfile::tempdir().expect("temp dir should be created");
+
+        let store_dir = tmp.path().join("store");
+        let manifest_path = tmp.path().join("surge.yml");
+        let packages_dir = tmp.path().join("packages");
+        let package_file = tmp.path().join("cache").join("packages.txt");
+        let app_id = "installer-app";
+        let rid = current_rid();
+        let previous_version = "2.1.0";
+        let version = "2.2.0";
+
+        std::fs::create_dir_all(&store_dir).expect("store dir should be created");
+        std::fs::create_dir_all(&packages_dir).expect("packages dir should be created");
+        write_manifest(&manifest_path, &store_dir, app_id, &rid);
+
+        let previous_full_bytes = b"previous full package bytes".to_vec();
+        let latest_full_bytes = b"latest full package bytes".to_vec();
+        let latest_patch =
+            bsdiff_buffers(&previous_full_bytes, &latest_full_bytes).expect("delta patch should be created");
+        let latest_delta = zstd::encode_all(latest_patch.as_slice(), 3).expect("delta should be compressed");
+
+        let previous_full = format!("{app_id}-{previous_version}-{rid}-full.tar.zst");
+        let latest_full = format!("{app_id}-{version}-{rid}-full.tar.zst");
+        let latest_delta_key = format!("{app_id}-{version}-{rid}-delta.tar.zst");
+        let mut latest_release = make_release(version, "stable", &rid, &latest_full, &sha256_hex(&latest_full_bytes));
+        latest_release.set_primary_delta(Some(surge_core::releases::manifest::DeltaArtifact::bsdiff_zstd(
+            "primary",
+            previous_version,
+            &latest_delta_key,
+            latest_delta.len() as i64,
+            &sha256_hex(&latest_delta),
+        )));
+        write_release_index(
+            &store_dir,
+            app_id,
+            vec![
+                make_release(
+                    previous_version,
+                    "stable",
+                    &rid,
+                    &previous_full,
+                    &sha256_hex(&previous_full_bytes),
+                ),
+                latest_release,
+            ],
+        );
+        std::fs::write(store_dir.join(&previous_full), &previous_full_bytes)
+            .expect("previous full package should be written to store");
+        std::fs::write(store_dir.join(&latest_delta_key), &latest_delta)
+            .expect("latest delta package should be written to store");
+
+        execute_installers_only(
+            &manifest_path,
+            Some(app_id),
+            Some(version),
+            Some(&rid),
+            None,
+            &packages_dir,
+            Some(&package_file),
+        )
+        .await
+        .expect("package manifest generation should succeed");
+
+        assert_eq!(
+            std::fs::read_to_string(&package_file).expect("package manifest should be readable"),
+            format!(
+                "{} {}\n{} {}\n",
+                sha256_hex(&previous_full_bytes),
+                previous_full,
+                sha256_hex(&latest_delta),
+                latest_delta_key
+            )
+        );
+        assert!(
+            !packages_dir.join(&latest_full).exists(),
+            "package manifest generation should not reconstruct the full package"
+        );
     }
 
     #[tokio::test]

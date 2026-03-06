@@ -35,6 +35,13 @@ struct ArtifactPrefetchSpec {
     size: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreArtifactSpec {
+    pub key: String,
+    pub sha256: String,
+    pub size: i64,
+}
+
 /// Return releases for a RID sorted by semantic version (oldest -> newest).
 #[must_use]
 pub fn sorted_releases_for_rid<'a>(index: &'a ReleaseIndex, rid: &str) -> Vec<&'a ReleaseEntry> {
@@ -70,6 +77,32 @@ pub fn find_previous_release_for_rid<'a>(
         previous = Some(release);
     }
     previous
+}
+
+pub async fn plan_full_archive_restore(
+    storage: &dyn StorageBackend,
+    index: &ReleaseIndex,
+    rid: &str,
+    version: &str,
+) -> Result<Vec<RestoreArtifactSpec>> {
+    let releases = sorted_releases_for_rid(index, rid);
+    let target_idx = releases
+        .iter()
+        .position(|release| release.version == version)
+        .ok_or_else(|| SurgeError::NotFound(format!("Release {version} ({rid}) not found in index")))?;
+
+    for base_idx in (0..=target_idx).rev() {
+        let Some(specs) = build_restore_plan_specs(&releases, target_idx, base_idx) else {
+            continue;
+        };
+        if restore_artifacts_exist(storage, &specs).await? {
+            return Ok(specs);
+        }
+    }
+
+    Err(SurgeError::NotFound(format!(
+        "No reconstructable full archive found for {version} ({rid})"
+    )))
 }
 
 /// Restore a release full archive for `version` by RID.
@@ -398,6 +431,50 @@ fn verify_expected_sha256(expected: &str, data: &[u8], context: &str) -> Result<
     Ok(())
 }
 
+fn build_restore_plan_specs(
+    releases: &[&ReleaseEntry],
+    target_idx: usize,
+    base_idx: usize,
+) -> Option<Vec<RestoreArtifactSpec>> {
+    let base_release = releases.get(base_idx)?;
+    let full_key = base_release.full_filename.trim();
+    if full_key.is_empty() {
+        return None;
+    }
+
+    let mut specs = vec![RestoreArtifactSpec {
+        key: full_key.to_string(),
+        sha256: base_release.full_sha256.clone(),
+        size: base_release.full_size,
+    }];
+
+    for release in releases.iter().take(target_idx + 1).skip(base_idx + 1) {
+        let delta = release.selected_delta()?;
+        if !is_supported_delta(&delta) {
+            return None;
+        }
+        specs.push(RestoreArtifactSpec {
+            key: delta.filename.clone(),
+            sha256: delta.sha256.clone(),
+            size: delta.size,
+        });
+    }
+
+    Some(specs)
+}
+
+async fn restore_artifacts_exist(storage: &dyn StorageBackend, specs: &[RestoreArtifactSpec]) -> Result<bool> {
+    for spec in specs {
+        match storage.head_object(&spec.key).await {
+            Ok(_) => {}
+            Err(SurgeError::NotFound(_)) => return Ok(false),
+            Err(e) => return Err(e),
+        }
+    }
+
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -724,5 +801,66 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(second, full_v2);
+    }
+
+    #[tokio::test]
+    async fn test_plan_full_archive_restore_reports_delta_chain_when_direct_full_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = FilesystemBackend::new(tmp.path().to_str().unwrap(), "");
+
+        let full_v1 = b"full-v1".to_vec();
+        let full_v2 = b"full-v2".to_vec();
+        let patch_v2 = bsdiff_buffers(&full_v1, &full_v2).unwrap();
+        let delta_v2 = zstd::encode_all(patch_v2.as_slice(), 3).unwrap();
+
+        let mut v1 = make_entry("1.0.0");
+        v1.set_primary_delta(None);
+        v1.full_sha256 = sha256_hex(&full_v1);
+
+        let mut v2 = make_entry("1.1.0");
+        v2.full_sha256 = sha256_hex(&full_v2);
+        v2.set_primary_delta(Some(DeltaArtifact::bsdiff_zstd(
+            "primary",
+            "1.0.0",
+            "demo-1.1.0-linux-x64-delta.tar.zst",
+            delta_v2.len() as i64,
+            &sha256_hex(&delta_v2),
+        )));
+
+        backend
+            .put_object(&v1.full_filename, &full_v1, "application/octet-stream")
+            .await
+            .unwrap();
+        let delta_key = v2.selected_delta().expect("v2 should have delta descriptor").filename;
+        backend
+            .put_object(&delta_key, &delta_v2, "application/octet-stream")
+            .await
+            .unwrap();
+
+        let index = ReleaseIndex {
+            app_id: "demo".to_string(),
+            releases: vec![v1.clone(), v2],
+            ..ReleaseIndex::default()
+        };
+
+        let specs = plan_full_archive_restore(&backend, &index, "linux-x64", "1.1.0")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            specs,
+            vec![
+                RestoreArtifactSpec {
+                    key: v1.full_filename,
+                    sha256: v1.full_sha256,
+                    size: v1.full_size,
+                },
+                RestoreArtifactSpec {
+                    key: delta_key,
+                    sha256: sha256_hex(&delta_v2),
+                    size: delta_v2.len() as i64,
+                },
+            ]
+        );
     }
 }

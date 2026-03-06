@@ -271,6 +271,8 @@ fn set_value(mapping: &mut Mapping, key: &str, value: Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use surge_core::platform::detect::current_rid;
+    use surge_core::platform::fs::make_executable;
 
     #[test]
     fn choose_recommended_prefers_fast_candidate_within_size_budget() {
@@ -324,5 +326,49 @@ apps:
         let rendered = String::from_utf8(rendered).expect("utf-8");
         assert!(rendered.contains("strategy: archive-bsdiff"));
         assert!(rendered.contains("level: 5"));
+    }
+
+    #[tokio::test]
+    async fn execute_pack_writes_recommended_policy_to_manifest() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let store_dir = temp_dir.path().join("store");
+        let artifacts_dir = temp_dir.path().join("artifacts");
+        let manifest_path = temp_dir.path().join("surge.yml");
+        let app_id = "demoapp";
+        let rid = current_rid();
+        let version = "1.0.0";
+
+        std::fs::create_dir_all(&store_dir).expect("store dir should be created");
+        std::fs::create_dir_all(&artifacts_dir).expect("artifacts dir should be created");
+        std::fs::write(
+            &manifest_path,
+            format!(
+                "schema: 1\nstorage:\n  provider: filesystem\n  bucket: {}\napps:\n  - id: {app_id}\n    main: demoapp\n    installDirectory: demoapp\n    target:\n      rid: {rid}\n",
+                store_dir.display()
+            ),
+        )
+        .expect("manifest should be written");
+
+        std::fs::write(artifacts_dir.join("demoapp"), b"#!/bin/sh\necho tuned\n")
+            .expect("main executable should be written");
+        make_executable(&artifacts_dir.join("demoapp")).expect("main executable should be executable");
+        std::fs::write(artifacts_dir.join("payload.txt"), b"payload").expect("payload should be written");
+
+        execute_pack(
+            &manifest_path,
+            Some(app_id),
+            version,
+            Some(&rid),
+            Some(&artifacts_dir),
+            &[3],
+            &[PackDeltaStrategy::ArchiveChunkedBsdiff.as_str().to_string()],
+            true,
+        )
+        .await
+        .expect("tune pack should succeed");
+
+        let rendered = std::fs::read_to_string(&manifest_path).expect("rendered manifest");
+        assert!(rendered.contains("strategy: archive-chunked-bsdiff"));
+        assert!(rendered.contains("level: 3"));
     }
 }

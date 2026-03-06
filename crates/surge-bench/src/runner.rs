@@ -1,3 +1,5 @@
+#![allow(clippy::cast_sign_loss, clippy::too_many_lines)]
+
 use std::fs;
 use std::io::Cursor;
 use std::path::Path;

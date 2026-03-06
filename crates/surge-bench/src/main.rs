@@ -1,4 +1,5 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::struct_excessive_bools, clippy::too_many_lines)]
 
 mod payload;
 mod report;

@@ -1,3 +1,9 @@
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};

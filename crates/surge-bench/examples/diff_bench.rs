@@ -1,4 +1,5 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::cast_precision_loss, clippy::doc_markdown)]
 //! Benchmark comparing classic bsdiff vs chunked bsdiff on real files.
 //!
 //! Usage: cargo run --release -p surge-bench --example diff_bench -- <old_file> <new_file>

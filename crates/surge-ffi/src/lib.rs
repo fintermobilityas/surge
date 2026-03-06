@@ -1,4 +1,12 @@
 #![deny(unsafe_op_in_unsafe_fn)]
+#![allow(
+    clippy::borrow_as_ptr,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::manual_let_else,
+    clippy::similar_names,
+    clippy::single_match_else
+)]
 
 //! C API (`cdylib`) for the Surge update framework.
 //!

@@ -1,3 +1,5 @@
+#![allow(clippy::cast_precision_loss)]
+
 use std::time::Duration;
 
 use serde::Serialize;

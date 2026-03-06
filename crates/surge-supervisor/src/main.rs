@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![allow(clippy::cast_possible_wrap)]
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode};

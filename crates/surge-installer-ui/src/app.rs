@@ -1,4 +1,11 @@
 #![forbid(unsafe_code)]
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::items_after_statements,
+    clippy::unnecessary_wraps
+)]
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};

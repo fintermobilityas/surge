@@ -682,7 +682,7 @@ async fn run(cli: Cli) -> surge_core::error::Result<()> {
 
         Commands::Sha256 { file } => {
             let hash = surge_core::crypto::sha256::sha256_hex_file(&file)?;
-            println!("{hash}");
+            logline::emit_raw(&hash);
             Ok(())
         }
 

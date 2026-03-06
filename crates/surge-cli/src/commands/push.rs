@@ -10,9 +10,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
-use std::time::Instant;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
 
-use crate::formatters::{format_byte_progress, format_duration};
+use crate::formatters::{format_byte_progress, format_bytes, format_duration};
 use crate::logline;
 use crate::ui::UiTheme;
 use surge_core::config::constants::{DEFAULT_ZSTD_LEVEL, RELEASES_FILE_COMPRESSED, SCHEMA_VERSION};
@@ -115,8 +118,8 @@ pub async fn execute(
     let mut uploaded_bytes_progress = 0u64;
 
     if full_uploaded {
-        backend.upload_from_file(&full_filename, &full_archive, None).await?;
-        uploaded_bytes_progress = uploaded_bytes_progress.saturating_add(full_size.max(0) as u64);
+        uploaded_bytes_progress = uploaded_bytes_progress
+            .saturating_add(upload_artifact_with_feedback(&*backend, "full", &full_filename, &full_archive).await?);
         logline::subtle(&format!(
             "      {}",
             format_byte_progress(uploaded_bytes_progress, total_upload_bytes, "uploaded")
@@ -126,8 +129,8 @@ pub async fn execute(
     }
 
     let (delta_filename, delta_size, delta_sha256, delta_patch_format, delta_uploaded) = if delta_available {
-        backend.upload_from_file(&delta_filename, &delta_archive, None).await?;
         let delta_size = std::fs::metadata(&delta_archive)?.len() as i64;
+        upload_artifact_with_feedback(&*backend, "delta", &delta_filename, &delta_archive).await?;
         let delta_sha256 = sha256_hex_file(&delta_archive)?;
         let delta_patch_format = infer_delta_patch_format(&delta_archive)?;
         uploaded_bytes_progress = uploaded_bytes_progress.saturating_add(delta_size.max(0) as u64);
@@ -414,4 +417,68 @@ fn print_stage(theme: UiTheme, stage: usize, total: usize, text: &str) {
 fn print_stage_done(theme: UiTheme, stage: usize, total: usize, text: &str) {
     let _ = theme;
     logline::success(&format!("[{stage}/{total}] {text}"));
+}
+
+async fn upload_artifact_with_feedback(
+    backend: &dyn StorageBackend,
+    artifact_kind: &str,
+    key: &str,
+    source_path: &Path,
+) -> Result<u64> {
+    let total_bytes = std::fs::metadata(source_path)?.len();
+    logline::subtle(&format!(
+        "  Uploading {artifact_kind} artifact {key} ({})",
+        format_bytes(total_bytes)
+    ));
+
+    let started = Instant::now();
+    let upload_running = Arc::new(AtomicBool::new(true));
+    let bytes_done = Arc::new(AtomicU64::new(0));
+
+    let upload_running_for_heartbeat = Arc::clone(&upload_running);
+    let bytes_done_for_heartbeat = Arc::clone(&bytes_done);
+    let key_for_heartbeat = key.to_string();
+    let heartbeat = thread::spawn(move || {
+        while upload_running_for_heartbeat.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_secs(5));
+            if !upload_running_for_heartbeat.load(Ordering::Relaxed) {
+                break;
+            }
+
+            let uploaded = bytes_done_for_heartbeat.load(Ordering::Relaxed).min(total_bytes);
+            let progress = if uploaded == 0 {
+                format!(
+                    "uploaded 0 B / {} (elapsed {})",
+                    format_bytes(total_bytes),
+                    format_duration(started.elapsed())
+                )
+            } else {
+                format!(
+                    "{} (elapsed {})",
+                    format_byte_progress(uploaded, total_bytes, "uploaded"),
+                    format_duration(started.elapsed())
+                )
+            };
+            logline::subtle(&format!("      {key_for_heartbeat}: {progress}"));
+        }
+    });
+
+    let bytes_done_for_progress = Arc::clone(&bytes_done);
+    let progress = move |done: u64, _total: u64| {
+        bytes_done_for_progress.store(done.min(total_bytes), Ordering::Relaxed);
+    };
+
+    let upload_result = backend.upload_from_file(key, source_path, Some(&progress)).await;
+    bytes_done.store(total_bytes, Ordering::Relaxed);
+    upload_running.store(false, Ordering::Relaxed);
+    let _ = heartbeat.join();
+    upload_result?;
+
+    logline::subtle(&format!(
+        "      {key}: {} in {}",
+        format_byte_progress(total_bytes, total_bytes, "uploaded"),
+        format_duration(started.elapsed())
+    ));
+
+    Ok(total_bytes)
 }

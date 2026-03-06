@@ -1866,6 +1866,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_download_and_apply_full_removes_non_persistent_files_and_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("store");
+        let install_root = tmp.path().join("install");
+        std::fs::create_dir_all(&store_root).unwrap();
+        std::fs::create_dir_all(&install_root).unwrap();
+
+        let current_app_dir = install_root.join("app");
+        std::fs::create_dir_all(current_app_dir.join("state")).unwrap();
+        std::fs::create_dir_all(current_app_dir.join("temp")).unwrap();
+        std::fs::write(current_app_dir.join("settings.json"), "persisted settings").unwrap();
+        std::fs::write(current_app_dir.join("state").join("user.db"), "persisted state").unwrap();
+        std::fs::write(current_app_dir.join("old-token.txt"), "remove me").unwrap();
+        std::fs::write(current_app_dir.join("temp").join("old.log"), "remove dir").unwrap();
+
+        let rid = current_rid();
+        let full_filename = format!("test-app-1.1.0-{rid}-full.tar.zst");
+        let full_path = store_root.join(&full_filename);
+
+        let mut packer = ArchivePacker::new(3).unwrap();
+        packer.add_buffer("payload.txt", b"new payload", 0o644).unwrap();
+        packer.add_buffer("settings.json", b"packaged settings", 0o644).unwrap();
+        packer.add_buffer("state/default.db", b"packaged state", 0o644).unwrap();
+        packer.finalize_to_file(&full_path).unwrap();
+
+        let full_size = std::fs::metadata(&full_path).unwrap().len() as i64;
+        let full_sha256 = sha256_hex_file(&full_path).unwrap();
+
+        let index = ReleaseIndex {
+            app_id: "test-app".to_string(),
+            releases: vec![ReleaseEntry {
+                version: "1.1.0".to_string(),
+                channels: vec!["stable".to_string()],
+                os: current_os_label_for_tests(),
+                rid: rid.clone(),
+                is_genesis: true,
+                full_filename: full_filename.clone(),
+                full_size,
+                full_sha256,
+                deltas: Vec::new(),
+                preferred_delta_id: String::new(),
+                created_utc: chrono::Utc::now().to_rfc3339(),
+                release_notes: String::new(),
+                name: String::new(),
+                main_exe: "test-app".to_string(),
+                install_directory: "test-app".to_string(),
+                supervisor_id: String::new(),
+                icon: String::new(),
+                shortcuts: Vec::new(),
+                persistent_assets: vec!["settings.json".to_string(), "state".to_string()],
+                installers: Vec::new(),
+                environment: std::collections::BTreeMap::new(),
+            }],
+            ..ReleaseIndex::default()
+        };
+
+        let compressed = compress_release_index(&index, DEFAULT_ZSTD_LEVEL).unwrap();
+        std::fs::write(store_root.join(RELEASES_FILE_COMPRESSED), compressed).unwrap();
+
+        let ctx = Arc::new(Context::new());
+        ctx.set_storage(
+            StorageProvider::Filesystem,
+            store_root.to_str().unwrap(),
+            "",
+            "",
+            "",
+            "",
+        );
+
+        let mut manager =
+            UpdateManager::new(ctx, "test-app", "1.0.0", "stable", install_root.to_str().unwrap()).unwrap();
+        let info = manager.check_for_updates().await.unwrap().unwrap();
+        assert_eq!(info.apply_strategy, ApplyStrategy::Full);
+
+        manager
+            .download_and_apply(&info, None::<fn(ProgressInfo)>)
+            .await
+            .unwrap();
+
+        let active_app_dir = install_root.join("app");
+        assert_eq!(
+            std::fs::read_to_string(active_app_dir.join("payload.txt")).unwrap(),
+            "new payload"
+        );
+        assert_eq!(
+            std::fs::read_to_string(active_app_dir.join("settings.json")).unwrap(),
+            "persisted settings"
+        );
+        assert_eq!(
+            std::fs::read_to_string(active_app_dir.join("state").join("user.db")).unwrap(),
+            "persisted state"
+        );
+        assert!(!active_app_dir.join("state").join("default.db").exists());
+        assert!(!active_app_dir.join("old-token.txt").exists());
+        assert!(!active_app_dir.join("temp").exists());
+    }
+
+    #[tokio::test]
     async fn test_download_and_apply_reports_incremental_progress_for_full_update() {
         let tmp = tempfile::tempdir().unwrap();
         let store_root = tmp.path().join("store");

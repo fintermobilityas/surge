@@ -45,6 +45,20 @@ If you are wiring Surge into CI, prefer the official release bundle for your pla
 toolchain (`surge`, `surge-supervisor`, `surge-installer`, `surge-installer-ui`, and the native runtime) so pack/push
 jobs do not have to assemble it from multiple crates.
 
+If your artifacts contain `Surge.NET.dll` but not the native runtime, `surge pack` will bundle the matching
+`libsurge`/`surge.dll` from the installed Surge toolchain automatically.
+
+If you are publishing preview versions in GitHub Actions and do not want to ship prebuilt release bundles, the fastest
+CI pattern is:
+
+1. Check out Surge once per host architecture.
+2. Restore Rust build outputs with `Swatinem/rust-cache`.
+3. Run `./scripts/stage-toolchain-artifact.sh --output "$RUNNER_TEMP/surge-toolchain"`.
+4. Upload that directory as a workflow artifact.
+5. Download it in every publish job and prepend it to `PATH`.
+
+That avoids repeated `cargo install` misses across the publish matrix and removes the separate `libsurge` bootstrap step.
+
 ### 1. Initialize your project
 
 ```bash

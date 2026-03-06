@@ -93,6 +93,19 @@ to override.
 Surge compresses everything into a `tar.zst` package. If a previous version exists in storage, it also generates a
 binary delta patch automatically.
 
+If you want to benchmark pack policy on a real payload before publishing, run:
+
+```bash
+surge tune pack \
+  --app-id my-app \
+  --rid linux-x64 \
+  --version 1.0.0 \
+  --write-manifest
+```
+
+This benchmarks candidate pack settings on the current artifacts and can write the recommended `pack.delta.strategy`
+and `pack.compression.level` back to `surge.yml`.
+
 ### 3. Push to storage
 
 ```bash
@@ -465,6 +478,7 @@ Use `surge-core` as a Cargo dependency for direct access to the async API withou
 ```
 surge init          Create a surge.yml manifest (--wizard for interactive)
 surge pack          Build full and delta packages from artifacts
+surge tune          Benchmark pack policy candidates
 surge push          Upload packages and update the release index
 surge list          List releases on a channel
 surge promote       Promote a release to another channel
@@ -528,6 +542,13 @@ storage:
 lock:
   url: https://snapx.dev         # distributed lock server (optional)
 
+pack:                             # optional; omitted uses built-in defaults
+  delta:
+    strategy: archive-chunked-bsdiff
+  compression:
+    format: zstd
+    level: 3
+
 apps:
   - id: my-app                    # unique identifier
     name: My App                  # display name
@@ -537,7 +558,7 @@ apps:
     channels: [stable, beta]      # supported channels
     shortcuts: [desktop, start_menu, startup]
     persistentAssets: [config.json, user-data/]
-    installers: [web, offline]
+    installers: [online, offline]
     environment:
       MY_VAR: value
     target:
@@ -545,6 +566,7 @@ apps:
 ```
 
 Target-level settings override app-level defaults for `icon`, `shortcuts`, `persistentAssets`, `installers`, and `environment`.
+`pack` policy is global and currently controls delta strategy plus compression format/level for `surge pack`.
 
 ### Architecture
 

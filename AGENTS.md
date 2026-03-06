@@ -114,6 +114,12 @@ If the local environment cannot run a listed command, document the exact gap in 
 - Keep `crates/surge-core/tests/unsafe_boundaries.rs` passing (unsafe confined to approved modules).
 - Before push, run Rust workspace tests + clippy and .NET tests.
 
+## Performance Memory
+- Benchmark and pack-policy memory lives under `docs/performance/`.
+- When changing pack defaults, delta strategy, `surge tune pack`, `surge-bench`, or `.github/workflows/benchmark.yml`, update the relevant files in `docs/performance/` in the same change.
+- Keep benchmark payload descriptions anonymized and generic; do not add private product names or file names to docs, workflow labels, or benchmark fixtures.
+- Keep `.github/workflows/benchmark.yml` aligned with `docs/performance/benchmark-profiles.md` and `docs/performance/pack-policy.md`.
+
 ## Releasing
 
 Versioning is managed by GitVersion (`GitVersion.yml`). The `next-version` field controls the base version.

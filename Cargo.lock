@@ -3044,6 +3044,7 @@ dependencies = [
  "serde_json",
  "surge-core",
  "tempfile",
+ "tokio",
  "zstd",
 ]
 

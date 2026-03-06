@@ -5,6 +5,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
+use surge_core::config::constants::PACK_DEFAULT_DELTA_STRATEGY;
+
 mod commands;
 mod formatters;
 mod logline;
@@ -191,6 +193,12 @@ enum Commands {
         action: LockAction,
     },
 
+    /// Benchmark pack policy candidates and optionally write the recommendation to the manifest
+    Tune {
+        #[command(subcommand)]
+        action: TuneAction,
+    },
+
     /// Migrate release data between storage backends
     Migrate {
         /// Application ID (auto-selected when manifest has exactly one app)
@@ -296,6 +304,40 @@ enum LockAction {
         /// Challenge token from acquire
         #[arg(long)]
         challenge: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum TuneAction {
+    /// Benchmark pack policy candidates for a specific app target and version
+    Pack {
+        /// Application ID (auto-selected when manifest has exactly one app)
+        #[arg(long)]
+        app_id: Option<String>,
+
+        /// Release version to benchmark
+        #[arg(long)]
+        version: String,
+
+        /// Runtime identifier (auto-selected when app has exactly one target)
+        #[arg(long)]
+        rid: Option<String>,
+
+        /// Path to build artifacts directory (defaults to .surge/artifacts/<app>/<rid>/<version>)
+        #[arg(long)]
+        artifacts_dir: Option<PathBuf>,
+
+        /// Comma-separated zstd compression levels to benchmark
+        #[arg(long, default_value = "1,3,5,9", value_delimiter = ',')]
+        zstd_levels: Vec<i32>,
+
+        /// Comma-separated delta strategies to benchmark
+        #[arg(long, default_value = PACK_DEFAULT_DELTA_STRATEGY, value_delimiter = ',')]
+        delta_strategies: Vec<String>,
+
+        /// Write the recommended pack policy back to the manifest
+        #[arg(long)]
+        write_manifest: bool,
     },
 }
 
@@ -567,6 +609,30 @@ async fn run(cli: Cli) -> surge_core::error::Result<()> {
         Commands::Lock { action } => match action {
             LockAction::Acquire { name, timeout } => commands::lock::acquire(&manifest_path, &name, timeout).await,
             LockAction::Release { name, challenge } => commands::lock::release(&manifest_path, &name, &challenge).await,
+        },
+
+        Commands::Tune { action } => match action {
+            TuneAction::Pack {
+                app_id,
+                version,
+                rid,
+                artifacts_dir,
+                zstd_levels,
+                delta_strategies,
+                write_manifest,
+            } => {
+                commands::tune::execute_pack(
+                    &manifest_path,
+                    app_id.as_deref(),
+                    &version,
+                    rid.as_deref(),
+                    artifacts_dir.as_deref(),
+                    &zstd_levels,
+                    &delta_strategies,
+                    write_manifest,
+                )
+                .await
+            }
         },
 
         Commands::Migrate {

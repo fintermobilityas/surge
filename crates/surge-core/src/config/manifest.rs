@@ -3,7 +3,12 @@ use serde_yaml::Value;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Component, Path};
 
+use crate::config::constants::{
+    PACK_DEFAULT_CHECKPOINT_EVERY, PACK_DEFAULT_COMPRESSION_FORMAT, PACK_DEFAULT_DELTA_STRATEGY,
+    PACK_DEFAULT_KEEP_LATEST_FULLS, PACK_DEFAULT_MAX_CHAIN_LENGTH, PACK_DEFAULT_ZSTD_LEVEL,
+};
 use crate::error::{Result, SurgeError};
+use crate::releases::manifest::COMPRESSION_ZSTD;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct StorageManifestConfig {
@@ -22,6 +27,40 @@ pub struct StorageManifestConfig {
 pub struct LockManifestConfig {
     #[serde(default)]
     pub url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PackManifestConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta: Option<PackDeltaManifestConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression: Option<PackCompressionManifestConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention: Option<PackRetentionManifestConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PackDeltaManifestConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_chain_length: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PackCompressionManifestConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PackRetentionManifestConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_latest_fulls: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_every: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -134,6 +173,76 @@ impl InstallerType {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackDeltaStrategy {
+    ArchiveChunkedBsdiff,
+    ArchiveBsdiff,
+}
+
+impl PackDeltaStrategy {
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            PACK_DEFAULT_DELTA_STRATEGY => Some(Self::ArchiveChunkedBsdiff),
+            "archive-bsdiff" => Some(Self::ArchiveBsdiff),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ArchiveChunkedBsdiff => "archive-chunked-bsdiff",
+            Self::ArchiveBsdiff => "archive-bsdiff",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackCompressionFormat {
+    Zstd,
+}
+
+impl PackCompressionFormat {
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            PACK_DEFAULT_COMPRESSION_FORMAT => Some(Self::Zstd),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Zstd => COMPRESSION_ZSTD,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackPolicy {
+    pub delta_strategy: PackDeltaStrategy,
+    pub compression_format: PackCompressionFormat,
+    pub compression_level: i32,
+    pub max_chain_length: u32,
+    pub keep_latest_fulls: u32,
+    pub checkpoint_every: u32,
+}
+
+impl Default for PackPolicy {
+    fn default() -> Self {
+        Self {
+            delta_strategy: PackDeltaStrategy::ArchiveChunkedBsdiff,
+            compression_format: PackCompressionFormat::Zstd,
+            compression_level: PACK_DEFAULT_ZSTD_LEVEL,
+            max_chain_length: PACK_DEFAULT_MAX_CHAIN_LENGTH,
+            keep_latest_fulls: PACK_DEFAULT_KEEP_LATEST_FULLS,
+            checkpoint_every: PACK_DEFAULT_CHECKPOINT_EVERY,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ChannelManifestConfig {
     #[serde(default)]
@@ -150,6 +259,8 @@ pub struct SurgeManifest {
     pub lock: Option<LockManifestConfig>,
     #[serde(default)]
     pub channels: Vec<ChannelManifestConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pack: Option<PackManifestConfig>,
     #[serde(default)]
     pub apps: Vec<AppConfig>,
 }
@@ -273,6 +384,42 @@ impl SurgeManifest {
         Ok(s.into_bytes())
     }
 
+    #[must_use]
+    pub fn effective_pack_policy(&self) -> PackPolicy {
+        let mut policy = PackPolicy::default();
+
+        if let Some(pack) = &self.pack {
+            if let Some(delta) = &pack.delta {
+                if let Some(strategy) = delta.strategy.as_deref().and_then(PackDeltaStrategy::parse) {
+                    policy.delta_strategy = strategy;
+                }
+                if let Some(max_chain_length) = delta.max_chain_length {
+                    policy.max_chain_length = max_chain_length;
+                }
+            }
+
+            if let Some(compression) = &pack.compression {
+                if let Some(format) = compression.format.as_deref().and_then(PackCompressionFormat::parse) {
+                    policy.compression_format = format;
+                }
+                if let Some(level) = compression.level {
+                    policy.compression_level = level;
+                }
+            }
+
+            if let Some(retention) = &pack.retention {
+                if let Some(keep_latest_fulls) = retention.keep_latest_fulls {
+                    policy.keep_latest_fulls = keep_latest_fulls;
+                }
+                if let Some(checkpoint_every) = retention.checkpoint_every {
+                    policy.checkpoint_every = checkpoint_every;
+                }
+            }
+        }
+
+        policy
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.schema != crate::config::constants::SCHEMA_VERSION && self.schema != 2 {
             return Err(SurgeError::Config(format!(
@@ -315,6 +462,55 @@ impl SurgeManifest {
                     "Duplicate top-level channel '{}'",
                     channel.name
                 )));
+            }
+        }
+
+        if let Some(pack) = &self.pack {
+            if let Some(delta) = &pack.delta {
+                if let Some(strategy) = &delta.strategy
+                    && PackDeltaStrategy::parse(strategy).is_none()
+                {
+                    return Err(SurgeError::Config(format!(
+                        "Unsupported pack delta strategy '{}'. Supported values: archive-chunked-bsdiff, archive-bsdiff",
+                        strategy
+                    )));
+                }
+                if delta.max_chain_length == Some(0) {
+                    return Err(SurgeError::Config(
+                        "pack.delta.max_chain_length must be greater than zero".to_string(),
+                    ));
+                }
+            }
+
+            if let Some(compression) = &pack.compression {
+                if let Some(format) = &compression.format
+                    && PackCompressionFormat::parse(format).is_none()
+                {
+                    return Err(SurgeError::Config(format!(
+                        "Unsupported pack compression format '{}'. Supported values: {}",
+                        format, COMPRESSION_ZSTD
+                    )));
+                }
+                if let Some(level) = compression.level
+                    && !(1..=22).contains(&level)
+                {
+                    return Err(SurgeError::Config(format!(
+                        "pack.compression.level must be between 1 and 22, got {level}"
+                    )));
+                }
+            }
+
+            if let Some(retention) = &pack.retention {
+                if retention.keep_latest_fulls == Some(0) {
+                    return Err(SurgeError::Config(
+                        "pack.retention.keep_latest_fulls must be greater than zero".to_string(),
+                    ));
+                }
+                if retention.checkpoint_every == Some(0) {
+                    return Err(SurgeError::Config(
+                        "pack.retention.checkpoint_every must be greater than zero".to_string(),
+                    ));
+                }
             }
         }
 
@@ -662,7 +858,11 @@ fn validate_persistent_asset(path: &str, app_id: &str, rid: &str) -> Result<()> 
 
 #[cfg(test)]
 mod tests {
-    use super::SurgeManifest;
+    use super::{PackDeltaStrategy, SurgeManifest};
+    use crate::config::constants::{
+        PACK_DEFAULT_CHECKPOINT_EVERY, PACK_DEFAULT_KEEP_LATEST_FULLS, PACK_DEFAULT_MAX_CHAIN_LENGTH,
+        PACK_DEFAULT_ZSTD_LEVEL,
+    };
 
     #[test]
     fn parse_derives_single_target_id_when_missing() {
@@ -700,5 +900,78 @@ apps:
         let manifest = SurgeManifest::parse(yaml).expect("manifest should parse");
         assert_eq!(manifest.apps.len(), 1);
         assert_eq!(manifest.apps[0].id, "explicit-id");
+    }
+
+    #[test]
+    fn effective_pack_policy_uses_defaults_when_pack_is_omitted() {
+        let yaml = br"schema: 1
+storage:
+  provider: filesystem
+  bucket: /tmp/store
+apps:
+  - id: demoapp
+    target:
+      rid: linux-x64
+";
+
+        let manifest = SurgeManifest::parse(yaml).expect("manifest should parse");
+        let policy = manifest.effective_pack_policy();
+
+        assert_eq!(policy.delta_strategy, PackDeltaStrategy::ArchiveChunkedBsdiff);
+        assert_eq!(policy.compression_level, PACK_DEFAULT_ZSTD_LEVEL);
+        assert_eq!(policy.max_chain_length, PACK_DEFAULT_MAX_CHAIN_LENGTH);
+        assert_eq!(policy.keep_latest_fulls, PACK_DEFAULT_KEEP_LATEST_FULLS);
+        assert_eq!(policy.checkpoint_every, PACK_DEFAULT_CHECKPOINT_EVERY);
+    }
+
+    #[test]
+    fn parse_accepts_pack_policy_override() {
+        let yaml = br"schema: 1
+storage:
+  provider: filesystem
+  bucket: /tmp/store
+pack:
+  delta:
+    strategy: archive-bsdiff
+    max_chain_length: 4
+  compression:
+    format: zstd
+    level: 5
+  retention:
+    keep_latest_fulls: 3
+    checkpoint_every: 9
+apps:
+  - id: demoapp
+    target:
+      rid: linux-x64
+";
+
+        let manifest = SurgeManifest::parse(yaml).expect("manifest should parse");
+        let policy = manifest.effective_pack_policy();
+
+        assert_eq!(policy.delta_strategy, PackDeltaStrategy::ArchiveBsdiff);
+        assert_eq!(policy.compression_level, 5);
+        assert_eq!(policy.max_chain_length, 4);
+        assert_eq!(policy.keep_latest_fulls, 3);
+        assert_eq!(policy.checkpoint_every, 9);
+    }
+
+    #[test]
+    fn parse_rejects_invalid_pack_compression_level() {
+        let yaml = br"schema: 1
+storage:
+  provider: filesystem
+  bucket: /tmp/store
+pack:
+  compression:
+    level: 23
+apps:
+  - id: demoapp
+    target:
+      rid: linux-x64
+";
+
+        let err = SurgeManifest::parse(yaml).expect_err("manifest should be rejected");
+        assert!(err.to_string().contains("pack.compression.level"));
     }
 }

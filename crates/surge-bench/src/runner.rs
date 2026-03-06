@@ -1,14 +1,23 @@
 use std::fs;
 use std::io::Cursor;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 
 use surge_core::archive::extractor;
 use surge_core::archive::packer::ArchivePacker;
+use surge_core::config::constants::RELEASES_FILE_COMPRESSED;
+use surge_core::context::{Context, StorageProvider};
 use surge_core::crypto::sha256;
 use surge_core::diff::chunked::{self, ChunkedDiffOptions};
 use surge_core::diff::wrapper;
+use surge_core::error::{Result, SurgeError};
+use surge_core::install::{LEGACY_RUNTIME_MANIFEST_RELATIVE_PATH, RUNTIME_MANIFEST_RELATIVE_PATH};
+use surge_core::pack::builder::PackBuilder;
+use surge_core::platform::detect::current_rid;
+use surge_core::update::manager::{ApplyStrategy, ProgressInfo, UpdateManager};
 
+use crate::payload::{PayloadTemplate, ScenarioProfile};
 use crate::report::BenchmarkResult;
 
 fn time<F, T>(f: F) -> (T, std::time::Duration)
@@ -244,77 +253,143 @@ pub fn run_chunked_bspatch(v1_data: &[u8], patch: &[u8], expected_size: u64) -> 
     }
 }
 
-/// Simulates a real-world update scenario:
-/// - Build a full package (archive of v1)
-/// - Build a delta package (chunked diff between v1 and v2 archives)
-/// - Apply N sequential deltas to reconstruct the final version
-///
-/// Returns results for: full package build, delta package build, and applying N deltas.
-pub fn run_update_scenario(v1_dir: &Path, v2_dir: &Path, num_deltas: usize) -> Vec<BenchmarkResult> {
+/// Publish a real release chain and benchmark the native update manager path.
+pub async fn run_update_scenario(
+    work_dir: &Path,
+    scale: f64,
+    seed: u64,
+    scenario: ScenarioProfile,
+    num_deltas: usize,
+    pack_zstd_level: i32,
+    pack_max_threads: Option<usize>,
+    pack_memory_mb: u64,
+) -> Result<Vec<BenchmarkResult>> {
     let mut results = Vec::new();
+    let version_count = num_deltas.max(1) + 1;
+    let app_id = "bench-app";
+    let rid = current_rid();
+    let store_dir = work_dir.join("update-store");
+    let install_dir = work_dir.join("update-install");
+    let artifacts_dir = work_dir.join("update-artifacts");
+    fs::create_dir_all(&store_dir)?;
+    fs::create_dir_all(&install_dir)?;
 
-    // 1. Build full package (archive v1)
-    let (full_pkg, full_duration) = time(|| {
-        let mut packer = ArchivePacker::new(3).expect("packer");
-        packer.add_directory(v1_dir, "").expect("add dir");
-        packer.finalize().expect("finalize")
-    });
-    results.push(BenchmarkResult {
-        name: "Full package build".to_string(),
-        duration: full_duration,
-        input_size: dir_size(v1_dir),
-        output_size: full_pkg.len() as u64,
-    });
+    let manifest_path = work_dir.join("update-bench.surge.yml");
+    write_bench_manifest(&manifest_path, &store_dir, app_id, &rid, pack_zstd_level)?;
 
-    // 2. Build delta package (chunked diff between archives)
-    let archive_v2 = {
-        let mut packer = ArchivePacker::new(3).expect("packer v2");
-        packer.add_directory(v2_dir, "").expect("add v2 dir");
-        packer.finalize().expect("finalize v2")
-    };
-
-    let opts = ChunkedDiffOptions::default();
-    let (delta_pkg, delta_duration) =
-        time(|| chunked::chunked_bsdiff(&full_pkg, &archive_v2, &opts).expect("chunked bsdiff"));
-    results.push(BenchmarkResult {
-        name: "Delta package build".to_string(),
-        duration: delta_duration,
-        input_size: (full_pkg.len() + archive_v2.len()) as u64,
-        output_size: delta_pkg.len() as u64,
-    });
-
-    // 3. Apply single delta
-    let (reconstructed, single_apply_duration) =
-        time(|| chunked::chunked_bspatch(&full_pkg, &delta_pkg, &opts).expect("chunked bspatch"));
-    assert_eq!(
-        sha256::sha256_hex(&reconstructed),
-        sha256::sha256_hex(&archive_v2),
-        "single delta verification failed"
+    let ctx = Arc::new(Context::new());
+    ctx.set_storage(
+        StorageProvider::Filesystem,
+        store_dir
+            .to_str()
+            .ok_or_else(|| SurgeError::Config(format!("Storage path is not valid UTF-8: {}", store_dir.display())))?,
+        "",
+        "",
+        "",
+        "",
     );
-    results.push(BenchmarkResult {
-        name: "Apply 1 delta".to_string(),
-        duration: single_apply_duration,
-        input_size: (full_pkg.len() + delta_pkg.len()) as u64,
-        output_size: reconstructed.len() as u64,
-    });
+    let mut budget = ctx.resource_budget();
+    let available_threads = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1);
+    let requested_threads = pack_max_threads.unwrap_or(available_threads).max(1);
+    budget.max_threads = i32::try_from(requested_threads).unwrap_or(i32::MAX);
+    budget.max_memory_bytes = i64::try_from(pack_memory_mb.saturating_mul(1024 * 1024)).unwrap_or(i64::MAX);
+    budget.zstd_compression_level = pack_zstd_level;
+    ctx.set_resource_budget(budget);
 
-    // 4. Apply N deltas independently (simulates catching up N versions behind
-    // by applying each delta from the same base — measures total patching throughput)
-    if num_deltas > 1 {
-        let ((), chain_duration) = time(|| {
-            for _ in 0..num_deltas {
-                let _ = chunked::chunked_bspatch(&full_pkg, &delta_pkg, &opts).expect("chain bspatch");
-            }
-        });
-        results.push(BenchmarkResult {
-            name: format!("Apply {num_deltas}x deltas"),
-            duration: chain_duration,
-            input_size: (full_pkg.len() as u64 + delta_pkg.len() as u64) * num_deltas as u64,
-            output_size: reconstructed.len() as u64 * num_deltas as u64,
-        });
+    let template = PayloadTemplate::new(scale, seed);
+    let mut total_input_bytes = template.write_base(&artifacts_dir, seed)?;
+    let publish_started = Instant::now();
+
+    for version_index in 1..=version_count {
+        if version_index > 1 {
+            total_input_bytes = total_input_bytes.saturating_add(template.mutate_version(
+                &artifacts_dir,
+                seed,
+                version_index,
+                scenario,
+            )?);
+        }
+
+        let version = version_label(version_index);
+        let mut builder = PackBuilder::new(
+            Arc::clone(&ctx),
+            manifest_path.to_str().ok_or_else(|| {
+                SurgeError::Config(format!("Manifest path is not valid UTF-8: {}", manifest_path.display()))
+            })?,
+            app_id,
+            &rid,
+            &version,
+            artifacts_dir.to_str().ok_or_else(|| {
+                SurgeError::Config(format!(
+                    "Artifacts path is not valid UTF-8: {}",
+                    artifacts_dir.display()
+                ))
+            })?,
+        )?;
+        builder.build(None).await?;
+        builder.push("stable", None).await?;
     }
 
-    results
+    results.push(BenchmarkResult {
+        name: format!("Publish {version_count} releases"),
+        duration: publish_started.elapsed(),
+        input_size: total_input_bytes,
+        output_size: dir_size_recursive(&store_dir),
+    });
+
+    let baseline_version = version_label(1);
+    let baseline_full = store_dir.join(format!("{app_id}-{baseline_version}-{rid}-full.tar.zst"));
+    let baseline_bytes = fs::read(&baseline_full)?;
+    let baseline_app_dir = install_dir.join("app");
+    extractor::extract_to(&baseline_bytes, &baseline_app_dir, None)?;
+
+    let mut update_manager = UpdateManager::new(
+        Arc::clone(&ctx),
+        app_id,
+        &baseline_version,
+        "stable",
+        install_dir
+            .to_str()
+            .ok_or_else(|| SurgeError::Config(format!("Install path is not valid UTF-8: {}", install_dir.display())))?,
+    )?;
+
+    let releases_index_path = store_dir.join(RELEASES_FILE_COMPRESSED);
+    let releases_index_size = fs::metadata(&releases_index_path).map(|meta| meta.len()).unwrap_or(0);
+    let check_started = Instant::now();
+    let info = update_manager
+        .check_for_updates()
+        .await?
+        .ok_or_else(|| SurgeError::Update("Expected update chain to be available".to_string()))?;
+    let check_duration = check_started.elapsed();
+    if version_count > 1 && !matches!(info.apply_strategy, ApplyStrategy::Delta) {
+        return Err(SurgeError::Update(format!(
+            "Expected delta update strategy for {version_count} published versions, got {:?}",
+            info.apply_strategy
+        )));
+    }
+    results.push(BenchmarkResult {
+        name: format!("Update check ({num_deltas} deltas)"),
+        duration: check_duration,
+        input_size: releases_index_size,
+        output_size: info.download_size.max(0) as u64,
+    });
+
+    let apply_started = Instant::now();
+    update_manager
+        .download_and_apply(&info, None::<fn(ProgressInfo)>)
+        .await?;
+    let apply_duration = apply_started.elapsed();
+    assert_directories_match(&install_dir.join("app"), &artifacts_dir)?;
+    results.push(BenchmarkResult {
+        name: format!("Update apply ({num_deltas} deltas)"),
+        duration: apply_duration,
+        input_size: info.download_size.max(0) as u64,
+        output_size: dir_size_recursive(&install_dir.join("app")),
+    });
+
+    Ok(results)
 }
 
 fn dir_size(dir: &Path) -> u64 {
@@ -345,4 +420,83 @@ fn dir_size_recursive(dir: &Path) -> u64 {
         }
     }
     total
+}
+
+fn write_bench_manifest(path: &Path, store_dir: &Path, app_id: &str, rid: &str, pack_zstd_level: i32) -> Result<()> {
+    let manifest = format!(
+        r"schema: 1
+storage:
+  provider: filesystem
+  bucket: {bucket}
+pack:
+  delta:
+    strategy: archive-chunked-bsdiff
+  compression:
+    format: zstd
+    level: {pack_zstd_level}
+apps:
+  - id: {app_id}
+    name: Benchmark App
+    main: app.main.dll
+    channels:
+      - stable
+    target:
+      rid: {rid}
+",
+        bucket = store_dir.display()
+    );
+    fs::write(path, manifest)?;
+    Ok(())
+}
+
+fn version_label(index: usize) -> String {
+    format!("1.0.{}", index.saturating_sub(1))
+}
+
+fn assert_directories_match(actual: &Path, expected: &Path) -> Result<()> {
+    let mut actual_files = collect_relative_files(actual, actual)?;
+    let mut expected_files = collect_relative_files(expected, expected)?;
+    actual_files.sort();
+    expected_files.sort();
+
+    if actual_files != expected_files {
+        return Err(SurgeError::Update(
+            "Installed files do not match the expected payload".to_string(),
+        ));
+    }
+
+    for relative in actual_files {
+        let actual_hash = sha256::sha256_hex_file(&actual.join(&relative))?;
+        let expected_hash = sha256::sha256_hex_file(&expected.join(&relative))?;
+        if actual_hash != expected_hash {
+            return Err(SurgeError::Update(format!(
+                "Installed file differs from expected payload: {}",
+                relative.display()
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn collect_relative_files(root: &Path, current: &Path) -> Result<Vec<std::path::PathBuf>> {
+    let mut files = Vec::new();
+    for entry in fs::read_dir(current)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
+            files.extend(collect_relative_files(root, &path)?);
+        } else if metadata.is_file() {
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|e| SurgeError::Update(format!("Failed to collect file list: {e}")))?;
+            if relative != Path::new(RUNTIME_MANIFEST_RELATIVE_PATH)
+                && relative != Path::new(LEGACY_RUNTIME_MANIFEST_RELATIVE_PATH)
+            {
+                files.push(relative.to_path_buf());
+            }
+        }
+    }
+    Ok(files)
 }

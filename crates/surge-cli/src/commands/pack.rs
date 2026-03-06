@@ -9,7 +9,7 @@ use crate::formatters::{format_bytes, format_duration};
 use crate::logline;
 use crate::ui::UiTheme;
 use surge_core::archive::packer::ArchivePacker;
-use surge_core::config::constants::{DEFAULT_ZSTD_LEVEL, RELEASES_FILE_COMPRESSED};
+use surge_core::config::constants::{PACK_DEFAULT_MAX_MEMORY_BYTES, RELEASES_FILE_COMPRESSED};
 use surge_core::config::installer::{
     InstallerManifest, InstallerRelease, InstallerRuntime, InstallerStorage, InstallerUi,
 };
@@ -548,7 +548,8 @@ fn build_installers_with_launcher(
 
         let payload_archive = tempfile::NamedTempFile::new()
             .map_err(|e| SurgeError::Pack(format!("Failed to create installer payload archive temp file: {e}")))?;
-        let mut payload_packer = ArchivePacker::new(DEFAULT_ZSTD_LEVEL)?;
+        let pack_policy = manifest.effective_pack_policy();
+        let mut payload_packer = ArchivePacker::new(pack_policy.compression_level)?;
         payload_packer.add_directory(staging, "")?;
         payload_packer.finalize_to_file(payload_archive.path())?;
         let launcher = if installer_type.is_gui() {
@@ -891,7 +892,7 @@ fn parse_rid(rid: &str) -> Option<(RidOs, RidArch)> {
     Some((os, arch))
 }
 
-fn default_artifacts_dir(manifest_path: &Path, app_id: &str, rid: &str, version: &str) -> PathBuf {
+pub(crate) fn default_artifacts_dir(manifest_path: &Path, app_id: &str, rid: &str, version: &str) -> PathBuf {
     manifest_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -928,19 +929,17 @@ fn pack_build_phase_message(step_done: i32, step_count: i32) -> String {
     "Finalizing package artifacts".to_string()
 }
 
-fn configure_context(manifest: &SurgeManifest, app_id: &str) -> Result<Context> {
-    const PACK_ZSTD_LEVEL: i32 = 3;
-    const PACK_MAX_MEMORY_BYTES: i64 = 256 * 1024 * 1024;
-
+pub(crate) fn configure_context(manifest: &SurgeManifest, app_id: &str) -> Result<Context> {
     let ctx = super::build_app_scoped_storage_context(manifest, app_id)?;
+    let pack_policy = manifest.effective_pack_policy();
     let mut budget = ctx.resource_budget();
     let available_threads = std::thread::available_parallelism()
         .map(std::num::NonZeroUsize::get)
         .unwrap_or(1);
 
     budget.max_threads = i32::try_from(available_threads).unwrap_or(i32::MAX);
-    budget.max_memory_bytes = PACK_MAX_MEMORY_BYTES;
-    budget.zstd_compression_level = PACK_ZSTD_LEVEL;
+    budget.max_memory_bytes = PACK_DEFAULT_MAX_MEMORY_BYTES;
+    budget.zstd_compression_level = pack_policy.compression_level;
     ctx.set_resource_budget(budget);
     Ok(ctx)
 }

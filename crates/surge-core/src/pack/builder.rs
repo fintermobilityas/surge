@@ -8,15 +8,16 @@ use tracing::{debug, info, warn};
 
 use crate::archive::packer::ArchivePacker;
 use crate::config::constants::{RELEASES_FILE_COMPRESSED, SCHEMA_VERSION};
-use crate::config::manifest::{ShortcutLocation, SurgeManifest};
+use crate::config::manifest::{PackDeltaStrategy, ShortcutLocation, SurgeManifest};
 use crate::context::{Context, ResourceBudget};
 use crate::crypto::sha256::sha256_hex;
 use crate::diff::chunked::{ChunkedDiffOptions, DEFAULT_CHUNK_SIZE, chunked_bsdiff};
+use crate::diff::wrapper::bsdiff_buffers;
 use crate::error::{Result, SurgeError};
 use crate::platform::fs::write_file_atomic;
 use crate::releases::manifest::{
-    DeltaArtifact, PATCH_FORMAT_CHUNKED_BSDIFF_V1, ReleaseEntry, ReleaseIndex, compress_release_index,
-    decompress_release_index,
+    DeltaArtifact, PATCH_FORMAT_BSDIFF4, PATCH_FORMAT_CHUNKED_BSDIFF_V1, ReleaseEntry, ReleaseIndex,
+    compress_release_index, decompress_release_index,
 };
 use crate::releases::restore::{find_previous_release_for_rid, restore_full_archive_for_version};
 use crate::storage::{StorageBackend, create_storage_backend};
@@ -63,6 +64,7 @@ pub struct PackBuilder {
     installers: Vec<String>,
     environment: BTreeMap<String, String>,
     artifacts_dir: PathBuf,
+    delta_strategy: PackDeltaStrategy,
     storage: Box<dyn StorageBackend>,
     artifacts: Vec<PackageArtifact>,
 }
@@ -87,6 +89,7 @@ impl PackBuilder {
         artifacts_dir: &str,
     ) -> Result<Self> {
         let manifest = SurgeManifest::from_file(Path::new(manifest_path))?;
+        let pack_policy = manifest.effective_pack_policy();
         let (app, target) = manifest
             .find_app_with_target(app_id, rid)
             .ok_or_else(|| SurgeError::Config(format!("Target '{rid}' not found for app '{app_id}'")))?;
@@ -141,6 +144,7 @@ impl PackBuilder {
             installers: target.installers.clone(),
             environment: target.environment.clone(),
             artifacts_dir: artifacts_path,
+            delta_strategy: pack_policy.delta_strategy,
             storage,
             artifacts: Vec::new(),
         })
@@ -315,8 +319,18 @@ impl PackBuilder {
             .ok_or_else(|| SurgeError::Pack("Full package not yet built".to_string()))?;
 
         let budget = self.ctx.resource_budget();
-        let diff_options = chunked_diff_options(&budget, prev_data.len(), new_data.len());
-        let patch = chunked_bsdiff(&prev_data, new_data, &diff_options)?;
+        let (patch, patch_format) = match self.delta_strategy {
+            PackDeltaStrategy::ArchiveChunkedBsdiff => {
+                let diff_options = chunked_diff_options(&budget, prev_data.len(), new_data.len());
+                (
+                    chunked_bsdiff(&prev_data, new_data, &diff_options)?,
+                    PATCH_FORMAT_CHUNKED_BSDIFF_V1.to_string(),
+                )
+            }
+            PackDeltaStrategy::ArchiveBsdiff => {
+                (bsdiff_buffers(&prev_data, new_data)?, PATCH_FORMAT_BSDIFF4.to_string())
+            }
+        };
 
         let delta_filename = format!("{}-{}-{}-delta.tar.zst", self.app_id, self.version, self.rid);
         let compressed = zstd::encode_all(patch.as_slice(), budget.zstd_compression_level)
@@ -332,7 +346,7 @@ impl PackBuilder {
             sha256,
             is_delta: true,
             from_version: previous_release.version.clone(),
-            patch_format: PATCH_FORMAT_CHUNKED_BSDIFF_V1.to_string(),
+            patch_format,
             bytes: compressed,
         }))
     }

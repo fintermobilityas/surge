@@ -42,6 +42,22 @@ pub struct GeneratedPayload {
     pub total_size_v2: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScenarioProfile {
+    FullRelease,
+    SdkOnly,
+}
+
+impl ScenarioProfile {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FullRelease => "full_release",
+            Self::SdkOnly => "sdk_only",
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum FilePattern {
     NativeSdk,
@@ -54,6 +70,12 @@ struct FileSpec {
     name: String,
     size: u64,
     pattern: FilePattern,
+}
+
+pub struct PayloadTemplate {
+    scale: f64,
+    specs: Vec<FileSpec>,
+    pub total_files: usize,
 }
 
 const LARGE_APP_TOTAL_FILES: usize = 319;
@@ -204,6 +226,50 @@ fn build_file_specs(rng: &mut Xorshift64, scale: f64) -> Vec<FileSpec> {
 
     append_filler_specs(rng, &mut specs, scale);
     specs
+}
+
+impl PayloadTemplate {
+    #[must_use]
+    pub fn new(scale: f64, seed: u64) -> Self {
+        let mut rng = Xorshift64::new(seed);
+        let specs = build_file_specs(&mut rng, scale);
+        let total_files = specs.len();
+        Self {
+            scale,
+            specs,
+            total_files,
+        }
+    }
+
+    pub fn write_base(&self, dir: &Path, seed: u64) -> io::Result<u64> {
+        reset_directory(dir)?;
+        for spec in &self.specs {
+            write_synthetic_file(seed, spec, &dir.join(&spec.name))?;
+        }
+        dir_size(dir)
+    }
+
+    pub fn mutate_version(
+        &self,
+        dir: &Path,
+        seed: u64,
+        version_index: usize,
+        scenario: ScenarioProfile,
+    ) -> io::Result<u64> {
+        match scenario {
+            ScenarioProfile::FullRelease => {
+                rewrite_large_release_files(&self.specs, dir, seed, version_index)?;
+                mutate_nativesdk(dir, seed, version_index)?;
+                write_feature_files(dir, self.scale, seed, version_index)?;
+                remove_rotating_config(dir, version_index)?;
+            }
+            ScenarioProfile::SdkOnly => {
+                mutate_nativesdk(dir, seed, version_index)?;
+            }
+        }
+
+        dir_size(dir)
+    }
 }
 
 fn append_filler_specs(rng: &mut Xorshift64, specs: &mut Vec<FileSpec>, scale: f64) {
@@ -414,6 +480,94 @@ fn write_synthetic_file(seed: u64, spec: &FileSpec, path: &Path) -> io::Result<(
     writer.flush()
 }
 
+fn reset_directory(dir: &Path) -> io::Result<()> {
+    if dir.exists() {
+        fs::remove_dir_all(dir)?;
+    }
+    fs::create_dir_all(dir)
+}
+
+fn copy_flat_directory(from: &Path, to: &Path) -> io::Result<()> {
+    reset_directory(to)?;
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        fs::copy(entry.path(), to.join(entry.file_name()))?;
+    }
+    Ok(())
+}
+
+fn rewrite_large_release_files(specs: &[FileSpec], dir: &Path, seed: u64, version_index: usize) -> io::Result<()> {
+    let rewrite_count = (specs.len() / 20).max(1);
+    let offset = version_index.saturating_sub(2) % specs.len().max(1);
+    let version_seed = seed.wrapping_add((version_index as u64).wrapping_mul(1_000));
+
+    for step in 0..rewrite_count {
+        let spec = &specs[(offset + step) % specs.len()];
+        write_synthetic_file(version_seed, spec, &dir.join(&spec.name))?;
+    }
+
+    Ok(())
+}
+
+fn mutate_nativesdk(dir: &Path, seed: u64, version_index: usize) -> io::Result<()> {
+    let nativesdk_path = dir.join("nativesdk.so");
+    if !nativesdk_path.exists() {
+        return Ok(());
+    }
+
+    let mut data = fs::read(&nativesdk_path)?;
+    if data.is_empty() {
+        return Ok(());
+    }
+
+    let page_span = 4096usize;
+    let page_index = version_index.saturating_sub(1) % 64;
+    let offset = (page_index * page_span).min(data.len().saturating_sub(1));
+    let patch_end = (offset + page_span).min(data.len());
+    let mut patch_rng = Xorshift64::new(seed.wrapping_add((version_index as u64).wrapping_mul(2_000)));
+    patch_rng.fill_bytes(&mut data[offset..patch_end]);
+    fs::write(&nativesdk_path, &data)
+}
+
+fn write_feature_files(dir: &Path, scale: f64, seed: u64, version_index: usize) -> io::Result<()> {
+    let feature_binary = FileSpec {
+        name: "app.feature.dll".to_string(),
+        size: scale_size(411_136, scale),
+        pattern: FilePattern::Binary,
+    };
+    let feature_config = FileSpec {
+        name: "app.feature.config.json".to_string(),
+        size: scale_size(12_000, scale),
+        pattern: FilePattern::Text,
+    };
+
+    write_synthetic_file(
+        seed.wrapping_add((version_index as u64).wrapping_mul(3_000)),
+        &feature_binary,
+        &dir.join(&feature_binary.name),
+    )?;
+    write_synthetic_file(
+        seed.wrapping_add((version_index as u64).wrapping_mul(4_000)),
+        &feature_config,
+        &dir.join(&feature_config.name),
+    )
+}
+
+fn remove_rotating_config(dir: &Path, version_index: usize) -> io::Result<()> {
+    const CANDIDATES: &[&str] = &[
+        "generated-config-007.json",
+        "generated-config-014.json",
+        "generated-config-021.json",
+        "generated-config-028.json",
+    ];
+    let candidate = CANDIDATES[version_index.saturating_sub(2) % CANDIDATES.len()];
+    match fs::remove_file(dir.join(candidate)) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
 fn dir_size(dir: &Path) -> io::Result<u64> {
     let mut total = 0;
     for entry in fs::read_dir(dir)? {
@@ -426,58 +580,14 @@ fn dir_size(dir: &Path) -> io::Result<u64> {
     Ok(total)
 }
 
-pub fn generate(work_dir: &Path, scale: f64, seed: u64) -> io::Result<GeneratedPayload> {
+pub fn generate(work_dir: &Path, scale: f64, seed: u64, scenario: ScenarioProfile) -> io::Result<GeneratedPayload> {
     let v1_dir = work_dir.join("v1");
     let v2_dir = work_dir.join("v2");
-    fs::create_dir_all(&v1_dir)?;
-    fs::create_dir_all(&v2_dir)?;
-
-    let mut rng = Xorshift64::new(seed);
-    let specs = build_file_specs(&mut rng, scale);
-    let total_files = specs.len();
-
-    for spec in &specs {
-        write_synthetic_file(seed, spec, &v1_dir.join(&spec.name))?;
-    }
-
-    let total_size_v1 = dir_size(&v1_dir)?;
-
-    for entry in fs::read_dir(&v1_dir)? {
-        let entry = entry?;
-        fs::copy(entry.path(), v2_dir.join(entry.file_name()))?;
-    }
-
-    for spec in specs.iter().take(total_files / 20) {
-        write_synthetic_file(seed.wrapping_add(1_000), spec, &v2_dir.join(&spec.name))?;
-    }
-
-    let nativesdk_path = v2_dir.join("nativesdk.so");
-    if nativesdk_path.exists() {
-        let mut data = fs::read(&nativesdk_path)?;
-        let offset = 4096.min(data.len());
-        let patch_end = (offset + 4096).min(data.len());
-        let mut patch_rng = Xorshift64::new(seed.wrapping_add(2_000));
-        patch_rng.fill_bytes(&mut data[offset..patch_end]);
-        fs::write(&nativesdk_path, &data)?;
-    }
-
-    let new_binary = FileSpec {
-        name: "app.feature.dll".to_string(),
-        size: scale_size(411_136, scale),
-        pattern: FilePattern::Binary,
-    };
-    write_synthetic_file(seed.wrapping_add(3_000), &new_binary, &v2_dir.join(&new_binary.name))?;
-
-    let new_config = FileSpec {
-        name: "app.feature.config.json".to_string(),
-        size: scale_size(12_000, scale),
-        pattern: FilePattern::Text,
-    };
-    write_synthetic_file(seed.wrapping_add(4_000), &new_config, &v2_dir.join(&new_config.name))?;
-
-    let _ = fs::remove_file(v2_dir.join("generated-config-007.json"));
-
-    let total_size_v2 = dir_size(&v2_dir)?;
+    let template = PayloadTemplate::new(scale, seed);
+    let total_files = template.total_files;
+    let total_size_v1 = template.write_base(&v1_dir, seed)?;
+    copy_flat_directory(&v1_dir, &v2_dir)?;
+    let total_size_v2 = template.mutate_version(&v2_dir, seed, 2, scenario)?;
 
     Ok(GeneratedPayload {
         v1_dir,

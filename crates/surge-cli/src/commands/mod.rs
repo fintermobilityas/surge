@@ -10,6 +10,7 @@ pub mod promote;
 pub mod push;
 pub mod restore;
 pub mod setup;
+pub mod tune;
 
 pub(crate) use surge_core::storage_config::{
     append_prefix, build_app_scoped_storage_config, build_app_scoped_storage_context, parse_storage_provider,

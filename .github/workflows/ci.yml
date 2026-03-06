@@ -126,6 +126,16 @@ jobs:
               target/release/surge-installer
               target/release/surge-installer-ui
               target/release/surge-supervisor
+          - os: ubuntu-24.04-arm
+            name: Linux arm64
+            cache_key: linux-arm64-artifacts
+            artifact_name: linux-arm64
+            artifact_path: |
+              target/release/libsurge.so
+              target/release/surge
+              target/release/surge-installer
+              target/release/surge-installer-ui
+              target/release/surge-supervisor
           - os: windows-latest
             name: Windows x64
             cache_key: windows-artifacts

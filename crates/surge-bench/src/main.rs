@@ -35,6 +35,10 @@ struct Args {
     #[arg(long)]
     skip_diff: bool,
 
+    /// Skip classic bsdiff/bspatch while still running chunked diff benchmarks
+    #[arg(long)]
+    skip_classic_diff: bool,
+
     /// Skip installer benchmarks
     #[arg(long)]
     skip_installers: bool,
@@ -77,12 +81,14 @@ fn main() {
     );
     if args.skip_diff {
         log!(json_mode, "  (bsdiff/bspatch: SKIPPED)");
+    } else if args.skip_classic_diff {
+        log!(json_mode, "  (classic bsdiff/bspatch: SKIPPED)");
     }
     if args.skip_installers {
         log!(json_mode, "  (installers: SKIPPED)");
     }
 
-    if !args.skip_diff && args.scale > 0.3 {
+    if !args.skip_diff && !args.skip_classic_diff && args.scale > 0.3 {
         log!(json_mode, "");
         log!(json_mode, "WARNING: bsdiff at scale > 0.3 may require ~15 GB of RAM.");
         log!(json_mode, "         Use --skip-diff to skip if memory is limited.");
@@ -217,25 +223,26 @@ fn main() {
         packer_v2.add_directory(&generated.v2_dir, "").expect("add v2 dir");
         let archive_v2 = packer_v2.finalize().expect("finalize v2");
 
-        // Classic bsdiff
-        let (diff_result, patch) = runner::run_bsdiff(&first_archive, &archive_v2);
-        log!(
-            json_mode,
-            "  {} {}",
-            report::format_duration(diff_result.duration),
-            diff_result.name
-        );
-        results.push(diff_result);
+        if !args.skip_classic_diff {
+            let (diff_result, patch) = runner::run_bsdiff(&first_archive, &archive_v2);
+            log!(
+                json_mode,
+                "  {} {}",
+                report::format_duration(diff_result.duration),
+                diff_result.name
+            );
+            results.push(diff_result);
 
-        let patch_result = runner::run_bspatch(&first_archive, &patch, archive_v2.len() as u64);
-        log!(
-            json_mode,
-            "  {} {}",
-            report::format_duration(patch_result.duration),
-            patch_result.name
-        );
-        results.push(patch_result);
-        drop(patch);
+            let patch_result = runner::run_bspatch(&first_archive, &patch, archive_v2.len() as u64);
+            log!(
+                json_mode,
+                "  {} {}",
+                report::format_duration(patch_result.duration),
+                patch_result.name
+            );
+            results.push(patch_result);
+            drop(patch);
+        }
 
         // Chunked bsdiff
         let (chunked_diff_result, chunked_patch) = runner::run_chunked_bsdiff(&first_archive, &archive_v2);

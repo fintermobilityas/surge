@@ -1412,11 +1412,13 @@ mod tests {
 
     use super::*;
     use surge_core::archive::packer::ArchivePacker;
+    use surge_core::config::constants::DEFAULT_ZSTD_LEVEL;
     use surge_core::config::manifest::ShortcutLocation;
     use surge_core::config::manifest::SurgeManifest;
     use surge_core::crypto::sha256::sha256_hex;
     use surge_core::diff::wrapper::bsdiff_buffers;
-    use surge_core::releases::manifest::DeltaArtifact;
+    use surge_core::platform::detect::current_rid;
+    use surge_core::releases::manifest::{DeltaArtifact, ReleaseIndex, compress_release_index};
     use surge_core::storage::filesystem::FilesystemBackend;
 
     fn release(version: &str, channel: &str, rid: &str, full: &str) -> ReleaseEntry {
@@ -1443,6 +1445,88 @@ mod tests {
             installers: Vec::new(),
             environment: BTreeMap::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn execute_installs_selected_release_locally_from_backend() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should exist");
+        let store_dir = temp_dir.path().join("store");
+        let install_root = temp_dir.path().join("install-root");
+        let download_dir = temp_dir.path().join("download-cache");
+        let application_manifest_path = temp_dir.path().join(".surge").join("application.yml");
+        let fallback_manifest_path = temp_dir.path().join("fallback-surge.yml");
+        let rid = current_rid();
+        let full_filename = format!("demo-1.2.3-{rid}-full.tar.zst");
+
+        std::fs::create_dir_all(&store_dir).expect("store dir should be created");
+        std::fs::create_dir_all(application_manifest_path.parent().expect("app manifest parent"))
+            .expect("app manifest dir should be created");
+
+        let mut packer = ArchivePacker::new(3).expect("archive packer should be created");
+        packer
+            .add_buffer("demoapp", b"#!/bin/sh\necho installed\n", 0o755)
+            .expect("main executable should be added");
+        packer
+            .add_buffer("payload.txt", b"installed from execute", 0o644)
+            .expect("payload should be added");
+        let package_bytes = packer.finalize().expect("archive should be finalized");
+        std::fs::write(store_dir.join(&full_filename), &package_bytes).expect("package should be written");
+
+        let mut entry = release("1.2.3", "stable", &rid, &full_filename);
+        entry.main_exe = "demoapp".to_string();
+        entry.install_directory = install_root.to_string_lossy().to_string();
+        entry.shortcuts = Vec::new();
+        entry.full_size = i64::try_from(package_bytes.len()).expect("package length should fit i64");
+        entry.full_sha256 = sha256_hex(&package_bytes);
+
+        let index = ReleaseIndex {
+            app_id: "demo".to_string(),
+            releases: vec![entry],
+            ..ReleaseIndex::default()
+        };
+        let compressed = compress_release_index(&index, DEFAULT_ZSTD_LEVEL).expect("release index should compress");
+        std::fs::write(store_dir.join(RELEASES_FILE_COMPRESSED), compressed).expect("release index should be written");
+
+        let manifest_yaml = format!(
+            "schema: 1\nstorage:\n  provider: filesystem\n  bucket: {}\napps:\n  - id: demo\n    channels: [stable]\n    target:\n      rid: {rid}\n",
+            store_dir.display()
+        );
+        std::fs::write(&application_manifest_path, manifest_yaml).expect("application manifest should be written");
+
+        execute(
+            &fallback_manifest_path,
+            &application_manifest_path,
+            None,
+            None,
+            Some("demo"),
+            Some("stable"),
+            Some(&rid),
+            Some("1.2.3"),
+            false,
+            true,
+            &download_dir,
+            StorageOverrides::default(),
+        )
+        .await
+        .expect("install command should succeed");
+
+        let active_app_dir = install_root.join("app");
+        assert_eq!(
+            std::fs::read_to_string(active_app_dir.join("payload.txt")).expect("payload file should exist"),
+            "installed from execute"
+        );
+        assert!(
+            download_dir.join(&full_filename).is_file(),
+            "package should be cached locally after install"
+        );
+
+        let runtime_manifest =
+            std::fs::read_to_string(active_app_dir.join(surge_core::install::RUNTIME_MANIFEST_RELATIVE_PATH))
+                .expect("runtime manifest should be written");
+        assert!(runtime_manifest.contains("id: demo"));
+        assert!(runtime_manifest.contains("version: 1.2.3"));
+        assert!(runtime_manifest.contains("channel: stable"));
+        assert!(runtime_manifest.contains(&format!("bucket: {}", store_dir.display())));
     }
 
     #[test]

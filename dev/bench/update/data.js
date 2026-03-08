@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1772952879164,
+  "lastUpdate": 1772954111937,
   "repoUrl": "https://github.com/fintermobilityas/surge",
   "entries": {
     "Surge Update (localized-chain)": [
@@ -112,6 +112,43 @@ window.BENCHMARK_DATA = {
           {
             "name": "Update apply (10 deltas)",
             "value": 48777.231873,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Peter Rekdal Khan-Sunde",
+            "username": "peters",
+            "email": "peter.sunde@gmail.com"
+          },
+          "committer": {
+            "name": "Peter Rekdal Khan-Sunde",
+            "username": "peters",
+            "email": "peter.sunde@gmail.com"
+          },
+          "id": "03a31c12c8ff93d7f2e9716e9ab79448f79cb384",
+          "message": "test(core): stabilize archive delta demoapp regression",
+          "timestamp": "2026-03-06T20:35:23Z",
+          "url": "https://github.com/fintermobilityas/surge/commit/03a31c12c8ff93d7f2e9716e9ab79448f79cb384"
+        },
+        "date": 1772954110986,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "Publish 11 releases",
+            "value": 1080557.458712,
+            "unit": "ms"
+          },
+          {
+            "name": "Update check (10 deltas)",
+            "value": 0.519641,
+            "unit": "ms"
+          },
+          {
+            "name": "Update apply (10 deltas)",
+            "value": 48947.531345,
             "unit": "ms"
           }
         ]

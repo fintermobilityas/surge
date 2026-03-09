@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1773037265207,
+  "lastUpdate": 1773037573314,
   "repoUrl": "https://github.com/fintermobilityas/surge",
   "entries": {
     "Surge Micro (small)": [
@@ -499,6 +499,68 @@ window.BENCHMARK_DATA = {
           {
             "name": "chunked bspatch",
             "value": 3719.321539,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Peter Rekdal Khan-Sunde",
+            "username": "peters",
+            "email": "peter.sunde@gmail.com"
+          },
+          "committer": {
+            "name": "Peter Rekdal Khan-Sunde",
+            "username": "peters",
+            "email": "peter.sunde@gmail.com"
+          },
+          "id": "03a31c12c8ff93d7f2e9716e9ab79448f79cb384",
+          "message": "test(core): stabilize archive delta demoapp regression",
+          "timestamp": "2026-03-06T20:35:23Z",
+          "url": "https://github.com/fintermobilityas/surge/commit/03a31c12c8ff93d7f2e9716e9ab79448f79cb384"
+        },
+        "date": 1773037572872,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "Archive create (zstd=3)",
+            "value": 2000.7065069999999,
+            "unit": "ms"
+          },
+          {
+            "name": "Archive extract",
+            "value": 1173.865519,
+            "unit": "ms"
+          },
+          {
+            "name": "SHA-256 (in-memory)",
+            "value": 97.13671000000001,
+            "unit": "ms"
+          },
+          {
+            "name": "SHA-256 (file)",
+            "value": 109.72713300000001,
+            "unit": "ms"
+          },
+          {
+            "name": "Zstd compress (level=3)",
+            "value": 1604.3832569999997,
+            "unit": "ms"
+          },
+          {
+            "name": "Zstd decompress",
+            "value": 187.038437,
+            "unit": "ms"
+          },
+          {
+            "name": "chunked bsdiff",
+            "value": 216604.925961,
+            "unit": "ms"
+          },
+          {
+            "name": "chunked bspatch",
+            "value": 3805.201985,
             "unit": "ms"
           }
         ]

@@ -7,6 +7,58 @@ use crate::error::{Result, SurgeError};
 const FOOTER_MAGIC: [u8; 8] = *b"SRGINST1";
 const FOOTER_SIZE: usize = FOOTER_MAGIC.len() + 8 + 8;
 
+fn read_payload_footer(file: &mut File, executable: &Path) -> Result<(u64, u64, u64)> {
+    let len = file
+        .metadata()
+        .map_err(|e| {
+            SurgeError::Pack(format!(
+                "Failed to read installer metadata '{}': {e}",
+                executable.display()
+            ))
+        })?
+        .len();
+    if len < FOOTER_SIZE as u64 {
+        return Err(SurgeError::Pack(format!(
+            "Installer '{}' does not contain an embedded payload footer",
+            executable.display()
+        )));
+    }
+
+    let footer_start = len - FOOTER_SIZE as u64;
+    file.seek(SeekFrom::Start(footer_start))
+        .map_err(|e| SurgeError::Pack(format!("Failed to seek installer footer: {e}")))?;
+
+    let mut footer = [0u8; FOOTER_SIZE];
+    file.read_exact(&mut footer)
+        .map_err(|e| SurgeError::Pack(format!("Failed to read installer footer: {e}")))?;
+
+    if footer[..FOOTER_MAGIC.len()] != FOOTER_MAGIC {
+        return Err(SurgeError::Pack(format!(
+            "Installer '{}' has invalid embedded payload footer magic",
+            executable.display()
+        )));
+    }
+
+    let offset_start = FOOTER_MAGIC.len();
+    let len_start = offset_start + 8;
+    let mut offset_bytes = [0u8; 8];
+    offset_bytes.copy_from_slice(&footer[offset_start..len_start]);
+    let mut payload_len_bytes = [0u8; 8];
+    payload_len_bytes.copy_from_slice(&footer[len_start..len_start + 8]);
+
+    let payload_offset = u64::from_le_bytes(offset_bytes);
+    let payload_len = u64::from_le_bytes(payload_len_bytes);
+    let payload_end = payload_offset.saturating_add(payload_len);
+    if payload_end > footer_start {
+        return Err(SurgeError::Pack(format!(
+            "Installer '{}' has an invalid payload range ({payload_offset}..{payload_end})",
+            executable.display()
+        )));
+    }
+
+    Ok((payload_offset, payload_len, len))
+}
+
 pub fn write_embedded_installer(launcher: &Path, payload_archive: &Path, output: &Path) -> Result<()> {
     let mut launcher_file = File::open(launcher).map_err(|e| {
         SurgeError::Pack(format!(
@@ -61,53 +113,7 @@ pub fn read_embedded_payload(executable: &Path) -> Result<Vec<u8>> {
             executable.display()
         ))
     })?;
-    let len = file
-        .metadata()
-        .map_err(|e| {
-            SurgeError::Pack(format!(
-                "Failed to read installer metadata '{}': {e}",
-                executable.display()
-            ))
-        })?
-        .len();
-    if len < FOOTER_SIZE as u64 {
-        return Err(SurgeError::Pack(format!(
-            "Installer '{}' does not contain an embedded payload footer",
-            executable.display()
-        )));
-    }
-
-    file.seek(SeekFrom::Start(len - FOOTER_SIZE as u64))
-        .map_err(|e| SurgeError::Pack(format!("Failed to seek installer footer: {e}")))?;
-
-    let mut footer = [0u8; FOOTER_SIZE];
-    file.read_exact(&mut footer)
-        .map_err(|e| SurgeError::Pack(format!("Failed to read installer footer: {e}")))?;
-
-    if footer[..FOOTER_MAGIC.len()] != FOOTER_MAGIC {
-        return Err(SurgeError::Pack(format!(
-            "Installer '{}' has invalid embedded payload footer magic",
-            executable.display()
-        )));
-    }
-
-    let offset_start = FOOTER_MAGIC.len();
-    let len_start = offset_start + 8;
-    let mut offset_bytes = [0u8; 8];
-    offset_bytes.copy_from_slice(&footer[offset_start..len_start]);
-    let mut payload_len_bytes = [0u8; 8];
-    payload_len_bytes.copy_from_slice(&footer[len_start..len_start + 8]);
-
-    let payload_offset = u64::from_le_bytes(offset_bytes);
-    let payload_len = u64::from_le_bytes(payload_len_bytes);
-    let payload_end = payload_offset.saturating_add(payload_len);
-    let footer_start = len - FOOTER_SIZE as u64;
-    if payload_end > footer_start {
-        return Err(SurgeError::Pack(format!(
-            "Installer '{}' has an invalid payload range ({payload_offset}..{payload_end})",
-            executable.display()
-        )));
-    }
+    let (payload_offset, payload_len, _len) = read_payload_footer(&mut file, executable)?;
 
     let payload_size = usize::try_from(payload_len)
         .map_err(|_| SurgeError::Pack(format!("Embedded payload is too large ({payload_len} bytes)")))?;
@@ -117,6 +123,24 @@ pub fn read_embedded_payload(executable: &Path) -> Result<Vec<u8>> {
     file.read_exact(&mut payload)
         .map_err(|e| SurgeError::Pack(format!("Failed to read embedded payload: {e}")))?;
     Ok(payload)
+}
+
+pub fn read_launcher_stub(executable: &Path) -> Result<Vec<u8>> {
+    let mut file = File::open(executable).map_err(|e| {
+        SurgeError::Pack(format!(
+            "Failed to open installer executable '{}': {e}",
+            executable.display()
+        ))
+    })?;
+    let (payload_offset, _payload_len, _len) = read_payload_footer(&mut file, executable)?;
+    let launcher_len = usize::try_from(payload_offset)
+        .map_err(|_| SurgeError::Pack(format!("Installer launcher is too large ({payload_offset} bytes)")))?;
+    let mut launcher = vec![0u8; launcher_len];
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| SurgeError::Pack(format!("Failed to seek installer launcher: {e}")))?;
+    file.read_exact(&mut launcher)
+        .map_err(|e| SurgeError::Pack(format!("Failed to read installer launcher: {e}")))?;
+    Ok(launcher)
 }
 
 #[cfg(test)]
@@ -129,7 +153,8 @@ mod tests {
     fn embedded_installer_roundtrip() {
         let tmp = tempfile::tempdir().expect("temp dir should be created");
         let launcher = tmp.path().join("surge-installer");
-        std::fs::write(&launcher, b"launcher-bytes").expect("launcher should be written");
+        let launcher_bytes = b"launcher-bytes";
+        std::fs::write(&launcher, launcher_bytes).expect("launcher should be written");
 
         let payload_archive = tmp.path().join("payload.tar.zst");
         let mut packer = ArchivePacker::new(1).expect("packer should be created");
@@ -145,5 +170,9 @@ mod tests {
         let payload = read_embedded_payload(&installer).expect("payload should be readable");
         let installer_manifest = read_entry(&payload, "installer.yml").expect("installer manifest should exist");
         assert_eq!(installer_manifest, b"schema: 1\n");
+        assert_eq!(
+            read_launcher_stub(&installer).expect("launcher should be readable"),
+            launcher_bytes
+        );
     }
 }

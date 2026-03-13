@@ -4,6 +4,13 @@ use std::path::{Path, PathBuf};
 use crate::config::manifest::ShortcutLocation;
 use crate::error::{Result, SurgeError};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinuxShortcutFile {
+    pub location: ShortcutLocation,
+    pub file_name: String,
+    pub content: String,
+}
+
 /// Create platform shortcuts for an installed release.
 ///
 /// Supported platforms:
@@ -279,37 +286,68 @@ fn install_shortcuts_linux(
     environment: &BTreeMap<String, String>,
     paths: &LinuxShortcutPaths,
 ) -> Result<()> {
-    let file_name = format!("{}.desktop", sanitize_file_stem(name));
-    let mut desktop_entry: Option<String> = None;
-    let mut startup_entry: Option<String> = None;
-
-    for location in shortcuts {
-        match location {
+    for rendered in render_linux_shortcut_files(
+        name,
+        exe_path,
+        icon_path,
+        supervisor_id,
+        install_root,
+        shortcuts,
+        environment,
+    ) {
+        let target_dir = match rendered.location {
             ShortcutLocation::Desktop | ShortcutLocation::StartMenu => {
-                let entry = desktop_entry.get_or_insert_with(|| {
-                    build_desktop_entry_linux(name, exe_path, icon_path, install_root, environment)
-                });
                 std::fs::create_dir_all(&paths.applications_dir)?;
-                let shortcut_path = paths.applications_dir.join(&file_name);
-                crate::platform::fs::write_file_atomic(&shortcut_path, entry.as_bytes())?;
-                crate::platform::fs::make_executable(&shortcut_path)?;
+                &paths.applications_dir
             }
             ShortcutLocation::Startup => {
-                let entry = startup_entry.get_or_insert_with(|| {
-                    build_startup_entry_linux(name, exe_path, icon_path, supervisor_id, install_root, environment)
-                });
                 std::fs::create_dir_all(&paths.autostart_dir)?;
-                let shortcut_path = paths.autostart_dir.join(&file_name);
-                crate::platform::fs::write_file_atomic(&shortcut_path, entry.as_bytes())?;
-                crate::platform::fs::make_executable(&shortcut_path)?;
+                &paths.autostart_dir
             }
-        }
+        };
+        let shortcut_path = target_dir.join(&rendered.file_name);
+        crate::platform::fs::write_file_atomic(&shortcut_path, rendered.content.as_bytes())?;
+        crate::platform::fs::make_executable(&shortcut_path)?;
     }
 
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+pub fn render_linux_shortcut_files(
+    name: &str,
+    exe_path: &Path,
+    icon_path: &Path,
+    supervisor_id: &str,
+    install_root: &Path,
+    shortcuts: &[ShortcutLocation],
+    environment: &BTreeMap<String, String>,
+) -> Vec<LinuxShortcutFile> {
+    let file_name = format!("{}.desktop", sanitize_file_stem(name));
+    let mut desktop_entry: Option<String> = None;
+    let mut startup_entry: Option<String> = None;
+    let mut rendered = Vec::new();
+
+    for location in shortcuts {
+        let content = match location {
+            ShortcutLocation::Desktop | ShortcutLocation::StartMenu => desktop_entry
+                .get_or_insert_with(|| build_desktop_entry_linux(name, exe_path, icon_path, install_root, environment))
+                .clone(),
+            ShortcutLocation::Startup => startup_entry
+                .get_or_insert_with(|| {
+                    build_startup_entry_linux(name, exe_path, icon_path, supervisor_id, install_root, environment)
+                })
+                .clone(),
+        };
+        rendered.push(LinuxShortcutFile {
+            location: *location,
+            file_name: file_name.clone(),
+            content,
+        });
+    }
+
+    rendered
+}
+
 fn build_desktop_entry_linux(
     name: &str,
     exe_path: &Path,
@@ -328,7 +366,6 @@ fn build_desktop_entry_linux(
     )
 }
 
-#[cfg(target_os = "linux")]
 fn build_startup_entry_linux(
     name: &str,
     exe_path: &Path,
@@ -358,7 +395,6 @@ fn build_startup_entry_linux(
     )
 }
 
-#[cfg(target_os = "linux")]
 fn build_exec_line_linux(command: String, environment: &BTreeMap<String, String>) -> String {
     if environment.is_empty() {
         format!("Exec={command}")
@@ -372,7 +408,6 @@ fn build_exec_line_linux(command: String, environment: &BTreeMap<String, String>
     }
 }
 
-#[cfg(target_os = "linux")]
 fn escape_desktop_value(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', " ")
 }
@@ -807,6 +842,31 @@ mod tests {
             content.contains("Exec=env MY_VAR=my_value"),
             "desktop entry should contain env vars: {content}"
         );
+    }
+
+    #[test]
+    fn test_render_linux_shortcut_files_emits_application_and_autostart_entries() {
+        let install_root = PathBuf::from("/home/demo/.local/share/demoapp");
+        let exe_path = install_root.join("app").join("demoapp");
+        let icon_path = install_root.join("app").join("icon.png");
+        let mut env = BTreeMap::new();
+        env.insert("DISPLAY".to_string(), ":0".to_string());
+
+        let rendered = render_linux_shortcut_files(
+            "Demo App",
+            &exe_path,
+            &icon_path,
+            "demo-supervisor",
+            &install_root,
+            &[ShortcutLocation::Desktop, ShortcutLocation::Startup],
+            &env,
+        );
+
+        assert_eq!(rendered.len(), 2);
+        assert_eq!(rendered[0].file_name, "Demo-App.desktop");
+        assert!(rendered[0].content.contains("Exec=env DISPLAY=:0"));
+        assert!(rendered[1].content.contains("surge-supervisor"));
+        assert!(rendered[1].content.contains("--id demo-supervisor"));
     }
 
     #[test]

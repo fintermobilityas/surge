@@ -1,8 +1,8 @@
 #![allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::IsTerminal;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -20,7 +20,7 @@ use surge_core::config::installer::{
 use surge_core::config::manifest::SurgeManifest;
 use surge_core::error::{Result, SurgeError};
 use surge_core::install::{self as core_install, InstallProfile};
-use surge_core::releases::artifact_cache::{CacheFetchOutcome, fetch_or_reuse_file};
+use surge_core::releases::artifact_cache::{CacheFetchOutcome, cache_path_for_key, fetch_or_reuse_file};
 use surge_core::releases::manifest::{ReleaseEntry, ReleaseIndex, decompress_release_index};
 use surge_core::releases::restore::{RestoreOptions, RestoreProgress, restore_full_archive_for_version_with_options};
 use surge_core::releases::version::compare_versions;
@@ -129,6 +129,12 @@ struct RemoteInstallState {
     channel: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemotePublishedInstallerPlan {
+    candidate_keys: Vec<String>,
+    blockers: Vec<String>,
+}
+
 pub async fn execute(
     manifest_path: &Path,
     application_manifest_path: &Path,
@@ -145,17 +151,16 @@ pub async fn execute(
     overrides: StorageOverrides<'_>,
 ) -> Result<()> {
     let selected_manifest_path = selected_install_manifest_path(application_manifest_path, manifest_path);
-    let manifest = SurgeManifest::from_file(selected_manifest_path)?;
-    let interactive_wizard = should_prompt_install_selection();
+    let manifest = load_install_manifest_if_available(selected_manifest_path)?;
+    let interactive_wizard = manifest.is_some() && should_prompt_install_selection();
     let interactive_selection = if interactive_wizard {
-        Some(prompt_install_selection(&manifest, app_id, rid)?)
+        Some(prompt_install_selection(
+            manifest.as_ref().expect("interactive install requires a manifest"),
+            app_id,
+            rid,
+        )?)
     } else {
         None
-    };
-    let app_id = if let Some(selection) = &interactive_selection {
-        selection.app_id.clone()
-    } else {
-        super::resolve_app_id_with_rid_hint(&manifest, app_id, rid)?
     };
     let selected_os = interactive_selection.as_ref().map(|selection| selection.os.clone());
     let explicit_channel = channel.map(str::trim).filter(|value| !value.is_empty());
@@ -171,48 +176,53 @@ pub async fn execute(
         None => InstallTarget::Local,
     };
 
-    let selected_rid = interactive_selection
+    let explicit_app_id = if let Some(selection) = &interactive_selection {
+        Some(selection.app_id.clone())
+    } else if let Some(manifest) = manifest.as_ref() {
+        Some(super::resolve_app_id_with_rid_hint(manifest, app_id, rid)?)
+    } else {
+        app_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    };
+    let selected_rid_input = interactive_selection
         .as_ref()
         .map(|selection| selection.rid.as_str())
         .or_else(|| rid.map(str::trim).filter(|value| !value.is_empty()));
-
-    let (rid_candidates, profile) = match &install_target {
-        InstallTarget::Local => {
-            let detected = detect_local_profile();
-            if let Some(requested_rid) = selected_rid {
-                warn_if_local_rid_looks_incompatible(requested_rid, &detected);
-                (vec![requested_rid.to_string()], Some(detected))
-            } else {
-                let base_rid = derive_base_rid(&detected).ok_or_else(|| {
-                    SurgeError::Platform(format!(
-                        "Unable to map profile to a RID (os='{}', arch='{}'). Use --rid to override.",
-                        detected.os, detected.arch
-                    ))
-                })?;
-                (
-                    build_rid_candidates(&base_rid, detected.has_nvidia_gpu()),
-                    Some(detected),
-                )
-            }
-        }
-        InstallTarget::Tailscale { .. } => {
-            let selected_rid = if let Some(requested_rid) = selected_rid {
-                requested_rid.to_string()
-            } else {
-                super::resolve_rid(&manifest, &app_id, None)?
-            };
-            ensure_supported_tailscale_rid(&selected_rid)?;
-            (vec![selected_rid], None)
-        }
+    let mut storage_config = if let Some(manifest) = manifest.as_ref() {
+        let app_id = explicit_app_id
+            .as_deref()
+            .ok_or_else(|| SurgeError::Config("Install app id could not be resolved".to_string()))?;
+        build_storage_config_with_overrides(manifest, selected_manifest_path, app_id, overrides)?
+    } else {
+        build_storage_config_without_manifest(selected_manifest_path, explicit_app_id.as_deref(), overrides)?
     };
-
-    let storage_config = build_storage_config_with_overrides(&manifest, selected_manifest_path, &app_id, overrides)?;
-    let backend = storage::create_storage_backend(&storage_config)?;
+    let mut backend = storage::create_storage_backend(&storage_config)?;
     logline::info(&format!(
         "Fetching release index '{RELEASES_FILE_COMPRESSED}' from storage backend..."
     ));
     let index_fetch_started = Instant::now();
-    let (index, index_found) = fetch_release_index(&*backend).await?;
+    let (mut index, mut index_found) = fetch_release_index(&*backend).await?;
+    if manifest.is_none()
+        && !index_found
+        && storage_config.prefix.trim().is_empty()
+        && let Some(app_id) = explicit_app_id.as_deref().filter(|value| !value.is_empty())
+    {
+        let mut prefixed_storage_config = storage_config.clone();
+        prefixed_storage_config.prefix = app_id.to_string();
+        let prefixed_backend = storage::create_storage_backend(&prefixed_storage_config)?;
+        logline::info(&format!(
+            "Release index was not found at storage root; retrying with derived app-scoped prefix '{app_id}'."
+        ));
+        let (prefixed_index, prefixed_found) = fetch_release_index(&*prefixed_backend).await?;
+        if prefixed_found {
+            storage_config = prefixed_storage_config;
+            backend = prefixed_backend;
+            index = prefixed_index;
+            index_found = true;
+        }
+    }
     let index_fetch_elapsed_ms = index_fetch_started.elapsed().as_millis();
     if index_found {
         logline::info(&format!(
@@ -224,16 +234,72 @@ pub async fn execute(
             "Release index '{RELEASES_FILE_COMPRESSED}' was not found ({index_fetch_elapsed_ms}ms)."
         ));
     }
+
+    let (app_id, app_id_note) = if manifest.is_some() {
+        (
+            explicit_app_id.ok_or_else(|| SurgeError::Config("Install app id could not be resolved".to_string()))?,
+            None,
+        )
+    } else {
+        resolve_install_app_id_without_manifest(explicit_app_id, &index)?
+    };
+    if let Some(note) = app_id_note {
+        logline::info(&note);
+    }
     if !index.app_id.is_empty() && index.app_id != app_id {
         return Err(SurgeError::NotFound(format!(
             "Release index belongs to app '{}' not '{}'",
             index.app_id, app_id
         )));
     }
+
+    let (rid_candidates, profile, rid_note) = match &install_target {
+        InstallTarget::Local => {
+            let detected = detect_local_profile();
+            if let Some(requested_rid) = selected_rid_input {
+                warn_if_local_rid_looks_incompatible(requested_rid, &detected);
+                (vec![requested_rid.to_string()], Some(detected), None)
+            } else {
+                let base_rid = derive_base_rid(&detected).ok_or_else(|| {
+                    SurgeError::Platform(format!(
+                        "Unable to map profile to a RID (os='{}', arch='{}'). Use --rid to override.",
+                        detected.os, detected.arch
+                    ))
+                })?;
+                (
+                    build_rid_candidates(&base_rid, detected.has_nvidia_gpu()),
+                    Some(detected),
+                    None,
+                )
+            }
+        }
+        InstallTarget::Tailscale { .. } => {
+            let (selected_rid, note) = if let Some(requested_rid) = selected_rid_input {
+                (requested_rid.to_string(), None)
+            } else if let Some(manifest) = manifest.as_ref() {
+                (super::resolve_rid(manifest, &app_id, None)?, None)
+            } else {
+                resolve_tailscale_rid_without_manifest(selected_rid_input, &index)?
+            };
+            ensure_supported_tailscale_rid(&selected_rid)?;
+            (vec![selected_rid], None, note)
+        }
+    };
+    if let Some(note) = rid_note {
+        logline::info(&note);
+    }
+
     let resolved_channel = if interactive_wizard {
-        prompt_install_channel(&manifest, &index, &app_id, explicit_channel)?
+        prompt_install_channel(
+            manifest.as_ref().expect("interactive install requires a manifest"),
+            &index,
+            &app_id,
+            explicit_channel,
+        )?
+    } else if let Some(manifest) = manifest.as_ref() {
+        resolve_install_channel(manifest, &index, &app_id, explicit_channel)?
     } else {
-        resolve_install_channel(&manifest, &index, &app_id, explicit_channel)?
+        resolve_install_channel_without_manifest(&index, explicit_channel)?
     };
     if let Some(note) = &resolved_channel.note {
         logline::info(note);
@@ -423,7 +489,67 @@ pub async fn execute(
                         "No remote graphical session environment detected; install will default to headless startup.",
                     );
                 }
-                let installer_path = if installer_mode == RemoteInstallerMode::Offline {
+                if !host_can_build_installer_locally(&selected_rid) {
+                    deploy_remote_app_copy_for_tailscale(
+                        &*backend,
+                        &index,
+                        download_dir,
+                        ssh_target,
+                        file_target,
+                        &app_id,
+                        &selected_rid,
+                        release,
+                        &channel,
+                        &storage_config,
+                        &launch_env,
+                        &rid_candidates,
+                        full_filename,
+                        no_start,
+                    )
+                    .await?;
+                    logline::success(&format!("Installed '{app_id}' on tailscale node '{file_target}'."));
+                    return Ok(());
+                }
+                let published_installer_plan = if let Some(manifest) = manifest.as_ref() {
+                    plan_remote_published_installer(
+                        manifest,
+                        &app_id,
+                        &selected_rid,
+                        &channel,
+                        release,
+                        installer_mode,
+                    )?
+                } else {
+                    plan_remote_published_installer_without_manifest(
+                        &app_id,
+                        &selected_rid,
+                        &channel,
+                        release,
+                        installer_mode,
+                    )
+                };
+                let installer_path = if let Some(installer_path) = try_prepare_published_installer_for_tailscale(
+                    &*backend,
+                    download_dir,
+                    &published_installer_plan,
+                    &app_id,
+                    release,
+                    &channel,
+                    &storage_config,
+                    &launch_env,
+                    installer_mode,
+                )
+                .await?
+                {
+                    installer_path
+                } else if installer_mode == RemoteInstallerMode::Offline {
+                    if !host_can_build_installer_locally(&selected_rid) {
+                        return Err(missing_remote_installer_error(
+                            &selected_rid,
+                            &published_installer_plan,
+                            installer_mode,
+                        ));
+                    }
                     std::fs::create_dir_all(download_dir)?;
                     let local_package = download_dir.join(Path::new(full_filename).file_name().unwrap_or_default());
                     let acquisition = download_release_archive(
@@ -459,7 +585,7 @@ pub async fn execute(
                     }
                     logline::info("Building offline installer for remote deployment...");
                     build_installer_for_tailscale(
-                        &manifest,
+                        manifest.as_ref(),
                         &app_id,
                         &selected_rid,
                         release,
@@ -470,9 +596,16 @@ pub async fn execute(
                         installer_mode,
                     )?
                 } else {
+                    if !host_can_build_installer_locally(&selected_rid) {
+                        return Err(missing_remote_installer_error(
+                            &selected_rid,
+                            &published_installer_plan,
+                            installer_mode,
+                        ));
+                    }
                     logline::info("Building online installer for remote deployment...");
                     build_installer_for_tailscale(
-                        &manifest,
+                        manifest.as_ref(),
                         &app_id,
                         &selected_rid,
                         release,
@@ -812,6 +945,157 @@ pub(crate) fn selected_install_manifest_path<'a>(
     }
 }
 
+fn load_install_manifest_if_available(path: &Path) -> Result<Option<SurgeManifest>> {
+    if path.is_file() {
+        SurgeManifest::from_file(path).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+fn install_override_value(scope: &Path, explicit: Option<&str>, env_key: &str, app_id: Option<&str>) -> Option<String> {
+    explicit
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| crate::envfile::storage_env_lookup(env_key, scope, app_id))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn build_storage_config_without_manifest(
+    scope: &Path,
+    app_id: Option<&str>,
+    overrides: StorageOverrides<'_>,
+) -> Result<surge_core::context::StorageConfig> {
+    let provider =
+        install_override_value(scope, overrides.provider, "SURGE_STORAGE_PROVIDER", app_id).ok_or_else(|| {
+            SurgeError::Config(
+                "No install manifest was found. For manifestless install, provide --provider or SURGE_STORAGE_PROVIDER."
+                    .to_string(),
+            )
+        })?;
+    let bucket = install_override_value(scope, overrides.bucket, "SURGE_STORAGE_BUCKET", app_id).ok_or_else(|| {
+        SurgeError::Config(
+            "No install manifest was found. For manifestless install, provide --bucket or SURGE_STORAGE_BUCKET."
+                .to_string(),
+        )
+    })?;
+    let region = install_override_value(scope, overrides.region, "SURGE_STORAGE_REGION", app_id).unwrap_or_default();
+    let endpoint =
+        install_override_value(scope, overrides.endpoint, "SURGE_STORAGE_ENDPOINT", app_id).unwrap_or_default();
+    let prefix = install_override_value(scope, overrides.prefix, "SURGE_STORAGE_PREFIX", app_id).unwrap_or_default();
+
+    let provider = super::parse_storage_provider(&provider)?;
+    let credentials = surge_core::storage_config::storage_credentials_from_lookup(provider, |name| {
+        crate::envfile::storage_env_lookup(name, scope, app_id)
+    });
+
+    Ok(surge_core::context::StorageConfig {
+        provider: Some(provider),
+        bucket,
+        region,
+        access_key: credentials.access_key,
+        secret_key: credentials.secret_key,
+        endpoint,
+        prefix,
+    })
+}
+
+fn resolve_install_app_id_without_manifest(
+    explicit_app_id: Option<String>,
+    index: &ReleaseIndex,
+) -> Result<(String, Option<String>)> {
+    if let Some(app_id) = explicit_app_id {
+        return Ok((app_id, None));
+    }
+
+    let app_id = index.app_id.trim();
+    if !app_id.is_empty() {
+        return Ok((
+            app_id.to_string(),
+            Some(format!(
+                "No install manifest was found; using app id '{app_id}' from the release index."
+            )),
+        ));
+    }
+
+    Err(SurgeError::Config(
+        "No install manifest was found and the release index does not declare an app id. Provide --app-id.".to_string(),
+    ))
+}
+
+fn resolve_tailscale_rid_without_manifest(
+    explicit_rid: Option<&str>,
+    index: &ReleaseIndex,
+) -> Result<(String, Option<String>)> {
+    if let Some(rid) = explicit_rid.map(str::trim).filter(|value| !value.is_empty()) {
+        return Ok((rid.to_string(), None));
+    }
+
+    let mut rids = index
+        .releases
+        .iter()
+        .map(|release| release.rid.trim())
+        .filter(|rid| !rid.is_empty())
+        .collect::<Vec<_>>();
+    rids.sort_unstable();
+    rids.dedup();
+
+    match rids.as_slice() {
+        [rid] => Ok((
+            (*rid).to_string(),
+            Some(format!(
+                "No install manifest was found; using the only RID '{rid}' advertised by the release index."
+            )),
+        )),
+        [] => Err(SurgeError::Config(
+            "No install manifest was found and the release index does not advertise a concrete RID. Provide --rid."
+                .to_string(),
+        )),
+        _ => Err(SurgeError::Config(format!(
+            "No install manifest was found and the release index advertises multiple RIDs ({}). Provide --rid.",
+            rids.join(", ")
+        ))),
+    }
+}
+
+fn resolve_install_channel_without_manifest(
+    index: &ReleaseIndex,
+    explicit: Option<&str>,
+) -> Result<ResolvedInstallChannel> {
+    if let Some(channel) = explicit {
+        return Ok(ResolvedInstallChannel {
+            name: channel.to_string(),
+            note: None,
+        });
+    }
+
+    let available_channels = collect_available_channels(&index.releases);
+    if available_channels.len() == 1 {
+        let selected = available_channels[0].clone();
+        return Ok(ResolvedInstallChannel {
+            name: selected.clone(),
+            note: Some(format!(
+                "No --channel provided; single available channel '{selected}' selected automatically."
+            )),
+        });
+    }
+    if available_channels.len() > 1 {
+        return Err(SurgeError::Config(format!(
+            "Multiple channels are available in the release index: {}. Specify --channel <name> to choose.",
+            available_channels.join(", ")
+        )));
+    }
+
+    Ok(ResolvedInstallChannel {
+        name: "stable".to_string(),
+        note: Some(
+            "No --channel provided and the release index has no channel metadata; defaulting to 'stable'.".to_string(),
+        ),
+    })
+}
+
 fn release_install_profile<'a>(app_id: &'a str, release: &'a ReleaseEntry) -> InstallProfile<'a> {
     InstallProfile::new(
         app_id,
@@ -865,6 +1149,317 @@ fn release_runtime_manifest_metadata<'a>(
     )
 }
 
+fn remote_installer_extension_for_rid(rid: &str) -> &'static str {
+    if rid.starts_with("win-") || rid.starts_with("windows-") {
+        "exe"
+    } else {
+        "bin"
+    }
+}
+
+fn host_can_build_installer_locally(rid: &str) -> bool {
+    super::pack::ensure_host_compatible_rid(rid).is_ok()
+}
+
+fn default_channel_for_remote_installer(manifest: &SurgeManifest, app_id: &str) -> Result<String> {
+    let app = manifest
+        .apps
+        .iter()
+        .find(|candidate| candidate.id == app_id)
+        .ok_or_else(|| SurgeError::Config(format!("App '{app_id}' was not found in manifest")))?;
+    Ok(app
+        .channels
+        .first()
+        .cloned()
+        .or_else(|| manifest.channels.first().map(|channel| channel.name.clone()))
+        .unwrap_or_else(|| "stable".to_string()))
+}
+
+fn plan_remote_published_installer(
+    manifest: &SurgeManifest,
+    app_id: &str,
+    rid: &str,
+    channel: &str,
+    release: &ReleaseEntry,
+    installer_mode: RemoteInstallerMode,
+) -> Result<RemotePublishedInstallerPlan> {
+    let (_app, target) = manifest
+        .find_app_with_target(app_id, rid)
+        .ok_or_else(|| SurgeError::Config(format!("App '{app_id}' with RID '{rid}' not found in manifest")))?;
+    let default_channel = default_channel_for_remote_installer(manifest, app_id)?;
+    let declared_installers = if release.installers.is_empty() {
+        &target.installers
+    } else {
+        &release.installers
+    };
+    let desired_installer = match installer_mode {
+        RemoteInstallerMode::Online => "online",
+        RemoteInstallerMode::Offline => "offline",
+    };
+    let installer_ext = remote_installer_extension_for_rid(rid);
+    let candidate_key =
+        format!("installers/Setup-{rid}-{app_id}-{default_channel}-{desired_installer}.{installer_ext}");
+
+    let mut blockers = Vec::new();
+    if !declared_installers
+        .iter()
+        .any(|installer| installer == desired_installer)
+    {
+        let declared = if declared_installers.is_empty() {
+            "none".to_string()
+        } else {
+            declared_installers.join(", ")
+        };
+        blockers.push(format!(
+            "release does not declare a '{desired_installer}' installer (declared installers: {declared})"
+        ));
+    }
+    if channel != default_channel {
+        blockers.push(format!(
+            "published installers are currently bound to app default channel '{default_channel}', but install requested '{channel}'"
+        ));
+    }
+
+    Ok(RemotePublishedInstallerPlan {
+        candidate_keys: vec![candidate_key],
+        blockers,
+    })
+}
+
+fn plan_remote_published_installer_without_manifest(
+    app_id: &str,
+    rid: &str,
+    channel: &str,
+    release: &ReleaseEntry,
+    installer_mode: RemoteInstallerMode,
+) -> RemotePublishedInstallerPlan {
+    let desired_installer = match installer_mode {
+        RemoteInstallerMode::Online => "online",
+        RemoteInstallerMode::Offline => "offline",
+    };
+    let installer_ext = remote_installer_extension_for_rid(rid);
+    let candidate_key = format!("installers/Setup-{rid}-{app_id}-{channel}-{desired_installer}.{installer_ext}");
+    let declared_installers = &release.installers;
+
+    let mut blockers = Vec::new();
+    if !declared_installers
+        .iter()
+        .any(|installer| installer == desired_installer)
+    {
+        let declared = if declared_installers.is_empty() {
+            "none".to_string()
+        } else {
+            declared_installers.join(", ")
+        };
+        blockers.push(format!(
+            "release does not declare a '{desired_installer}' installer (declared installers: {declared})"
+        ));
+    }
+
+    RemotePublishedInstallerPlan {
+        candidate_keys: vec![candidate_key],
+        blockers,
+    }
+}
+
+fn missing_remote_installer_error(
+    rid: &str,
+    plan: &RemotePublishedInstallerPlan,
+    installer_mode: RemoteInstallerMode,
+) -> SurgeError {
+    let installer_label = match installer_mode {
+        RemoteInstallerMode::Online => "online",
+        RemoteInstallerMode::Offline => "offline",
+    };
+    let attempted = if plan.candidate_keys.is_empty() {
+        "none".to_string()
+    } else {
+        plan.candidate_keys.join(", ")
+    };
+    let blockers = if plan.blockers.is_empty() {
+        "published installer was not found in storage".to_string()
+    } else {
+        plan.blockers.join("; ")
+    };
+    let host_rid = surge_core::platform::detect::current_rid();
+    SurgeError::NotFound(format!(
+        "No published {installer_label} installer is available for remote deployment of RID '{rid}'. Tried keys: {attempted}. {blockers}. Local installer build is unavailable because target RID '{rid}' does not match current host RID '{host_rid}'. Publish the installer for this target or run the install command from a matching host."
+    ))
+}
+
+fn published_installer_public_url(storage_config: &surge_core::context::StorageConfig, key: &str) -> Option<String> {
+    match storage_config.provider {
+        Some(surge_core::context::StorageProvider::AzureBlob)
+            if !storage_config.endpoint.trim().is_empty() && !storage_config.bucket.trim().is_empty() =>
+        {
+            Some(format!(
+                "{}/{}/{}",
+                storage_config.endpoint.trim_end_matches('/'),
+                storage_config.bucket.trim_matches('/'),
+                key.trim_start_matches('/')
+            ))
+        }
+        _ => None,
+    }
+}
+
+async fn try_download_published_installer_via_public_url(
+    installer_path: &Path,
+    key: &str,
+    storage_config: &surge_core::context::StorageConfig,
+) -> Result<bool> {
+    let Some(url) = published_installer_public_url(storage_config, key) else {
+        return Ok(false);
+    };
+
+    let response = reqwest::get(&url)
+        .await
+        .map_err(|e| SurgeError::Storage(format!("Failed to fetch published installer URL '{url}': {e}")))?;
+    let status = response.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(false);
+    }
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(SurgeError::Storage(format!(
+            "Published installer URL '{url}' failed (HTTP {status}): {body}"
+        )));
+    }
+
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| SurgeError::Storage(format!("Failed to read published installer URL '{url}': {e}")))?;
+    if let Some(parent) = installer_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(installer_path, &bytes)?;
+    Ok(true)
+}
+
+async fn try_prepare_published_installer_for_tailscale(
+    backend: &dyn StorageBackend,
+    download_dir: &Path,
+    plan: &RemotePublishedInstallerPlan,
+    app_id: &str,
+    release: &ReleaseEntry,
+    channel: &str,
+    storage_config: &surge_core::context::StorageConfig,
+    launch_env: &RemoteLaunchEnvironment,
+    installer_mode: RemoteInstallerMode,
+) -> Result<Option<PathBuf>> {
+    if !plan.blockers.is_empty() {
+        return Ok(None);
+    }
+
+    let installer_cache_root = download_dir.join("installers");
+    std::fs::create_dir_all(&installer_cache_root)?;
+    for key in &plan.candidate_keys {
+        let installer_path = cache_path_for_key(&installer_cache_root, key)?;
+        match fetch_or_reuse_file(backend, key, &installer_path, "", None).await {
+            Ok(CacheFetchOutcome::ReusedLocal) => {
+                logline::info(&format!(
+                    "Using cached published installer '{key}' for remote deployment."
+                ));
+                return Ok(Some(customize_published_installer_for_tailscale(
+                    &installer_path,
+                    app_id,
+                    release,
+                    channel,
+                    storage_config,
+                    launch_env,
+                    installer_mode,
+                )?));
+            }
+            Ok(CacheFetchOutcome::DownloadedFresh | CacheFetchOutcome::DownloadedAfterInvalidLocal) => {
+                logline::info(&format!("Fetched published installer '{key}' for remote deployment."));
+                return Ok(Some(customize_published_installer_for_tailscale(
+                    &installer_path,
+                    app_id,
+                    release,
+                    channel,
+                    storage_config,
+                    launch_env,
+                    installer_mode,
+                )?));
+            }
+            Err(SurgeError::NotFound(_)) => {
+                if try_download_published_installer_via_public_url(&installer_path, key, storage_config).await? {
+                    let url = published_installer_public_url(storage_config, key).unwrap_or_default();
+                    logline::info(&format!(
+                        "Fetched published installer from public URL '{url}' for remote deployment."
+                    ));
+                    return Ok(Some(customize_published_installer_for_tailscale(
+                        &installer_path,
+                        app_id,
+                        release,
+                        channel,
+                        storage_config,
+                        launch_env,
+                        installer_mode,
+                    )?));
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    Ok(None)
+}
+
+fn customize_published_installer_for_tailscale(
+    published_installer_path: &Path,
+    app_id: &str,
+    release: &ReleaseEntry,
+    channel: &str,
+    storage_config: &surge_core::context::StorageConfig,
+    launch_env: &RemoteLaunchEnvironment,
+    installer_mode: RemoteInstallerMode,
+) -> Result<PathBuf> {
+    let installer_manifest =
+        build_remote_installer_manifest(app_id, release, channel, storage_config, launch_env, installer_mode);
+    let mut installer_yaml = serde_yaml::to_string(&installer_manifest)
+        .map_err(|e| SurgeError::Config(format!("Failed to serialize installer manifest: {e}")))?;
+    if !installer_yaml.ends_with('\n') {
+        installer_yaml.push('\n');
+    }
+
+    let payload_bytes = surge_core::installer_bundle::read_embedded_payload(published_installer_path)?;
+    let launcher_bytes = surge_core::installer_bundle::read_launcher_stub(published_installer_path)?;
+
+    let staging_dir =
+        tempfile::tempdir().map_err(|e| SurgeError::Platform(format!("Failed to create staging directory: {e}")))?;
+    let staging = staging_dir.path();
+    surge_core::archive::extractor::extract_to(&payload_bytes, staging, None)?;
+    std::fs::write(staging.join("installer.yml"), installer_yaml.as_bytes())?;
+
+    let payload_archive = tempfile::NamedTempFile::new()
+        .map_err(|e| SurgeError::Platform(format!("Failed to create payload temp file: {e}")))?;
+    let mut packer =
+        surge_core::archive::packer::ArchivePacker::new(surge_core::config::constants::DEFAULT_ZSTD_LEVEL)?;
+    packer.add_directory(staging, "")?;
+    packer.finalize_to_file(payload_archive.path())?;
+
+    let launcher_file = tempfile::NamedTempFile::new()
+        .map_err(|e| SurgeError::Platform(format!("Failed to create launcher temp file: {e}")))?;
+    std::fs::write(launcher_file.path(), launcher_bytes)?;
+
+    let installer_filename = published_installer_path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "surge-remote-installer.bin".to_string());
+    let installer_path = staging.join(installer_filename);
+    surge_core::installer_bundle::write_embedded_installer(
+        launcher_file.path(),
+        payload_archive.path(),
+        &installer_path,
+    )?;
+    surge_core::platform::fs::make_executable(&installer_path)?;
+
+    std::mem::forget(staging_dir);
+    Ok(installer_path)
+}
+
 fn build_storage_config_with_overrides(
     manifest: &SurgeManifest,
     manifest_path: &Path,
@@ -873,20 +1468,33 @@ fn build_storage_config_with_overrides(
 ) -> Result<surge_core::context::StorageConfig> {
     let mut config = super::build_app_scoped_storage_config(manifest, manifest_path, app_id)?;
 
-    if let Some(provider) = overrides.provider.map(str::trim).filter(|value| !value.is_empty()) {
-        config.provider = Some(super::parse_storage_provider(provider)?);
+    if let Some(provider) = install_override_value(
+        manifest_path,
+        overrides.provider,
+        "SURGE_STORAGE_PROVIDER",
+        Some(app_id),
+    ) {
+        config.provider = Some(super::parse_storage_provider(&provider)?);
     }
-    if let Some(bucket) = overrides.bucket.map(str::trim).filter(|value| !value.is_empty()) {
-        config.bucket = bucket.to_string();
+    if let Some(bucket) = install_override_value(manifest_path, overrides.bucket, "SURGE_STORAGE_BUCKET", Some(app_id))
+    {
+        config.bucket = bucket;
     }
-    if let Some(region) = overrides.region.map(str::trim).filter(|value| !value.is_empty()) {
-        config.region = region.to_string();
+    if let Some(region) = install_override_value(manifest_path, overrides.region, "SURGE_STORAGE_REGION", Some(app_id))
+    {
+        config.region = region;
     }
-    if let Some(endpoint) = overrides.endpoint.map(str::trim).filter(|value| !value.is_empty()) {
-        config.endpoint = endpoint.to_string();
+    if let Some(endpoint) = install_override_value(
+        manifest_path,
+        overrides.endpoint,
+        "SURGE_STORAGE_ENDPOINT",
+        Some(app_id),
+    ) {
+        config.endpoint = endpoint;
     }
-    if let Some(prefix) = overrides.prefix.map(str::trim).filter(|value| !value.is_empty()) {
-        config.prefix = prefix.to_string();
+    if let Some(prefix) = install_override_value(manifest_path, overrides.prefix, "SURGE_STORAGE_PREFIX", Some(app_id))
+    {
+        config.prefix = prefix;
     }
 
     Ok(config)
@@ -1242,14 +1850,10 @@ fn shell_single_quote(raw: &str) -> String {
     escaped
 }
 
-fn build_remote_installer_manifest(
-    app_id: &str,
+fn build_remote_runtime_environment(
     release: &ReleaseEntry,
-    channel: &str,
-    storage_config: &surge_core::context::StorageConfig,
     launch_env: &RemoteLaunchEnvironment,
-    installer_mode: RemoteInstallerMode,
-) -> InstallerManifest {
+) -> BTreeMap<String, String> {
     let mut environment = release.environment.clone();
     if let Some(display) = launch_env.display.as_deref().filter(|value| !value.is_empty()) {
         environment.insert("DISPLAY".to_string(), display.to_string());
@@ -1270,6 +1874,18 @@ fn build_remote_installer_manifest(
     if let Some(xdg_runtime_dir) = launch_env.xdg_runtime_dir.as_deref().filter(|value| !value.is_empty()) {
         environment.insert("XDG_RUNTIME_DIR".to_string(), xdg_runtime_dir.to_string());
     }
+    environment
+}
+
+fn build_remote_installer_manifest(
+    app_id: &str,
+    release: &ReleaseEntry,
+    channel: &str,
+    storage_config: &surge_core::context::StorageConfig,
+    launch_env: &RemoteLaunchEnvironment,
+    installer_mode: RemoteInstallerMode,
+) -> InstallerManifest {
+    let environment = build_remote_runtime_environment(release, launch_env);
 
     InstallerManifest {
         schema: 1,
@@ -1317,7 +1933,7 @@ fn build_remote_installer_manifest(
 
 #[allow(clippy::too_many_arguments)]
 fn build_installer_for_tailscale(
-    manifest: &SurgeManifest,
+    manifest: Option<&SurgeManifest>,
     app_id: &str,
     rid: &str,
     release: &ReleaseEntry,
@@ -1327,9 +1943,13 @@ fn build_installer_for_tailscale(
     launch_env: &RemoteLaunchEnvironment,
     installer_mode: RemoteInstallerMode,
 ) -> Result<std::path::PathBuf> {
-    let (_app, target) = manifest
-        .find_app_with_target(app_id, rid)
-        .ok_or_else(|| SurgeError::Config(format!("App '{app_id}' with RID '{rid}' not found in manifest")))?;
+    let target_icon = manifest
+        .and_then(|manifest| {
+            manifest
+                .find_app_with_target(app_id, rid)
+                .map(|(_, target)| target.icon.trim().to_string())
+        })
+        .filter(|icon| !icon.is_empty());
 
     let installer_manifest =
         build_remote_installer_manifest(app_id, release, channel, storage_config, launch_env, installer_mode);
@@ -1356,7 +1976,10 @@ fn build_installer_for_tailscale(
         std::fs::copy(full_package_path, payload_dir.join(&full_filename))?;
     }
 
-    let icon = target.icon.trim();
+    let icon = target_icon
+        .as_deref()
+        .or_else(|| (!release.icon.trim().is_empty()).then_some(release.icon.trim()))
+        .unwrap_or("");
     if !icon.is_empty() {
         let icon_base_dir = full_package_path
             .and_then(Path::parent)
@@ -1387,6 +2010,395 @@ fn build_installer_for_tailscale(
     std::mem::forget(staging_dir);
 
     Ok(installer_path)
+}
+
+fn remote_install_root(home: &Path, app_id: &str, install_directory: &str) -> Result<PathBuf> {
+    let name = if install_directory.trim().is_empty() {
+        app_id.trim()
+    } else {
+        install_directory.trim()
+    };
+    if name.is_empty() {
+        return Err(SurgeError::Config(
+            "App id or install directory is required for remote install".to_string(),
+        ));
+    }
+
+    let candidate = Path::new(name);
+    if candidate.is_absolute() {
+        Ok(candidate.to_path_buf())
+    } else {
+        Ok(home.join(".local/share").join(candidate))
+    }
+}
+
+fn remote_linux_shortcut_icon_path(
+    staged_app_dir: &Path,
+    remote_app_dir: &Path,
+    app_id: &str,
+    main_exe_name: &str,
+    configured_icon: &str,
+) -> PathBuf {
+    let configured_icon = configured_icon.trim();
+    if !configured_icon.is_empty() {
+        let candidate = Path::new(configured_icon);
+        return if candidate.is_absolute() {
+            candidate.to_path_buf()
+        } else {
+            remote_app_dir.join(candidate)
+        };
+    }
+
+    let mut candidates = Vec::new();
+    for stem in [main_exe_name.trim(), app_id.trim(), "icon", "logo"] {
+        if stem.is_empty() {
+            continue;
+        }
+        for ext in ["svg", "png", "xpm"] {
+            candidates.push(PathBuf::from(format!("{stem}.{ext}")));
+            candidates.push(Path::new(".surge").join(format!("{stem}.{ext}")));
+        }
+    }
+
+    for candidate in candidates {
+        if staged_app_dir.join(&candidate).is_file() {
+            return remote_app_dir.join(candidate);
+        }
+    }
+
+    remote_app_dir.join(main_exe_name)
+}
+
+fn stage_remote_linux_shortcuts(
+    stage_root: &Path,
+    rendered: &[surge_core::platform::shortcuts::LinuxShortcutFile],
+) -> Result<()> {
+    for shortcut in rendered {
+        let target_dir = match shortcut.location {
+            surge_core::config::manifest::ShortcutLocation::Desktop
+            | surge_core::config::manifest::ShortcutLocation::StartMenu => {
+                stage_root.join("shortcuts").join("applications")
+            }
+            surge_core::config::manifest::ShortcutLocation::Startup => stage_root.join("shortcuts").join("autostart"),
+        };
+        std::fs::create_dir_all(&target_dir)?;
+        std::fs::write(target_dir.join(&shortcut.file_name), shortcut.content.as_bytes())?;
+    }
+    Ok(())
+}
+
+fn shell_export_lines(environment: &BTreeMap<String, String>) -> String {
+    let mut lines = String::new();
+    for (key, value) in environment {
+        lines.push_str("export ");
+        lines.push_str(key);
+        lines.push('=');
+        lines.push_str(&shell_single_quote(value));
+        lines.push('\n');
+    }
+    lines
+}
+
+fn build_remote_app_copy_activation_script(
+    install_root: &Path,
+    main_exe: &str,
+    version: &str,
+    environment: &BTreeMap<String, String>,
+    no_start: bool,
+) -> String {
+    let install_root_quoted = shell_single_quote(&install_root.to_string_lossy());
+    let main_exe_quoted = shell_single_quote(main_exe);
+    let version_quoted = shell_single_quote(version);
+    let exports = shell_export_lines(environment);
+
+    let mut script = format!(
+        "set -eu\n\
+install_root={install_root_quoted}\n\
+stage_dir=\"$install_root/.surge-transfer-stage\"\n\
+next_app_dir=\"$install_root/.surge-app-next\"\n\
+active_app_dir=\"$install_root/app\"\n\
+previous_app_dir=\"$install_root/.surge-app-prev\"\n\
+applications_dir=\"$HOME/.local/share/applications\"\n\
+autostart_dir=\"$HOME/.config/autostart\"\n\
+main_exe={main_exe_quoted}\n\
+version={version_quoted}\n\
+\n\
+kill_matching() {{\n\
+  pattern=\"$1\"\n\
+  if ! command -v pgrep >/dev/null 2>&1; then\n\
+    return 0\n\
+  fi\n\
+  for pid in $(pgrep -u \"$(id -u)\" -f \"$pattern\" 2>/dev/null || true); do\n\
+    case \"$pid\" in\n\
+      \"$$\"|\"$PPID\")\n\
+        continue\n\
+        ;;\n\
+    esac\n\
+    kill \"$pid\" 2>/dev/null || true\n\
+  done\n\
+}}\n\
+\n\
+kill_matching \"$install_root/$main_exe\"\n\
+kill_matching \"$install_root/app-\"\n\
+kill_matching \"$install_root/app/\"\n\
+rm -rf \"$next_app_dir\" \"$previous_app_dir\"\n\
+if [ ! -d \"$stage_dir/app\" ]; then\n\
+  echo \"Remote install stage is missing app payload\" >&2\n\
+  exit 1\n\
+fi\n\
+mv \"$stage_dir/app\" \"$next_app_dir\"\n\
+if [ -d \"$active_app_dir\" ]; then\n\
+  mv \"$active_app_dir\" \"$previous_app_dir\"\n\
+fi\n\
+mv \"$next_app_dir\" \"$active_app_dir\"\n\
+rm -rf \"$previous_app_dir\"\n\
+\n\
+if [ -d \"$stage_dir/shortcuts/applications\" ]; then\n\
+  mkdir -p \"$applications_dir\"\n\
+  cp \"$stage_dir/shortcuts/applications/\"*.desktop \"$applications_dir/\" 2>/dev/null || true\n\
+  chmod +x \"$applications_dir/\"*.desktop 2>/dev/null || true\n\
+fi\n\
+if [ -d \"$stage_dir/shortcuts/autostart\" ]; then\n\
+  mkdir -p \"$autostart_dir\"\n\
+  cp \"$stage_dir/shortcuts/autostart/\"*.desktop \"$autostart_dir/\" 2>/dev/null || true\n\
+  chmod +x \"$autostart_dir/\"*.desktop 2>/dev/null || true\n\
+fi\n\
+rm -rf \"$stage_dir\"\n\
+{exports}\
+if [ ! -x \"$active_app_dir/$main_exe\" ] && [ -f \"$active_app_dir/$main_exe\" ]; then\n\
+  chmod +x \"$active_app_dir/$main_exe\" || true\n\
+fi\n"
+    );
+
+    if !no_start {
+        script.push_str(
+            "cd \"$install_root\"\n\
+if [ -n \"$version\" ]; then\n\
+  \"$active_app_dir/$main_exe\" --surge-installed \"$version\" >/dev/null 2>&1 || true\n\
+  nohup \"$active_app_dir/$main_exe\" --surge-first-run \"$version\" >/dev/null 2>&1 &\n\
+else\n\
+  \"$active_app_dir/$main_exe\" --surge-installed >/dev/null 2>&1 || true\n\
+  nohup \"$active_app_dir/$main_exe\" --surge-first-run >/dev/null 2>&1 &\n\
+fi\n",
+        );
+    }
+
+    script
+}
+
+async fn detect_remote_home_directory(ssh_node: &str) -> Result<PathBuf> {
+    let command = format!("sh -c {}", shell_single_quote("printf %s \"$HOME\""));
+    let output = run_tailscale_capture(&["ssh", ssh_node, command.as_str()]).await?;
+    let home = output.trim();
+    if home.is_empty() {
+        return Err(SurgeError::Platform(format!(
+            "Failed to determine HOME directory on remote node '{ssh_node}'"
+        )));
+    }
+    Ok(PathBuf::from(home))
+}
+
+async fn stream_directory_to_tailscale_node_with_command(
+    node: &str,
+    local_dir: &Path,
+    remote_command: &str,
+) -> Result<()> {
+    let ssh_command = format!("sh -lc {}", shell_single_quote(remote_command));
+    let local_dir_str = local_dir.to_string_lossy().to_string();
+    let mut tar_child = Command::new("tar")
+        .args(["-C", local_dir_str.as_str(), "-cf", "-", "."])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| SurgeError::Platform(format!("Failed to archive '{}' for transfer: {e}", local_dir.display())))?;
+    let mut remote_child = Command::new("tailscale")
+        .args(["ssh", node, ssh_command.as_str()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| SurgeError::Platform(format!("Failed to run tailscale ssh stream copy: {e}")))?;
+
+    let mut tar_stdout = tar_child
+        .stdout
+        .take()
+        .ok_or_else(|| SurgeError::Platform("Failed to capture local tar stdout".to_string()))?;
+    let mut remote_stdin = remote_child
+        .stdin
+        .take()
+        .ok_or_else(|| SurgeError::Platform("Failed to capture tailscale ssh stdin".to_string()))?;
+
+    let transfer_message = format!("Streaming '{}' to '{node}'", local_dir.display());
+    let transfer_spinner = make_spinner(&transfer_message);
+    let transfer_result: Result<()> = async {
+        let mut buffer = vec![0_u8; 128 * 1024];
+        loop {
+            let read_bytes = tar_stdout.read(&mut buffer).await.map_err(|e| {
+                SurgeError::Platform(format!(
+                    "Failed to read archived directory '{}' for transfer: {e}",
+                    local_dir.display()
+                ))
+            })?;
+            if read_bytes == 0 {
+                break;
+            }
+            remote_stdin.write_all(&buffer[..read_bytes]).await.map_err(|e| {
+                SurgeError::Platform(format!("Failed to stream '{}' to '{node}': {e}", local_dir.display()))
+            })?;
+            if let Some(spinner) = transfer_spinner.as_ref() {
+                spinner.tick();
+            }
+        }
+        remote_stdin.flush().await.map_err(|e| {
+            SurgeError::Platform(format!(
+                "Failed to flush transfer stream to '{node}' for '{}': {e}",
+                local_dir.display()
+            ))
+        })?;
+        Ok(())
+    }
+    .await;
+    drop(remote_stdin);
+
+    if let Some(spinner) = &transfer_spinner {
+        spinner.finish_and_clear();
+    }
+
+    if let Err(err) = transfer_result {
+        let _ = tar_child.kill().await;
+        let _ = remote_child.kill().await;
+        return Err(err);
+    }
+
+    let tar_output = tar_child
+        .wait_with_output()
+        .await
+        .map_err(|e| SurgeError::Platform(format!("Failed to wait for local tar process: {e}")))?;
+    if !tar_output.status.success() {
+        let stderr = String::from_utf8_lossy(&tar_output.stderr).trim().to_string();
+        return Err(SurgeError::Platform(if stderr.is_empty() {
+            format!("Command failed: tar -C '{}' -cf - .", local_dir.display())
+        } else {
+            format!("Command failed: tar -C '{}' -cf - .: {stderr}", local_dir.display())
+        }));
+    }
+
+    let remote_output = remote_child
+        .wait_with_output()
+        .await
+        .map_err(|e| SurgeError::Platform(format!("Failed to wait for tailscale ssh stream copy: {e}")))?;
+    if !remote_output.status.success() {
+        let stderr = String::from_utf8_lossy(&remote_output.stderr).trim().to_string();
+        return Err(SurgeError::Platform(if stderr.is_empty() {
+            format!("Command failed: tailscale ssh {node} sh -lc <stream-copy>")
+        } else {
+            format!("Command failed: tailscale ssh {node} sh -lc <stream-copy>: {stderr}")
+        }));
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn deploy_remote_app_copy_for_tailscale(
+    backend: &dyn StorageBackend,
+    index: &ReleaseIndex,
+    download_dir: &Path,
+    ssh_target: &str,
+    file_target: &str,
+    app_id: &str,
+    _rid: &str,
+    release: &ReleaseEntry,
+    channel: &str,
+    storage_config: &surge_core::context::StorageConfig,
+    launch_env: &RemoteLaunchEnvironment,
+    rid_candidates: &[String],
+    full_filename: &str,
+    no_start: bool,
+) -> Result<()> {
+    std::fs::create_dir_all(download_dir)?;
+    let local_package = download_dir.join(Path::new(full_filename).file_name().unwrap_or_default());
+    let acquisition =
+        download_release_archive(backend, index, release, rid_candidates, full_filename, &local_package).await?;
+    match acquisition {
+        ArchiveAcquisition::ReusedLocal => {
+            logline::success(&format!(
+                "Using cached package '{}' at '{}'.",
+                Path::new(full_filename).display(),
+                local_package.display()
+            ));
+        }
+        ArchiveAcquisition::Downloaded => {
+            logline::success(&format!(
+                "Downloaded '{}' to '{}'.",
+                Path::new(full_filename).display(),
+                local_package.display()
+            ));
+        }
+        ArchiveAcquisition::Reconstructed => {
+            logline::warn(&format!(
+                "Direct full package '{}' missing in backend; reconstructed from retained release artifacts.",
+                Path::new(full_filename).display()
+            ));
+        }
+    }
+
+    let remote_home = detect_remote_home_directory(ssh_target).await?;
+    let install_root = remote_install_root(&remote_home, app_id, &release.install_directory)?;
+    let active_app_dir = install_root.join("app");
+    let runtime_environment = build_remote_runtime_environment(release, launch_env);
+    let main_exe_name = if release.main_exe.trim().is_empty() {
+        app_id
+    } else {
+        release.main_exe.trim()
+    };
+
+    let staging_dir =
+        tempfile::tempdir().map_err(|e| SurgeError::Platform(format!("Failed to create staging directory: {e}")))?;
+    let stage_root = staging_dir.path().join("remote-stage");
+    let stage_app_dir = stage_root.join("app");
+    surge_core::archive::extractor::extract_file_to(&local_package, &stage_app_dir)?;
+
+    let install_profile = release_install_profile(app_id, release);
+    let runtime_manifest = release_runtime_manifest_metadata(release, channel, storage_config);
+    core_install::write_runtime_manifest(&stage_app_dir, &install_profile, &runtime_manifest)?;
+
+    if !release.shortcuts.is_empty() {
+        let icon_path =
+            remote_linux_shortcut_icon_path(&stage_app_dir, &active_app_dir, app_id, main_exe_name, &release.icon);
+        let rendered = surge_core::platform::shortcuts::render_linux_shortcut_files(
+            release.display_name(app_id),
+            &active_app_dir.join(main_exe_name),
+            &icon_path,
+            &release.supervisor_id,
+            &install_root,
+            &release.shortcuts,
+            &runtime_environment,
+        );
+        stage_remote_linux_shortcuts(&stage_root, &rendered)?;
+    }
+
+    let transfer_command = format!(
+        "command -v tar >/dev/null 2>&1 || {{ echo 'Remote host is missing tar' >&2; exit 1; }}; \
+install_root={}; stage_dir=\"$install_root/.surge-transfer-stage\"; \
+mkdir -p \"$install_root\"; rm -rf \"$stage_dir\"; mkdir -p \"$stage_dir\"; tar -C \"$stage_dir\" -xf -",
+        shell_single_quote(&install_root.to_string_lossy())
+    );
+    logline::info(&format!(
+        "Streaming extracted app payload to '{file_target}' for host-mismatch remote deployment..."
+    ));
+    stream_directory_to_tailscale_node_with_command(ssh_target, &stage_root, &transfer_command).await?;
+
+    let activation_script = build_remote_app_copy_activation_script(
+        &install_root,
+        main_exe_name,
+        &release.version,
+        &runtime_environment,
+        no_start,
+    );
+    let ssh_command = format!("sh -lc {}", shell_single_quote(&activation_script));
+    logline::info(&format!("Activating remote install on '{file_target}'..."));
+    run_tailscale_streaming(&["ssh", ssh_target, ssh_command.as_str()], "remote").await
 }
 
 fn select_remote_installer_mode(storage_config: &surge_core::context::StorageConfig) -> RemoteInstallerMode {
@@ -1744,14 +2756,17 @@ mod tests {
     #![allow(clippy::cast_possible_wrap, clippy::similar_names)]
 
     use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
 
     use super::*;
+    use surge_core::archive::extractor::read_entry;
     use surge_core::archive::packer::ArchivePacker;
     use surge_core::config::constants::DEFAULT_ZSTD_LEVEL;
     use surge_core::config::manifest::ShortcutLocation;
     use surge_core::config::manifest::SurgeManifest;
     use surge_core::crypto::sha256::sha256_hex;
     use surge_core::diff::wrapper::bsdiff_buffers;
+    use surge_core::installer_bundle::read_embedded_payload;
     use surge_core::platform::detect::current_rid;
     use surge_core::releases::manifest::{DeltaArtifact, ReleaseIndex, compress_release_index};
     use surge_core::storage::filesystem::FilesystemBackend;
@@ -1788,6 +2803,44 @@ mod tests {
             bucket: bucket.to_string(),
             ..surge_core::context::StorageConfig::default()
         }
+    }
+
+    fn remote_manifest(app_id: &str, rid: &str, channels: &[&str], installers: &[&str]) -> SurgeManifest {
+        let channels_yaml = channels
+            .iter()
+            .map(|channel| format!("      - {channel}\n"))
+            .collect::<String>();
+        let installers_yaml = installers
+            .iter()
+            .map(|installer| format!("          - {installer}\n"))
+            .collect::<String>();
+        let yaml = format!(
+            "schema: 1\napps:\n  - id: {app_id}\n    channels:\n{channels_yaml}    targets:\n      - rid: {rid}\n        installers:\n{installers_yaml}"
+        );
+        serde_yaml::from_str(&yaml).expect("manifest should parse")
+    }
+
+    fn create_published_installer(dir: &Path, installer_name: &str, manifest: &InstallerManifest) -> PathBuf {
+        let launcher = dir.join("surge-installer");
+        std::fs::write(&launcher, b"launcher-bytes").expect("launcher should be written");
+
+        let staging = dir.join("staging");
+        std::fs::create_dir_all(&staging).expect("staging dir should be created");
+        let installer_yaml = serde_yaml::to_string(manifest).expect("installer manifest should serialize");
+        std::fs::write(staging.join("installer.yml"), installer_yaml).expect("installer manifest should be written");
+        std::fs::write(staging.join("surge"), b"binary").expect("surge binary placeholder should be written");
+
+        let payload_archive = dir.join("payload.tar.zst");
+        let mut packer = ArchivePacker::new(3).expect("archive packer should be created");
+        packer.add_directory(&staging, "").expect("staging dir should be added");
+        packer
+            .finalize_to_file(&payload_archive)
+            .expect("payload archive should be written");
+
+        let installer = dir.join(installer_name);
+        surge_core::installer_bundle::write_embedded_installer(&launcher, &payload_archive, &installer)
+            .expect("installer should be created");
+        installer
     }
 
     #[test]
@@ -1865,6 +2918,104 @@ mod tests {
     }
 
     #[test]
+    fn build_storage_config_without_manifest_reads_generic_storage_env_overrides() {
+        let tmp = tempfile::tempdir().expect("temp dir should exist");
+        let scope = tmp.path().join(".surge").join("missing-application.yml");
+        let env_path = tmp.path().join(".env.surge");
+        std::fs::write(
+            &env_path,
+            "SURGE_STORAGE_PROVIDER=filesystem\nSURGE_STORAGE_BUCKET=/srv/releases\nSURGE_STORAGE_PREFIX=edge/demo\n",
+        )
+        .expect("env file should be written");
+        crate::envfile::load_storage_env_files(&scope, &[env_path]).expect("env file should load");
+
+        let config = build_storage_config_without_manifest(&scope, None, StorageOverrides::default())
+            .expect("manifestless storage config should build");
+
+        assert_eq!(config.provider, Some(surge_core::context::StorageProvider::Filesystem));
+        assert_eq!(config.bucket, "/srv/releases");
+        assert_eq!(config.prefix, "edge/demo");
+    }
+
+    #[test]
+    fn resolve_install_app_id_without_manifest_uses_release_index_value() {
+        let index = ReleaseIndex {
+            app_id: "demo".to_string(),
+            ..ReleaseIndex::default()
+        };
+
+        let (app_id, note) =
+            resolve_install_app_id_without_manifest(None, &index).expect("app id should resolve from index");
+
+        assert_eq!(app_id, "demo");
+        assert!(
+            note.as_deref()
+                .is_some_and(|value| value.contains("using app id 'demo' from the release index"))
+        );
+    }
+
+    #[test]
+    fn resolve_tailscale_rid_without_manifest_uses_single_index_rid() {
+        let index = ReleaseIndex {
+            releases: vec![release("1.2.3", "test", "linux-arm64", "demo.tar.zst")],
+            ..ReleaseIndex::default()
+        };
+
+        let (rid, note) = resolve_tailscale_rid_without_manifest(None, &index).expect("rid should resolve from index");
+
+        assert_eq!(rid, "linux-arm64");
+        assert!(
+            note.as_deref()
+                .is_some_and(|value| value.contains("only RID 'linux-arm64' advertised by the release index"))
+        );
+    }
+
+    #[test]
+    fn plan_remote_published_installer_without_manifest_uses_requested_channel() {
+        let mut entry = release("1.2.3", "test", "linux-arm64", "demo.tar.zst");
+        entry.installers = vec!["online".to_string()];
+
+        let plan = plan_remote_published_installer_without_manifest(
+            "demo",
+            "linux-arm64",
+            "test",
+            &entry,
+            RemoteInstallerMode::Online,
+        );
+
+        assert_eq!(
+            plan.candidate_keys,
+            vec!["installers/Setup-linux-arm64-demo-test-online.bin".to_string()]
+        );
+        assert!(plan.blockers.is_empty(), "unexpected blockers: {:?}", plan.blockers);
+    }
+
+    #[test]
+    fn build_remote_app_copy_activation_script_exports_env_and_lifecycle_hooks() {
+        let mut environment = BTreeMap::new();
+        environment.insert("DISPLAY".to_string(), ":0".to_string());
+        environment.insert(
+            "DBUS_SESSION_BUS_ADDRESS".to_string(),
+            "unix:path=/run/user/1000/bus".to_string(),
+        );
+
+        let script = build_remote_app_copy_activation_script(
+            Path::new("/home/demo/.local/share/demo"),
+            "demoapp",
+            "1.2.3",
+            &environment,
+            false,
+        );
+
+        assert!(script.contains("export DISPLAY=':0'"));
+        assert!(script.contains("export DBUS_SESSION_BUS_ADDRESS='unix:path=/run/user/1000/bus'"));
+        assert!(script.contains("--surge-installed \"$version\""));
+        assert!(script.contains("--surge-first-run \"$version\""));
+        assert!(script.contains("kill_matching \"$install_root/$main_exe\""));
+        assert!(script.contains("kill_matching \"$install_root/app-\""));
+    }
+
+    #[test]
     fn select_remote_installer_mode_prefers_online_for_remote_storage() {
         let filesystem = storage_config("/tmp/releases");
         assert_eq!(select_remote_installer_mode(&filesystem), RemoteInstallerMode::Offline);
@@ -1872,6 +3023,227 @@ mod tests {
         let mut azure = storage_config("bucket");
         azure.provider = Some(surge_core::context::StorageProvider::AzureBlob);
         assert_eq!(select_remote_installer_mode(&azure), RemoteInstallerMode::Online);
+    }
+
+    #[test]
+    fn plan_remote_published_installer_uses_default_channel_key() {
+        let manifest = remote_manifest("demo", "linux-arm64", &["test", "production"], &["online"]);
+        let mut entry = release("1.2.3", "test", "linux-arm64", "demo.tar.zst");
+        entry.installers = vec!["online".to_string()];
+
+        let plan = plan_remote_published_installer(
+            &manifest,
+            "demo",
+            "linux-arm64",
+            "test",
+            &entry,
+            RemoteInstallerMode::Online,
+        )
+        .expect("plan should resolve");
+
+        assert_eq!(
+            plan.candidate_keys,
+            vec!["installers/Setup-linux-arm64-demo-test-online.bin".to_string()]
+        );
+        assert!(plan.blockers.is_empty(), "unexpected blockers: {:?}", plan.blockers);
+    }
+
+    #[test]
+    fn plan_remote_published_installer_reports_channel_mismatch() {
+        let manifest = remote_manifest("demo", "linux-arm64", &["test", "production"], &["online"]);
+        let mut entry = release("1.2.3", "production", "linux-arm64", "demo.tar.zst");
+        entry.installers = vec!["online".to_string()];
+
+        let plan = plan_remote_published_installer(
+            &manifest,
+            "demo",
+            "linux-arm64",
+            "production",
+            &entry,
+            RemoteInstallerMode::Online,
+        )
+        .expect("plan should resolve");
+
+        assert_eq!(
+            plan.candidate_keys,
+            vec!["installers/Setup-linux-arm64-demo-test-online.bin".to_string()]
+        );
+        assert!(
+            plan.blockers
+                .iter()
+                .any(|blocker| blocker.contains("default channel 'test'")),
+            "missing channel mismatch blocker: {:?}",
+            plan.blockers
+        );
+    }
+
+    #[tokio::test]
+    async fn try_prepare_published_installer_for_tailscale_rewrites_manifest_for_remote_env() {
+        let tmp = tempfile::tempdir().expect("temp dir should exist");
+        let store_dir = tmp.path().join("store");
+        let download_dir = tmp.path().join("downloads");
+        std::fs::create_dir_all(store_dir.join("installers")).expect("installers dir should exist");
+
+        let manifest = remote_manifest("demo", "linux-arm64", &["test", "production"], &["online"]);
+        let mut entry = release("1.2.3", "test", "linux-arm64", "demo.tar.zst");
+        entry.installers = vec!["online".to_string()];
+        entry.main_exe = "demoapp".to_string();
+        entry.install_directory = "demo".to_string();
+        entry.full_filename = "demo.tar.zst".to_string();
+
+        let generic_installer_manifest = InstallerManifest {
+            schema: 1,
+            format: "surge-installer-v1".to_string(),
+            ui: InstallerUi::Console,
+            installer_type: "online".to_string(),
+            app_id: "demo".to_string(),
+            rid: "linux-arm64".to_string(),
+            version: "1.2.3".to_string(),
+            channel: "test".to_string(),
+            generated_utc: "2026-03-13T00:00:00Z".to_string(),
+            headless_default_if_no_display: true,
+            release_index_key: RELEASES_FILE_COMPRESSED.to_string(),
+            storage: InstallerStorage {
+                provider: "filesystem".to_string(),
+                bucket: store_dir.to_string_lossy().to_string(),
+                region: String::new(),
+                endpoint: String::new(),
+                prefix: String::new(),
+            },
+            release: InstallerRelease {
+                full_filename: "demo.tar.zst".to_string(),
+                delta_filename: String::new(),
+                delta_algorithm: String::new(),
+                delta_patch_format: String::new(),
+                delta_compression: String::new(),
+            },
+            runtime: InstallerRuntime {
+                name: "Demo".to_string(),
+                main_exe: "demoapp".to_string(),
+                install_directory: "demo".to_string(),
+                supervisor_id: "demo-supervisor".to_string(),
+                icon: String::new(),
+                shortcuts: Vec::new(),
+                persistent_assets: Vec::new(),
+                installers: vec!["online".to_string()],
+                environment: BTreeMap::new(),
+            },
+        };
+        create_published_installer(
+            &store_dir.join("installers"),
+            "Setup-linux-arm64-demo-test-online.bin",
+            &generic_installer_manifest,
+        );
+
+        let backend = FilesystemBackend::new(store_dir.to_str().expect("utf-8 path"), "");
+        let launch_env = RemoteLaunchEnvironment {
+            display: Some(":0".to_string()),
+            xauthority: Some("/run/user/1000/gdm/Xauthority".to_string()),
+            dbus_session_bus_address: Some("unix:path=/run/user/1000/bus".to_string()),
+            wayland_display: None,
+            xdg_runtime_dir: Some("/run/user/1000".to_string()),
+        };
+        let plan = plan_remote_published_installer(
+            &manifest,
+            "demo",
+            "linux-arm64",
+            "test",
+            &entry,
+            RemoteInstallerMode::Online,
+        )
+        .expect("plan should resolve");
+
+        let customized_installer = try_prepare_published_installer_for_tailscale(
+            &backend,
+            &download_dir,
+            &plan,
+            "demo",
+            &entry,
+            "test",
+            &storage_config(store_dir.to_str().expect("utf-8 path")),
+            &launch_env,
+            RemoteInstallerMode::Online,
+        )
+        .await
+        .expect("published installer should prepare")
+        .expect("customized installer should exist");
+
+        let payload = read_embedded_payload(&customized_installer).expect("payload should be readable");
+        let installer_manifest: InstallerManifest =
+            serde_yaml::from_slice(&read_entry(&payload, "installer.yml").expect("installer manifest should exist"))
+                .expect("installer manifest should parse");
+        assert_eq!(installer_manifest.channel, "test");
+        assert_eq!(
+            installer_manifest
+                .runtime
+                .environment
+                .get("DISPLAY")
+                .map(String::as_str),
+            Some(":0")
+        );
+        assert_eq!(
+            installer_manifest
+                .runtime
+                .environment
+                .get("XAUTHORITY")
+                .map(String::as_str),
+            Some("/run/user/1000/gdm/Xauthority")
+        );
+        assert_eq!(
+            installer_manifest
+                .runtime
+                .environment
+                .get("DBUS_SESSION_BUS_ADDRESS")
+                .map(String::as_str),
+            Some("unix:path=/run/user/1000/bus")
+        );
+        assert_eq!(
+            installer_manifest
+                .runtime
+                .environment
+                .get("XDG_RUNTIME_DIR")
+                .map(String::as_str),
+            Some("/run/user/1000")
+        );
+    }
+
+    #[test]
+    fn missing_remote_installer_error_mentions_keys_and_host_mismatch() {
+        let err = missing_remote_installer_error(
+            "linux-arm64",
+            &RemotePublishedInstallerPlan {
+                candidate_keys: vec!["installers/Setup-linux-arm64-demo-test-online.bin".to_string()],
+                blockers: vec!["published installer was not found in storage".to_string()],
+            },
+            RemoteInstallerMode::Online,
+        );
+
+        let message = err.to_string();
+        assert!(message.contains("Setup-linux-arm64-demo-test-online.bin"));
+        assert!(message.contains("current host RID"));
+        assert!(message.contains("matching host"));
+    }
+
+    #[test]
+    fn published_installer_public_url_uses_azure_endpoint_and_bucket() {
+        let config = surge_core::context::StorageConfig {
+            provider: Some(surge_core::context::StorageProvider::AzureBlob),
+            bucket: "sample-container".to_string(),
+            endpoint: "https://example.blob.core.windows.net".to_string(),
+            ..surge_core::context::StorageConfig::default()
+        };
+
+        let url = published_installer_public_url(
+            &config,
+            "installers/Setup-linux-arm64-sampleapp-linux-arm64-test-online.bin",
+        );
+
+        assert_eq!(
+            url.as_deref(),
+            Some(
+                "https://example.blob.core.windows.net/sample-container/installers/Setup-linux-arm64-sampleapp-linux-arm64-test-online.bin"
+            )
+        );
     }
 
     #[tokio::test]
@@ -2007,7 +3379,7 @@ mod tests {
 
         let mut packer = ArchivePacker::new(3).expect("archive packer should be created");
         packer
-            .add_buffer("youpark", b"#!/bin/sh\necho ok\n", 0o755)
+            .add_buffer("sampleapp", b"#!/bin/sh\necho ok\n", 0o755)
             .expect("main executable should be added");
         packer
             .add_buffer(".surge/surge.yml", b"schema: 1\n", 0o644)
@@ -2015,16 +3387,16 @@ mod tests {
         let package_bytes = packer.finalize().expect("archive should be finalized");
         std::fs::write(&package_path, package_bytes).expect("archive should be written");
 
-        let mut entry = release("1.2.3", "test", "linux-x64-cuda", "youpark-full.tar.zst");
-        entry.main_exe = "youpark".to_string();
-        entry.install_directory = "youpark".to_string();
+        let mut entry = release("1.2.3", "test", "linux-x64-cuda", "sampleapp-full.tar.zst");
+        entry.main_exe = "sampleapp".to_string();
+        entry.install_directory = "sampleapp".to_string();
         entry.shortcuts = Vec::new();
 
-        let profile = release_install_profile("youpark", &entry);
+        let profile = release_install_profile("sampleapp", &entry);
         core_install::install_package_locally_at_root(&profile, &package_path, &install_root)
             .expect("local install should succeed");
 
-        assert!(install_root.join("app").join("youpark").is_file());
+        assert!(install_root.join("app").join("sampleapp").is_file());
         assert!(install_root.join("app").join(".surge").join("surge.yml").is_file());
         assert!(!install_root.join(".surge-app-next").exists());
         assert!(!install_root.join(".surge-app-prev").exists());
@@ -2046,12 +3418,12 @@ mod tests {
         let package_bytes = packer.finalize().expect("archive should be finalized");
         std::fs::write(&package_path, package_bytes).expect("archive should be written");
 
-        let mut entry = release("1.2.3", "test", "linux-x64-cuda", "youpark-full.tar.zst");
-        entry.main_exe = "youpark".to_string();
-        entry.install_directory = "youpark".to_string();
+        let mut entry = release("1.2.3", "test", "linux-x64-cuda", "sampleapp-full.tar.zst");
+        entry.main_exe = "sampleapp".to_string();
+        entry.install_directory = "sampleapp".to_string();
         entry.shortcuts = Vec::new();
 
-        let profile = release_install_profile("youpark", &entry);
+        let profile = release_install_profile("sampleapp", &entry);
         core_install::install_package_locally_at_root(&profile, &package_path, &install_root)
             .expect("local install should succeed");
 
@@ -2233,7 +3605,7 @@ apps:
     }
 
     #[test]
-    fn derive_rid_candidates_cover_youpark_variants() {
+    fn derive_rid_candidates_cover_cpu_cuda_variants() {
         let x64_cpu = build_rid_candidates("linux-x64", false);
         assert!(x64_cpu.contains(&"linux-x64".to_string()));
         assert!(x64_cpu.contains(&"linux-x64-cpu".to_string()));
@@ -2296,7 +3668,7 @@ apps:
     }
 
     #[test]
-    fn select_release_supports_youpark_style_cpu_cuda_variants() {
+    fn select_release_supports_cpu_cuda_variants() {
         let releases = vec![
             release("1.0.0", "production", "linux-x64-cpu", "cpu"),
             release("1.0.0", "production", "linux-x64-cuda", "cuda"),

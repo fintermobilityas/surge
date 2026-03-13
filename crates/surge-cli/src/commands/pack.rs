@@ -1067,7 +1067,7 @@ fn gui_installer_launcher_name_for_rid(rid: &str) -> &'static str {
     }
 }
 
-fn ensure_host_compatible_rid(rid: &str) -> Result<()> {
+pub(crate) fn ensure_host_compatible_rid(rid: &str) -> Result<()> {
     let target = parse_rid(rid).ok_or_else(|| {
         SurgeError::Pack(format!(
             "Unsupported target RID '{rid}'. Supported values use linux|win|windows|osx|macos and x86|x64|arm64."

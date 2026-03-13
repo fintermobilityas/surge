@@ -1022,7 +1022,11 @@ impl UpdateManager {
             }
         };
         if let Some(index) = prune_index {
-            let retained_artifacts = required_artifacts_for_index(&index);
+            let mut retained_artifacts = required_artifacts_for_index(&index);
+            let warm_full_filename = latest.full_filename.trim();
+            if !warm_full_filename.is_empty() {
+                retained_artifacts.insert(warm_full_filename.to_string());
+            }
             match prune_cached_artifacts(&artifact_cache_dir, &retained_artifacts) {
                 Ok(0) => {}
                 Ok(pruned) => {

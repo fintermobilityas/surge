@@ -59,7 +59,7 @@ pub async fn execute(dir: &Path, no_start: bool) -> Result<()> {
     core_install::write_runtime_manifest(&active_app_dir, &profile, &runtime_manifest)?;
 
     if let Some(required_artifacts) = package.required_artifacts.as_ref() {
-        match prune_install_artifact_cache(&install_root, required_artifacts) {
+        match prune_install_artifact_cache(&install_root, required_artifacts, &manifest.release.full_filename) {
             Ok(0) => {}
             Ok(pruned) => {
                 logline::info(&format!(
@@ -249,8 +249,14 @@ fn find_release_for_installer<'a>(index: &'a ReleaseIndex, manifest: &InstallerM
 fn prune_install_artifact_cache(
     install_root: &Path,
     required_artifacts: &BTreeSet<String>,
+    warm_full_filename: &str,
 ) -> Result<usize> {
-    prune_cached_artifacts(&install_artifact_cache_dir(install_root), required_artifacts)
+    let mut retained_artifacts = required_artifacts.clone();
+    let warm_full_filename = warm_full_filename.trim();
+    if !warm_full_filename.is_empty() {
+        retained_artifacts.insert(warm_full_filename.to_string());
+    }
+    prune_cached_artifacts(&install_artifact_cache_dir(install_root), &retained_artifacts)
 }
 
 /// Kill any running process whose executable lives in the app directory.
@@ -310,8 +316,9 @@ mod tests {
     use surge_core::config::constants::RELEASES_FILE_COMPRESSED;
     use surge_core::config::installer::{InstallerRelease, InstallerRuntime, InstallerStorage, InstallerUi};
     use surge_core::crypto::sha256::sha256_hex;
+    use surge_core::diff::wrapper::bsdiff_buffers;
     use surge_core::platform::detect::current_rid;
-    use surge_core::releases::manifest::{ReleaseEntry, ReleaseIndex, compress_release_index};
+    use surge_core::releases::manifest::{DeltaArtifact, ReleaseEntry, ReleaseIndex, compress_release_index};
 
     fn make_manifest(
         install_root: &Path,
@@ -499,6 +506,110 @@ mod tests {
                 .join(full_filename)
                 .is_file(),
             "resolved package should remain in cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_retains_installed_full_in_artifact_cache_when_release_graph_prunes_it() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let installer_dir = temp_dir.path().join("installer");
+        let install_root = temp_dir.path().join("installed-app");
+        let store_root = temp_dir.path().join("store");
+        let rid = current_rid();
+        let base_full_filename = "demo-app-1.0.0-full.tar.zst";
+        let target_full_filename = "demo-app-1.2.3-full.tar.zst";
+        let delta_filename = "demo-app-1.2.3-delta.tar.zst";
+        let base_archive_path = store_root.join(base_full_filename);
+        let target_archive_path = temp_dir.path().join(target_full_filename);
+        let delta_path = store_root.join(delta_filename);
+
+        std::fs::create_dir_all(&installer_dir).expect("installer dir");
+        std::fs::create_dir_all(&store_root).expect("store dir");
+        write_archive(&base_archive_path, b"base payload");
+        write_archive(&target_archive_path, b"target payload");
+
+        let base_archive = std::fs::read(&base_archive_path).expect("base archive");
+        let target_archive = std::fs::read(&target_archive_path).expect("target archive");
+        let patch = bsdiff_buffers(&base_archive, &target_archive).expect("delta patch");
+        let delta_bytes = zstd::encode_all(patch.as_slice(), 3).expect("delta bytes");
+        std::fs::write(&delta_path, &delta_bytes).expect("write delta");
+
+        let manifest = make_manifest(&install_root, &store_root, target_full_filename, "online");
+        let installer_yaml = serde_yaml::to_string(&manifest).expect("installer yaml");
+        std::fs::write(installer_dir.join("installer.yml"), installer_yaml).expect("installer manifest");
+
+        let mut base_release = ReleaseEntry {
+            version: "1.0.0".to_string(),
+            channels: vec![manifest.channel.clone()],
+            os: "linux".to_string(),
+            rid: rid.clone(),
+            is_genesis: false,
+            full_filename: base_full_filename.to_string(),
+            full_size: i64::try_from(base_archive.len()).expect("base size"),
+            full_sha256: sha256_hex(&base_archive),
+            deltas: Vec::new(),
+            preferred_delta_id: String::new(),
+            created_utc: manifest.generated_utc.clone(),
+            release_notes: String::new(),
+            name: manifest.runtime.name.clone(),
+            main_exe: manifest.runtime.main_exe.clone(),
+            install_directory: manifest.runtime.install_directory.clone(),
+            supervisor_id: manifest.runtime.supervisor_id.clone(),
+            icon: manifest.runtime.icon.clone(),
+            shortcuts: manifest.runtime.shortcuts.clone(),
+            persistent_assets: manifest.runtime.persistent_assets.clone(),
+            installers: manifest.runtime.installers.clone(),
+            environment: manifest.runtime.environment.clone(),
+        };
+        base_release.set_primary_delta(None);
+
+        let mut target_release = ReleaseEntry {
+            version: manifest.version.clone(),
+            channels: vec![manifest.channel.clone()],
+            os: "linux".to_string(),
+            rid,
+            is_genesis: false,
+            full_filename: target_full_filename.to_string(),
+            full_size: i64::try_from(target_archive.len()).expect("target size"),
+            full_sha256: sha256_hex(&target_archive),
+            deltas: Vec::new(),
+            preferred_delta_id: String::new(),
+            created_utc: manifest.generated_utc.clone(),
+            release_notes: String::new(),
+            name: manifest.runtime.name.clone(),
+            main_exe: manifest.runtime.main_exe.clone(),
+            install_directory: manifest.runtime.install_directory.clone(),
+            supervisor_id: manifest.runtime.supervisor_id.clone(),
+            icon: manifest.runtime.icon.clone(),
+            shortcuts: manifest.runtime.shortcuts.clone(),
+            persistent_assets: manifest.runtime.persistent_assets.clone(),
+            installers: manifest.runtime.installers.clone(),
+            environment: manifest.runtime.environment.clone(),
+        };
+        target_release.set_primary_delta(Some(DeltaArtifact::bsdiff_zstd(
+            "primary",
+            "1.0.0",
+            delta_filename,
+            i64::try_from(delta_bytes.len()).expect("delta size"),
+            &sha256_hex(&delta_bytes),
+        )));
+
+        write_release_index_entries(&store_root, &manifest.app_id, vec![base_release, target_release]);
+
+        execute(&installer_dir, true).await.expect("setup should succeed");
+
+        let artifact_cache = install_root.join(".surge-cache").join("artifacts");
+        assert!(
+            artifact_cache.join(base_full_filename).is_file(),
+            "base full should remain because the release graph still needs it"
+        );
+        assert!(
+            artifact_cache.join(delta_filename).is_file(),
+            "delta should remain because the release graph still needs it"
+        );
+        assert!(
+            artifact_cache.join(target_full_filename).is_file(),
+            "installed target full should remain as a warm cache entry"
         );
     }
 }

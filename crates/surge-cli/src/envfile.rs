@@ -288,7 +288,7 @@ fn parse_quoted_env_value(value: &str, quote: char) -> std::result::Result<Strin
     let consumed = if quote == '"' {
         format!("\"{}\"", escape_double_quoted_value(&result))
     } else {
-        format!("'{}'", result)
+        format!("'{result}'")
     };
     let remainder = value
         .strip_prefix(&consumed)
@@ -319,14 +319,6 @@ pub(crate) fn with_storage_env_state_for_test<T>(
 ) -> T {
     static TEST_STORAGE_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
-    let _guard = TEST_STORAGE_ENV_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    *write_state() = StorageEnvState {
-        scopes: BTreeMap::from([(storage_env_scope_key(scope), ScopedStorageEnvState { global, per_app })]),
-    };
-
     struct ResetOverlayOnDrop;
 
     impl Drop for ResetOverlayOnDrop {
@@ -334,6 +326,14 @@ pub(crate) fn with_storage_env_state_for_test<T>(
             *write_state() = StorageEnvState::default();
         }
     }
+
+    let _guard = TEST_STORAGE_ENV_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    *write_state() = StorageEnvState {
+        scopes: BTreeMap::from([(storage_env_scope_key(scope), ScopedStorageEnvState { global, per_app })]),
+    };
 
     let _reset = ResetOverlayOnDrop;
     test()

@@ -493,22 +493,22 @@ fn main() -> ExitCode {
 fn load_env_files_for_cli(cli: &Cli) -> surge_core::error::Result<()> {
     match &cli.command {
         Commands::Init { .. } | Commands::Lock { .. } | Commands::Sha256 { .. } => Ok(()),
-        Commands::Setup { dir, .. } => load_env_files_for_scope(dir, envfile::candidate_paths_for_setup(dir)),
+        Commands::Setup { dir, .. } => load_env_files_for_scope(dir, &envfile::candidate_paths_for_setup(dir)),
         Commands::Install { options, .. } => {
             let manifest_path =
                 commands::install::selected_install_manifest_path(&options.application_manifest, &cli.manifest_path);
-            load_env_files_for_scope(manifest_path, envfile::candidate_paths_for_manifest(manifest_path))
+            load_env_files_for_scope(manifest_path, &envfile::candidate_paths_for_manifest(manifest_path))
         }
         Commands::Migrate { dest_manifest, .. } => {
             load_env_files_for_scope(
                 &cli.manifest_path,
-                envfile::candidate_paths_for_manifest(&cli.manifest_path),
+                &envfile::candidate_paths_for_manifest(&cli.manifest_path),
             )?;
-            load_env_files_for_scope(dest_manifest, envfile::candidate_paths_for_manifest(dest_manifest))
+            load_env_files_for_scope(dest_manifest, &envfile::candidate_paths_for_manifest(dest_manifest))
         }
         _ => load_env_files_for_scope(
             &cli.manifest_path,
-            envfile::candidate_paths_for_manifest(&cli.manifest_path),
+            &envfile::candidate_paths_for_manifest(&cli.manifest_path),
         ),
     }
 }
@@ -521,8 +521,8 @@ fn load_env_files_for_setup(dir: &std::path::Path) -> surge_core::error::Result<
     Ok(())
 }
 
-fn load_env_files_for_scope(scope: &Path, candidates: Vec<PathBuf>) -> surge_core::error::Result<()> {
-    let loaded = envfile::load_storage_env_files(scope, &candidates)?;
+fn load_env_files_for_scope(scope: &Path, candidates: &[PathBuf]) -> surge_core::error::Result<()> {
+    let loaded = envfile::load_storage_env_files(scope, candidates)?;
     for path in loaded {
         logline::info(&format!("Loaded storage env overrides from {}", path.display()));
     }

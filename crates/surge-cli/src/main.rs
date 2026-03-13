@@ -390,6 +390,10 @@ struct InstallOptions {
     #[arg(long)]
     no_start: bool,
 
+    /// Reinstall even if the selected version/channel is already installed on the target
+    #[arg(long)]
+    force: bool,
+
     /// Local cache directory for downloaded packages
     #[arg(long, default_value = ".surge/install-cache")]
     download_dir: PathBuf,
@@ -776,6 +780,7 @@ async fn run(cli: Cli) -> surge_core::error::Result<()> {
                 options.version.as_deref(),
                 options.plan_only,
                 options.no_start,
+                options.force,
                 &options.download_dir,
                 commands::install::StorageOverrides {
                     provider: options.provider.as_deref(),
@@ -826,5 +831,17 @@ mod tests {
         };
 
         assert!(err.to_string().contains("--package-file"));
+    }
+
+    #[test]
+    fn install_force_flag_parses() {
+        let cli = Cli::try_parse_from(["surge", "install", "tailscale", "my-node", "--force"])
+            .expect("install command with --force should parse");
+
+        let Commands::Install { options, .. } = cli.command else {
+            panic!("expected install command");
+        };
+
+        assert!(options.force);
     }
 }

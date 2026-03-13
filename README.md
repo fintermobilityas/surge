@@ -220,8 +220,9 @@ This command:
 - resolves the newest matching release on the selected channel,
 - downloads it locally and sends it with `tailscale file cp`.
 
-Use `--plan-only` to preview selection without transfer, or `--rid` to force a specific RID. If your tailnet
-requires explicit SSH identity, pass `--node-user <account>` (or set `--node <account>@<node>` directly).
+Use `--plan-only` to preview selection without transfer, `--rid` to force a specific RID, or `--force` to
+reinstall even when the same version/channel is already installed on the target. If your tailnet requires
+explicit SSH identity, pass `--node-user <account>` (or set `--node <account>@<node>` directly).
 
 ### 4. Add update checking to your app
 

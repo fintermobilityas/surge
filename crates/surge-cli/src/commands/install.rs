@@ -140,6 +140,7 @@ pub async fn execute(
     version: Option<&str>,
     plan_only: bool,
     no_start: bool,
+    force: bool,
     download_dir: &Path,
     overrides: StorageOverrides<'_>,
 ) -> Result<()> {
@@ -387,13 +388,19 @@ pub async fn execute(
                 release.install_directory.trim()
             };
             let remote_state = check_remote_install_state(ssh_target, install_dir).await;
-            if remote_install_matches(remote_state.as_ref(), &release.version, &channel) {
+            let install_matches = remote_install_matches(remote_state.as_ref(), &release.version, &channel);
+            if should_skip_remote_install(install_matches, force) {
                 logline::success(&format!(
                     "'{app_id}' v{} ({channel}) is already installed on '{file_target}', skipping.",
                     release.version
                 ));
             } else {
-                if let Some(remote_state) = &remote_state
+                if install_matches {
+                    logline::info(&format!(
+                        "'{app_id}' v{} ({channel}) is already installed on '{file_target}'; reinstalling due to --force.",
+                        release.version
+                    ));
+                } else if let Some(remote_state) = &remote_state
                     && remote_state.version.trim() == release.version
                 {
                     logline::info(&format!(
@@ -1619,6 +1626,10 @@ fn remote_install_matches(
     })
 }
 
+fn should_skip_remote_install(install_matches: bool, force: bool) -> bool {
+    install_matches && !force
+}
+
 async fn run_tailscale_capture(args: &[&str]) -> Result<String> {
     let output = Command::new("tailscale")
         .args(args)
@@ -1899,6 +1910,7 @@ mod tests {
             Some("1.2.3"),
             false,
             true,
+            false,
             &download_dir,
             StorageOverrides::default(),
         )
@@ -2586,5 +2598,18 @@ apps:
         assert!(!remote_install_matches(Some(&production), "1.2.4", "production"));
         assert!(!remote_install_matches(Some(&test), "1.2.3", "production"));
         assert!(!remote_install_matches(None, "1.2.3", "production"));
+    }
+
+    #[test]
+    fn force_flag_bypasses_remote_install_skip() {
+        let remote_state = RemoteInstallState {
+            version: "1.2.3".to_string(),
+            channel: Some("test".to_string()),
+        };
+
+        let install_matches = remote_install_matches(Some(&remote_state), "1.2.3", "test");
+
+        assert!(should_skip_remote_install(install_matches, false));
+        assert!(!should_skip_remote_install(install_matches, true));
     }
 }

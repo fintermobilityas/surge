@@ -77,7 +77,16 @@ pub async fn execute_pack(
             candidate.delta_strategy.as_str(),
             candidate.compression_level
         ));
-        let result = benchmark_candidate(&raw_manifest, &app_id, version, &rid, &artifacts_dir, *candidate).await?;
+        let result = benchmark_candidate(
+            manifest_path,
+            &raw_manifest,
+            &app_id,
+            version,
+            &rid,
+            &artifacts_dir,
+            *candidate,
+        )
+        .await?;
         logline::plain(&format!(
             "  {:24} zstd={:<2} build {:>7} | full {:>8} | delta {:>8}",
             result.candidate.delta_strategy.as_str(),
@@ -154,6 +163,7 @@ fn build_candidates(zstd_levels: &[i32], delta_strategies: &[String]) -> Result<
 }
 
 async fn benchmark_candidate(
+    manifest_path: &Path,
     raw_manifest: &[u8],
     app_id: &str,
     version: &str,
@@ -167,11 +177,7 @@ async fn benchmark_candidate(
         build_manifest_with_policy(raw_manifest, candidate.delta_strategy, candidate.compression_level)?;
     write_file_atomic(&candidate_manifest_path, &candidate_manifest_yaml)?;
     let candidate_manifest = SurgeManifest::parse(&candidate_manifest_yaml)?;
-    let ctx = Arc::new(super::pack::configure_context(
-        &candidate_manifest_path,
-        &candidate_manifest,
-        app_id,
-    )?);
+    let ctx = Arc::new(configure_benchmark_context(manifest_path, &candidate_manifest, app_id)?);
 
     let manifest_path = candidate_manifest_path.to_str().ok_or_else(|| {
         SurgeError::Config(format!(
@@ -208,6 +214,14 @@ async fn benchmark_candidate(
         full_size,
         delta_size,
     })
+}
+
+fn configure_benchmark_context(
+    manifest_path: &Path,
+    manifest: &SurgeManifest,
+    app_id: &str,
+) -> Result<surge_core::context::Context> {
+    super::pack::configure_context(manifest_path, manifest, app_id)
 }
 
 fn choose_recommended(results: &[PackTuneResult]) -> Option<&PackTuneResult> {
@@ -275,6 +289,8 @@ fn set_value(mapping: &mut Mapping, key: &str, value: Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+
     use surge_core::platform::detect::current_rid;
     use surge_core::platform::fs::make_executable;
 
@@ -330,6 +346,40 @@ apps:
         let rendered = String::from_utf8(rendered).expect("utf-8");
         assert!(rendered.contains("strategy: archive-bsdiff"));
         assert!(rendered.contains("level: 5"));
+    }
+
+    #[test]
+    fn configure_benchmark_context_uses_original_manifest_scope_for_env_lookup() {
+        let manifest_scope = Path::new("/tmp/demo/surge.yml");
+        crate::envfile::with_storage_env_state_for_test(
+            manifest_scope,
+            BTreeMap::new(),
+            BTreeMap::from([(
+                "demoapp".to_string(),
+                BTreeMap::from([
+                    ("AZURE_STORAGE_ACCOUNT_NAME".to_string(), "overlay-account".to_string()),
+                    ("AZURE_STORAGE_ACCOUNT_KEY".to_string(), "overlay-key".to_string()),
+                ]),
+            )]),
+            || {
+                let manifest_yaml = br"schema: 1
+storage:
+  provider: azure
+  bucket: demo
+apps:
+  - id: demoapp
+    target:
+      rid: linux-x64
+";
+                let manifest = SurgeManifest::parse(manifest_yaml).expect("manifest should parse");
+                let ctx = configure_benchmark_context(manifest_scope, &manifest, "demoapp")
+                    .expect("context should use original manifest scope");
+                let storage_config = ctx.storage_config();
+
+                assert_eq!(storage_config.access_key, "overlay-account");
+                assert_eq!(storage_config.secret_key, "overlay-key");
+            },
+        );
     }
 
     #[tokio::test]

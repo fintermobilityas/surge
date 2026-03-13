@@ -826,12 +826,22 @@ mod tests {
             .unwrap();
         let full_v3 = packer_v3.finalize().unwrap();
 
-        let patch_v2 =
-            crate::releases::delta::build_archive_chunked_patch(&full_v1, &full_v2, 7, &ChunkedDiffOptions::default())
-                .unwrap();
-        let patch_v3 =
-            crate::releases::delta::build_archive_chunked_patch(&full_v2, &full_v3, 7, &ChunkedDiffOptions::default())
-                .unwrap();
+        let patch_v2 = crate::releases::delta::build_archive_chunked_patch(
+            &full_v1,
+            &full_v2,
+            7,
+            0,
+            &ChunkedDiffOptions::default(),
+        )
+        .unwrap();
+        let patch_v3 = crate::releases::delta::build_archive_chunked_patch(
+            &full_v2,
+            &full_v3,
+            7,
+            0,
+            &ChunkedDiffOptions::default(),
+        )
+        .unwrap();
         let delta_v2 = zstd::encode_all(patch_v2.as_slice(), 3).unwrap();
         let delta_v3 = zstd::encode_all(patch_v3.as_slice(), 3).unwrap();
 

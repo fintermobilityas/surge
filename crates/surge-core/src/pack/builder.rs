@@ -16,7 +16,7 @@ use crate::error::{Result, SurgeError};
 use crate::platform::fs::write_file_atomic;
 use crate::releases::delta::{build_archive_bsdiff_patch, build_archive_chunked_patch};
 use crate::releases::manifest::{
-    DeltaArtifact, PATCH_FORMAT_BSDIFF4_ARCHIVE_V2, PATCH_FORMAT_CHUNKED_BSDIFF_ARCHIVE_V2, ReleaseEntry, ReleaseIndex,
+    DeltaArtifact, PATCH_FORMAT_BSDIFF4_ARCHIVE_V3, PATCH_FORMAT_CHUNKED_BSDIFF_ARCHIVE_V3, ReleaseEntry, ReleaseIndex,
     compress_release_index, decompress_release_index,
 };
 use crate::releases::restore::{find_previous_release_for_rid, restore_full_archive_for_version};
@@ -326,23 +326,29 @@ impl PackBuilder {
             .find(|a| !a.is_delta)
             .map(PackageArtifact::bytes)
             .ok_or_else(|| SurgeError::Pack("Full package not yet built".to_string()))?;
+        let n_workers = budget.effective_zstd_workers();
 
         let (patch, patch_format) = match self.delta_strategy {
             PackDeltaStrategy::ArchiveChunkedBsdiff => {
                 let diff_options = chunked_diff_options(&budget, prev_data.len(), new_data.len());
                 (
-                    build_archive_chunked_patch(&prev_data, new_data, budget.zstd_compression_level, &diff_options)?,
-                    PATCH_FORMAT_CHUNKED_BSDIFF_ARCHIVE_V2.to_string(),
+                    build_archive_chunked_patch(
+                        &prev_data,
+                        new_data,
+                        budget.zstd_compression_level,
+                        n_workers,
+                        &diff_options,
+                    )?,
+                    PATCH_FORMAT_CHUNKED_BSDIFF_ARCHIVE_V3.to_string(),
                 )
             }
             PackDeltaStrategy::ArchiveBsdiff => (
-                build_archive_bsdiff_patch(&prev_data, new_data, budget.zstd_compression_level)?,
-                PATCH_FORMAT_BSDIFF4_ARCHIVE_V2.to_string(),
+                build_archive_bsdiff_patch(&prev_data, new_data, budget.zstd_compression_level, n_workers)?,
+                PATCH_FORMAT_BSDIFF4_ARCHIVE_V3.to_string(),
             ),
         };
 
         let delta_filename = format!("{}-{}-{}-delta.tar.zst", self.app_id, self.version, self.rid);
-        let n_workers = budget.effective_zstd_workers();
         let compressed = zstd_encode_mt(patch.as_slice(), budget.zstd_compression_level, n_workers)?;
 
         let sha256 = sha256_hex(&compressed);
@@ -404,48 +410,14 @@ impl PackBuilder {
         };
         let mut entry = entry;
         let primary_delta = delta.map(|artifact| {
-            if artifact
-                .patch_format
-                .eq_ignore_ascii_case(PATCH_FORMAT_CHUNKED_BSDIFF_ARCHIVE_V2)
-            {
-                DeltaArtifact::chunked_bsdiff_archive_zstd(
-                    "primary",
-                    &artifact.from_version,
-                    &artifact.filename,
-                    artifact.size,
-                    &artifact.sha256,
-                )
-            } else if artifact
-                .patch_format
-                .eq_ignore_ascii_case(PATCH_FORMAT_BSDIFF4_ARCHIVE_V2)
-            {
-                DeltaArtifact::bsdiff_archive_zstd(
-                    "primary",
-                    &artifact.from_version,
-                    &artifact.filename,
-                    artifact.size,
-                    &artifact.sha256,
-                )
-            } else if artifact
-                .patch_format
-                .eq_ignore_ascii_case(crate::releases::manifest::PATCH_FORMAT_CHUNKED_BSDIFF_V1)
-            {
-                DeltaArtifact::chunked_bsdiff_zstd(
-                    "primary",
-                    &artifact.from_version,
-                    &artifact.filename,
-                    artifact.size,
-                    &artifact.sha256,
-                )
-            } else {
-                DeltaArtifact::bsdiff_zstd(
-                    "primary",
-                    &artifact.from_version,
-                    &artifact.filename,
-                    artifact.size,
-                    &artifact.sha256,
-                )
-            }
+            DeltaArtifact::with_patch_format(
+                "primary",
+                &artifact.from_version,
+                &artifact.patch_format,
+                &artifact.filename,
+                artifact.size,
+                &artifact.sha256,
+            )
         });
         entry.set_primary_delta(primary_delta);
 
@@ -1071,7 +1043,7 @@ apps:
             .find(|artifact| artifact.is_delta)
             .unwrap()
             .clone();
-        assert_eq!(delta_v2.patch_format, PATCH_FORMAT_CHUNKED_BSDIFF_ARCHIVE_V2);
+        assert_eq!(delta_v2.patch_format, PATCH_FORMAT_CHUNKED_BSDIFF_ARCHIVE_V3);
         assert!(delta_v2.bytes().len() * 100 < full_v2.bytes().len());
         builder_v2.push("stable", None).await.unwrap();
 
@@ -1097,7 +1069,7 @@ apps:
             .find(|artifact| artifact.is_delta)
             .unwrap()
             .clone();
-        assert_eq!(delta_v3.patch_format, PATCH_FORMAT_CHUNKED_BSDIFF_ARCHIVE_V2);
+        assert_eq!(delta_v3.patch_format, PATCH_FORMAT_CHUNKED_BSDIFF_ARCHIVE_V3);
         assert!(delta_v3.bytes().len() * 100 < full_v3.bytes().len());
         builder_v3.push("stable", None).await.unwrap();
 

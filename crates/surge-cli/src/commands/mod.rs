@@ -175,7 +175,7 @@ mod tests {
     use surge_core::platform::fs::make_executable;
     use surge_core::releases::delta::build_archive_chunked_patch;
     use surge_core::releases::manifest::{
-        PATCH_FORMAT_CHUNKED_BSDIFF_ARCHIVE_V2, PATCH_FORMAT_CHUNKED_BSDIFF_V1, ReleaseEntry, ReleaseIndex,
+        PATCH_FORMAT_CHUNKED_BSDIFF_ARCHIVE_V3, PATCH_FORMAT_CHUNKED_BSDIFF_V1, ReleaseEntry, ReleaseIndex,
         compress_release_index, decompress_release_index,
     };
 
@@ -869,7 +869,7 @@ apps:
             .unwrap();
         let v2_full = packer_v2.finalize().unwrap();
 
-        let v2_patch = build_archive_chunked_patch(&v1_full, &v2_full, 7, &ChunkedDiffOptions::default()).unwrap();
+        let v2_patch = build_archive_chunked_patch(&v1_full, &v2_full, 7, 0, &ChunkedDiffOptions::default()).unwrap();
         let v2_delta = zstd::encode_all(v2_patch.as_slice(), 3).unwrap();
 
         std::fs::write(packages_dir.join(&v1_full_key), &v1_full).unwrap();
@@ -891,7 +891,7 @@ apps:
             .expect("v2 release should exist in index");
         let delta = v2_entry.selected_delta().expect("v2 should include delta");
         assert_eq!(delta.filename, v2_delta_key);
-        assert_eq!(delta.patch_format, PATCH_FORMAT_CHUNKED_BSDIFF_ARCHIVE_V2);
+        assert_eq!(delta.patch_format, PATCH_FORMAT_CHUNKED_BSDIFF_ARCHIVE_V3);
     }
 
     #[tokio::test]

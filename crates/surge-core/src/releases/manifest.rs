@@ -10,8 +10,8 @@ use crate::releases::version::compare_versions;
 pub const DIFF_ALGORITHM_BSDIFF: &str = "bsdiff";
 pub const PATCH_FORMAT_BSDIFF4: &str = "bsdiff4";
 pub const PATCH_FORMAT_CHUNKED_BSDIFF_V1: &str = "chunked-bsdiff-v1";
-pub const PATCH_FORMAT_BSDIFF4_ARCHIVE_V2: &str = "bsdiff4-archive-v2";
-pub const PATCH_FORMAT_CHUNKED_BSDIFF_ARCHIVE_V2: &str = "chunked-bsdiff-archive-v2";
+pub const PATCH_FORMAT_BSDIFF4_ARCHIVE_V3: &str = "bsdiff4-archive-v3";
+pub const PATCH_FORMAT_CHUNKED_BSDIFF_ARCHIVE_V3: &str = "chunked-bsdiff-archive-v3";
 pub const COMPRESSION_ZSTD: &str = "zstd";
 
 /// A single delta artifact descriptor.
@@ -49,6 +49,18 @@ impl DeltaArtifact {
         }
     }
 
+    #[must_use]
+    pub fn with_patch_format(
+        id: &str,
+        from_version: &str,
+        patch_format: &str,
+        filename: &str,
+        size: i64,
+        sha256: &str,
+    ) -> Self {
+        Self::with_format(id, from_version, patch_format, filename, size, sha256)
+    }
+
     /// Build a descriptor for the classic bsdiff + zstd delta format.
     #[must_use]
     pub fn bsdiff_zstd(id: &str, from_version: &str, filename: &str, size: i64, sha256: &str) -> Self {
@@ -67,7 +79,7 @@ impl DeltaArtifact {
         Self::with_format(
             id,
             from_version,
-            PATCH_FORMAT_BSDIFF4_ARCHIVE_V2,
+            PATCH_FORMAT_BSDIFF4_ARCHIVE_V3,
             filename,
             size,
             sha256,
@@ -80,7 +92,7 @@ impl DeltaArtifact {
         Self::with_format(
             id,
             from_version,
-            PATCH_FORMAT_CHUNKED_BSDIFF_ARCHIVE_V2,
+            PATCH_FORMAT_CHUNKED_BSDIFF_ARCHIVE_V3,
             filename,
             size,
             sha256,

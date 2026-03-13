@@ -267,8 +267,9 @@ impl PackBuilder {
     fn build_full_package(&mut self) -> Result<PackageArtifact> {
         let budget = self.ctx.resource_budget();
         let filename = format!("{}-{}-{}-full.tar.zst", self.app_id, self.version, self.rid);
+        let n_workers = budget.effective_zstd_workers();
 
-        let mut packer = ArchivePacker::new(budget.zstd_compression_level)?;
+        let mut packer = ArchivePacker::with_threads(budget.zstd_compression_level, n_workers)?;
         packer.add_directory(&self.artifacts_dir, "")?;
 
         // Bundle surge-supervisor if supervisor_id is configured and not already in artifacts.
@@ -315,6 +316,7 @@ impl PackBuilder {
             return Ok(None);
         };
 
+        let budget = self.ctx.resource_budget();
         let prev_data =
             restore_full_archive_for_version(self.storage.as_ref(), &index, &self.rid, &previous_release.version)
                 .await?;
@@ -325,7 +327,6 @@ impl PackBuilder {
             .map(PackageArtifact::bytes)
             .ok_or_else(|| SurgeError::Pack("Full package not yet built".to_string()))?;
 
-        let budget = self.ctx.resource_budget();
         let (patch, patch_format) = match self.delta_strategy {
             PackDeltaStrategy::ArchiveChunkedBsdiff => {
                 let diff_options = chunked_diff_options(&budget, prev_data.len(), new_data.len());
@@ -341,8 +342,8 @@ impl PackBuilder {
         };
 
         let delta_filename = format!("{}-{}-{}-delta.tar.zst", self.app_id, self.version, self.rid);
-        let compressed = zstd::encode_all(patch.as_slice(), budget.zstd_compression_level)
-            .map_err(|e| SurgeError::Archive(format!("Failed to compress delta: {e}")))?;
+        let n_workers = budget.effective_zstd_workers();
+        let compressed = zstd_encode_mt(patch.as_slice(), budget.zstd_compression_level, n_workers)?;
 
         let sha256 = sha256_hex(&compressed);
         let size = i64::try_from(compressed.len())
@@ -656,6 +657,27 @@ fn supervisor_binary_name_for_rid(rid: &str) -> &'static str {
         "win" | "windows" => "surge-supervisor.exe",
         "linux" | "osx" | "macos" => "surge-supervisor",
         _ => supervisor_binary_name(),
+    }
+}
+
+/// Compress `data` with zstd, optionally using multi-threaded compression.
+fn zstd_encode_mt(data: &[u8], compression_level: i32, n_workers: u32) -> Result<Vec<u8>> {
+    if n_workers > 0 {
+        use std::io::Write;
+        let mut encoder = zstd::Encoder::new(Vec::new(), compression_level)
+            .map_err(|e| SurgeError::Archive(format!("Failed to create zstd encoder: {e}")))?;
+        encoder
+            .multithread(n_workers)
+            .map_err(|e| SurgeError::Archive(format!("Failed to enable multi-threaded zstd: {e}")))?;
+        encoder
+            .write_all(data)
+            .map_err(|e| SurgeError::Archive(format!("Failed to compress delta: {e}")))?;
+        encoder
+            .finish()
+            .map_err(|e| SurgeError::Archive(format!("Failed to finalize zstd encoder: {e}")))
+    } else {
+        zstd::encode_all(data, compression_level)
+            .map_err(|e| SurgeError::Archive(format!("Failed to compress delta: {e}")))
     }
 }
 

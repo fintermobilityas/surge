@@ -53,6 +53,27 @@ pub struct ResourceBudget {
     pub zstd_compression_level: i32,
 }
 
+impl ResourceBudget {
+    /// Derive the effective number of zstd worker threads from this budget.
+    ///
+    /// Returns 0 (single-threaded) when `max_threads <= 1`, otherwise returns
+    /// the budget thread count capped at available parallelism.
+    #[must_use]
+    pub fn effective_zstd_workers(&self) -> u32 {
+        let requested = u32::try_from(self.max_threads.max(0)).unwrap_or(u32::MAX);
+        if requested <= 1 {
+            return 0;
+        }
+        let cpus = u32::try_from(
+            std::thread::available_parallelism()
+                .map(std::num::NonZeroUsize::get)
+                .unwrap_or(1),
+        )
+        .unwrap_or(u32::MAX);
+        requested.min(cpus)
+    }
+}
+
 impl Default for ResourceBudget {
     fn default() -> Self {
         Self {

@@ -11,8 +11,17 @@ pub struct ArchivePacker {
 
 impl ArchivePacker {
     pub fn new(compression_level: i32) -> Result<Self> {
-        let encoder = zstd::Encoder::new(Vec::new(), compression_level)
+        Self::with_threads(compression_level, 0)
+    }
+
+    pub fn with_threads(compression_level: i32, n_workers: u32) -> Result<Self> {
+        let mut encoder = zstd::Encoder::new(Vec::new(), compression_level)
             .map_err(|e| SurgeError::Archive(format!("Failed to create zstd encoder: {e}")))?;
+        if n_workers > 0 {
+            encoder
+                .multithread(n_workers)
+                .map_err(|e| SurgeError::Archive(format!("Failed to enable multi-threaded zstd: {e}")))?;
+        }
         let builder = tar::Builder::new(encoder);
         Ok(Self { builder })
     }

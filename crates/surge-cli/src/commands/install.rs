@@ -10,7 +10,7 @@ use std::time::Instant;
 use crate::logline;
 use crate::prompts;
 use indicatif::{ProgressBar, ProgressStyle};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
 use surge_core::config::constants::RELEASES_FILE_COMPRESSED;
@@ -491,13 +491,8 @@ pub async fn execute(
                 let no_start_flag = if no_start { " --no-start" } else { "" };
                 let run_cmd = format!("/tmp/.surge-installer{no_start_flag} && rm -f /tmp/.surge-installer");
                 let ssh_command = format!("sh -lc {}", shell_single_quote(&run_cmd));
-                let output = run_tailscale_capture(&["ssh", ssh_target, ssh_command.as_str()]).await?;
-                for line in output.lines() {
-                    let trimmed = line.trim();
-                    if !trimmed.is_empty() {
-                        logline::subtle(&format!("remote: {trimmed}"));
-                    }
-                }
+                logline::info(&format!("Running installer on '{file_target}'..."));
+                run_tailscale_streaming(&["ssh", ssh_target, ssh_command.as_str()], "remote").await?;
                 logline::success(&format!("Installed '{app_id}' on tailscale node '{file_target}'."));
             }
         }
@@ -1643,6 +1638,83 @@ async fn run_tailscale_capture(args: &[&str]) -> Result<String> {
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+async fn run_tailscale_streaming(args: &[&str], prefix: &str) -> Result<()> {
+    let mut child = Command::new("tailscale")
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| SurgeError::Platform(format!("Failed to run tailscale command: {e}")))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| SurgeError::Platform("Failed to capture tailscale stdout".to_string()))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| SurgeError::Platform("Failed to capture tailscale stderr".to_string()))?;
+
+    let stdout_task = tokio::spawn(relay_tailscale_output(stdout, prefix.to_string()));
+    let stderr_task = tokio::spawn(relay_tailscale_output(stderr, prefix.to_string()));
+
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| SurgeError::Platform(format!("Failed to wait for tailscale command: {e}")))?;
+    let stdout = stdout_task
+        .await
+        .map_err(|e| SurgeError::Platform(format!("Failed to read tailscale stdout: {e}")))?
+        .map_err(|e| SurgeError::Platform(format!("Failed to read tailscale stdout: {e}")))?;
+    let stderr = stderr_task
+        .await
+        .map_err(|e| SurgeError::Platform(format!("Failed to read tailscale stderr: {e}")))?
+        .map_err(|e| SurgeError::Platform(format!("Failed to read tailscale stderr: {e}")))?;
+
+    if !status.success() {
+        let cmd = format!("tailscale {}", args.join(" "));
+        let message = stderr
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .or_else(|| stdout.lines().rev().find(|line| !line.trim().is_empty()));
+        let msg = if let Some(message) = message {
+            format!("Command failed: {cmd}: {}", message.trim())
+        } else {
+            format!("Command failed: {cmd}")
+        };
+        return Err(SurgeError::Platform(msg));
+    }
+
+    Ok(())
+}
+
+async fn relay_tailscale_output<R>(reader: R, prefix: String) -> std::io::Result<String>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    let mut reader = BufReader::new(reader);
+    let mut buffer = Vec::new();
+    let mut captured = String::new();
+
+    loop {
+        buffer.clear();
+        let read = reader.read_until(b'\n', &mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+
+        let chunk = String::from_utf8_lossy(&buffer);
+        let trimmed = chunk.trim();
+        if !trimmed.is_empty() {
+            logline::subtle(&format!("{prefix}: {trimmed}"));
+        }
+        captured.push_str(&chunk);
+    }
+
+    Ok(captured)
 }
 
 #[cfg(test)]

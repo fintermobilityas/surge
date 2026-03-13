@@ -109,6 +109,12 @@ struct AppInstallTargetOption {
     rid: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemoteInstallState {
+    version: String,
+    channel: Option<String>,
+}
+
 pub async fn execute(
     manifest_path: &Path,
     application_manifest_path: &Path,
@@ -365,12 +371,22 @@ pub async fn execute(
             } else {
                 release.install_directory.trim()
             };
-            if check_remote_version(ssh_target, install_dir, &release.version).await {
+            let remote_state = check_remote_install_state(ssh_target, install_dir).await;
+            if remote_install_matches(remote_state.as_ref(), &release.version, &channel) {
                 logline::success(&format!(
-                    "'{app_id}' v{} is already installed on '{file_target}', skipping.",
-                    release.version,
+                    "'{app_id}' v{} ({channel}) is already installed on '{file_target}', skipping.",
+                    release.version
                 ));
             } else {
+                if let Some(remote_state) = &remote_state
+                    && remote_state.version.trim() == release.version
+                {
+                    logline::info(&format!(
+                        "'{app_id}' v{} is installed on '{file_target}' with channel '{}'; reinstalling to switch to '{channel}'.",
+                        release.version,
+                        remote_state.channel.as_deref().unwrap_or("unknown")
+                    ));
+                }
                 logline::info("Building offline installer for remote deployment...");
                 let installer_path = build_offline_installer_for_tailscale(
                     &manifest,
@@ -1375,16 +1391,60 @@ async fn stream_file_to_tailscale_node_with_command(node: &str, local_file: &Pat
     Ok(())
 }
 
-async fn check_remote_version(ssh_node: &str, install_dir: &str, expected_version: &str) -> bool {
+async fn check_remote_install_state(ssh_node: &str, install_dir: &str) -> Option<RemoteInstallState> {
     let probe = format!(
-        "cat \"$HOME/.local/share/{}/app/.surge/runtime.yml\" 2>/dev/null | grep -oP '^version:\\s*\\K\\S+' || echo none",
+        r#"manifest="$HOME/.local/share/{}/app/.surge/runtime.yml";
+if [ ! -f "$manifest" ]; then
+  exit 0
+fi
+version="$(sed -n 's/^version:[[:space:]]*//p' "$manifest" | head -n1)"
+channel="$(sed -n 's/^channel:[[:space:]]*//p' "$manifest" | head -n1)"
+printf 'version=%s\nchannel=%s\n' "$version" "$channel""#,
         install_dir.replace('\'', ""),
     );
     let command = format!("sh -c {}", shell_single_quote(&probe));
     match run_tailscale_capture(&["ssh", ssh_node, command.as_str()]).await {
-        Ok(output) => output.trim() == expected_version,
-        Err(_) => false,
+        Ok(output) => parse_remote_install_state(&output),
+        Err(_) => None,
     }
+}
+
+fn parse_remote_install_state(output: &str) -> Option<RemoteInstallState> {
+    let mut version = None;
+    let mut channel = None;
+
+    for line in output.lines() {
+        if let Some(value) = line.strip_prefix("version=") {
+            let value = value.trim();
+            if !value.is_empty() {
+                version = Some(value.to_string());
+            }
+            continue;
+        }
+
+        if let Some(value) = line.strip_prefix("channel=") {
+            let value = value.trim();
+            if !value.is_empty() {
+                channel = Some(value.to_string());
+            }
+        }
+    }
+
+    version.map(|version| RemoteInstallState { version, channel })
+}
+
+fn remote_install_matches(
+    remote_state: Option<&RemoteInstallState>,
+    expected_version: &str,
+    expected_channel: &str,
+) -> bool {
+    remote_state.is_some_and(|state| {
+        state.version.trim() == expected_version
+            && state
+                .channel
+                .as_deref()
+                .is_some_and(|channel| channel.trim() == expected_channel)
+    })
 }
 
 async fn run_tailscale_capture(args: &[&str]) -> Result<String> {
@@ -2165,5 +2225,35 @@ apps:
         ];
         let channels = collect_available_channels(&releases);
         assert_eq!(channels, vec!["production".to_string(), "test".to_string()]);
+    }
+
+    #[test]
+    fn parse_remote_install_state_extracts_version_and_channel() {
+        let state = parse_remote_install_state("version=1.2.3\nchannel=production\n")
+            .expect("remote install state should parse");
+        assert_eq!(state.version, "1.2.3");
+        assert_eq!(state.channel.as_deref(), Some("production"));
+    }
+
+    #[test]
+    fn parse_remote_install_state_requires_version() {
+        assert!(parse_remote_install_state("channel=test\n").is_none());
+    }
+
+    #[test]
+    fn remote_install_matches_requires_matching_channel_and_version() {
+        let production = RemoteInstallState {
+            version: "1.2.3".to_string(),
+            channel: Some("production".to_string()),
+        };
+        let test = RemoteInstallState {
+            version: "1.2.3".to_string(),
+            channel: Some("test".to_string()),
+        };
+
+        assert!(remote_install_matches(Some(&production), "1.2.3", "production"));
+        assert!(!remote_install_matches(Some(&production), "1.2.4", "production"));
+        assert!(!remote_install_matches(Some(&test), "1.2.3", "production"));
+        assert!(!remote_install_matches(None, "1.2.3", "production"));
     }
 }

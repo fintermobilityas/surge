@@ -585,17 +585,17 @@ apps:
 
         let mut release_v1 = make_release_entry(app_id, &rid, v1);
         release_v1.set_primary_delta(None);
-        release_v1.full_size = full_v1.len() as i64;
+        release_v1.full_size = i64::try_from(full_v1.len()).expect("full_v1 length should fit i64");
         release_v1.full_sha256 = sha256_hex(&full_v1);
 
         let mut release_v2 = make_release_entry(app_id, &rid, v2);
-        release_v2.full_size = full_v2.len() as i64;
+        release_v2.full_size = i64::try_from(full_v2.len()).expect("full_v2 length should fit i64");
         release_v2.full_sha256 = sha256_hex(&full_v2);
         release_v2.set_primary_delta(Some(DeltaArtifact::bsdiff_zstd(
             "primary",
             v1,
             &format!("{app_id}-{v2}-{rid}-delta.tar.zst"),
-            delta_v2.len() as i64,
+            i64::try_from(delta_v2.len()).expect("delta_v2 length should fit i64"),
             &sha256_hex(&delta_v2),
         )));
 

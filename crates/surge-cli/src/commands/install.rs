@@ -76,6 +76,14 @@ struct RemoteLaunchEnvironment {
     display: Option<String>,
     xauthority: Option<String>,
     dbus_session_bus_address: Option<String>,
+    wayland_display: Option<String>,
+    xdg_runtime_dir: Option<String>,
+}
+
+impl RemoteLaunchEnvironment {
+    fn has_graphical_session(&self) -> bool {
+        self.display.is_some() || self.wayland_display.is_some()
+    }
 }
 
 enum InstallTarget {
@@ -387,6 +395,20 @@ pub async fn execute(
                         remote_state.channel.as_deref().unwrap_or("unknown")
                     ));
                 }
+                let launch_env = detect_remote_launch_environment(ssh_target).await;
+                if let Some(display) = launch_env.display.as_deref() {
+                    logline::info(&format!("Detected remote X11 session for install: DISPLAY={display}"));
+                } else if let Some(wayland_display) = launch_env.wayland_display.as_deref() {
+                    logline::info(&format!(
+                        "Detected remote Wayland session for install: WAYLAND_DISPLAY={wayland_display}"
+                    ));
+                } else if launch_env.has_graphical_session() {
+                    logline::info("Detected remote graphical session for install.");
+                } else {
+                    logline::info(
+                        "No remote graphical session environment detected; install will default to headless startup.",
+                    );
+                }
                 logline::info("Building offline installer for remote deployment...");
                 let installer_path = build_offline_installer_for_tailscale(
                     &manifest,
@@ -396,6 +418,7 @@ pub async fn execute(
                     &channel,
                     &storage_config,
                     &local_package,
+                    &launch_env,
                 )?;
                 let installer_size = std::fs::metadata(&installer_path).map(|m| m.len()).unwrap_or(0);
                 logline::info(&format!(
@@ -1177,6 +1200,12 @@ fn build_remote_installer_manifest(
     {
         environment.insert("DBUS_SESSION_BUS_ADDRESS".to_string(), dbus.to_string());
     }
+    if let Some(wayland_display) = launch_env.wayland_display.as_deref().filter(|value| !value.is_empty()) {
+        environment.insert("WAYLAND_DISPLAY".to_string(), wayland_display.to_string());
+    }
+    if let Some(xdg_runtime_dir) = launch_env.xdg_runtime_dir.as_deref().filter(|value| !value.is_empty()) {
+        environment.insert("XDG_RUNTIME_DIR".to_string(), xdg_runtime_dir.to_string());
+    }
 
     InstallerManifest {
         schema: 1,
@@ -1227,13 +1256,13 @@ fn build_offline_installer_for_tailscale(
     channel: &str,
     storage_config: &surge_core::context::StorageConfig,
     full_package_path: &Path,
+    launch_env: &RemoteLaunchEnvironment,
 ) -> Result<std::path::PathBuf> {
     let (_app, target) = manifest
         .find_app_with_target(app_id, rid)
         .ok_or_else(|| SurgeError::Config(format!("App '{app_id}' with RID '{rid}' not found in manifest")))?;
 
-    let launch_env = RemoteLaunchEnvironment::default();
-    let installer_manifest = build_remote_installer_manifest(app_id, release, channel, storage_config, &launch_env);
+    let installer_manifest = build_remote_installer_manifest(app_id, release, channel, storage_config, launch_env);
     let installer_yaml = serde_yaml::to_string(&installer_manifest)
         .map_err(|e| SurgeError::Config(format!("Failed to serialize installer manifest: {e}")))?;
 
@@ -1433,6 +1462,69 @@ fn parse_remote_install_state(output: &str) -> Option<RemoteInstallState> {
     version.map(|version| RemoteInstallState { version, channel })
 }
 
+async fn detect_remote_launch_environment(ssh_node: &str) -> RemoteLaunchEnvironment {
+    let probe = r"if command -v systemctl >/dev/null 2>&1; then
+  systemctl --user show-environment 2>/dev/null || true
+fi";
+    let command = format!("sh -c {}", shell_single_quote(probe));
+    match run_tailscale_capture(&["ssh", ssh_node, command.as_str()]).await {
+        Ok(output) => parse_remote_launch_environment(&output),
+        Err(error) => {
+            logline::warn(&format!(
+                "Could not detect remote graphical session environment on '{ssh_node}': {error}"
+            ));
+            RemoteLaunchEnvironment::default()
+        }
+    }
+}
+
+fn parse_remote_launch_environment(output: &str) -> RemoteLaunchEnvironment {
+    let mut launch_env = RemoteLaunchEnvironment::default();
+
+    for line in output.lines() {
+        if let Some(value) = line.strip_prefix("DISPLAY=") {
+            let value = value.trim();
+            if !value.is_empty() {
+                launch_env.display = Some(value.to_string());
+            }
+            continue;
+        }
+
+        if let Some(value) = line.strip_prefix("XAUTHORITY=") {
+            let value = value.trim();
+            if !value.is_empty() {
+                launch_env.xauthority = Some(value.to_string());
+            }
+            continue;
+        }
+
+        if let Some(value) = line.strip_prefix("DBUS_SESSION_BUS_ADDRESS=") {
+            let value = value.trim();
+            if !value.is_empty() {
+                launch_env.dbus_session_bus_address = Some(value.to_string());
+            }
+            continue;
+        }
+
+        if let Some(value) = line.strip_prefix("WAYLAND_DISPLAY=") {
+            let value = value.trim();
+            if !value.is_empty() {
+                launch_env.wayland_display = Some(value.to_string());
+            }
+            continue;
+        }
+
+        if let Some(value) = line.strip_prefix("XDG_RUNTIME_DIR=") {
+            let value = value.trim();
+            if !value.is_empty() {
+                launch_env.xdg_runtime_dir = Some(value.to_string());
+            }
+        }
+    }
+
+    launch_env
+}
+
 fn remote_install_matches(
     remote_state: Option<&RemoteInstallState>,
     expected_version: &str,
@@ -1509,6 +1601,76 @@ mod tests {
             installers: Vec::new(),
             environment: BTreeMap::new(),
         }
+    }
+
+    fn storage_config(bucket: &str) -> surge_core::context::StorageConfig {
+        surge_core::context::StorageConfig {
+            provider: Some(surge_core::context::StorageProvider::Filesystem),
+            bucket: bucket.to_string(),
+            ..surge_core::context::StorageConfig::default()
+        }
+    }
+
+    #[test]
+    fn parse_remote_launch_environment_reads_graphical_session_vars() {
+        let launch_env = parse_remote_launch_environment(
+            "DISPLAY=:0\nXAUTHORITY=/run/user/1000/gdm/Xauthority\nDBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus\nWAYLAND_DISPLAY=wayland-0\nXDG_RUNTIME_DIR=/run/user/1000\n",
+        );
+
+        assert_eq!(launch_env.display.as_deref(), Some(":0"));
+        assert_eq!(launch_env.xauthority.as_deref(), Some("/run/user/1000/gdm/Xauthority"));
+        assert_eq!(
+            launch_env.dbus_session_bus_address.as_deref(),
+            Some("unix:path=/run/user/1000/bus")
+        );
+        assert_eq!(launch_env.wayland_display.as_deref(), Some("wayland-0"));
+        assert_eq!(launch_env.xdg_runtime_dir.as_deref(), Some("/run/user/1000"));
+        assert!(launch_env.has_graphical_session());
+    }
+
+    #[test]
+    fn build_remote_installer_manifest_includes_remote_launch_environment() {
+        let release = release("1.2.3", "stable", "linux-x64", "demo.tar.zst");
+        let launch_env = RemoteLaunchEnvironment {
+            display: Some(":0".to_string()),
+            xauthority: Some("/run/user/1000/gdm/Xauthority".to_string()),
+            dbus_session_bus_address: Some("unix:path=/run/user/1000/bus".to_string()),
+            wayland_display: Some("wayland-0".to_string()),
+            xdg_runtime_dir: Some("/run/user/1000".to_string()),
+        };
+
+        let manifest = build_remote_installer_manifest(
+            "demoapp",
+            &release,
+            "stable",
+            &storage_config("/tmp/releases"),
+            &launch_env,
+        );
+
+        assert_eq!(
+            manifest.runtime.environment.get("DISPLAY").map(String::as_str),
+            Some(":0")
+        );
+        assert_eq!(
+            manifest.runtime.environment.get("XAUTHORITY").map(String::as_str),
+            Some("/run/user/1000/gdm/Xauthority")
+        );
+        assert_eq!(
+            manifest
+                .runtime
+                .environment
+                .get("DBUS_SESSION_BUS_ADDRESS")
+                .map(String::as_str),
+            Some("unix:path=/run/user/1000/bus")
+        );
+        assert_eq!(
+            manifest.runtime.environment.get("WAYLAND_DISPLAY").map(String::as_str),
+            Some("wayland-0")
+        );
+        assert_eq!(
+            manifest.runtime.environment.get("XDG_RUNTIME_DIR").map(String::as_str),
+            Some("/run/user/1000")
+        );
     }
 
     #[tokio::test]

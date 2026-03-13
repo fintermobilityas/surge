@@ -15,7 +15,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { workspace = true }
 thiserror = { workspace = true }
-sysinfo = "0.38.3"
+sysinfo = "0.38.4"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["signal", "process"] }

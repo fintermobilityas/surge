@@ -296,7 +296,7 @@ fn install_shortcuts_linux(
             }
             ShortcutLocation::Startup => {
                 let entry = startup_entry.get_or_insert_with(|| {
-                    build_startup_entry_linux(name, exe_path, icon_path, supervisor_id, install_root)
+                    build_startup_entry_linux(name, exe_path, icon_path, supervisor_id, install_root, environment)
                 });
                 std::fs::create_dir_all(&paths.autostart_dir)?;
                 let shortcut_path = paths.autostart_dir.join(&file_name);
@@ -318,20 +318,10 @@ fn build_desktop_entry_linux(
     environment: &BTreeMap<String, String>,
 ) -> String {
     let display_name = escape_desktop_value(name);
-    let exe = escape_desktop_value(&exe_path.to_string_lossy());
     let icon = escape_desktop_value(&icon_path.to_string_lossy());
     let working_dir = escape_desktop_value(&install_root.to_string_lossy());
-
-    let exec_line = if environment.is_empty() {
-        format!("Exec=\"{exe}\"")
-    } else {
-        let env_prefix: String = environment
-            .iter()
-            .map(|(k, v)| format!("{}={}", escape_desktop_value(k), escape_desktop_value(v)))
-            .collect::<Vec<_>>()
-            .join(" ");
-        format!("Exec=env {env_prefix} \"{exe}\"")
-    };
+    let exe = escape_desktop_value(&exe_path.to_string_lossy());
+    let exec_line = build_exec_line_linux(format!("\"{exe}\""), environment);
 
     format!(
         "[Desktop Entry]\nType=Application\nVersion=1.0\nName={display_name}\n{exec_line}\nIcon={icon}\nPath={working_dir}\nTerminal=false\n"
@@ -345,25 +335,41 @@ fn build_startup_entry_linux(
     icon_path: &Path,
     supervisor_id: &str,
     install_root: &Path,
+    environment: &BTreeMap<String, String>,
 ) -> String {
     let display_name = escape_desktop_value(name);
     let icon = escape_desktop_value(&icon_path.to_string_lossy());
 
-    let exec_line = if supervisor_id.trim().is_empty() {
+    let exec_command = if supervisor_id.trim().is_empty() {
         let exe = escape_desktop_value(&exe_path.to_string_lossy());
-        format!("Exec=\"{exe}\"")
+        format!("\"{exe}\"")
     } else {
         let supervisor_path = install_root.join("app").join("surge-supervisor");
         let sup = escape_desktop_value(&supervisor_path.to_string_lossy());
         let exe = escape_desktop_value(&exe_path.to_string_lossy());
         let root = escape_desktop_value(&install_root.to_string_lossy());
         let sid = escape_desktop_value(supervisor_id);
-        format!("Exec=\"{sup}\" run --id {sid} --dir \"{root}\" --exe \"{exe}\"")
+        format!("\"{sup}\" run --id {sid} --dir \"{root}\" --exe \"{exe}\"")
     };
+    let exec_line = build_exec_line_linux(exec_command, environment);
 
     format!(
         "[Desktop Entry]\nType=Application\nVersion=1.0\nName={display_name}\n{exec_line}\nIcon={icon}\nTerminal=false\n"
     )
+}
+
+#[cfg(target_os = "linux")]
+fn build_exec_line_linux(command: String, environment: &BTreeMap<String, String>) -> String {
+    if environment.is_empty() {
+        format!("Exec={command}")
+    } else {
+        let env_prefix = environment
+            .iter()
+            .map(|(key, value)| format!("{}={}", escape_desktop_value(key), escape_desktop_value(value)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("Exec=env {env_prefix} {command}")
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -822,6 +828,9 @@ mod tests {
             autostart_dir: tmp.path().join("autostart"),
         };
 
+        let mut env = BTreeMap::new();
+        env.insert("MY_VAR".to_string(), "my_value".to_string());
+
         install_shortcuts_linux(
             "demoapp",
             &exe_path,
@@ -829,12 +838,16 @@ mod tests {
             "my-supervisor-id",
             &install_root,
             &[ShortcutLocation::Startup],
-            &BTreeMap::new(),
+            &env,
             &paths,
         )
         .unwrap();
 
         let content = std::fs::read_to_string(paths.autostart_dir.join("demoapp.desktop")).unwrap();
+        assert!(
+            content.contains("Exec=env MY_VAR=my_value"),
+            "startup entry should contain env vars: {content}"
+        );
         assert!(
             content.contains("surge-supervisor"),
             "startup entry should reference supervisor: {content}"

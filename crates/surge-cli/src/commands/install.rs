@@ -1550,9 +1550,7 @@ fn parse_remote_install_state(output: &str) -> Option<RemoteInstallState> {
 }
 
 async fn detect_remote_launch_environment(ssh_node: &str) -> RemoteLaunchEnvironment {
-    let probe = r"if command -v systemctl >/dev/null 2>&1; then
-  systemctl --user show-environment 2>/dev/null || true
-fi";
+    let probe = remote_launch_environment_probe();
     let command = format!("sh -c {}", shell_single_quote(probe));
     match run_tailscale_capture(&["ssh", ssh_node, command.as_str()]).await {
         Ok(output) => parse_remote_launch_environment(&output),
@@ -1563,6 +1561,19 @@ fi";
             RemoteLaunchEnvironment::default()
         }
     }
+}
+
+fn remote_launch_environment_probe() -> &'static str {
+    r#"if command -v systemctl >/dev/null 2>&1; then
+  systemctl --user show-environment 2>/dev/null || true
+fi
+if command -v pgrep >/dev/null 2>&1; then
+  for name in gnome-shell gnome-session-binary plasmashell kwin_wayland kwin_x11 startplasma-wayland startplasma-x11 Xwayland Xorg sway weston; do
+    for pid in $(pgrep -u "$(id -u)" -x "$name" 2>/dev/null); do
+      tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null | grep -E '^(DISPLAY|XAUTHORITY|DBUS_SESSION_BUS_ADDRESS|WAYLAND_DISPLAY|XDG_RUNTIME_DIR)=' || true
+    done
+  done
+fi"#
 }
 
 fn parse_remote_launch_environment(output: &str) -> RemoteLaunchEnvironment {
@@ -1794,6 +1805,16 @@ mod tests {
         assert_eq!(launch_env.wayland_display.as_deref(), Some("wayland-0"));
         assert_eq!(launch_env.xdg_runtime_dir.as_deref(), Some("/run/user/1000"));
         assert!(launch_env.has_graphical_session());
+    }
+
+    #[test]
+    fn remote_launch_environment_probe_checks_systemd_and_session_processes() {
+        let probe = remote_launch_environment_probe();
+
+        assert!(probe.contains("systemctl --user show-environment"));
+        assert!(probe.contains("gnome-shell"));
+        assert!(probe.contains("Xwayland"));
+        assert!(probe.contains("DISPLAY|XAUTHORITY|DBUS_SESSION_BUS_ADDRESS|WAYLAND_DISPLAY|XDG_RUNTIME_DIR"));
     }
 
     #[test]

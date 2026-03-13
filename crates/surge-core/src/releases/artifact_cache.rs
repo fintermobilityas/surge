@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 
 use crate::crypto::sha256::sha256_hex_file;
@@ -41,6 +42,14 @@ pub fn sha256_matches_file(path: &Path, expected_sha256: &str) -> Result<bool> {
     Ok(actual.eq_ignore_ascii_case(expected))
 }
 
+pub fn cached_artifact_matches(path: &Path, expected_sha256: &str) -> Result<bool> {
+    let expected = expected_sha256.trim();
+    if expected.is_empty() {
+        return Ok(path.is_file());
+    }
+    sha256_matches_file(path, expected)
+}
+
 pub async fn fetch_or_reuse_file(
     storage: &dyn StorageBackend,
     key: &str,
@@ -70,6 +79,77 @@ pub async fn fetch_or_reuse_file(
     } else {
         Ok(CacheFetchOutcome::DownloadedFresh)
     }
+}
+
+pub fn prune_cached_artifacts(cache_root: &Path, required_keys: &BTreeSet<String>) -> Result<usize> {
+    if !cache_root.exists() {
+        return Ok(0);
+    }
+    if !cache_root.is_dir() {
+        return Err(SurgeError::Storage(format!(
+            "Artifact cache path is not a directory: {}",
+            cache_root.display()
+        )));
+    }
+
+    let mut pruned = 0usize;
+    prune_cached_artifacts_recursive(cache_root, cache_root, required_keys, &mut pruned)?;
+    prune_empty_directories(cache_root, cache_root)?;
+    Ok(pruned)
+}
+
+fn prune_cached_artifacts_recursive(
+    cache_root: &Path,
+    dir: &Path,
+    required_keys: &BTreeSet<String>,
+    pruned: &mut usize,
+) -> Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            prune_cached_artifacts_recursive(cache_root, &path, required_keys, pruned)?;
+            continue;
+        }
+        if !path.is_file() {
+            continue;
+        }
+
+        let rel = path
+            .strip_prefix(cache_root)
+            .map_err(|e| SurgeError::Storage(format!("Invalid cache entry '{}': {e}", path.display())))?;
+        let key = rel.to_string_lossy().replace('\\', "/");
+        if required_keys.contains(&key) {
+            continue;
+        }
+
+        std::fs::remove_file(&path)?;
+        *pruned = pruned.saturating_add(1);
+    }
+
+    Ok(())
+}
+
+fn prune_empty_directories(dir: &Path, root: &Path) -> Result<bool> {
+    let mut is_empty = true;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            if !prune_empty_directories(&path, root)? {
+                is_empty = false;
+            }
+            continue;
+        }
+        is_empty = false;
+    }
+
+    if is_empty && dir != root {
+        std::fs::remove_dir(dir)?;
+        return Ok(true);
+    }
+
+    Ok(is_empty)
 }
 
 #[cfg(test)]
@@ -159,5 +239,32 @@ mod tests {
 
         assert_eq!(outcome, CacheFetchOutcome::DownloadedFresh);
         assert_eq!(std::fs::read(&local).expect("read local"), b"remote-payload");
+    }
+
+    #[test]
+    fn cached_artifact_matches_accepts_existing_file_without_hash() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("artifact.bin");
+        std::fs::write(&path, b"payload").expect("write");
+        assert!(cached_artifact_matches(&path, "").expect("match check"));
+    }
+
+    #[test]
+    fn prune_cached_artifacts_removes_stale_files_and_empty_directories() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cache_root = tmp.path().join("cache");
+        let required = cache_root.join("required.bin");
+        let stale = cache_root.join("nested").join("stale.bin");
+        std::fs::create_dir_all(stale.parent().expect("nested dir")).expect("mkdir");
+        std::fs::write(&required, b"required").expect("write required");
+        std::fs::write(&stale, b"stale").expect("write stale");
+
+        let required_keys = BTreeSet::from([String::from("required.bin")]);
+        let pruned = prune_cached_artifacts(&cache_root, &required_keys).expect("prune cache");
+
+        assert_eq!(pruned, 1);
+        assert!(required.is_file());
+        assert!(!stale.exists());
+        assert!(!cache_root.join("nested").exists());
     }
 }

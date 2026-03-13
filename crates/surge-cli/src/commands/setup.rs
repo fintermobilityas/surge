@@ -1,11 +1,18 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use crate::logline;
+use surge_core::config::constants::RELEASES_FILE_COMPRESSED;
 use surge_core::config::installer::InstallerManifest;
 use surge_core::error::{Result, SurgeError};
 use surge_core::install::{self as core_install, InstallProfile};
 use surge_core::platform::paths::default_install_root;
-use surge_core::storage;
+use surge_core::releases::artifact_cache::{cache_path_for_key, cached_artifact_matches, prune_cached_artifacts};
+use surge_core::releases::manifest::{ReleaseEntry, ReleaseIndex, decompress_release_index};
+use surge_core::releases::restore::{
+    RestoreOptions, required_artifacts_for_index, restore_full_archive_for_version_with_options,
+};
+use surge_core::storage::{self, StorageBackend};
 
 /// Execute setup from an extracted installer directory.
 ///
@@ -35,7 +42,7 @@ pub async fn execute(dir: &Path, no_start: bool) -> Result<()> {
     }
     stop_running_app(&install_root, &manifest.runtime.main_exe);
 
-    let package = resolve_package(dir, &manifest).await?;
+    let package = resolve_package(dir, &manifest, &install_root).await?;
 
     let profile = InstallProfile::from_installer_manifest(&manifest, &manifest.runtime.shortcuts);
 
@@ -50,6 +57,21 @@ pub async fn execute(dir: &Path, no_start: bool) -> Result<()> {
         &manifest.storage.endpoint,
     );
     core_install::write_runtime_manifest(&active_app_dir, &profile, &runtime_manifest)?;
+
+    if let Some(required_artifacts) = package.required_artifacts.as_ref() {
+        match prune_install_artifact_cache(&install_root, required_artifacts) {
+            Ok(0) => {}
+            Ok(pruned) => {
+                logline::info(&format!(
+                    "Pruned {pruned} stale artifact cache entr{}.",
+                    if pruned == 1 { "y" } else { "ies" }
+                ));
+            }
+            Err(e) => {
+                logline::warn(&format!("Artifact cache pruning failed: {e}"));
+            }
+        }
+    }
 
     logline::success(&format!(
         "Installed '{}' to '{}'",
@@ -76,8 +98,9 @@ pub async fn execute(dir: &Path, no_start: bool) -> Result<()> {
     Ok(())
 }
 
-/// Resolve the full package: prefer local payload, fall back to downloading.
-async fn resolve_package(dir: &Path, manifest: &InstallerManifest) -> Result<ResolvedPackage> {
+/// Resolve the full package: prefer bundled payload, then the persistent
+/// artifact cache, then release-graph reconstruction/download into that cache.
+async fn resolve_package(dir: &Path, manifest: &InstallerManifest, install_root: &Path) -> Result<ResolvedPackage> {
     let full_filename = manifest.release.full_filename.trim();
     if full_filename.is_empty() {
         return Err(SurgeError::Config(
@@ -88,33 +111,146 @@ async fn resolve_package(dir: &Path, manifest: &InstallerManifest) -> Result<Res
     let payload_path = dir.join("payload").join(full_filename);
     if payload_path.is_file() {
         logline::info(&format!("Using bundled payload: {}", payload_path.display()));
-        return Ok(ResolvedPackage::Bundled(payload_path));
+        return Ok(ResolvedPackage {
+            path: payload_path,
+            required_artifacts: None,
+        });
     }
 
-    logline::info(&format!("Downloading package '{full_filename}' from storage"));
-
+    let artifact_cache_dir = install_artifact_cache_dir(install_root);
+    std::fs::create_dir_all(&artifact_cache_dir)?;
+    let cached_package_path = cache_path_for_key(&artifact_cache_dir, full_filename)?;
     let storage_config = build_storage_config_from_manifest(manifest)?;
     let backend = storage::create_storage_backend(&storage_config)?;
+    let index = match fetch_release_index(&*backend, manifest).await {
+        Ok(index) => index,
+        Err(error) if cached_package_path.is_file() => {
+            logline::warn(&format!(
+                "Could not fetch release index; using cached package '{}' without verification: {error}",
+                cached_package_path.display()
+            ));
+            return Ok(ResolvedPackage {
+                path: cached_package_path,
+                required_artifacts: None,
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    let required_artifacts = index.as_ref().map(required_artifacts_for_index);
 
-    let download_dir = tempfile::tempdir()?;
-    let destination = download_dir.path().join(full_filename);
+    if let Some(index) = index.as_ref()
+        && let Some(release) = find_release_for_installer(index, manifest)
+    {
+        if cached_artifact_matches(&cached_package_path, &release.full_sha256)? {
+            logline::info(&format!(
+                "Using cached package from artifact cache: {}",
+                cached_package_path.display()
+            ));
+            return Ok(ResolvedPackage {
+                path: cached_package_path,
+                required_artifacts,
+            });
+        }
 
-    backend.download_to_file(full_filename, &destination, None).await?;
+        logline::info(&format!(
+            "Resolving package '{full_filename}' via artifact cache and release graph"
+        ));
+        let restored = restore_full_archive_for_version_with_options(
+            &*backend,
+            index,
+            &manifest.rid,
+            &manifest.version,
+            RestoreOptions {
+                cache_dir: Some(&artifact_cache_dir),
+                progress: None,
+            },
+        )
+        .await?;
+        std::fs::write(&cached_package_path, restored)?;
+        logline::success(&format!(
+            "Prepared '{}' in artifact cache ({})",
+            full_filename,
+            file_size_label(&cached_package_path)
+        ));
+        return Ok(ResolvedPackage {
+            path: cached_package_path,
+            required_artifacts,
+        });
+    }
+
+    if cached_package_path.is_file() {
+        logline::warn(&format!(
+            "Release metadata for '{}' was not found; using cached package '{}'.",
+            full_filename,
+            cached_package_path.display()
+        ));
+        return Ok(ResolvedPackage {
+            path: cached_package_path,
+            required_artifacts,
+        });
+    }
+
+    logline::info(&format!("Downloading package '{full_filename}' into artifact cache"));
+
+    backend
+        .download_to_file(full_filename, &cached_package_path, None)
+        .await?;
 
     logline::success(&format!(
-        "Downloaded '{}' ({})",
+        "Downloaded '{}' to artifact cache ({})",
         full_filename,
-        file_size_label(&destination)
+        file_size_label(&cached_package_path)
     ));
 
-    Ok(ResolvedPackage::Downloaded {
-        path: destination,
-        _guard: download_dir,
+    Ok(ResolvedPackage {
+        path: cached_package_path,
+        required_artifacts,
     })
 }
 
 fn build_storage_config_from_manifest(manifest: &InstallerManifest) -> Result<surge_core::context::StorageConfig> {
     surge_core::storage_config::build_storage_config_from_installer_manifest(manifest)
+}
+
+fn install_artifact_cache_dir(install_root: &Path) -> PathBuf {
+    install_root.join(".surge-cache").join("artifacts")
+}
+
+async fn fetch_release_index(
+    backend: &dyn StorageBackend,
+    manifest: &InstallerManifest,
+) -> Result<Option<ReleaseIndex>> {
+    let key = manifest.release_index_key.trim();
+    let key = if key.is_empty() { RELEASES_FILE_COMPRESSED } else { key };
+    match backend.get_object(key).await {
+        Ok(bytes) => {
+            let index = decompress_release_index(&bytes)?;
+            if !index.app_id.is_empty() && index.app_id != manifest.app_id {
+                return Err(SurgeError::NotFound(format!(
+                    "Release index belongs to app '{}' not '{}'",
+                    index.app_id, manifest.app_id
+                )));
+            }
+            Ok(Some(index))
+        }
+        Err(SurgeError::NotFound(_)) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+fn find_release_for_installer<'a>(index: &'a ReleaseIndex, manifest: &InstallerManifest) -> Option<&'a ReleaseEntry> {
+    index.releases.iter().find(|release| {
+        release.version == manifest.version
+            && release.full_filename.trim() == manifest.release.full_filename.trim()
+            && (release.rid.is_empty() || manifest.rid.is_empty() || release.rid == manifest.rid)
+    })
+}
+
+fn prune_install_artifact_cache(
+    install_root: &Path,
+    required_artifacts: &BTreeSet<String>,
+) -> Result<usize> {
+    prune_cached_artifacts(&install_artifact_cache_dir(install_root), required_artifacts)
 }
 
 /// Kill any running process whose executable lives in the app directory.
@@ -154,16 +290,14 @@ fn file_size_label(path: &Path) -> String {
     }
 }
 
-enum ResolvedPackage {
-    Bundled(PathBuf),
-    Downloaded { path: PathBuf, _guard: tempfile::TempDir },
+struct ResolvedPackage {
+    path: PathBuf,
+    required_artifacts: Option<BTreeSet<String>>,
 }
 
 impl ResolvedPackage {
     fn path(&self) -> &Path {
-        match self {
-            Self::Bundled(path) | Self::Downloaded { path, .. } => path,
-        }
+        &self.path
     }
 }
 
@@ -175,7 +309,9 @@ mod tests {
     use surge_core::archive::packer::ArchivePacker;
     use surge_core::config::constants::RELEASES_FILE_COMPRESSED;
     use surge_core::config::installer::{InstallerRelease, InstallerRuntime, InstallerStorage, InstallerUi};
+    use surge_core::crypto::sha256::sha256_hex;
     use surge_core::platform::detect::current_rid;
+    use surge_core::releases::manifest::{ReleaseEntry, ReleaseIndex, compress_release_index};
 
     fn make_manifest(
         install_root: &Path,
@@ -232,6 +368,44 @@ mod tests {
         packer.finalize_to_file(path).expect("archive file");
     }
 
+    fn write_release_index(store_root: &Path, manifest: &InstallerManifest, archive_path: &Path) {
+        let archive = std::fs::read(archive_path).expect("archive bytes");
+        let release = ReleaseEntry {
+            version: manifest.version.clone(),
+            channels: vec![manifest.channel.clone()],
+            os: "linux".to_string(),
+            rid: manifest.rid.clone(),
+            is_genesis: false,
+            full_filename: manifest.release.full_filename.clone(),
+            full_size: i64::try_from(archive.len()).expect("archive len fits i64"),
+            full_sha256: sha256_hex(&archive),
+            deltas: Vec::new(),
+            preferred_delta_id: String::new(),
+            created_utc: manifest.generated_utc.clone(),
+            release_notes: String::new(),
+            name: manifest.runtime.name.clone(),
+            main_exe: manifest.runtime.main_exe.clone(),
+            install_directory: manifest.runtime.install_directory.clone(),
+            supervisor_id: manifest.runtime.supervisor_id.clone(),
+            icon: manifest.runtime.icon.clone(),
+            shortcuts: manifest.runtime.shortcuts.clone(),
+            persistent_assets: manifest.runtime.persistent_assets.clone(),
+            installers: manifest.runtime.installers.clone(),
+            environment: manifest.runtime.environment.clone(),
+        };
+        write_release_index_entries(store_root, &manifest.app_id, vec![release]);
+    }
+
+    fn write_release_index_entries(store_root: &Path, app_id: &str, releases: Vec<ReleaseEntry>) {
+        let index = ReleaseIndex {
+            app_id: app_id.to_string(),
+            releases,
+            ..ReleaseIndex::default()
+        };
+        let compressed = compress_release_index(&index, 3).expect("release index");
+        std::fs::write(store_root.join(RELEASES_FILE_COMPRESSED), compressed).expect("write release index");
+    }
+
     #[tokio::test]
     async fn execute_installs_bundled_payload_and_writes_runtime_manifest() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -281,19 +455,50 @@ mod tests {
         write_archive(&stored_archive, b"downloaded payload");
 
         let manifest = make_manifest(&install_root, &store_root, full_filename, "online");
-        let package = resolve_package(&installer_dir, &manifest)
+        write_release_index(&store_root, &manifest, &stored_archive);
+        let package = resolve_package(&installer_dir, &manifest, &install_root)
             .await
             .expect("downloaded package");
 
-        match &package {
-            ResolvedPackage::Downloaded { path, .. } => {
-                assert!(path.is_file());
-                assert_eq!(
-                    std::fs::read(path).expect("downloaded bytes"),
-                    std::fs::read(stored_archive).expect("stored bytes")
-                );
-            }
-            ResolvedPackage::Bundled(_) => panic!("expected downloaded package"),
-        }
+        assert!(package.path.is_file());
+        assert_eq!(
+            std::fs::read(&package.path).expect("downloaded bytes"),
+            std::fs::read(stored_archive).expect("stored bytes")
+        );
+        assert!(package.required_artifacts.is_some());
+    }
+
+    #[tokio::test]
+    async fn execute_prunes_stale_artifact_cache_entries_after_online_setup() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let installer_dir = temp_dir.path().join("installer");
+        let install_root = temp_dir.path().join("installed-app");
+        let store_root = temp_dir.path().join("store");
+        let full_filename = "demo-app-1.2.3-full.tar.zst";
+        let stored_archive = store_root.join(full_filename);
+        let stale_path = install_root.join(".surge-cache").join("artifacts").join("stale.bin");
+
+        std::fs::create_dir_all(&installer_dir).expect("installer dir");
+        std::fs::create_dir_all(&store_root).expect("store dir");
+        std::fs::create_dir_all(stale_path.parent().expect("stale parent")).expect("cache dir");
+        std::fs::write(&stale_path, b"stale").expect("stale cache entry");
+        write_archive(&stored_archive, b"cached payload");
+
+        let manifest = make_manifest(&install_root, &store_root, full_filename, "online");
+        write_release_index(&store_root, &manifest, &stored_archive);
+        let installer_yaml = serde_yaml::to_string(&manifest).expect("installer yaml");
+        std::fs::write(installer_dir.join("installer.yml"), installer_yaml).expect("installer manifest");
+
+        execute(&installer_dir, true).await.expect("setup should succeed");
+
+        assert!(!stale_path.exists(), "stale cache entry should be pruned");
+        assert!(
+            install_root
+                .join(".surge-cache")
+                .join("artifacts")
+                .join(full_filename)
+                .is_file(),
+            "resolved package should remain in cache"
+        );
     }
 }

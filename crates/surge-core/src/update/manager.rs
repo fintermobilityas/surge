@@ -18,12 +18,16 @@ use crate::platform::detect::current_rid;
 use crate::platform::fs::{atomic_rename, copy_directory};
 use crate::platform::process::{current_pid, spawn_detached, spawn_process, supervisor_binary_name};
 use crate::platform::shortcuts::install_shortcuts;
-use crate::releases::artifact_cache::{CacheFetchOutcome, cache_path_for_key, fetch_or_reuse_file};
+use crate::releases::artifact_cache::{
+    CacheFetchOutcome, cache_path_for_key, fetch_or_reuse_file, prune_cached_artifacts,
+};
 use crate::releases::delta::{apply_delta_patch, decode_delta_patch, is_supported_delta};
 use crate::releases::manifest::{
     ReleaseEntry, ReleaseIndex, decompress_release_index, get_delta_chain, get_releases_newer_than,
 };
-use crate::releases::restore::{RestoreOptions, restore_full_archive_for_version_with_options};
+use crate::releases::restore::{
+    RestoreOptions, required_artifacts_for_index, restore_full_archive_for_version_with_options,
+};
 use crate::releases::version::compare_versions;
 use crate::storage::{StorageBackend, create_storage_backend};
 use crate::storage_config::append_prefix;
@@ -1006,6 +1010,32 @@ impl UpdateManager {
         // Clean up staging directory
         if staging_dir.exists() {
             let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+        }
+
+        let prune_index = if let Some(cached) = &self.cached_index {
+            Some(cached.clone())
+        } else {
+            match self.storage.get_object(RELEASES_FILE_COMPRESSED).await {
+                Ok(data) => Some(decompress_release_index(&data)?),
+                Err(SurgeError::NotFound(_)) => None,
+                Err(e) => return Err(e),
+            }
+        };
+        if let Some(index) = prune_index {
+            let retained_artifacts = required_artifacts_for_index(&index);
+            match prune_cached_artifacts(&artifact_cache_dir, &retained_artifacts) {
+                Ok(0) => {}
+                Ok(pruned) => {
+                    debug!(
+                        pruned,
+                        retained = retained_artifacts.len(),
+                        "Pruned stale local artifact cache entries"
+                    );
+                }
+                Err(e) => {
+                    warn!(error = %e, "Failed to prune local artifact cache");
+                }
+            }
         }
 
         invoke_post_update_hook(&self.install_dir, &active_app_dir, latest);

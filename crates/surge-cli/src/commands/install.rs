@@ -104,6 +104,12 @@ enum ArchiveAcquisition {
     Reconstructed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteInstallerMode {
+    Online,
+    Offline,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InstallSelection {
     app_id: String,
@@ -309,42 +315,41 @@ pub async fn execute(
         return Ok(());
     }
 
-    std::fs::create_dir_all(download_dir)?;
-    let local_package = download_dir.join(Path::new(full_filename).file_name().unwrap_or_default());
-    let acquisition = download_release_archive(
-        &*backend,
-        &index,
-        release,
-        &rid_candidates,
-        full_filename,
-        &local_package,
-    )
-    .await?;
-    match acquisition {
-        ArchiveAcquisition::ReusedLocal => {
-            logline::success(&format!(
-                "Using cached package '{}' at '{}'.",
-                Path::new(full_filename).display(),
-                local_package.display()
-            ));
-        }
-        ArchiveAcquisition::Downloaded => {
-            logline::success(&format!(
-                "Downloaded '{}' to '{}'.",
-                Path::new(full_filename).display(),
-                local_package.display()
-            ));
-        }
-        ArchiveAcquisition::Reconstructed => {
-            logline::warn(&format!(
-                "Direct full package '{}' missing in backend; reconstructed from retained release artifacts.",
-                Path::new(full_filename).display()
-            ));
-        }
-    }
-
     match &install_target {
         InstallTarget::Local => {
+            std::fs::create_dir_all(download_dir)?;
+            let local_package = download_dir.join(Path::new(full_filename).file_name().unwrap_or_default());
+            let acquisition = download_release_archive(
+                &*backend,
+                &index,
+                release,
+                &rid_candidates,
+                full_filename,
+                &local_package,
+            )
+            .await?;
+            match acquisition {
+                ArchiveAcquisition::ReusedLocal => {
+                    logline::success(&format!(
+                        "Using cached package '{}' at '{}'.",
+                        Path::new(full_filename).display(),
+                        local_package.display()
+                    ));
+                }
+                ArchiveAcquisition::Downloaded => {
+                    logline::success(&format!(
+                        "Downloaded '{}' to '{}'.",
+                        Path::new(full_filename).display(),
+                        local_package.display()
+                    ));
+                }
+                ArchiveAcquisition::Reconstructed => {
+                    logline::warn(&format!(
+                        "Direct full package '{}' missing in backend; reconstructed from retained release artifacts.",
+                        Path::new(full_filename).display()
+                    ));
+                }
+            }
             stop_running_supervisor(&app_id, release).await?;
             let install_root = install_package_locally(&app_id, release, &local_package)?;
             let active_app_dir = install_root.join("app");
@@ -374,6 +379,7 @@ pub async fn execute(
             ssh_target,
             file_target,
         } => {
+            let installer_mode = select_remote_installer_mode(&storage_config);
             let install_dir = if release.install_directory.trim().is_empty() {
                 &app_id
             } else {
@@ -409,17 +415,66 @@ pub async fn execute(
                         "No remote graphical session environment detected; install will default to headless startup.",
                     );
                 }
-                logline::info("Building offline installer for remote deployment...");
-                let installer_path = build_offline_installer_for_tailscale(
-                    &manifest,
-                    &app_id,
-                    &selected_rid,
-                    release,
-                    &channel,
-                    &storage_config,
-                    &local_package,
-                    &launch_env,
-                )?;
+                let installer_path = if installer_mode == RemoteInstallerMode::Offline {
+                    std::fs::create_dir_all(download_dir)?;
+                    let local_package = download_dir.join(Path::new(full_filename).file_name().unwrap_or_default());
+                    let acquisition = download_release_archive(
+                        &*backend,
+                        &index,
+                        release,
+                        &rid_candidates,
+                        full_filename,
+                        &local_package,
+                    )
+                    .await?;
+                    match acquisition {
+                        ArchiveAcquisition::ReusedLocal => {
+                            logline::success(&format!(
+                                "Using cached package '{}' at '{}'.",
+                                Path::new(full_filename).display(),
+                                local_package.display()
+                            ));
+                        }
+                        ArchiveAcquisition::Downloaded => {
+                            logline::success(&format!(
+                                "Downloaded '{}' to '{}'.",
+                                Path::new(full_filename).display(),
+                                local_package.display()
+                            ));
+                        }
+                        ArchiveAcquisition::Reconstructed => {
+                            logline::warn(&format!(
+                                "Direct full package '{}' missing in backend; reconstructed from retained release artifacts.",
+                                Path::new(full_filename).display()
+                            ));
+                        }
+                    }
+                    logline::info("Building offline installer for remote deployment...");
+                    build_installer_for_tailscale(
+                        &manifest,
+                        &app_id,
+                        &selected_rid,
+                        release,
+                        &channel,
+                        &storage_config,
+                        Some(&local_package),
+                        &launch_env,
+                        installer_mode,
+                    )?
+                } else {
+                    logline::info("Building online installer for remote deployment...");
+                    build_installer_for_tailscale(
+                        &manifest,
+                        &app_id,
+                        &selected_rid,
+                        release,
+                        &channel,
+                        &storage_config,
+                        None,
+                        &launch_env,
+                        installer_mode,
+                    )?
+                };
                 let installer_size = std::fs::metadata(&installer_path).map(|m| m.len()).unwrap_or(0);
                 logline::info(&format!(
                     "Transferring installer to '{file_target}' ({})...",
@@ -1185,6 +1240,7 @@ fn build_remote_installer_manifest(
     channel: &str,
     storage_config: &surge_core::context::StorageConfig,
     launch_env: &RemoteLaunchEnvironment,
+    installer_mode: RemoteInstallerMode,
 ) -> InstallerManifest {
     let mut environment = release.environment.clone();
     if let Some(display) = launch_env.display.as_deref().filter(|value| !value.is_empty()) {
@@ -1211,7 +1267,11 @@ fn build_remote_installer_manifest(
         schema: 1,
         format: "surge-installer-v1".to_string(),
         ui: InstallerUi::Console,
-        installer_type: "offline".to_string(),
+        installer_type: match installer_mode {
+            RemoteInstallerMode::Online => "online",
+            RemoteInstallerMode::Offline => "offline",
+        }
+        .to_string(),
         app_id: app_id.to_string(),
         rid: release.rid.clone(),
         version: release.version.clone(),
@@ -1248,28 +1308,25 @@ fn build_remote_installer_manifest(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_offline_installer_for_tailscale(
+fn build_installer_for_tailscale(
     manifest: &SurgeManifest,
     app_id: &str,
     rid: &str,
     release: &ReleaseEntry,
     channel: &str,
     storage_config: &surge_core::context::StorageConfig,
-    full_package_path: &Path,
+    full_package_path: Option<&Path>,
     launch_env: &RemoteLaunchEnvironment,
+    installer_mode: RemoteInstallerMode,
 ) -> Result<std::path::PathBuf> {
     let (_app, target) = manifest
         .find_app_with_target(app_id, rid)
         .ok_or_else(|| SurgeError::Config(format!("App '{app_id}' with RID '{rid}' not found in manifest")))?;
 
-    let installer_manifest = build_remote_installer_manifest(app_id, release, channel, storage_config, launch_env);
+    let installer_manifest =
+        build_remote_installer_manifest(app_id, release, channel, storage_config, launch_env, installer_mode);
     let installer_yaml = serde_yaml::to_string(&installer_manifest)
         .map_err(|e| SurgeError::Config(format!("Failed to serialize installer manifest: {e}")))?;
-
-    let full_filename = full_package_path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .ok_or_else(|| SurgeError::Config("Full package path has no filename".to_string()))?;
 
     let staging_dir =
         tempfile::tempdir().map_err(|e| SurgeError::Platform(format!("Failed to create staging directory: {e}")))?;
@@ -1281,13 +1338,22 @@ fn build_offline_installer_for_tailscale(
     let surge_name = super::pack::surge_binary_name_for_rid(rid);
     std::fs::copy(&surge_binary, staging.join(surge_name))?;
 
-    let payload_dir = staging.join("payload");
-    std::fs::create_dir_all(&payload_dir)?;
-    std::fs::copy(full_package_path, payload_dir.join(&full_filename))?;
+    if let Some(full_package_path) = full_package_path {
+        let full_filename = full_package_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .ok_or_else(|| SurgeError::Config("Full package path has no filename".to_string()))?;
+        let payload_dir = staging.join("payload");
+        std::fs::create_dir_all(&payload_dir)?;
+        std::fs::copy(full_package_path, payload_dir.join(&full_filename))?;
+    }
 
     let icon = target.icon.trim();
     if !icon.is_empty() {
-        let icon_source = full_package_path.parent().unwrap_or(Path::new(".")).join(icon);
+        let icon_base_dir = full_package_path
+            .and_then(Path::parent)
+            .unwrap_or_else(|| Path::new("."));
+        let icon_source = icon_base_dir.join(icon);
         if icon_source.is_file() {
             let assets_dir = staging.join("assets");
             std::fs::create_dir_all(&assets_dir)?;
@@ -1313,6 +1379,19 @@ fn build_offline_installer_for_tailscale(
     std::mem::forget(staging_dir);
 
     Ok(installer_path)
+}
+
+fn select_remote_installer_mode(storage_config: &surge_core::context::StorageConfig) -> RemoteInstallerMode {
+    match storage_config
+        .provider
+        .unwrap_or(surge_core::context::StorageProvider::Filesystem)
+    {
+        surge_core::context::StorageProvider::Filesystem => RemoteInstallerMode::Offline,
+        surge_core::context::StorageProvider::S3
+        | surge_core::context::StorageProvider::AzureBlob
+        | surge_core::context::StorageProvider::Gcs
+        | surge_core::context::StorageProvider::GitHubReleases => RemoteInstallerMode::Online,
+    }
 }
 
 async fn stream_file_to_tailscale_node_with_command(node: &str, local_file: &Path, remote_command: &str) -> Result<()> {
@@ -1645,6 +1724,7 @@ mod tests {
             "stable",
             &storage_config("/tmp/releases"),
             &launch_env,
+            RemoteInstallerMode::Online,
         );
 
         assert_eq!(
@@ -1671,6 +1751,17 @@ mod tests {
             manifest.runtime.environment.get("XDG_RUNTIME_DIR").map(String::as_str),
             Some("/run/user/1000")
         );
+        assert_eq!(manifest.installer_type, "online");
+    }
+
+    #[test]
+    fn select_remote_installer_mode_prefers_online_for_remote_storage() {
+        let filesystem = storage_config("/tmp/releases");
+        assert_eq!(select_remote_installer_mode(&filesystem), RemoteInstallerMode::Offline);
+
+        let mut azure = storage_config("bucket");
+        azure.provider = Some(surge_core::context::StorageProvider::AzureBlob);
+        assert_eq!(select_remote_installer_mode(&azure), RemoteInstallerMode::Online);
     }
 
     #[tokio::test]

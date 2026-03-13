@@ -5,7 +5,7 @@ use std::path::Path;
 
 use crate::crypto::sha256::sha256_hex;
 use crate::error::{Result, SurgeError};
-use crate::releases::artifact_cache::{cache_path_for_key, fetch_or_reuse_file};
+use crate::releases::artifact_cache::{cache_path_for_key, cached_artifact_matches, fetch_or_reuse_file};
 use crate::releases::delta::{apply_delta_patch, decode_delta_patch, is_supported_delta};
 use crate::releases::manifest::{ReleaseEntry, ReleaseIndex};
 use crate::releases::version::compare_versions;
@@ -40,6 +40,16 @@ pub struct RestoreArtifactSpec {
     pub key: String,
     pub sha256: String,
     pub size: i64,
+}
+
+struct RestoreCandidate<'a> {
+    base_release: &'a ReleaseEntry,
+    chain_releases: Vec<&'a ReleaseEntry>,
+    chain_deltas: Vec<crate::releases::manifest::DeltaArtifact>,
+    total_items: i64,
+    total_bytes: i64,
+    missing_items: i64,
+    missing_bytes: i64,
 }
 
 /// Return releases for a RID sorted by semantic version (oldest -> newest).
@@ -119,6 +129,10 @@ pub async fn restore_full_archive_for_version(
 }
 
 /// Restore a release full archive with optional local-cache and progress reporting.
+///
+/// When `cache_dir` is provided, the restore path prefers any valid cached
+/// artifact chain that minimizes additional downloads rather than always
+/// fetching the direct target full archive.
 pub async fn restore_full_archive_for_version_with_options(
     storage: &dyn StorageBackend,
     index: &ReleaseIndex,
@@ -132,171 +146,268 @@ pub async fn restore_full_archive_for_version_with_options(
         .position(|release| release.version == version)
         .ok_or_else(|| SurgeError::NotFound(format!("Release {version} ({rid}) not found in index")))?;
 
-    for base_idx in (0..=target_idx).rev() {
-        let base_release = releases[base_idx];
-        if base_release.full_filename.trim().is_empty() {
-            continue;
-        }
+    let candidate = select_restore_candidate(storage, &releases, target_idx, options.cache_dir).await?;
 
-        let chain_releases: Vec<&ReleaseEntry> = releases
-            .iter()
-            .take(target_idx + 1)
-            .skip(base_idx + 1)
-            .copied()
-            .collect();
-        let mut chain_deltas = Vec::with_capacity(chain_releases.len());
-        let mut chain_valid = true;
-        let mut total_bytes = base_release.full_size.max(0);
-        for release in &chain_releases {
-            let Some(delta) = release.selected_delta() else {
-                chain_valid = false;
-                break;
-            };
-            if !is_supported_delta(&delta) {
-                chain_valid = false;
-                break;
-            }
-            total_bytes = total_bytes.saturating_add(delta.size.max(0));
-            chain_deltas.push(delta);
-        }
-        if !chain_valid {
-            continue;
-        }
-
-        let total_items = i64::try_from(chain_deltas.len())
-            .ok()
-            .and_then(|count| count.checked_add(1))
-            .unwrap_or(i64::MAX);
-        let mut items_done = 0i64;
-        let mut bytes_done = 0i64;
-        let report_progress = |items_done: i64, bytes_done: i64| {
-            if let Some(callback) = options.progress {
-                callback(RestoreProgress {
-                    items_done,
-                    items_total: total_items,
-                    bytes_done,
-                    bytes_total: total_bytes,
-                });
-            }
-        };
-        let prefetch_specs = {
-            let mut specs = Vec::with_capacity(chain_deltas.len().saturating_add(1));
-            specs.push(ArtifactPrefetchSpec {
-                key: base_release.full_filename.clone(),
-                sha256: base_release.full_sha256.clone(),
-                size: base_release.full_size,
+    let report_progress = |items_done: i64, bytes_done: i64| {
+        if let Some(callback) = options.progress {
+            callback(RestoreProgress {
+                items_done,
+                items_total: candidate.total_items,
+                bytes_done,
+                bytes_total: candidate.total_bytes,
             });
-            for delta in &chain_deltas {
-                specs.push(ArtifactPrefetchSpec {
-                    key: delta.filename.clone(),
-                    sha256: delta.sha256.clone(),
-                    size: delta.size,
-                });
-            }
-            specs
-        };
-        let used_prefetch = if let Some(cache_root) = options.cache_dir {
-            match prefetch_artifacts_to_cache(
-                storage,
-                cache_root,
-                &prefetch_specs,
-                options.progress,
-                total_items,
-                total_bytes,
-            )
-            .await
-            {
-                Ok(()) => true,
-                Err(SurgeError::NotFound(_)) => continue,
-                Err(e) => return Err(e),
-            }
-        } else {
-            false
-        };
-
-        let mut candidate = match fetch_artifact_bytes(
-            storage,
-            &base_release.full_filename,
-            &base_release.full_sha256,
-            options.cache_dir,
-        )
-        .await
-        {
-            Ok(bytes) => bytes,
-            Err(SurgeError::NotFound(_)) => continue,
-            Err(e) => return Err(e),
-        };
-        if verify_expected_sha256(
-            &base_release.full_sha256,
-            &candidate,
-            &format!("full artifact '{}'", base_release.full_filename),
-        )
-        .is_err()
-        {
-            continue;
         }
+    };
+    let prefetch_specs = {
+        let mut specs = Vec::with_capacity(candidate.chain_deltas.len().saturating_add(1));
+        specs.push(ArtifactPrefetchSpec {
+            key: candidate.base_release.full_filename.clone(),
+            sha256: candidate.base_release.full_sha256.clone(),
+            size: candidate.base_release.full_size,
+        });
+        for delta in &candidate.chain_deltas {
+            specs.push(ArtifactPrefetchSpec {
+                key: delta.filename.clone(),
+                sha256: delta.sha256.clone(),
+                size: delta.size,
+            });
+        }
+        specs
+    };
+    let used_prefetch = if let Some(cache_root) = options.cache_dir {
+        prefetch_artifacts_to_cache(
+            storage,
+            cache_root,
+            &prefetch_specs,
+            options.progress,
+            candidate.total_items,
+            candidate.total_bytes,
+        )
+        .await?;
+        true
+    } else {
+        false
+    };
+
+    let mut restored = fetch_artifact_bytes(
+        storage,
+        &candidate.base_release.full_filename,
+        &candidate.base_release.full_sha256,
+        options.cache_dir,
+    )
+    .await?;
+    verify_expected_sha256(
+        &candidate.base_release.full_sha256,
+        &restored,
+        &format!("full artifact '{}'", candidate.base_release.full_filename),
+    )?;
+
+    let mut items_done = 1i64;
+    let mut bytes_done = candidate.base_release.full_size.max(0);
+    if !used_prefetch {
+        report_progress(items_done, bytes_done);
+    }
+
+    for (release, delta) in candidate.chain_releases.iter().zip(candidate.chain_deltas.iter()) {
+        let delta_compressed = fetch_artifact_bytes(storage, &delta.filename, &delta.sha256, options.cache_dir).await?;
+        verify_expected_sha256(
+            &delta.sha256,
+            &delta_compressed,
+            &format!("delta artifact '{}'", delta.filename),
+        )?;
         items_done = items_done.saturating_add(1);
-        bytes_done = bytes_done.saturating_add(base_release.full_size.max(0));
+        bytes_done = bytes_done.saturating_add(delta.size.max(0));
         if !used_prefetch {
             report_progress(items_done, bytes_done);
         }
 
-        for (release, delta) in chain_releases.iter().zip(chain_deltas.iter()) {
-            let delta_compressed =
-                match fetch_artifact_bytes(storage, &delta.filename, &delta.sha256, options.cache_dir).await {
-                    Ok(bytes) => bytes,
-                    Err(SurgeError::NotFound(_)) => {
-                        chain_valid = false;
-                        break;
-                    }
-                    Err(e) => return Err(e),
-                };
-            if verify_expected_sha256(
-                &delta.sha256,
-                &delta_compressed,
-                &format!("delta artifact '{}'", delta.filename),
-            )
-            .is_err()
-            {
-                chain_valid = false;
-                break;
-            }
-            items_done = items_done.saturating_add(1);
-            bytes_done = bytes_done.saturating_add(delta.size.max(0));
-            if !used_prefetch {
-                report_progress(items_done, bytes_done);
-            }
+        let patch = decode_delta_patch(delta_compressed.as_slice(), delta).map_err(|_| {
+            SurgeError::NotFound(format!(
+                "Failed to decode delta artifact '{}' while restoring {version} ({rid})",
+                delta.filename
+            ))
+        })?;
+        restored = apply_delta_patch(&restored, &patch, delta).map_err(|_| {
+            SurgeError::NotFound(format!(
+                "Failed to apply delta artifact '{}' while restoring {version} ({rid})",
+                delta.filename
+            ))
+        })?;
+        verify_expected_sha256(
+            &release.full_sha256,
+            &restored,
+            &format!("rebuilt full archive for {}", release.version),
+        )?;
+    }
 
-            let Ok(patch) = decode_delta_patch(delta_compressed.as_slice(), delta) else {
-                chain_valid = false;
-                break;
-            };
-            candidate = if let Ok(bytes) = apply_delta_patch(&candidate, &patch, delta) {
-                bytes
-            } else {
-                chain_valid = false;
-                break;
-            };
-            if verify_expected_sha256(
-                &release.full_sha256,
-                &candidate,
-                &format!("rebuilt full archive for {}", release.version),
-            )
-            .is_err()
-            {
-                chain_valid = false;
-                break;
-            }
-        }
+    Ok(restored)
+}
 
-        if chain_valid {
+async fn select_restore_candidate<'a>(
+    storage: &dyn StorageBackend,
+    releases: &[&'a ReleaseEntry],
+    target_idx: usize,
+    cache_dir: Option<&Path>,
+) -> Result<RestoreCandidate<'a>> {
+    let mut best: Option<RestoreCandidate<'a>> = None;
+    let mut cache_state = BTreeMap::new();
+    let mut storage_state = BTreeMap::new();
+
+    for base_idx in (0..=target_idx).rev() {
+        let Some(mut candidate) = build_restore_candidate(releases, target_idx, base_idx) else {
+            continue;
+        };
+        let Some((missing_items, missing_bytes)) =
+            assess_restore_candidate(storage, &candidate, cache_dir, &mut cache_state, &mut storage_state).await?
+        else {
+            continue;
+        };
+        candidate.missing_items = missing_items;
+        candidate.missing_bytes = missing_bytes;
+        if cache_dir.is_none() {
             return Ok(candidate);
+        }
+        if best
+            .as_ref()
+            .is_none_or(|current| restore_candidate_is_better(&candidate, current))
+        {
+            best = Some(candidate);
         }
     }
 
-    Err(SurgeError::NotFound(format!(
-        "No reconstructable full archive found for {version} ({rid})"
-    )))
+    best.ok_or_else(|| {
+        let version = releases
+            .get(target_idx)
+            .map_or_else(|| "<unknown>".to_string(), |release| release.version.clone());
+        let rid = releases
+            .get(target_idx)
+            .map_or_else(|| "<unknown>".to_string(), |release| release.rid.clone());
+        SurgeError::NotFound(format!("No reconstructable full archive found for {version} ({rid})"))
+    })
+}
+
+fn build_restore_candidate<'a>(
+    releases: &[&'a ReleaseEntry],
+    target_idx: usize,
+    base_idx: usize,
+) -> Option<RestoreCandidate<'a>> {
+    let base_release = *releases.get(base_idx)?;
+    if base_release.full_filename.trim().is_empty() {
+        return None;
+    }
+
+    let chain_releases: Vec<&ReleaseEntry> = releases
+        .iter()
+        .take(target_idx + 1)
+        .skip(base_idx + 1)
+        .copied()
+        .collect();
+    let mut chain_deltas = Vec::with_capacity(chain_releases.len());
+    let mut total_bytes = base_release.full_size.max(0);
+    for release in &chain_releases {
+        let delta = release.selected_delta()?;
+        if !is_supported_delta(&delta) {
+            return None;
+        }
+        total_bytes = total_bytes.saturating_add(delta.size.max(0));
+        chain_deltas.push(delta);
+    }
+
+    let total_items = i64::try_from(chain_deltas.len())
+        .ok()
+        .and_then(|count| count.checked_add(1))
+        .unwrap_or(i64::MAX);
+
+    Some(RestoreCandidate {
+        base_release,
+        chain_releases,
+        chain_deltas,
+        total_items,
+        total_bytes,
+        missing_items: 0,
+        missing_bytes: 0,
+    })
+}
+
+async fn assess_restore_candidate(
+    storage: &dyn StorageBackend,
+    candidate: &RestoreCandidate<'_>,
+    cache_dir: Option<&Path>,
+    cache_state: &mut BTreeMap<String, bool>,
+    storage_state: &mut BTreeMap<String, bool>,
+) -> Result<Option<(i64, i64)>> {
+    let mut missing_items = 0i64;
+    let mut missing_bytes = 0i64;
+
+    let mut specs = Vec::with_capacity(candidate.chain_deltas.len().saturating_add(1));
+    specs.push(RestoreArtifactSpec {
+        key: candidate.base_release.full_filename.clone(),
+        sha256: candidate.base_release.full_sha256.clone(),
+        size: candidate.base_release.full_size,
+    });
+    for delta in &candidate.chain_deltas {
+        specs.push(RestoreArtifactSpec {
+            key: delta.filename.clone(),
+            sha256: delta.sha256.clone(),
+            size: delta.size,
+        });
+    }
+
+    for spec in specs {
+        if let Some(cache_root) = cache_dir
+            && cached_artifact_available(cache_root, &spec, cache_state)?
+        {
+            continue;
+        }
+        if !storage_artifact_available(storage, &spec.key, storage_state).await? {
+            return Ok(None);
+        }
+        missing_items = missing_items.saturating_add(1);
+        missing_bytes = missing_bytes.saturating_add(spec.size.max(0));
+    }
+
+    Ok(Some((missing_items, missing_bytes)))
+}
+
+fn cached_artifact_available(
+    cache_root: &Path,
+    spec: &RestoreArtifactSpec,
+    cache_state: &mut BTreeMap<String, bool>,
+) -> Result<bool> {
+    if let Some(cached) = cache_state.get(&spec.key) {
+        return Ok(*cached);
+    }
+
+    let cache_path = cache_path_for_key(cache_root, &spec.key)?;
+    let cached = cached_artifact_matches(&cache_path, &spec.sha256)?;
+    cache_state.insert(spec.key.clone(), cached);
+    Ok(cached)
+}
+
+async fn storage_artifact_available(
+    storage: &dyn StorageBackend,
+    key: &str,
+    storage_state: &mut BTreeMap<String, bool>,
+) -> Result<bool> {
+    if let Some(cached) = storage_state.get(key) {
+        return Ok(*cached);
+    }
+
+    let available = match storage.head_object(key).await {
+        Ok(_) => true,
+        Err(SurgeError::NotFound(_)) => false,
+        Err(e) => return Err(e),
+    };
+    storage_state.insert(key.to_string(), available);
+    Ok(available)
+}
+
+fn restore_candidate_is_better(candidate: &RestoreCandidate<'_>, current: &RestoreCandidate<'_>) -> bool {
+    (
+        candidate.missing_bytes,
+        candidate.missing_items,
+        candidate.chain_deltas.len(),
+    ) < (current.missing_bytes, current.missing_items, current.chain_deltas.len())
 }
 
 async fn fetch_artifact_bytes(
@@ -892,6 +1003,83 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(second, full_v2);
+    }
+
+    #[tokio::test]
+    async fn test_restore_full_archive_prefers_cached_graph_over_direct_full_download() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend_root = tmp.path().join("backend");
+        std::fs::create_dir_all(&backend_root).unwrap();
+        let cache_root = tmp.path().join("cache");
+        std::fs::create_dir_all(&cache_root).unwrap();
+        let backend = FilesystemBackend::new(backend_root.to_str().unwrap(), "");
+
+        let full_v1 = vec![b'a'; 4096];
+        let mut full_v2 = full_v1.clone();
+        full_v2[0] = b'b';
+        let patch_v2 = bsdiff_buffers(&full_v1, &full_v2).unwrap();
+        let delta_v2 = zstd::encode_all(patch_v2.as_slice(), 3).unwrap();
+
+        let mut v1 = make_entry("1.0.0");
+        v1.set_primary_delta(None);
+        v1.full_size = i64::try_from(full_v1.len()).unwrap();
+        v1.full_sha256 = sha256_hex(&full_v1);
+
+        let mut v2 = make_entry("1.1.0");
+        v2.full_size = i64::try_from(full_v2.len()).unwrap();
+        v2.full_sha256 = sha256_hex(&full_v2);
+        v2.set_primary_delta(Some(DeltaArtifact::bsdiff_zstd(
+            "primary",
+            "1.0.0",
+            "demo-1.1.0-linux-x64-delta.tar.zst",
+            i64::try_from(delta_v2.len()).unwrap(),
+            &sha256_hex(&delta_v2),
+        )));
+
+        backend
+            .put_object(&v1.full_filename, &full_v1, "application/octet-stream")
+            .await
+            .unwrap();
+        backend
+            .put_object(&v2.full_filename, &full_v2, "application/octet-stream")
+            .await
+            .unwrap();
+        let delta_key = v2.selected_delta().unwrap().filename.clone();
+        backend
+            .put_object(&delta_key, &delta_v2, "application/octet-stream")
+            .await
+            .unwrap();
+
+        let cached_v1 = cache_path_for_key(&cache_root, &v1.full_filename).unwrap();
+        let cached_delta = cache_path_for_key(&cache_root, &delta_key).unwrap();
+        std::fs::create_dir_all(cached_v1.parent().unwrap()).unwrap();
+        std::fs::write(&cached_v1, &full_v1).unwrap();
+        std::fs::write(&cached_delta, &delta_v2).unwrap();
+
+        let index = ReleaseIndex {
+            app_id: "demo".to_string(),
+            releases: vec![v1.clone(), v2.clone()],
+            ..ReleaseIndex::default()
+        };
+
+        let restored = restore_full_archive_for_version_with_options(
+            &backend,
+            &index,
+            "linux-x64",
+            "1.1.0",
+            RestoreOptions {
+                cache_dir: Some(&cache_root),
+                progress: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(restored, full_v2);
+        assert!(
+            !cache_path_for_key(&cache_root, &v2.full_filename).unwrap().exists(),
+            "direct full should not be fetched when the cached graph can reconstruct the target"
+        );
     }
 
     #[tokio::test]

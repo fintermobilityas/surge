@@ -38,7 +38,7 @@ pub async fn execute(manifest_path: &Path, app_id: Option<&str>, rid: Option<&st
     let mut prepared_targets = Vec::with_capacity(targets.len());
     let mut preflight_errors = Vec::new();
     for (app_id, rid) in &targets {
-        match super::build_app_scoped_storage_config(&manifest, app_id) {
+        match super::build_app_scoped_storage_config(&manifest, manifest_path, app_id) {
             Ok(storage_config) => {
                 if let Err(err) = super::ensure_mutating_storage_access(&storage_config, "compact releases") {
                     preflight_errors.push(format!("{app_id}/{rid}: {err}"));

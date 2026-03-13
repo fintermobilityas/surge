@@ -143,7 +143,8 @@ pub async fn execute(
     download_dir: &Path,
     overrides: StorageOverrides<'_>,
 ) -> Result<()> {
-    let manifest = load_install_manifest(application_manifest_path, manifest_path)?;
+    let selected_manifest_path = selected_install_manifest_path(application_manifest_path, manifest_path);
+    let manifest = SurgeManifest::from_file(selected_manifest_path)?;
     let interactive_wizard = should_prompt_install_selection();
     let interactive_selection = if interactive_wizard {
         Some(prompt_install_selection(&manifest, app_id, rid)?)
@@ -204,7 +205,7 @@ pub async fn execute(
         }
     };
 
-    let storage_config = build_storage_config_with_overrides(&manifest, &app_id, overrides)?;
+    let storage_config = build_storage_config_with_overrides(&manifest, selected_manifest_path, &app_id, overrides)?;
     let backend = storage::create_storage_backend(&storage_config)?;
     logline::info(&format!(
         "Fetching release index '{RELEASES_FILE_COMPRESSED}' from storage backend..."
@@ -798,11 +799,15 @@ fn resolve_tailscale_targets(node: &str, node_user: Option<&str>) -> Result<(Str
     }
 }
 
-fn load_install_manifest(application_manifest_path: &Path, fallback_manifest_path: &Path) -> Result<SurgeManifest> {
+pub(crate) fn selected_install_manifest_path<'a>(
+    application_manifest_path: &'a Path,
+    fallback_manifest_path: &'a Path,
+) -> &'a Path {
     if application_manifest_path.is_file() {
-        return SurgeManifest::from_file(application_manifest_path);
+        application_manifest_path
+    } else {
+        fallback_manifest_path
     }
-    SurgeManifest::from_file(fallback_manifest_path)
 }
 
 fn release_install_profile<'a>(app_id: &'a str, release: &'a ReleaseEntry) -> InstallProfile<'a> {
@@ -860,10 +865,11 @@ fn release_runtime_manifest_metadata<'a>(
 
 fn build_storage_config_with_overrides(
     manifest: &SurgeManifest,
+    manifest_path: &Path,
     app_id: &str,
     overrides: StorageOverrides<'_>,
 ) -> Result<surge_core::context::StorageConfig> {
-    let mut config = super::build_app_scoped_storage_config(manifest, app_id)?;
+    let mut config = super::build_app_scoped_storage_config(manifest, manifest_path, app_id)?;
 
     if let Some(provider) = overrides.provider.map(str::trim).filter(|value| !value.is_empty()) {
         config.provider = Some(super::parse_storage_provider(provider)?);

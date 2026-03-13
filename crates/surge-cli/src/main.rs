@@ -2,13 +2,14 @@
 #![allow(clippy::too_many_lines)]
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
 use surge_core::config::constants::PACK_DEFAULT_DELTA_STRATEGY;
 
 mod commands;
+mod envfile;
 mod formatters;
 mod logline;
 mod prompts;
@@ -435,6 +436,10 @@ fn main() -> ExitCode {
                 && let Some(installer_dir) = detect_installer_context()
             {
                 init_tracing(false);
+                if let Err(e) = load_env_files_for_setup(&installer_dir) {
+                    logline::error_chain(&e);
+                    return ExitCode::FAILURE;
+                }
                 let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build();
                 let rt = match rt {
                     Ok(runtime) => runtime,
@@ -456,6 +461,10 @@ fn main() -> ExitCode {
     };
     logline::init_verbose(cli.verbose);
     init_tracing(cli.verbose);
+    if let Err(e) = load_env_files_for_cli(&cli) {
+        logline::error_chain(&e);
+        return ExitCode::FAILURE;
+    }
 
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build();
     let rt = match rt {
@@ -475,6 +484,45 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn load_env_files_for_cli(cli: &Cli) -> surge_core::error::Result<()> {
+    match &cli.command {
+        Commands::Init { .. } | Commands::Lock { .. } | Commands::Sha256 { .. } => Ok(()),
+        Commands::Setup { dir, .. } => load_env_files_for_scope(dir, envfile::candidate_paths_for_setup(dir)),
+        Commands::Install { options, .. } => {
+            let manifest_path =
+                commands::install::selected_install_manifest_path(&options.application_manifest, &cli.manifest_path);
+            load_env_files_for_scope(manifest_path, envfile::candidate_paths_for_manifest(manifest_path))
+        }
+        Commands::Migrate { dest_manifest, .. } => {
+            load_env_files_for_scope(
+                &cli.manifest_path,
+                envfile::candidate_paths_for_manifest(&cli.manifest_path),
+            )?;
+            load_env_files_for_scope(dest_manifest, envfile::candidate_paths_for_manifest(dest_manifest))
+        }
+        _ => load_env_files_for_scope(
+            &cli.manifest_path,
+            envfile::candidate_paths_for_manifest(&cli.manifest_path),
+        ),
+    }
+}
+
+fn load_env_files_for_setup(dir: &std::path::Path) -> surge_core::error::Result<()> {
+    let loaded = envfile::load_storage_env_files(dir, &envfile::candidate_paths_for_setup(dir))?;
+    for path in loaded {
+        logline::info(&format!("Loaded storage env overrides from {}", path.display()));
+    }
+    Ok(())
+}
+
+fn load_env_files_for_scope(scope: &Path, candidates: Vec<PathBuf>) -> surge_core::error::Result<()> {
+    let loaded = envfile::load_storage_env_files(scope, &candidates)?;
+    for path in loaded {
+        logline::info(&format!("Loaded storage env overrides from {}", path.display()));
+    }
+    Ok(())
 }
 
 /// Check if `installer.yml` exists next to the current executable.

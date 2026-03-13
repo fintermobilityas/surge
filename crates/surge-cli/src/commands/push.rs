@@ -61,7 +61,7 @@ pub async fn execute(
     let installers = target.installers.clone();
     let environment = target.environment.clone();
 
-    let storage_config = super::build_app_scoped_storage_config(&manifest, &app_id)?;
+    let storage_config = super::build_app_scoped_storage_config(&manifest, manifest_path, &app_id)?;
     let backend = storage::create_storage_backend(&storage_config)?;
     print_stage_done(theme, 1, TOTAL_STAGES, &format!("Target: {app_id}/{rid}"));
 

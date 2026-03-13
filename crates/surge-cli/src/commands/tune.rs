@@ -167,7 +167,11 @@ async fn benchmark_candidate(
         build_manifest_with_policy(raw_manifest, candidate.delta_strategy, candidate.compression_level)?;
     write_file_atomic(&candidate_manifest_path, &candidate_manifest_yaml)?;
     let candidate_manifest = SurgeManifest::parse(&candidate_manifest_yaml)?;
-    let ctx = Arc::new(super::pack::configure_context(&candidate_manifest, app_id)?);
+    let ctx = Arc::new(super::pack::configure_context(
+        &candidate_manifest_path,
+        &candidate_manifest,
+        app_id,
+    )?);
 
     let manifest_path = candidate_manifest_path.to_str().ok_or_else(|| {
         SurgeError::Config(format!(

@@ -32,8 +32,8 @@ pub async fn execute(
     let canonical_app_id = canonicalize_app_id(&source_app_id, &rid);
     let dest_manifest = SurgeManifest::from_file(dest_manifest_path)?;
 
-    let src_config = build_storage_config(&src_manifest, &source_app_id)?;
-    let dest_config = build_storage_config(&dest_manifest, &canonical_app_id)?;
+    let src_config = build_storage_config(manifest_path, &src_manifest, &source_app_id)?;
+    let dest_config = build_storage_config(dest_manifest_path, &dest_manifest, &canonical_app_id)?;
 
     let src_backend = storage::create_storage_backend(&src_config)?;
     let dest_backend = storage::create_storage_backend(&dest_config)?;
@@ -281,7 +281,11 @@ struct CopyOperation {
     size_hint: u64,
 }
 
-fn build_storage_config(manifest: &SurgeManifest, app_id: &str) -> Result<surge_core::context::StorageConfig> {
+fn build_storage_config(
+    manifest_path: &Path,
+    manifest: &SurgeManifest,
+    app_id: &str,
+) -> Result<surge_core::context::StorageConfig> {
     if manifest.storage.provider.trim().is_empty() {
         return Err(SurgeError::Config(
             "Storage provider is required for migration manifests".to_string(),
@@ -292,7 +296,7 @@ fn build_storage_config(manifest: &SurgeManifest, app_id: &str) -> Result<surge_
             "Storage bucket/root is required for migration manifests".to_string(),
         ));
     }
-    super::build_app_scoped_storage_config(manifest, app_id)
+    super::build_app_scoped_storage_config(manifest, manifest_path, app_id)
 }
 
 fn print_stage(theme: UiTheme, stage: usize, total: usize, text: &str) {

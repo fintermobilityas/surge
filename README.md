@@ -91,7 +91,58 @@ apps:
       rid: linux-x64
 ```
 
-Credentials are never stored in the manifest. Surge reads them from environment variables (`AWS_ACCESS_KEY_ID`, `GITHUB_TOKEN`, etc.) or IAM roles.
+Credentials are never stored in the manifest. Surge reads them from process environment variables (`AWS_ACCESS_KEY_ID`, `GITHUB_TOKEN`, etc.), from `.env.surge` files discovered next to the active manifest (and from project-root `.env.surge` when using the default `.surge/surge.yml` layout), from per-app overrides in `.env.surge.<app-id>`, or from provider-native identity mechanisms such as IAM roles.
+
+#### Storage credentials with `.env.surge`
+
+Use `.env.surge` when you want storage credentials to follow a project, manifest, or installer without exporting them globally in your shell or CI job.
+
+Lookup rules:
+
+- Process environment variables always win.
+- With the default `.surge/surge.yml` layout, Surge loads `<project>/.env.surge` first and `.surge/.env.surge` second. Later files override earlier ones.
+- With a custom manifest path such as `surge --manifest-path ./deploy/prod.yml ...`, Surge loads `./deploy/.env.surge`.
+- Per-app overrides live beside the shared file as `.env.surge.<app-id>` and override shared values for that app only.
+- `surge install` loads overrides from the manifest it actually installs from: `.surge/application.yml` if present, otherwise the fallback manifest path.
+- `surge migrate` scopes source and destination manifests separately, so each side can use different backend credentials safely.
+- `surge setup` reads `.env.surge` next to the extracted `installer.yml`.
+
+Supported file syntax:
+
+- `KEY=value`
+- `export KEY=value`
+- blank lines and `# comments`
+- single-quoted or double-quoted values
+
+Example project layout:
+
+```text
+my-app/
+├── .env.surge
+├── .env.surge.admin-ui
+└── .surge/
+    ├── .env.surge
+    └── surge.yml
+```
+
+Example files:
+
+```bash
+# my-app/.env.surge
+GITHUB_TOKEN=ghp_shared_token
+
+# my-app/.env.surge.admin-ui
+GITHUB_TOKEN=ghp_admin_ui_token
+
+# my-app/.surge/.env.surge
+GITHUB_TOKEN=ghp_local_override
+```
+
+In that layout:
+
+- Most commands against `.surge/surge.yml` see `ghp_local_override`.
+- Commands for app `admin-ui` first try `.env.surge.admin-ui`, then fall back to the shared `.env.surge` values for that same manifest scope.
+- Running with a different manifest path uses the `.env.surge` files next to that manifest instead of reusing another manifest's credentials.
 
 ### 2. Pack a release
 

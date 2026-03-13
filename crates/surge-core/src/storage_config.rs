@@ -69,8 +69,15 @@ where
 }
 
 pub fn build_storage_context(manifest: &SurgeManifest) -> Result<Context> {
+    build_storage_context_with_lookup(manifest, |name| std::env::var(name).ok())
+}
+
+pub fn build_storage_context_with_lookup<F>(manifest: &SurgeManifest, lookup: F) -> Result<Context>
+where
+    F: FnMut(&str) -> Option<String>,
+{
     let provider = parse_storage_provider(&manifest.storage.provider)?;
-    let creds = storage_credentials_from_env(provider);
+    let creds = storage_credentials_from_lookup(provider, lookup);
 
     let ctx = Context::new();
     ctx.set_storage(
@@ -86,11 +93,29 @@ pub fn build_storage_context(manifest: &SurgeManifest) -> Result<Context> {
 }
 
 pub fn build_storage_config(manifest: &SurgeManifest) -> Result<StorageConfig> {
-    Ok(build_storage_context(manifest)?.storage_config())
+    build_storage_config_with_lookup(manifest, |name| std::env::var(name).ok())
+}
+
+pub fn build_storage_config_with_lookup<F>(manifest: &SurgeManifest, lookup: F) -> Result<StorageConfig>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    Ok(build_storage_context_with_lookup(manifest, lookup)?.storage_config())
 }
 
 pub fn build_app_scoped_storage_config(manifest: &SurgeManifest, app_id: &str) -> Result<StorageConfig> {
-    let mut config = build_storage_config(manifest)?;
+    build_app_scoped_storage_config_with_lookup(manifest, app_id, |name| std::env::var(name).ok())
+}
+
+pub fn build_app_scoped_storage_config_with_lookup<F>(
+    manifest: &SurgeManifest,
+    app_id: &str,
+    lookup: F,
+) -> Result<StorageConfig>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let mut config = build_storage_config_with_lookup(manifest, lookup)?;
     if manifest.apps.len() > 1 {
         config.prefix = append_prefix(&config.prefix, app_id);
     }
@@ -98,7 +123,18 @@ pub fn build_app_scoped_storage_config(manifest: &SurgeManifest, app_id: &str) -
 }
 
 pub fn build_app_scoped_storage_context(manifest: &SurgeManifest, app_id: &str) -> Result<Context> {
-    let ctx = build_storage_context(manifest)?;
+    build_app_scoped_storage_context_with_lookup(manifest, app_id, |name| std::env::var(name).ok())
+}
+
+pub fn build_app_scoped_storage_context_with_lookup<F>(
+    manifest: &SurgeManifest,
+    app_id: &str,
+    lookup: F,
+) -> Result<Context>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let ctx = build_storage_context_with_lookup(manifest, lookup)?;
     if manifest.apps.len() > 1 {
         let base_prefix = ctx.storage_config().prefix;
         ctx.set_storage_prefix(&append_prefix(&base_prefix, app_id));
@@ -120,8 +156,18 @@ pub fn append_prefix(prefix: &str, segment: &str) -> String {
 }
 
 pub fn build_storage_config_from_installer_manifest(manifest: &InstallerManifest) -> Result<StorageConfig> {
+    build_storage_config_from_installer_manifest_with_lookup(manifest, |name| std::env::var(name).ok())
+}
+
+pub fn build_storage_config_from_installer_manifest_with_lookup<F>(
+    manifest: &InstallerManifest,
+    lookup: F,
+) -> Result<StorageConfig>
+where
+    F: FnMut(&str) -> Option<String>,
+{
     let provider = parse_storage_provider(&manifest.storage.provider)?;
-    let creds = storage_credentials_from_env(provider);
+    let creds = storage_credentials_from_lookup(provider, lookup);
 
     Ok(StorageConfig {
         provider: Some(provider),

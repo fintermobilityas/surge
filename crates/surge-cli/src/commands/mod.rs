@@ -12,15 +12,57 @@ pub mod restore;
 pub mod setup;
 pub mod tune;
 
-pub(crate) use surge_core::storage_config::{
-    append_prefix, build_app_scoped_storage_config, build_app_scoped_storage_context, parse_storage_provider,
-};
+pub(crate) use surge_core::storage_config::{append_prefix, parse_storage_provider};
 
 #[allow(unused_imports)]
 pub(crate) use crate::prompts::{resolve_app_id, resolve_app_id_with_rid_hint, resolve_rid};
 
-use surge_core::context::{StorageConfig, StorageProvider};
+use std::path::Path;
+
+use surge_core::config::installer::InstallerManifest;
+use surge_core::config::manifest::SurgeManifest;
+use surge_core::context::{Context, StorageConfig, StorageProvider};
 use surge_core::error::{Result, SurgeError};
+
+pub(crate) fn build_storage_config(
+    manifest: &SurgeManifest,
+    scope: &Path,
+    app_id: Option<&str>,
+) -> Result<StorageConfig> {
+    surge_core::storage_config::build_storage_config_with_lookup(manifest, |name| {
+        crate::envfile::storage_env_lookup(name, scope, app_id)
+    })
+}
+
+pub(crate) fn build_app_scoped_storage_config(
+    manifest: &SurgeManifest,
+    scope: &Path,
+    app_id: &str,
+) -> Result<StorageConfig> {
+    surge_core::storage_config::build_app_scoped_storage_config_with_lookup(manifest, app_id, |name| {
+        crate::envfile::storage_env_lookup(name, scope, Some(app_id))
+    })
+}
+
+pub(crate) fn build_app_scoped_storage_context(
+    manifest: &SurgeManifest,
+    scope: &Path,
+    app_id: &str,
+) -> Result<Context> {
+    surge_core::storage_config::build_app_scoped_storage_context_with_lookup(manifest, app_id, |name| {
+        crate::envfile::storage_env_lookup(name, scope, Some(app_id))
+    })
+}
+
+pub(crate) fn build_storage_config_from_installer_manifest(
+    manifest: &InstallerManifest,
+    setup_dir: &Path,
+) -> Result<StorageConfig> {
+    let app_id = manifest.app_id.trim();
+    surge_core::storage_config::build_storage_config_from_installer_manifest_with_lookup(manifest, |name| {
+        crate::envfile::storage_env_lookup(name, setup_dir, (!app_id.is_empty()).then_some(app_id))
+    })
+}
 
 pub(crate) fn ensure_mutating_storage_access(config: &StorageConfig, action: &str) -> Result<()> {
     let provider = config
@@ -121,6 +163,9 @@ mod tests {
     use surge_core::archive::extractor::{list_entries_from_bytes, read_entry};
     use surge_core::archive::packer::ArchivePacker;
     use surge_core::config::constants::{DEFAULT_ZSTD_LEVEL, RELEASES_FILE_COMPRESSED};
+    use surge_core::config::installer::{
+        InstallerManifest, InstallerRelease, InstallerRuntime, InstallerStorage, InstallerUi,
+    };
     use surge_core::config::manifest::{ShortcutLocation, SurgeManifest};
     use surge_core::context::{StorageConfig, StorageProvider};
     use surge_core::diff::chunked::{ChunkedDiffOptions, chunked_bsdiff};
@@ -390,7 +435,8 @@ apps:
       rid: linux-x64
 ";
         let single = SurgeManifest::parse(single_yaml).unwrap();
-        let single_cfg = super::build_app_scoped_storage_config(&single, "app-a").unwrap();
+        let scope = Path::new("/tmp/single/surge.yml");
+        let single_cfg = super::build_app_scoped_storage_config(&single, scope, "app-a").unwrap();
         assert_eq!(single_cfg.prefix, "base");
 
         let multi_yaml = br"schema: 1
@@ -407,8 +453,96 @@ apps:
       rid: linux-x64
 ";
         let multi = SurgeManifest::parse(multi_yaml).unwrap();
-        let multi_cfg = super::build_app_scoped_storage_config(&multi, "app-a").unwrap();
+        let multi_cfg = super::build_app_scoped_storage_config(&multi, scope, "app-a").unwrap();
         assert_eq!(multi_cfg.prefix, "base/app-a");
+    }
+
+    #[test]
+    fn test_build_app_scoped_storage_config_uses_loaded_env_overlay() {
+        let scope = Path::new("/tmp/demo/surge.yml");
+        crate::envfile::with_storage_env_state_for_test(
+            scope,
+            BTreeMap::new(),
+            BTreeMap::from([(
+                "app-a".to_string(),
+                BTreeMap::from([
+                    ("AZURE_STORAGE_ACCOUNT_NAME".to_string(), "overlay-account".to_string()),
+                    ("AZURE_STORAGE_ACCOUNT_KEY".to_string(), "overlay-key".to_string()),
+                ]),
+            )]),
+            || {
+                let yaml = br"schema: 1
+storage:
+  provider: azure
+  bucket: demo
+apps:
+  - id: app-a
+    target:
+      rid: linux-x64
+";
+                let manifest = SurgeManifest::parse(yaml).unwrap();
+                let config = super::build_app_scoped_storage_config(&manifest, scope, "app-a").unwrap();
+
+                assert_eq!(config.access_key, "overlay-account");
+                assert_eq!(config.secret_key, "overlay-key");
+            },
+        );
+    }
+
+    #[test]
+    fn test_build_storage_config_from_installer_manifest_uses_loaded_env_overlay() {
+        let setup_dir = Path::new("/tmp/setup");
+        crate::envfile::with_storage_env_state_for_test(
+            setup_dir,
+            BTreeMap::new(),
+            BTreeMap::from([(
+                "demo".to_string(),
+                BTreeMap::from([("GITHUB_TOKEN".to_string(), "ghp_overlay".to_string())]),
+            )]),
+            || {
+                let manifest = InstallerManifest {
+                    schema: 1,
+                    format: "surge-installer-v1".to_string(),
+                    ui: InstallerUi::Console,
+                    installer_type: "online".to_string(),
+                    app_id: "demo".to_string(),
+                    rid: "linux-x64".to_string(),
+                    version: "1.2.3".to_string(),
+                    channel: "stable".to_string(),
+                    generated_utc: "2026-03-13T12:00:00Z".to_string(),
+                    headless_default_if_no_display: false,
+                    release_index_key: "releases.zstd".to_string(),
+                    storage: InstallerStorage {
+                        provider: "github_releases".to_string(),
+                        bucket: "owner/repo".to_string(),
+                        region: String::new(),
+                        endpoint: String::new(),
+                        prefix: String::new(),
+                    },
+                    release: InstallerRelease {
+                        full_filename: "demo-full.tar.zst".to_string(),
+                        delta_filename: String::new(),
+                        delta_algorithm: String::new(),
+                        delta_patch_format: String::new(),
+                        delta_compression: String::new(),
+                    },
+                    runtime: InstallerRuntime {
+                        name: "Demo".to_string(),
+                        main_exe: "demo".to_string(),
+                        install_directory: "demo".to_string(),
+                        supervisor_id: String::new(),
+                        icon: String::new(),
+                        shortcuts: Vec::new(),
+                        persistent_assets: Vec::new(),
+                        installers: Vec::new(),
+                        environment: BTreeMap::new(),
+                    },
+                };
+
+                let config = super::build_storage_config_from_installer_manifest(&manifest, setup_dir).unwrap();
+                assert_eq!(config.secret_key, "ghp_overlay");
+            },
+        );
     }
 
     fn create_stub_installer_launcher(dir: &Path, rid: &str) -> std::path::PathBuf {

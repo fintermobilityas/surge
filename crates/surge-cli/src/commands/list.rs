@@ -75,7 +75,7 @@ pub async fn execute(
         target_rids.sort();
         target_rids.dedup();
 
-        let index = fetch_release_index_for_app(&manifest, app).await?;
+        let index = fetch_release_index_for_app(manifest_path, &manifest, app).await?;
         for target_rid in target_rids {
             rows.push(build_overview_row(app, &target_rid, index.as_ref(), &channel_headers));
         }
@@ -395,8 +395,12 @@ fn print_table_separator(widths: &[usize], theme: UiTheme) {
     logline::subtle(&line);
 }
 
-async fn fetch_release_index_for_app(manifest: &SurgeManifest, app_id: &str) -> Result<Option<ReleaseIndex>> {
-    let configs = build_storage_configs_for_app(manifest, app_id)?;
+async fn fetch_release_index_for_app(
+    manifest_path: &Path,
+    manifest: &SurgeManifest,
+    app_id: &str,
+) -> Result<Option<ReleaseIndex>> {
+    let configs = build_storage_configs_for_app(manifest_path, manifest, app_id)?;
 
     for config in configs {
         let backend = storage::create_storage_backend(&config)?;
@@ -415,8 +419,12 @@ async fn fetch_release_index_for_app(manifest: &SurgeManifest, app_id: &str) -> 
     Ok(None)
 }
 
-fn build_storage_configs_for_app(manifest: &SurgeManifest, app_id: &str) -> Result<Vec<StorageConfig>> {
-    let base = build_storage_config(manifest)?;
+fn build_storage_configs_for_app(
+    manifest_path: &Path,
+    manifest: &SurgeManifest,
+    app_id: &str,
+) -> Result<Vec<StorageConfig>> {
+    let base = build_storage_config(manifest_path, manifest, Some(app_id))?;
 
     if manifest.apps.len() <= 1 {
         return Ok(vec![base]);
@@ -434,20 +442,11 @@ fn build_storage_configs_for_app(manifest: &SurgeManifest, app_id: &str) -> Resu
     Ok(configs)
 }
 
-/// Build a storage config without credentials.
+/// Build a storage config for release listing.
 ///
-/// `list` only performs public reads so credentials are never required.
-fn build_storage_config(manifest: &SurgeManifest) -> Result<StorageConfig> {
-    let provider = super::parse_storage_provider(&manifest.storage.provider)?;
-    Ok(StorageConfig {
-        provider: Some(provider),
-        bucket: manifest.storage.bucket.clone(),
-        region: manifest.storage.region.clone(),
-        access_key: String::new(),
-        secret_key: String::new(),
-        endpoint: manifest.storage.endpoint.clone(),
-        prefix: manifest.storage.prefix.clone(),
-    })
+/// Private backends can still provide credentials via process env or `.env.surge`.
+fn build_storage_config(manifest_path: &Path, manifest: &SurgeManifest, app_id: Option<&str>) -> Result<StorageConfig> {
+    super::build_storage_config(manifest, manifest_path, app_id)
 }
 
 #[cfg(test)]
@@ -594,7 +593,8 @@ apps:
         std::fs::create_dir_all(&scoped_dir).expect("scoped dir should be created");
         std::fs::write(scoped_dir.join(RELEASES_FILE_COMPRESSED), scoped_data).expect("scoped index should be written");
 
-        let fetched = fetch_release_index_for_app(&manifest, "app-a")
+        let manifest_path = tmp.path().join("surge.yml");
+        let fetched = fetch_release_index_for_app(&manifest_path, &manifest, "app-a")
             .await
             .expect("fetch should succeed")
             .expect("index should exist");

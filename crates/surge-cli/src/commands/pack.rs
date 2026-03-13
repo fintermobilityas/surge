@@ -88,7 +88,7 @@ pub async fn execute(
     );
 
     print_stage(theme, 3, TOTAL_STAGES, "Building full/delta packages");
-    let ctx = Arc::new(configure_context(&manifest, &app_id)?);
+    let ctx = Arc::new(configure_context(manifest_path, &manifest, &app_id)?);
     let manifest_path_s = manifest_path
         .to_str()
         .ok_or_else(|| SurgeError::Config(format!("Manifest path is not valid UTF-8: {}", manifest_path.display())))?;
@@ -419,7 +419,7 @@ async fn resolve_installer_package(
         .find_app_with_target(&app_id, &rid)
         .ok_or_else(|| SurgeError::Config(format!("No target {rid} found for app {app_id}")))?;
     let default_channel = default_channel_for_app(manifest, app);
-    let storage_config = super::build_app_scoped_storage_config(manifest, &app_id)?;
+    let storage_config = super::build_app_scoped_storage_config(manifest, manifest_path, &app_id)?;
     let backend = storage::create_storage_backend(&storage_config)?;
     let index = fetch_release_index(&*backend).await?;
     if !index.app_id.is_empty() && index.app_id != app_id {
@@ -1051,8 +1051,8 @@ fn pack_build_phase_message(step_done: i32, step_count: i32) -> String {
     "Finalizing package artifacts".to_string()
 }
 
-pub(crate) fn configure_context(manifest: &SurgeManifest, app_id: &str) -> Result<Context> {
-    let ctx = super::build_app_scoped_storage_context(manifest, app_id)?;
+pub(crate) fn configure_context(manifest_path: &Path, manifest: &SurgeManifest, app_id: &str) -> Result<Context> {
+    let ctx = super::build_app_scoped_storage_context(manifest, manifest_path, app_id)?;
     let pack_policy = manifest.effective_pack_policy();
     let mut budget = ctx.resource_budget();
     let available_threads = std::thread::available_parallelism()

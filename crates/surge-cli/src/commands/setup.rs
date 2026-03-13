@@ -120,7 +120,7 @@ async fn resolve_package(dir: &Path, manifest: &InstallerManifest, install_root:
     let artifact_cache_dir = install_artifact_cache_dir(install_root);
     std::fs::create_dir_all(&artifact_cache_dir)?;
     let cached_package_path = cache_path_for_key(&artifact_cache_dir, full_filename)?;
-    let storage_config = build_storage_config_from_manifest(manifest)?;
+    let storage_config = build_storage_config_from_manifest(dir, manifest)?;
     let backend = storage::create_storage_backend(&storage_config)?;
     let index = match fetch_release_index(&*backend, manifest).await {
         Ok(index) => index,
@@ -208,8 +208,11 @@ async fn resolve_package(dir: &Path, manifest: &InstallerManifest, install_root:
     })
 }
 
-fn build_storage_config_from_manifest(manifest: &InstallerManifest) -> Result<surge_core::context::StorageConfig> {
-    surge_core::storage_config::build_storage_config_from_installer_manifest(manifest)
+fn build_storage_config_from_manifest(
+    dir: &Path,
+    manifest: &InstallerManifest,
+) -> Result<surge_core::context::StorageConfig> {
+    super::build_storage_config_from_installer_manifest(manifest, dir)
 }
 
 fn install_artifact_cache_dir(install_root: &Path) -> PathBuf {

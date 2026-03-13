@@ -37,7 +37,7 @@ pub async fn execute(
         .find_app_with_target(&app_id, &rid)
         .ok_or_else(|| SurgeError::Config(format!("No target {rid} found for app {app_id}")))?;
     let default_channel = default_channel_for_app(&manifest, app);
-    let storage_config = super::build_app_scoped_storage_config(&manifest, &app_id)?;
+    let storage_config = super::build_app_scoped_storage_config(&manifest, manifest_path, &app_id)?;
     let backend = storage::create_storage_backend(&storage_config)?;
 
     if packages_dir.exists() && !packages_dir.is_dir() {

@@ -32,6 +32,10 @@ impl UiTheme {
         self.yellow(text)
     }
 
+    pub(crate) fn error(self, text: &str) -> String {
+        self.red(text)
+    }
+
     pub(crate) fn subtle(self, text: &str) -> String {
         self.dim(text)
     }
@@ -54,6 +58,10 @@ impl UiTheme {
 
     pub(crate) fn green(self, text: &str) -> String {
         self.apply(text, "32")
+    }
+
+    pub(crate) fn red(self, text: &str) -> String {
+        self.apply(text, "31")
     }
 
     pub(crate) fn yellow(self, text: &str) -> String {

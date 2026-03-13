@@ -51,7 +51,20 @@ pub(crate) fn warn(message: &str) {
 }
 
 pub(crate) fn error(message: &str) {
-    emit(Level::Error, message);
+    emit_inner(Level::Error, message, true);
+}
+
+/// Display an error and its full cause chain.
+///
+/// The top-level error is printed on the first line. Each chained cause
+/// is printed on a subsequent line indented with "  caused by: ".
+pub(crate) fn error_chain(err: &dyn std::error::Error) {
+    emit_inner(Level::Error, &err.to_string(), true);
+    let mut source = err.source();
+    while let Some(cause) = source {
+        emit_inner(Level::Error, &format!("  caused by: {cause}"), true);
+        source = cause.source();
+    }
 }
 
 pub(crate) fn subtle(message: &str) {
@@ -113,7 +126,8 @@ fn style_message(theme: UiTheme, level: Level, message: &str) -> String {
     match level {
         Level::Info => theme.info(message),
         Level::Success => theme.success(message),
-        Level::Warn | Level::Error => theme.warning(message),
+        Level::Warn => theme.warning(message),
+        Level::Error => theme.error(message),
         Level::Subtle => theme.subtle(message),
         Level::Plain => message.to_string(),
         Level::Title => theme.title(message),

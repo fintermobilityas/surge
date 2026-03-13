@@ -446,7 +446,7 @@ fn main() -> ExitCode {
                 return match rt.block_on(commands::setup::execute(&installer_dir, false)) {
                     Ok(()) => ExitCode::SUCCESS,
                     Err(e) => {
-                        logline::error(&e.to_string());
+                        logline::error_chain(&e);
                         ExitCode::FAILURE
                     }
                 };
@@ -471,7 +471,7 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            logline::error(&e.to_string());
+            logline::error_chain(&e);
             ExitCode::FAILURE
         }
     }

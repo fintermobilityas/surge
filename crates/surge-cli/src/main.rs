@@ -234,6 +234,10 @@ enum Commands {
         #[arg(long, short = 'i')]
         installers: bool,
 
+        /// Upload generated installers to storage under installers/<filename>
+        #[arg(long, requires = "installers", conflicts_with = "package_file")]
+        upload_installers: bool,
+
         /// Write a cache-manifest file for the selected installer package and exit
         #[arg(long, requires = "installers")]
         package_file: Option<PathBuf>,
@@ -699,6 +703,7 @@ async fn run(cli: Cli) -> surge_core::error::Result<()> {
             rid,
             version,
             installers,
+            upload_installers,
             package_file,
             artifacts_dir,
             packages_dir,
@@ -712,6 +717,7 @@ async fn run(cli: Cli) -> surge_core::error::Result<()> {
                     artifacts_dir.as_deref(),
                     &packages_dir,
                     package_file.as_deref(),
+                    upload_installers,
                 )
                 .await
             } else {
@@ -795,5 +801,30 @@ mod tests {
         };
 
         assert!(err.to_string().contains("--installers"));
+    }
+
+    #[test]
+    fn restore_upload_installers_requires_installers_flag() {
+        let Err(err) = Cli::try_parse_from(["surge", "restore", "--upload-installers"]) else {
+            panic!("upload-installers should require installers mode");
+        };
+
+        assert!(err.to_string().contains("--installers"));
+    }
+
+    #[test]
+    fn restore_upload_installers_conflicts_with_package_file() {
+        let Err(err) = Cli::try_parse_from([
+            "surge",
+            "restore",
+            "--installers",
+            "--upload-installers",
+            "--package-file",
+            "packages.txt",
+        ]) else {
+            panic!("upload-installers should conflict with package-file");
+        };
+
+        assert!(err.to_string().contains("--package-file"));
     }
 }

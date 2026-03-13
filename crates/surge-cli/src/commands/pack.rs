@@ -2,12 +2,12 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
-use crate::formatters::{format_bytes, format_duration};
+use crate::formatters::{format_byte_progress, format_bytes, format_duration};
 use crate::logline;
 use crate::ui::UiTheme;
 use surge_core::archive::packer::ArchivePacker;
@@ -27,6 +27,7 @@ use surge_core::releases::restore::{
 };
 use surge_core::releases::version::compare_versions;
 use surge_core::storage::{self, StorageBackend};
+use surge_core::storage_config::build_storage_config;
 
 #[derive(Debug, Clone)]
 struct ResolvedInstallerPackage {
@@ -214,13 +215,24 @@ pub async fn execute_installers_only(
     artifacts_dir: Option<&Path>,
     output_dir: &Path,
     package_file: Option<&Path>,
+    upload_installers: bool,
 ) -> Result<()> {
     let theme = UiTheme::global();
     let started = Instant::now();
-    let total_stages = if package_file.is_some() { 4 } else { 5 };
+    let total_stages = if package_file.is_some() {
+        4
+    } else if upload_installers {
+        6
+    } else {
+        5
+    };
 
     print_stage(theme, 1, total_stages, "Resolving manifest and target");
     let manifest = SurgeManifest::from_file(manifest_path)?;
+    if upload_installers {
+        let storage_config = build_storage_config(&manifest)?;
+        super::ensure_mutating_storage_access(&storage_config, "upload installers")?;
+    }
     let (backend, index, resolved) =
         resolve_installer_package(&manifest, manifest_path, app_id, version, rid, artifacts_dir).await?;
     print_stage_done(
@@ -394,10 +406,24 @@ pub async fn execute_installers_only(
     }
 
     print_stage_done(theme, 4, total_stages, "Installer bundles created");
-    print_stage(theme, 5, total_stages, "Finalize restore-installers summary");
+    let finalize_stage = if upload_installers {
+        print_stage(theme, 5, total_stages, "Uploading installers to storage");
+        let upload_backend = build_installer_upload_backend(&manifest)?;
+        upload_installers_to_storage(&*upload_backend, &installer_paths).await?;
+        print_stage_done(theme, 5, total_stages, "Installer bundles uploaded");
+        6
+    } else {
+        5
+    };
+    print_stage(
+        theme,
+        finalize_stage,
+        total_stages,
+        "Finalize restore-installers summary",
+    );
     print_stage_done(
         theme,
-        5,
+        finalize_stage,
         total_stages,
         &format!("Completed in {}", format_duration(started.elapsed())),
     );
@@ -484,6 +510,86 @@ fn write_package_manifest(path: &Path, specs: &[RestoreArtifactSpec]) -> Result<
     }
     std::fs::write(path, manifest)?;
     Ok(())
+}
+
+fn build_installer_upload_backend(manifest: &SurgeManifest) -> Result<Box<dyn StorageBackend>> {
+    let storage_config = build_storage_config(manifest)?;
+    super::ensure_mutating_storage_access(&storage_config, "upload installers")?;
+    storage::create_storage_backend(&storage_config)
+}
+
+async fn upload_installers_to_storage(backend: &dyn StorageBackend, installer_paths: &[PathBuf]) -> Result<()> {
+    for installer_path in installer_paths {
+        let filename = installer_path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .ok_or_else(|| {
+                SurgeError::Pack(format!(
+                    "Invalid installer path (missing filename): {}",
+                    installer_path.display()
+                ))
+            })?;
+        let key = format!("installers/{filename}");
+        upload_installer_with_feedback(backend, &key, installer_path).await?;
+    }
+
+    Ok(())
+}
+
+async fn upload_installer_with_feedback(backend: &dyn StorageBackend, key: &str, source_path: &Path) -> Result<u64> {
+    let total_bytes = std::fs::metadata(source_path)?.len();
+    logline::subtle(&format!("  Uploading installer {key} ({})", format_bytes(total_bytes)));
+
+    let started = Instant::now();
+    let upload_running = Arc::new(AtomicBool::new(true));
+    let bytes_done = Arc::new(AtomicU64::new(0));
+
+    let upload_running_for_heartbeat = Arc::clone(&upload_running);
+    let bytes_done_for_heartbeat = Arc::clone(&bytes_done);
+    let key_for_heartbeat = key.to_string();
+    let heartbeat = thread::spawn(move || {
+        while upload_running_for_heartbeat.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_secs(5));
+            if !upload_running_for_heartbeat.load(Ordering::Relaxed) {
+                break;
+            }
+
+            let uploaded = bytes_done_for_heartbeat.load(Ordering::Relaxed).min(total_bytes);
+            let progress = if uploaded == 0 {
+                format!(
+                    "uploaded 0 B / {} (elapsed {})",
+                    format_bytes(total_bytes),
+                    format_duration(started.elapsed())
+                )
+            } else {
+                format!(
+                    "{} (elapsed {})",
+                    format_byte_progress(uploaded, total_bytes, "uploaded"),
+                    format_duration(started.elapsed())
+                )
+            };
+            logline::subtle(&format!("      {key_for_heartbeat}: {progress}"));
+        }
+    });
+
+    let bytes_done_for_progress = Arc::clone(&bytes_done);
+    let progress = move |done: u64, _total: u64| {
+        bytes_done_for_progress.store(done.min(total_bytes), Ordering::Relaxed);
+    };
+
+    let upload_result = backend.upload_from_file(key, source_path, Some(&progress)).await;
+    bytes_done.store(total_bytes, Ordering::Relaxed);
+    upload_running.store(false, Ordering::Relaxed);
+    let _ = heartbeat.join();
+    upload_result?;
+
+    logline::subtle(&format!(
+        "      {key}: {} in {}",
+        format_byte_progress(total_bytes, total_bytes, "uploaded"),
+        format_duration(started.elapsed())
+    ));
+
+    Ok(total_bytes)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1210,6 +1316,7 @@ apps:
             Some(&artifacts_dir),
             &packages_dir,
             None,
+            false,
         )
         .await
         .expect("installer generation should succeed");
@@ -1320,6 +1427,7 @@ apps:
             None,
             &packages_dir,
             None,
+            false,
         )
         .await
         .expect("installer generation should succeed");
@@ -1377,6 +1485,7 @@ apps:
             None,
             &packages_dir,
             Some(&package_file),
+            false,
         )
         .await
         .expect("package manifest generation should succeed");
@@ -1460,6 +1569,7 @@ apps:
             None,
             &packages_dir,
             Some(&package_file),
+            false,
         )
         .await
         .expect("package manifest generation should succeed");
@@ -1477,6 +1587,67 @@ apps:
         assert!(
             !packages_dir.join(&latest_full).exists(),
             "package manifest generation should not reconstruct the full package"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_installers_only_uploads_installers_to_storage() {
+        let tmp = tempfile::tempdir().expect("temp dir should be created");
+
+        let store_dir = tmp.path().join("store");
+        let artifacts_dir = tmp.path().join("artifacts");
+        let packages_dir = tmp.path().join("packages");
+        let manifest_path = tmp.path().join("surge.yml");
+        let app_id = "installer-app";
+        let rid = current_rid();
+        let version = "2.3.0";
+        let stub = create_stub_installer_launcher(tmp.path(), &rid);
+        set_installer_launcher_override(&stub);
+
+        std::fs::create_dir_all(&store_dir).expect("store dir should be created");
+        std::fs::create_dir_all(&artifacts_dir).expect("artifacts dir should be created");
+        std::fs::create_dir_all(&packages_dir).expect("packages dir should be created");
+        std::fs::write(artifacts_dir.join("icon.png"), b"icon").expect("icon should be written");
+        write_manifest(&manifest_path, &store_dir, app_id, &rid);
+
+        let full_name = format!("{app_id}-{version}-{rid}-full.tar.zst");
+        write_release_index(
+            &store_dir,
+            app_id,
+            vec![make_release(
+                version,
+                "stable",
+                &rid,
+                &full_name,
+                &sha256_hex(b"full package bytes"),
+            )],
+        );
+        std::fs::write(packages_dir.join(&full_name), b"full package bytes").expect("full package should be written");
+
+        execute_installers_only(
+            &manifest_path,
+            Some(app_id),
+            Some(version),
+            Some(&rid),
+            Some(&artifacts_dir),
+            &packages_dir,
+            None,
+            true,
+        )
+        .await
+        .expect("installer generation and upload should succeed");
+
+        let installer_ext = if rid.starts_with("win-") { "exe" } else { "bin" };
+        let online_name = format!("Setup-{rid}-{app_id}-stable-online.{installer_ext}");
+        let offline_name = format!("Setup-{rid}-{app_id}-stable-offline.{installer_ext}");
+
+        assert!(
+            store_dir.join("installers").join(&online_name).is_file(),
+            "online installer should be uploaded to the flat installers/ path"
+        );
+        assert!(
+            store_dir.join("installers").join(&offline_name).is_file(),
+            "offline installer should be uploaded to the flat installers/ path"
         );
     }
 

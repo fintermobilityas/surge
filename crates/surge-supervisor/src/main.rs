@@ -385,15 +385,13 @@ fn install_signal_handlers() -> std::sync::Arc<std::sync::atomic::AtomicBool> {
         let _ = sigset.thread_block();
 
         let shutdown_clone = shutdown.clone();
-        std::thread::spawn(move || {
-            match sigset.wait() {
-                Ok(sig) => {
-                    tracing::info!("Received signal: {sig}");
-                    shutdown_clone.store(true, std::sync::atomic::Ordering::Release);
-                }
-                Err(e) => {
-                    tracing::error!("Signal wait error: {e}");
-                }
+        std::thread::spawn(move || match sigset.wait() {
+            Ok(sig) => {
+                tracing::info!("Received signal: {sig}");
+                shutdown_clone.store(true, std::sync::atomic::Ordering::Release);
+            }
+            Err(e) => {
+                tracing::error!("Signal wait error: {e}");
             }
         });
     }

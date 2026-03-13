@@ -375,9 +375,8 @@ impl SurgeManifest {
     }
 
     pub fn from_file(path: &Path) -> Result<Self> {
-        let data = std::fs::read(path).map_err(|e| {
-            SurgeError::Config(format!("Failed to read manifest '{}': {e}", path.display()))
-        })?;
+        let data = std::fs::read(path)
+            .map_err(|e| SurgeError::Config(format!("Failed to read manifest '{}': {e}", path.display())))?;
         Self::parse(&data)
     }
 

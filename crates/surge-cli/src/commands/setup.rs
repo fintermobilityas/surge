@@ -1,5 +1,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use crate::logline;
 use surge_core::config::constants::RELEASES_FILE_COMPRESSED;
@@ -10,9 +12,99 @@ use surge_core::platform::paths::default_install_root;
 use surge_core::releases::artifact_cache::{cache_path_for_key, cached_artifact_matches, prune_cached_artifacts};
 use surge_core::releases::manifest::{ReleaseEntry, ReleaseIndex, decompress_release_index};
 use surge_core::releases::restore::{
-    RestoreOptions, required_artifacts_for_index, restore_full_archive_for_version_with_options,
+    RestoreOptions, RestoreProgress, required_artifacts_for_index, restore_full_archive_for_version_with_options,
 };
 use surge_core::storage::{self, StorageBackend};
+
+const PACKAGE_PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(10);
+const PACKAGE_PROGRESS_PERCENT_STEP: u64 = 10;
+
+#[derive(Debug)]
+struct ProgressReporter {
+    label: &'static str,
+    last_logged_at: Instant,
+    last_value: u64,
+    next_percent: u64,
+}
+
+impl ProgressReporter {
+    fn new(label: &'static str) -> Self {
+        Self {
+            label,
+            last_logged_at: Instant::now(),
+            last_value: 0,
+            next_percent: PACKAGE_PROGRESS_PERCENT_STEP,
+        }
+    }
+
+    fn observe_bytes(&mut self, done: u64, total: u64) -> Option<String> {
+        self.observe_bytes_at(Instant::now(), done, total)
+    }
+
+    fn observe_bytes_at(&mut self, now: Instant, done: u64, total: u64) -> Option<String> {
+        let total = total.max(done);
+        let percent = percent(done, total);
+        let crossed_percent = total > 0 && percent >= self.next_percent;
+        let timed_out =
+            now.duration_since(self.last_logged_at) >= PACKAGE_PROGRESS_LOG_INTERVAL && done > self.last_value;
+        let finished = total > 0 && done >= total && done > self.last_value;
+
+        if !crossed_percent && !timed_out && !finished {
+            return None;
+        }
+
+        self.last_logged_at = now;
+        self.last_value = done;
+        while self.next_percent <= percent && self.next_percent <= 100 {
+            self.next_percent = self.next_percent.saturating_add(PACKAGE_PROGRESS_PERCENT_STEP);
+        }
+
+        Some(format!(
+            "{} {} / {} ({}%)",
+            self.label,
+            crate::formatters::format_bytes(done),
+            crate::formatters::format_bytes(total),
+            percent
+        ))
+    }
+
+    fn observe_restore(&mut self, progress: RestoreProgress) -> Option<String> {
+        let bytes_total = u64::try_from(progress.bytes_total.max(0)).unwrap_or(0);
+        let bytes_done = u64::try_from(progress.bytes_done.max(0)).unwrap_or(0);
+        if bytes_total > 0 {
+            return self.observe_bytes(bytes_done, bytes_total);
+        }
+
+        let items_total = u64::try_from(progress.items_total.max(0)).unwrap_or(0);
+        let items_done = u64::try_from(progress.items_done.max(0)).unwrap_or(0);
+        let percent = percent(items_done, items_total);
+        let now = Instant::now();
+        let crossed_percent = items_total > 0 && percent >= self.next_percent;
+        let timed_out =
+            now.duration_since(self.last_logged_at) >= PACKAGE_PROGRESS_LOG_INTERVAL && items_done > self.last_value;
+        let finished = items_total > 0 && items_done >= items_total && items_done > self.last_value;
+
+        if !crossed_percent && !timed_out && !finished {
+            return None;
+        }
+
+        self.last_logged_at = now;
+        self.last_value = items_done;
+        while self.next_percent <= percent && self.next_percent <= 100 {
+            self.next_percent = self.next_percent.saturating_add(PACKAGE_PROGRESS_PERCENT_STEP);
+        }
+
+        Some(format!("{} step {items_done}/{items_total} ({}%)", self.label, percent))
+    }
+}
+
+fn percent(done: u64, total: u64) -> u64 {
+    if total == 0 {
+        return 0;
+    }
+
+    done.saturating_mul(100).saturating_div(total).min(100)
+}
 
 /// Execute setup from an extracted installer directory.
 ///
@@ -152,9 +244,8 @@ async fn resolve_package(dir: &Path, manifest: &InstallerManifest, install_root:
             });
         }
 
-        logline::info(&format!(
-            "Resolving package '{full_filename}' via artifact cache and release graph"
-        ));
+        logline::info(&format!("Preparing package '{full_filename}' in artifact cache"));
+        let progress = Mutex::new(ProgressReporter::new("Preparing package..."));
         let restored = restore_full_archive_for_version_with_options(
             &*backend,
             index,
@@ -162,7 +253,12 @@ async fn resolve_package(dir: &Path, manifest: &InstallerManifest, install_root:
             &manifest.version,
             RestoreOptions {
                 cache_dir: Some(&artifact_cache_dir),
-                progress: None,
+                progress: Some(&|update| {
+                    let mut reporter = progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if let Some(message) = reporter.observe_restore(update) {
+                        logline::subtle(&message);
+                    }
+                }),
             },
         )
         .await?;
@@ -191,9 +287,19 @@ async fn resolve_package(dir: &Path, manifest: &InstallerManifest, install_root:
     }
 
     logline::info(&format!("Downloading package '{full_filename}' into artifact cache"));
+    let progress = Mutex::new(ProgressReporter::new("Downloading package..."));
 
     backend
-        .download_to_file(full_filename, &cached_package_path, None)
+        .download_to_file(
+            full_filename,
+            &cached_package_path,
+            Some(&|done, total| {
+                let mut reporter = progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(message) = reporter.observe_bytes(done, total) {
+                    logline::subtle(&message);
+                }
+            }),
+        )
         .await?;
 
     logline::success(&format!(
@@ -414,6 +520,35 @@ mod tests {
         };
         let compressed = compress_release_index(&index, 3).expect("release index");
         std::fs::write(store_root.join(RELEASES_FILE_COMPRESSED), compressed).expect("write release index");
+    }
+
+    #[test]
+    fn progress_reporter_logs_each_percent_bucket_once() {
+        let base = Instant::now();
+        let mut reporter = ProgressReporter::new("Preparing package...");
+
+        assert!(reporter.observe_bytes_at(base, 9, 100).is_none());
+        assert_eq!(
+            reporter.observe_bytes_at(base, 10, 100),
+            Some("Preparing package... 10 B / 100 B (10%)".to_string())
+        );
+        assert!(reporter.observe_bytes_at(base, 19, 100).is_none());
+        assert_eq!(
+            reporter.observe_bytes_at(base, 20, 100),
+            Some("Preparing package... 20 B / 100 B (20%)".to_string())
+        );
+    }
+
+    #[test]
+    fn progress_reporter_emits_time_based_update_between_percent_buckets() {
+        let base = Instant::now();
+        let mut reporter = ProgressReporter::new("Downloading package...");
+
+        assert!(reporter.observe_bytes_at(base, 5, 100).is_none());
+        assert_eq!(
+            reporter.observe_bytes_at(base + PACKAGE_PROGRESS_LOG_INTERVAL + Duration::from_millis(1), 6, 100),
+            Some("Downloading package... 6 B / 100 B (6%)".to_string())
+        );
     }
 
     #[tokio::test]

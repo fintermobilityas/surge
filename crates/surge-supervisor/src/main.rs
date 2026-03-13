@@ -371,13 +371,21 @@ fn install_signal_handlers() -> std::sync::Arc<std::sync::atomic::AtomicBool> {
 
     #[cfg(unix)]
     {
+        use nix::sys::signal::{SigSet, Signal};
+
+        // Block SIGTERM/SIGINT on the main thread *before* spawning the
+        // handler thread. Spawned threads inherit the signal mask, so these
+        // signals will be blocked process-wide and can only be consumed by
+        // sigwait() in the handler thread. Without this, SIGTERM hits the
+        // main thread's default handler, killing the process before PID-file
+        // cleanup runs.
+        let mut sigset = SigSet::empty();
+        sigset.add(Signal::SIGTERM);
+        sigset.add(Signal::SIGINT);
+        let _ = sigset.thread_block();
+
         let shutdown_clone = shutdown.clone();
         std::thread::spawn(move || {
-            use nix::sys::signal::{SigSet, Signal};
-            let mut sigset = SigSet::empty();
-            sigset.add(Signal::SIGTERM);
-            sigset.add(Signal::SIGINT);
-            let _ = sigset.thread_block();
             match sigset.wait() {
                 Ok(sig) => {
                     tracing::info!("Received signal: {sig}");

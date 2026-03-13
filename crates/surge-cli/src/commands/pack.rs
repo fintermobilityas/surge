@@ -1855,7 +1855,7 @@ apps:
         std::fs::create_dir_all(&artifacts_dir).expect("artifacts dir should be created");
         std::fs::create_dir_all(&output_dir).expect("packages dir should be created");
 
-        let icon_path = manifest_root.join("youpark.svg");
+        let icon_path = manifest_root.join("sample-icon.svg");
         std::fs::write(&icon_path, b"<svg></svg>").expect("icon should be written");
 
         let full_package = output_dir.join(format!("{app_id}-{version}-{rid}-full.tar.zst"));
@@ -1872,7 +1872,7 @@ apps:
     channels: [stable]
     target:
       rid: {rid}
-      icon: .surge/youpark.svg
+      icon: .surge/sample-icon.svg
       installers: [online]
 ",
             store_dir.display(),
@@ -1905,7 +1905,7 @@ apps:
         assert!(
             entries
                 .iter()
-                .any(|entry| entry.path.to_string_lossy() == "assets/youpark.svg"),
+                .any(|entry| entry.path.to_string_lossy() == "assets/sample-icon.svg"),
             "installer payload should contain icon asset copied from manifest-relative path"
         );
     }

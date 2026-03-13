@@ -149,8 +149,8 @@ pub(crate) fn resolve_rid(manifest: &SurgeManifest, app_id: &str, requested: Opt
 ///
 /// Uses structured data from the manifest (target distro, rid, variant) to
 /// produce labels like:
-///   `youpark · linux/x64 · ubuntu 24.04 · cpu`
-///   `youpark · linux/arm64 · jetpack 5.0`
+///   `sampleapp · linux/x64 · ubuntu 24.04 · cpu`
+///   `sampleapp · linux/arm64 · jetpack 5.0`
 pub(crate) fn format_app_label(manifest: &SurgeManifest, app_id: &str) -> String {
     let app = manifest.apps.iter().find(|a| a.id == app_id);
     let name = app.map(AppConfig::effective_name).unwrap_or_default();
@@ -243,8 +243,8 @@ mod tests {
 storage: { provider: filesystem, bucket: /tmp }
 channels: [{ name: stable }]
 apps:
-  - id: youpark
-    name: youpark
+  - id: sampleapp
+    name: sampleapp
     targets:
       - rid: linux-x64
         distro: ubuntu24.04
@@ -254,8 +254,8 @@ apps:
         variant: cuda
 ",
         );
-        let label = format_app_label(&m, "youpark-ubuntu24.04-linux-x64-cpu");
-        assert_eq!(label, "youpark · linux/x64 · ubuntu24.04 · cpu");
+        let label = format_app_label(&m, "sampleapp-ubuntu24.04-linux-x64-cpu");
+        assert_eq!(label, "sampleapp · linux/x64 · ubuntu24.04 · cpu");
     }
 
     #[test]
@@ -265,8 +265,8 @@ apps:
 storage: { provider: filesystem, bucket: /tmp }
 channels: [{ name: stable }]
 apps:
-  - id: youpark
-    name: youpark
+  - id: sampleapp
+    name: sampleapp
     targets:
       - rid: linux-arm64
         distro: jetpack5.0
@@ -274,8 +274,8 @@ apps:
         distro: jetpack4.6
 ",
         );
-        let label = format_app_label(&m, "youpark-jetpack5.0-linux-arm64");
-        assert_eq!(label, "youpark · linux/arm64 · jetpack5.0");
+        let label = format_app_label(&m, "sampleapp-jetpack5.0-linux-arm64");
+        assert_eq!(label, "sampleapp · linux/arm64 · jetpack5.0");
     }
 
     #[test]

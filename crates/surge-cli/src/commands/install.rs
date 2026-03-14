@@ -274,7 +274,7 @@ pub async fn execute(
             }
         }
         InstallTarget::Tailscale { .. } => {
-            let (selected_rid, note) = if let Some(requested_rid) = selected_rid_input {
+            let (selected_rid, rid_resolution_note) = if let Some(requested_rid) = selected_rid_input {
                 (requested_rid.to_string(), None)
             } else if let Some(manifest) = manifest.as_ref() {
                 (super::resolve_rid(manifest, &app_id, None)?, None)
@@ -282,7 +282,7 @@ pub async fn execute(
                 resolve_tailscale_rid_without_manifest(selected_rid_input, &index)?
             };
             ensure_supported_tailscale_rid(&selected_rid)?;
-            (vec![selected_rid], None, note)
+            (vec![selected_rid], None, rid_resolution_note)
         }
     };
     if let Some(note) = rid_note {

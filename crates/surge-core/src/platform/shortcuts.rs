@@ -359,7 +359,7 @@ fn build_desktop_entry_linux(
     let icon = escape_desktop_value(&icon_path.to_string_lossy());
     let working_dir = escape_desktop_value(&install_root.to_string_lossy());
     let exe = escape_desktop_value(&exe_path.to_string_lossy());
-    let exec_line = build_exec_line_linux(format!("\"{exe}\""), environment);
+    let exec_line = build_exec_line_linux(&format!("\"{exe}\""), environment);
 
     format!(
         "[Desktop Entry]\nType=Application\nVersion=1.0\nName={display_name}\n{exec_line}\nIcon={icon}\nPath={working_dir}\nTerminal=false\n"
@@ -388,14 +388,14 @@ fn build_startup_entry_linux(
         let sid = escape_desktop_value(supervisor_id);
         format!("\"{sup}\" run --id {sid} --dir \"{root}\" --exe \"{exe}\"")
     };
-    let exec_line = build_exec_line_linux(exec_command, environment);
+    let exec_line = build_exec_line_linux(&exec_command, environment);
 
     format!(
         "[Desktop Entry]\nType=Application\nVersion=1.0\nName={display_name}\n{exec_line}\nIcon={icon}\nTerminal=false\n"
     )
 }
 
-fn build_exec_line_linux(command: String, environment: &BTreeMap<String, String>) -> String {
+fn build_exec_line_linux(command: &str, environment: &BTreeMap<String, String>) -> String {
     if environment.is_empty() {
         format!("Exec={command}")
     } else {

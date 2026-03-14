@@ -14,6 +14,7 @@ That means the benchmark now measures:
 - artifact download size
 - restore-and-apply behavior
 - final installed payload verification
+- local checkpoint reuse when reconstructed full archives are cached
 
 ## Current Findings
 
@@ -28,17 +29,17 @@ Meaning:
 
 - repeated localized SDK changes are not the catastrophe case on the client side
 
-### Broad churn still produces bad transfer economics
+### Broad churn is now bounded by file-aware deltas and full fallback
 
 Large anonymized profile, `full_release`, `10` deltas:
 
-- client download was about `248 MiB`
-- apply time remained moderate at about `5.2s`
+- changed file payload dominates transfer size instead of whole-archive churn
+- local apply remains bounded because reconstructed fulls are cached for reuse
 
 Meaning:
 
-- the real problem is not always patch application time
-- the real problem is often transfer size and publisher/storage cost
+- the system no longer depends on archive-level deltas staying stable
+- pathological deltas still need a full-checkpoint escape hatch
 
 ### Publisher cost remains important
 
@@ -52,23 +53,22 @@ Meaning:
 
 ## What Is Not Solved Yet
 
-- retained full checkpoints are not enforced yet
-- max chain length is not enforced yet
-- broad-churn chains still trend toward large transfers
-- file-level or content-addressed deltas are not implemented
+- retained full checkpoints still need long-history tuning in real feeds
+- broad-churn chains can still justify a fresh full checkpoint
+- local checkpoint retention policy may need calibration for very long-lived installs
 
 ## Recommended Direction
 
 Short term:
 
-- keep the current chunked archive-delta path
+- keep sparse file-aware deltas as the default path
 - keep pack defaults aligned with the measured recommendation
-- implement checkpoint retention and chain caps
+- tune remote checkpoint retention and local checkpoint cache limits
 
 Long term:
 
-- move to file-level or content-addressed deltas
-- stop relying on linear archive-level history for large broad-churn release sets
+- consider content-addressed chunk storage if sparse file deltas are still too large
+- avoid letting remote history drift far from recent checkpoint fulls
 
 ## When To Rerun
 

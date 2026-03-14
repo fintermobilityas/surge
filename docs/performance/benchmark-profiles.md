@@ -23,9 +23,9 @@ Represents broad churn:
 
 Use this when measuring:
 
-- worst-case or near-worst-case archive churn
+- worst-case or near-worst-case file churn
 - pack throughput under broad changes
-- how quickly archive-level deltas degrade toward full-size transfers
+- when sparse file-aware deltas should fall back to a full checkpoint
 
 ### `sdk_only`
 
@@ -103,8 +103,8 @@ Recommended CI benchmark coverage:
 
 This combination tracks:
 
-- archive/pack drift
-- chunked diff drift
+- sparse-delta pack drift
+- per-file diff drift
 - real updater drift for long localized chains
 - real updater drift for broad-churn chains
 

@@ -184,9 +184,9 @@ enum Commands {
         #[arg(long)]
         rid: Option<String>,
 
-        /// Channel to compact
-        #[arg(long, default_value = "stable")]
-        channel: String,
+        /// Channel to compact (auto-selected only when exactly one channel exists)
+        #[arg(long)]
+        channel: Option<String>,
     },
 
     /// Manage distributed locks
@@ -660,7 +660,7 @@ async fn run(cli: Cli) -> surge_core::error::Result<()> {
         } => commands::demote::execute(&manifest_path, app_id.as_deref(), &version, rid.as_deref(), &channel).await,
 
         Commands::Compact { app_id, rid, channel } => {
-            commands::compact::execute(&manifest_path, app_id.as_deref(), rid.as_deref(), &channel).await
+            commands::compact::execute(&manifest_path, app_id.as_deref(), rid.as_deref(), channel.as_deref()).await
         }
 
         Commands::List { app_id, rid, channel } => {

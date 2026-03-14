@@ -16,8 +16,14 @@ use surge_core::storage::{self, StorageBackend};
 /// Compact a channel to a single latest full release and prune stale artifacts.
 ///
 /// When `app_id` and `rid` are omitted, iterates over every app and target in the manifest.
-pub async fn execute(manifest_path: &Path, app_id: Option<&str>, rid: Option<&str>, channel: &str) -> Result<()> {
+pub async fn execute(
+    manifest_path: &Path,
+    app_id: Option<&str>,
+    rid: Option<&str>,
+    channel: Option<&str>,
+) -> Result<()> {
     let manifest = SurgeManifest::from_file(manifest_path)?;
+    let requested_channel = channel.map(str::trim).filter(|value| !value.is_empty());
 
     let targets: Vec<(String, String)> = if let Some(app_id) = app_id {
         let app_id = app_id.to_string();
@@ -59,12 +65,18 @@ pub async fn execute(manifest_path: &Path, app_id: Option<&str>, rid: Option<&st
     }
 
     let total_targets = prepared_targets.len();
-    logline::info(&format!("Compacting {total_targets} target(s) on channel '{channel}'"));
+    if let Some(channel) = requested_channel {
+        logline::info(&format!("Compacting {total_targets} target(s) on channel '{channel}'"));
+    } else {
+        logline::info(&format!(
+            "Compacting {total_targets} target(s) with auto-discovered channel selection"
+        ));
+    }
     logline::plain("");
 
     let mut errors = Vec::new();
     for (app_id, rid, storage_config) in &prepared_targets {
-        if let Err(e) = compact_single(app_id, rid, channel, storage_config).await {
+        if let Err(e) = compact_single(app_id, rid, requested_channel, storage_config).await {
             logline::warn(&format!("  Failed {app_id}/{rid}: {e}"));
             errors.push(format!("{app_id}/{rid}: {e}"));
         }
@@ -86,10 +98,10 @@ pub async fn execute(manifest_path: &Path, app_id: Option<&str>, rid: Option<&st
 async fn compact_single(
     app_id: &str,
     rid: &str,
-    channel: &str,
+    requested_channel: Option<&str>,
     storage_config: &surge_core::context::StorageConfig,
 ) -> Result<()> {
-    const TOTAL_STAGES: usize = 5;
+    const TOTAL_STAGES: usize = 6;
 
     let theme = UiTheme::global();
     let started = Instant::now();
@@ -107,26 +119,38 @@ async fn compact_single(
     };
     let total_before = index.releases.len();
 
-    print_stage(theme, 2, TOTAL_STAGES, "Finding latest release");
-    let channel_name = channel.to_string();
+    print_stage(theme, 2, TOTAL_STAGES, "Resolving channel");
+    let Some(resolved_channel) = resolve_compact_channel(app_id, rid, &index, requested_channel)? else {
+        print_stage_done(theme, 2, TOTAL_STAGES, "No channels found for target, skipped");
+        return Ok(());
+    };
+    let channel = resolved_channel.name;
+    print_stage_done(theme, 2, TOTAL_STAGES, &resolved_channel.note);
+
+    print_stage(
+        theme,
+        3,
+        TOTAL_STAGES,
+        &format!("Finding latest release on '{channel}'"),
+    );
     let latest_version = index
         .releases
         .iter()
-        .filter(|r| r.rid == rid && r.channels.contains(&channel_name))
+        .filter(|r| r.rid == rid && r.channels.iter().any(|existing| existing == &channel))
         .max_by(|a, b| compare_versions(&a.version, &b.version))
         .map(|r| r.version.clone());
 
     let Some(latest_version) = latest_version else {
-        print_stage_done(theme, 2, TOTAL_STAGES, &format!("No releases on '{channel}', skipped"));
+        print_stage_done(theme, 3, TOTAL_STAGES, &format!("No releases on '{channel}', skipped"));
         return Ok(());
     };
-    print_stage_done(theme, 2, TOTAL_STAGES, &format!("v{latest_version}"));
+    print_stage_done(theme, 3, TOTAL_STAGES, &format!("v{latest_version}"));
 
-    print_stage(theme, 3, TOTAL_STAGES, "Ensuring latest full artifact exists");
+    print_stage(theme, 4, TOTAL_STAGES, "Ensuring latest full artifact exists");
     let full_materialized = ensure_release_full_artifact(&*backend, &index, rid, &latest_version).await?;
     print_stage_done(
         theme,
-        3,
+        4,
         TOTAL_STAGES,
         if full_materialized {
             "Rebuilt and uploaded latest full artifact"
@@ -137,26 +161,27 @@ async fn compact_single(
 
     print_stage(
         theme,
-        4,
+        5,
         TOTAL_STAGES,
         "Pruning compacted channel history and stale artifacts",
     );
     let stale_filenames = referenced_artifacts(&index);
+    let channel_name = channel.as_str();
     let releases_on_channel_before = index
         .releases
         .iter()
-        .filter(|release| release.rid == rid && release.channels.iter().any(|existing| existing == channel))
+        .filter(|release| release.rid == rid && release.channels.iter().any(|existing| existing == channel_name))
         .count();
 
     for release in &mut index.releases {
-        if release.rid != rid || !release.channels.iter().any(|existing| existing == channel) {
+        if release.rid != rid || !release.channels.iter().any(|existing| existing == channel_name) {
             continue;
         }
 
         if release.version == latest_version {
             release.set_primary_delta(None);
         } else {
-            release.channels.retain(|existing| existing != channel);
+            release.channels.retain(|existing| existing != channel_name);
         }
     }
     index
@@ -190,7 +215,7 @@ async fn compact_single(
     let removed = total_before - index.releases.len();
     print_stage_done(
         theme,
-        4,
+        5,
         TOTAL_STAGES,
         &format!(
             "Pruned {older} older '{channel}' release(s), removed {removed} release row(s), deleted {deleted} artifact(s)",
@@ -200,14 +225,70 @@ async fn compact_single(
 
     print_stage_done(
         theme,
-        5,
+        6,
         TOTAL_STAGES,
         &format!(
-            "Compacted to v{latest_version} (full only) in {}",
+            "Compacted channel '{channel}' to v{latest_version} (full only) in {}",
             format_duration(started.elapsed())
         ),
     );
     Ok(())
+}
+
+struct ResolvedCompactChannel {
+    name: String,
+    note: String,
+}
+
+fn resolve_compact_channel(
+    app_id: &str,
+    rid: &str,
+    index: &surge_core::releases::manifest::ReleaseIndex,
+    requested_channel: Option<&str>,
+) -> Result<Option<ResolvedCompactChannel>> {
+    let available_channels = collect_available_channels_for_rid(index, rid);
+
+    if let Some(channel) = requested_channel {
+        if available_channels.is_empty() || available_channels.iter().any(|existing| existing == channel) {
+            return Ok(Some(ResolvedCompactChannel {
+                name: channel.to_string(),
+                note: format!("Using requested channel '{channel}'"),
+            }));
+        }
+
+        return Err(SurgeError::Config(format!(
+            "Channel '{channel}' is not available for target {app_id}/{rid}. Available channels: {}.",
+            available_channels.join(", ")
+        )));
+    }
+
+    match available_channels.as_slice() {
+        [] => Ok(None),
+        [channel] => Ok(Some(ResolvedCompactChannel {
+            name: channel.clone(),
+            note: format!("Available channels: {channel}. Selected '{channel}' automatically."),
+        })),
+        _ => Err(SurgeError::Config(format!(
+            "Multiple channels available for target {app_id}/{rid}: {}. Specify --channel <name> to choose.",
+            available_channels.join(", ")
+        ))),
+    }
+}
+
+fn collect_available_channels_for_rid(index: &surge_core::releases::manifest::ReleaseIndex, rid: &str) -> Vec<String> {
+    let mut channels = BTreeSet::new();
+    for release in &index.releases {
+        if release.rid != rid {
+            continue;
+        }
+        for channel in &release.channels {
+            let trimmed = channel.trim();
+            if !trimmed.is_empty() {
+                channels.insert(trimmed.to_string());
+            }
+        }
+    }
+    channels.into_iter().collect()
 }
 
 fn print_stage(theme: UiTheme, stage: usize, total: usize, text: &str) {
@@ -377,7 +458,7 @@ apps:
             vec![v1.clone(), v2, v3.clone()],
         );
 
-        execute(&manifest_path, Some(app_id), Some(&rid), "stable")
+        execute(&manifest_path, Some(app_id), Some(&rid), Some("stable"))
             .await
             .unwrap();
 
@@ -463,7 +544,7 @@ apps:
             vec![v1.clone(), v2, v3, v4.clone(), v5, v6.clone()],
         );
 
-        execute(&manifest_path, Some(app_id), Some(&rid), "stable")
+        execute(&manifest_path, Some(app_id), Some(&rid), Some("stable"))
             .await
             .unwrap();
 
@@ -479,5 +560,78 @@ apps:
         assert!(!store_dir.join(&v3_delta_key).exists());
         assert!(!store_dir.join(&v4.full_filename).exists());
         assert!(!store_dir.join(&v5_delta_key).exists());
+    }
+
+    #[tokio::test]
+    async fn compact_auto_selects_single_available_channel_when_channel_omitted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_dir = tmp.path().join("store");
+        let manifest_path = tmp.path().join("surge.yml");
+        let rid = current_rid();
+        let app_id = "compact-app";
+        std::fs::create_dir_all(&store_dir).unwrap();
+        write_manifest(&manifest_path, &store_dir, app_id, &rid);
+
+        let full_v1 = b"full-v1".to_vec();
+        let full_v2 = b"full-v2".to_vec();
+        let delta_v2 = zstd::encode_all(bsdiff_buffers(&full_v1, &full_v2).unwrap().as_slice(), 3).unwrap();
+
+        let mut v1 = make_release("1.0.0", &rid, &full_v1);
+        v1.channels = vec!["test".to_string()];
+        v1.set_primary_delta(None);
+
+        let mut v2 = make_release("1.1.0", &rid, &full_v2);
+        v2.channels = vec!["test".to_string()];
+        let v2_delta_key = format!("{app_id}-1.1.0-{rid}-delta.tar.zst");
+        v2.set_primary_delta(Some(DeltaArtifact::bsdiff_zstd(
+            "primary",
+            "1.0.0",
+            &v2_delta_key,
+            i64::try_from(delta_v2.len()).unwrap(),
+            &sha256_hex(&delta_v2),
+        )));
+
+        std::fs::write(store_dir.join(&v1.full_filename), &full_v1).unwrap();
+        std::fs::write(store_dir.join(&v2_delta_key), &delta_v2).unwrap();
+        write_index(&store_dir.join(RELEASES_FILE_COMPRESSED), vec![v1, v2.clone()]);
+
+        execute(&manifest_path, Some(app_id), Some(&rid), None).await.unwrap();
+
+        let compacted =
+            decompress_release_index(&std::fs::read(store_dir.join(RELEASES_FILE_COMPRESSED)).unwrap()).unwrap();
+        assert_eq!(compacted.releases.len(), 1);
+        assert_eq!(compacted.releases[0].version, "1.1.0");
+        assert_eq!(compacted.releases[0].channels, vec!["test".to_string()]);
+        assert!(compacted.releases[0].selected_delta().is_none());
+        assert_eq!(std::fs::read(store_dir.join(&v2.full_filename)).unwrap(), full_v2);
+    }
+
+    #[tokio::test]
+    async fn compact_requires_explicit_channel_when_multiple_channels_exist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_dir = tmp.path().join("store");
+        let manifest_path = tmp.path().join("surge.yml");
+        let rid = current_rid();
+        let app_id = "compact-app";
+        std::fs::create_dir_all(&store_dir).unwrap();
+        write_manifest(&manifest_path, &store_dir, app_id, &rid);
+
+        let mut stable = make_release("1.0.0", &rid, b"stable-release");
+        stable.channels = vec!["stable".to_string()];
+
+        let mut test = make_release("1.1.0", &rid, b"test-release");
+        test.channels = vec!["test".to_string()];
+
+        std::fs::write(store_dir.join(&stable.full_filename), b"stable-release").unwrap();
+        std::fs::write(store_dir.join(&test.full_filename), b"test-release").unwrap();
+        write_index(&store_dir.join(RELEASES_FILE_COMPRESSED), vec![stable, test]);
+
+        let err = execute(&manifest_path, Some(app_id), Some(&rid), None)
+            .await
+            .unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("Multiple channels available"));
+        assert!(message.contains("stable, test"));
     }
 }

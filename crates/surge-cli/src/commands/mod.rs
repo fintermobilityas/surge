@@ -941,7 +941,7 @@ apps:
             "delta artifact should be present before compaction"
         );
 
-        super::compact::execute(&manifest_path, Some(app_id), Some(&rid), "test")
+        super::compact::execute(&manifest_path, Some(app_id), Some(&rid), Some("test"))
             .await
             .unwrap();
 

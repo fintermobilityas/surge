@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1773386430112,
+  "lastUpdate": 1773471439770,
   "repoUrl": "https://github.com/fintermobilityas/surge",
   "entries": {
     "Surge Update (localized-chain)": [
@@ -258,6 +258,43 @@ window.BENCHMARK_DATA = {
           {
             "name": "Update apply (100 deltas)",
             "value": 375457.82540699997,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Peter Rekdal Khan-Sunde",
+            "username": "peters",
+            "email": "peter.sunde@gmail.com"
+          },
+          "committer": {
+            "name": "Peter Rekdal Khan-Sunde",
+            "username": "peters",
+            "email": "peter.sunde@gmail.com"
+          },
+          "id": "0da4d6f6905bc091bf0dd1d8631d427fe7d3489e",
+          "message": "ci: publish prerelease packages",
+          "timestamp": "2026-03-14T06:27:05Z",
+          "url": "https://github.com/fintermobilityas/surge/commit/0da4d6f6905bc091bf0dd1d8631d427fe7d3489e"
+        },
+        "date": 1773471439339,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "Publish 101 releases",
+            "value": 1701053.426256,
+            "unit": "ms"
+          },
+          {
+            "name": "Update check (100 deltas)",
+            "value": 5.018602,
+            "unit": "ms"
+          },
+          {
+            "name": "Update apply (100 deltas)",
+            "value": 310834.448638,
             "unit": "ms"
           }
         ]

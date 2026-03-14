@@ -346,22 +346,34 @@ impl PackBuilder {
         let budget = self.ctx.resource_budget();
         let filename = format!("{}-{}-{}-full.tar.zst", self.app_id, self.version, self.rid);
         let n_workers = budget.effective_zstd_workers();
-
-        let mut packer = ArchivePacker::with_threads(budget.zstd_compression_level, n_workers)?;
-        packer.add_directory(&self.artifacts_dir, "")?;
+        let mut bundled = Vec::new();
 
         // Bundle surge-supervisor if supervisor_id is configured and not already in artifacts.
         if !self.supervisor_id.trim().is_empty() {
             let supervisor_name = supervisor_binary_name_for_rid(&self.rid);
             if !self.artifacts_dir.join(supervisor_name).is_file() {
-                let supervisor_source = find_supervisor_binary(supervisor_name)?;
-                packer.add_file(&supervisor_source, supervisor_name)?;
+                bundled.push(BundledArtifact {
+                    source: find_supervisor_binary(supervisor_name)?,
+                    archive_name: supervisor_name.to_string(),
+                });
             }
         }
 
         if let Some(native_runtime) = resolve_surge_dotnet_native_runtime_bundle(&self.artifacts_dir, &self.rid)? {
-            packer.add_file(&native_runtime.source, &native_runtime.archive_name)?;
+            bundled.push(native_runtime);
         }
+
+        let staging_root = if bundled.is_empty() {
+            None
+        } else {
+            Some(materialize_canonical_pack_root(&self.artifacts_dir, &bundled)?)
+        };
+        let pack_root = staging_root
+            .as_ref()
+            .map_or(self.artifacts_dir.as_path(), tempfile::TempDir::path);
+
+        let mut packer = ArchivePacker::with_threads(budget.zstd_compression_level, n_workers)?;
+        packer.add_directory(pack_root, "")?;
 
         let archive_bytes = packer.finalize()?;
         let sha256 = sha256_hex(&archive_bytes);
@@ -805,6 +817,83 @@ fn zstd_encode_mt(data: &[u8], compression_level: i32, n_workers: u32) -> Result
     }
 }
 
+fn materialize_canonical_pack_root(source_root: &Path, bundled: &[BundledArtifact]) -> Result<tempfile::TempDir> {
+    let parent = source_root.parent().unwrap_or_else(|| Path::new("."));
+    let staging = tempfile::tempdir_in(parent)?;
+    mirror_tree(source_root, staging.path())?;
+    for artifact in bundled {
+        materialize_file_like(&artifact.source, &staging.path().join(&artifact.archive_name))?;
+    }
+    Ok(staging)
+}
+
+fn mirror_tree(source_root: &Path, dest_root: &Path) -> Result<()> {
+    std::fs::create_dir_all(dest_root)?;
+    let mut entries = std::fs::read_dir(source_root)?.collect::<std::result::Result<Vec<_>, std::io::Error>>()?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+
+    for entry in entries {
+        let source = entry.path();
+        let dest = dest_root.join(entry.file_name());
+        let metadata = std::fs::symlink_metadata(&source)?;
+        let file_type = metadata.file_type();
+
+        if file_type.is_dir() {
+            mirror_tree(&source, &dest)?;
+        } else if file_type.is_file() || file_type.is_symlink() {
+            materialize_file_like(&source, &dest)?;
+        } else {
+            return Err(SurgeError::Pack(format!(
+                "Unsupported filesystem entry while staging full package: {}",
+                source.display()
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn materialize_file_like(source: &Path, dest: &Path) -> Result<()> {
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let metadata = std::fs::symlink_metadata(source)?;
+    if metadata.file_type().is_symlink() {
+        let target = std::fs::read_link(source)?;
+        create_symlink_for_staging(&target, dest)?;
+        return Ok(());
+    }
+
+    if let Err(err) = std::fs::hard_link(source, dest) {
+        std::fs::copy(source, dest).map_err(|copy_err| {
+            SurgeError::Pack(format!(
+                "Failed to stage bundled artifact '{}' via hard link ({err}) or copy ({copy_err})",
+                source.display()
+            ))
+        })?;
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_symlink_for_staging(target: &Path, dest: &Path) -> Result<()> {
+    std::os::unix::fs::symlink(target, dest)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn create_symlink_for_staging(target: &Path, dest: &Path) -> Result<()> {
+    let metadata = std::fs::metadata(target)?;
+    if metadata.is_dir() {
+        std::os::windows::fs::symlink_dir(target, dest)?;
+    } else {
+        std::os::windows::fs::symlink_file(target, dest)?;
+    }
+    Ok(())
+}
+
 fn find_supervisor_binary(name: &str) -> Result<PathBuf> {
     if let Ok(current_exe) = std::env::current_exe()
         && let Some(parent) = current_exe.parent()
@@ -824,6 +913,7 @@ mod tests {
     #![allow(clippy::cast_possible_wrap)]
 
     use super::*;
+    use crate::archive::extractor::extract_to;
     use crate::archive::packer::ArchivePacker;
     use crate::config::constants::{DEFAULT_ZSTD_LEVEL, RELEASES_FILE_COMPRESSED};
     use crate::context::StorageProvider;
@@ -968,6 +1058,90 @@ mod tests {
             deterministic_payload(16 * 1024 * 1024, marker),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn test_materialized_pack_root_with_bundled_artifacts_roundtrips_deterministically() {
+        let tmp = tempfile::tempdir().unwrap();
+        let artifacts = tmp.path().join("artifacts");
+        let bundled_root = tmp.path().join("bundled");
+        std::fs::create_dir_all(artifacts.join("nested")).unwrap();
+        std::fs::create_dir_all(&bundled_root).unwrap();
+        std::fs::write(artifacts.join("app.dll"), b"managed").unwrap();
+        std::fs::write(artifacts.join("nested").join("payload.bin"), b"payload").unwrap();
+        let supervisor = bundled_root.join("surge-supervisor");
+        let native = bundled_root.join("libsurge.so");
+        std::fs::write(&supervisor, b"supervisor").unwrap();
+        std::fs::write(&native, b"native").unwrap();
+
+        let staging = materialize_canonical_pack_root(
+            &artifacts,
+            &[
+                BundledArtifact {
+                    source: supervisor,
+                    archive_name: "surge-supervisor".to_string(),
+                },
+                BundledArtifact {
+                    source: native,
+                    archive_name: "libsurge.so".to_string(),
+                },
+            ],
+        )
+        .unwrap();
+
+        let mut packer = ArchivePacker::new(3).unwrap();
+        packer.add_directory(staging.path(), "").unwrap();
+        let archive = packer.finalize().unwrap();
+
+        let extracted = tmp.path().join("extracted");
+        extract_to(&archive, &extracted, None).unwrap();
+
+        let mut roundtrip_packer = ArchivePacker::new(3).unwrap();
+        roundtrip_packer.add_directory(&extracted, "").unwrap();
+        let roundtrip_archive = roundtrip_packer.finalize().unwrap();
+
+        assert_eq!(roundtrip_archive, archive);
+    }
+
+    #[test]
+    fn test_legacy_appended_bundled_pack_differs_from_canonical_staged_pack() {
+        let tmp = tempfile::tempdir().unwrap();
+        let artifacts = tmp.path().join("artifacts");
+        let bundled_root = tmp.path().join("bundled");
+        std::fs::create_dir_all(artifacts.join("nested")).unwrap();
+        std::fs::create_dir_all(&bundled_root).unwrap();
+        std::fs::write(artifacts.join("app.dll"), b"managed").unwrap();
+        std::fs::write(artifacts.join("nested").join("payload.bin"), b"payload").unwrap();
+        let supervisor = bundled_root.join("surge-supervisor");
+        let native = bundled_root.join("libsurge.so");
+        std::fs::write(&supervisor, b"supervisor").unwrap();
+        std::fs::write(&native, b"native").unwrap();
+
+        let mut legacy = ArchivePacker::new(3).unwrap();
+        legacy.add_directory(&artifacts, "").unwrap();
+        legacy.add_file(&supervisor, "surge-supervisor").unwrap();
+        legacy.add_file(&native, "libsurge.so").unwrap();
+        let legacy_archive = legacy.finalize().unwrap();
+
+        let staging = materialize_canonical_pack_root(
+            &artifacts,
+            &[
+                BundledArtifact {
+                    source: supervisor,
+                    archive_name: "surge-supervisor".to_string(),
+                },
+                BundledArtifact {
+                    source: native,
+                    archive_name: "libsurge.so".to_string(),
+                },
+            ],
+        )
+        .unwrap();
+        let mut canonical = ArchivePacker::new(3).unwrap();
+        canonical.add_directory(staging.path(), "").unwrap();
+        let canonical_archive = canonical.finalize().unwrap();
+
+        assert_ne!(legacy_archive, canonical_archive);
     }
 
     #[tokio::test]

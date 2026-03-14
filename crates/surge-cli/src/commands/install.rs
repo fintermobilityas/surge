@@ -155,7 +155,7 @@ pub async fn execute(
     let interactive_wizard = manifest.is_some() && should_prompt_install_selection();
     let interactive_selection = if interactive_wizard {
         Some(prompt_install_selection(
-            manifest.as_ref().expect("interactive install requires a manifest"),
+            require_interactive_manifest(manifest.as_ref())?,
             app_id,
             rid,
         )?)
@@ -291,7 +291,7 @@ pub async fn execute(
 
     let resolved_channel = if interactive_wizard {
         prompt_install_channel(
-            manifest.as_ref().expect("interactive install requires a manifest"),
+            require_interactive_manifest(manifest.as_ref())?,
             &index,
             &app_id,
             explicit_channel,
@@ -712,6 +712,10 @@ fn prompt_install_channel(
         name: selected.clone(),
         note: Some(format!("Selected channel '{selected}' via install wizard.")),
     })
+}
+
+fn require_interactive_manifest(manifest: Option<&SurgeManifest>) -> Result<&SurgeManifest> {
+    manifest.ok_or_else(|| SurgeError::Config("Interactive install requires an install manifest.".to_string()))
 }
 
 fn collect_install_channel_options(manifest: &SurgeManifest, index: &ReleaseIndex, app_id: &str) -> Vec<String> {
@@ -1444,10 +1448,10 @@ fn customize_published_installer_for_tailscale(
         .map_err(|e| SurgeError::Platform(format!("Failed to create launcher temp file: {e}")))?;
     std::fs::write(launcher_file.path(), launcher_bytes)?;
 
-    let installer_filename = published_installer_path
-        .file_name()
-        .map(|name| name.to_string_lossy().to_string())
-        .unwrap_or_else(|| "surge-remote-installer.bin".to_string());
+    let installer_filename = published_installer_path.file_name().map_or_else(
+        || "surge-remote-installer.bin".to_string(),
+        |name| name.to_string_lossy().to_string(),
+    );
     let installer_path = staging.join(installer_filename);
     surge_core::installer_bundle::write_embedded_installer(
         launcher_file.path(),
@@ -2806,14 +2810,20 @@ mod tests {
     }
 
     fn remote_manifest(app_id: &str, rid: &str, channels: &[&str], installers: &[&str]) -> SurgeManifest {
-        let channels_yaml = channels
-            .iter()
-            .map(|channel| format!("      - {channel}\n"))
-            .collect::<String>();
-        let installers_yaml = installers
-            .iter()
-            .map(|installer| format!("          - {installer}\n"))
-            .collect::<String>();
+        let mut channels_yaml = String::new();
+        for channel in channels {
+            channels_yaml.push_str("      - ");
+            channels_yaml.push_str(channel);
+            channels_yaml.push('\n');
+        }
+
+        let mut installers_yaml = String::new();
+        for installer in installers {
+            installers_yaml.push_str("          - ");
+            installers_yaml.push_str(installer);
+            installers_yaml.push('\n');
+        }
+
         let yaml = format!(
             "schema: 1\napps:\n  - id: {app_id}\n    channels:\n{channels_yaml}    targets:\n      - rid: {rid}\n        installers:\n{installers_yaml}"
         );

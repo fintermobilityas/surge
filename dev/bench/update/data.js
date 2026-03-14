@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1773472743089,
+  "lastUpdate": 1773476743162,
   "repoUrl": "https://github.com/fintermobilityas/surge",
   "entries": {
     "Surge Update (localized-chain)": [
@@ -295,6 +295,123 @@ window.BENCHMARK_DATA = {
           {
             "name": "Update apply (100 deltas)",
             "value": 310834.448638,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Peter Rekdal Khan-Sunde",
+            "username": "peters",
+            "email": "peter.sunde@gmail.com"
+          },
+          "committer": {
+            "name": "Peter Rekdal Khan-Sunde",
+            "username": "peters",
+            "email": "peter.sunde@gmail.com"
+          },
+          "id": "8f159edfe42dd5c599f6b1581d03a9c06d070df4",
+          "message": "bench: track release and installer KPIs",
+          "timestamp": "2026-03-14T07:31:32Z",
+          "url": "https://github.com/fintermobilityas/surge/commit/8f159edfe42dd5c599f6b1581d03a9c06d070df4"
+        },
+        "date": 1773476742304,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "Full pack build (baseline)",
+            "value": 730.565318,
+            "unit": "ms"
+          },
+          {
+            "name": "Full pack build (baseline) size",
+            "value": 145.38126754760742,
+            "unit": "MiB"
+          },
+          {
+            "name": "Full artifact upload (baseline)",
+            "value": 110.278296,
+            "unit": "ms"
+          },
+          {
+            "name": "Full artifact upload (baseline) size",
+            "value": 145.38126754760742,
+            "unit": "MiB"
+          },
+          {
+            "name": "Full pack build (incremental avg)",
+            "value": 709.2239999999999,
+            "unit": "ms"
+          },
+          {
+            "name": "Full pack build (incremental avg) size",
+            "value": 145.5310821533203,
+            "unit": "MiB"
+          },
+          {
+            "name": "Delta pack build (avg)",
+            "value": 12455.56,
+            "unit": "ms"
+          },
+          {
+            "name": "Delta pack build (avg) size",
+            "value": 0.004723548889160156,
+            "unit": "MiB"
+          },
+          {
+            "name": "Full artifact upload (incremental avg)",
+            "value": 108.848,
+            "unit": "ms"
+          },
+          {
+            "name": "Full artifact upload (incremental avg) size",
+            "value": 145.5310821533203,
+            "unit": "MiB"
+          },
+          {
+            "name": "Delta artifact upload (avg)",
+            "value": 0.152,
+            "unit": "ms"
+          },
+          {
+            "name": "Delta artifact upload (avg) size",
+            "value": 0.004723548889160156,
+            "unit": "MiB"
+          },
+          {
+            "name": "Release index update (avg)",
+            "value": 2.764,
+            "unit": "ms"
+          },
+          {
+            "name": "Release index update (avg) size",
+            "value": 0.005298614501953125,
+            "unit": "MiB"
+          },
+          {
+            "name": "Release publish (incremental avg)",
+            "value": 111.785,
+            "unit": "ms"
+          },
+          {
+            "name": "Publish 101 releases",
+            "value": 1663727.498168,
+            "unit": "ms"
+          },
+          {
+            "name": "Update check (100 deltas)",
+            "value": 5.055196,
+            "unit": "ms"
+          },
+          {
+            "name": "Update check (100 deltas) size",
+            "value": 0.47238922119140625,
+            "unit": "MiB"
+          },
+          {
+            "name": "Update apply (100 deltas)",
+            "value": 238169.60494400002,
             "unit": "ms"
           }
         ]

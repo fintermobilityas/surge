@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tracing::{debug, info, warn};
 
@@ -38,6 +39,27 @@ pub struct PackageArtifact {
     /// Delta patch format identifier, empty for full packages.
     pub patch_format: String,
     bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TimedArtifact {
+    pub filename: String,
+    pub size_bytes: u64,
+    pub is_delta: bool,
+    pub duration: Duration,
+}
+
+#[derive(Debug, Clone)]
+pub struct BuildBreakdown {
+    pub full: TimedArtifact,
+    pub delta: Option<TimedArtifact>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PushBreakdown {
+    pub artifacts: Vec<TimedArtifact>,
+    pub release_index_update: Duration,
+    pub total: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,6 +184,13 @@ impl PackBuilder {
     ///
     /// The optional `progress` callback receives `(items_done, items_total)`.
     pub async fn build(&mut self, progress: Option<&dyn Fn(i32, i32)>) -> Result<()> {
+        self.build_with_breakdown(progress).await.map(|_| ())
+    }
+
+    /// Build the full and delta packages and return per-artifact timings.
+    ///
+    /// The optional `progress` callback receives `(items_done, items_total)`.
+    pub async fn build_with_breakdown(&mut self, progress: Option<&dyn Fn(i32, i32)>) -> Result<BuildBreakdown> {
         self.ctx.check_cancelled()?;
 
         let total_steps = 2; // full + potential delta
@@ -180,34 +209,66 @@ impl PackBuilder {
 
         // Step 1: Build full package
         report(0);
+        let full_started = Instant::now();
         let full_artifact = self.build_full_package()?;
+        let full_duration = full_started.elapsed();
+        let full_timing = TimedArtifact {
+            filename: full_artifact.filename.clone(),
+            size_bytes: u64::try_from(full_artifact.size).unwrap_or(0),
+            is_delta: false,
+            duration: full_duration,
+        };
         self.artifacts.push(full_artifact);
         report(1);
 
         // Step 2: Attempt delta package (non-fatal if it fails)
-        match self.build_delta_package().await {
+        let delta_started = Instant::now();
+        let delta = match self.build_delta_package().await {
             Ok(Some(delta_artifact)) => {
+                let timing = TimedArtifact {
+                    filename: delta_artifact.filename.clone(),
+                    size_bytes: u64::try_from(delta_artifact.size).unwrap_or(0),
+                    is_delta: true,
+                    duration: delta_started.elapsed(),
+                };
                 self.artifacts.push(delta_artifact);
                 debug!("Delta package built successfully");
+                Some(timing)
             }
             Ok(None) => {
                 debug!("No previous version for delta, skipping");
+                None
             }
             Err(e) => {
                 warn!("Delta package build failed (non-fatal): {e}");
+                None
             }
-        }
+        };
         report(2);
 
         info!(artifact_count = self.artifacts.len(), "Package build complete");
 
-        Ok(())
+        Ok(BuildBreakdown {
+            full: full_timing,
+            delta,
+        })
     }
 
     /// Upload built packages to storage and update the release index.
     ///
     /// The optional `progress` callback receives `(items_done, items_total)`.
     pub async fn push(&self, channel: &str, progress: Option<&dyn Fn(i32, i32)>) -> Result<()> {
+        self.push_with_breakdown(channel, progress).await.map(|_| ())
+    }
+
+    /// Upload built packages to storage and return per-artifact upload timings.
+    ///
+    /// The optional `progress` callback receives `(items_done, items_total)`.
+    pub async fn push_with_breakdown(
+        &self,
+        channel: &str,
+        progress: Option<&dyn Fn(i32, i32)>,
+    ) -> Result<PushBreakdown> {
         self.ctx.check_cancelled()?;
 
         if self.artifacts.is_empty() {
@@ -222,25 +283,40 @@ impl PackBuilder {
         };
 
         info!(channel, artifact_count = self.artifacts.len(), "Uploading packages");
+        let push_started = Instant::now();
+        let mut artifact_timings = Vec::with_capacity(self.artifacts.len());
 
         // Upload each artifact
         for (i, artifact) in self.artifacts.iter().enumerate() {
             self.ctx.check_cancelled()?;
 
             debug!(filename = %artifact.filename, "Uploading artifact");
+            let upload_started = Instant::now();
             self.storage
                 .put_object(&artifact.filename, artifact.bytes(), "application/octet-stream")
                 .await?;
+            artifact_timings.push(TimedArtifact {
+                filename: artifact.filename.clone(),
+                size_bytes: u64::try_from(artifact.size).unwrap_or(0),
+                is_delta: artifact.is_delta,
+                duration: upload_started.elapsed(),
+            });
 
             report(i32::try_from(i).unwrap_or(i32::MAX - 1) + 1);
         }
 
         // Update the release index
+        let release_index_started = Instant::now();
         self.update_release_index(channel).await?;
+        let release_index_update = release_index_started.elapsed();
         report(total);
 
         info!("Push complete");
-        Ok(())
+        Ok(PushBreakdown {
+            artifacts: artifact_timings,
+            release_index_update,
+            total: push_started.elapsed(),
+        })
     }
 
     /// Get the list of built artifacts.
@@ -951,6 +1027,96 @@ apps:
             .find(|artifact| artifact.is_delta)
             .expect("delta artifact should be produced");
         assert_eq!(delta.from_version, "1.1.0");
+    }
+
+    #[tokio::test]
+    async fn test_build_and_push_breakdown_reports_full_and_delta_timings() {
+        let tmp = tempfile::tempdir().expect("tempdir should be created");
+        let store_root = tmp.path().join("store");
+        let artifacts_root = tmp.path().join("artifacts");
+        std::fs::create_dir_all(&store_root).expect("store dir should exist");
+        std::fs::create_dir_all(&artifacts_root).expect("artifacts dir should exist");
+
+        let app_id = "demo";
+        let rid = current_rid();
+        let manifest_path = tmp.path().join("surge.yml");
+        let manifest_yaml = format!(
+            r"schema: 1
+storage:
+  provider: filesystem
+  bucket: {bucket}
+apps:
+  - id: {app_id}
+    target:
+      rid: {rid}
+",
+            bucket = store_root.display()
+        );
+        std::fs::write(&manifest_path, manifest_yaml).expect("manifest should be written");
+
+        let ctx = Arc::new(Context::new());
+        ctx.set_storage(
+            StorageProvider::Filesystem,
+            store_root.to_str().expect("store root utf8"),
+            "",
+            "",
+            "",
+            "",
+        );
+
+        std::fs::write(artifacts_root.join("payload.txt"), b"v1 payload").expect("v1 payload should be written");
+        let mut builder_v1 = PackBuilder::new(
+            Arc::clone(&ctx),
+            manifest_path.to_str().expect("manifest path utf8"),
+            app_id,
+            &rid,
+            "1.0.0",
+            artifacts_root.to_str().expect("artifacts path utf8"),
+        )
+        .expect("builder v1");
+        let build_v1 = builder_v1
+            .build_with_breakdown(None)
+            .await
+            .expect("first build breakdown should succeed");
+        assert!(!build_v1.full.is_delta);
+        assert!(
+            build_v1.delta.is_none(),
+            "first publish should not have a delta artifact"
+        );
+        assert!(build_v1.full.size_bytes > 0);
+
+        let push_v1 = builder_v1
+            .push_with_breakdown("stable", None)
+            .await
+            .expect("first push breakdown should succeed");
+        assert_eq!(push_v1.artifacts.len(), 1);
+        assert!(!push_v1.artifacts[0].is_delta);
+
+        std::fs::write(artifacts_root.join("payload.txt"), b"v2 payload").expect("v2 payload should be written");
+        let mut builder_v2 = PackBuilder::new(
+            Arc::clone(&ctx),
+            manifest_path.to_str().expect("manifest path utf8"),
+            app_id,
+            &rid,
+            "1.1.0",
+            artifacts_root.to_str().expect("artifacts path utf8"),
+        )
+        .expect("builder v2");
+        let build_v2 = builder_v2
+            .build_with_breakdown(None)
+            .await
+            .expect("second build breakdown should succeed");
+        let delta_timing = build_v2.delta.expect("second publish should include a delta artifact");
+        assert!(delta_timing.is_delta);
+        assert!(delta_timing.size_bytes > 0);
+
+        let push_v2 = builder_v2
+            .push_with_breakdown("stable", None)
+            .await
+            .expect("second push breakdown should succeed");
+        assert_eq!(push_v2.artifacts.len(), 2);
+        assert!(push_v2.artifacts.iter().any(|artifact| artifact.is_delta));
+        assert!(push_v2.release_index_update <= push_v2.total);
     }
 
     #[tokio::test]

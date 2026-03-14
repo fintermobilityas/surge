@@ -8,6 +8,9 @@ That means the benchmark now measures:
 
 - release-index lookup
 - delta-chain selection
+- full-pack rebuild time during publishing
+- delta-pack build time during publishing
+- full and delta artifact upload time
 - artifact download size
 - restore-and-apply behavior
 - final installed payload verification

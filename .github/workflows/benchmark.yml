@@ -117,3 +117,43 @@ jobs:
           fail-on-alert: false
           gh-pages-branch: gh-pages
           benchmark-data-dir-path: dev/bench/update
+
+  installers:
+    name: Installers (medium)
+    needs: update-chains
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build benchmark and installer tools
+        run: cargo build --release -p surge-bench -p surge-cli -p surge-installer
+
+      - name: Run benchmark
+        env:
+          SURGE_INSTALLER_BINARY: target/release/surge
+          SURGE_INSTALLER_LAUNCHER: target/release/surge-installer
+        run: |
+          cargo run --release -p surge-bench -- \
+            --installers-only \
+            --scale 0.25 \
+            --pack-zstd-level 3 \
+            --json --benchmark-format \
+            > benchmark-results.json
+
+      - name: Store results
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: "Surge Installers (medium)"
+          tool: customSmallerIsBetter
+          output-file-path: benchmark-results.json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: true
+          alert-threshold: '150%'
+          comment-on-alert: true
+          fail-on-alert: false
+          gh-pages-branch: gh-pages
+          benchmark-data-dir-path: dev/bench/installers

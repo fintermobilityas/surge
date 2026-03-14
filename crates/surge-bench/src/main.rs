@@ -56,6 +56,10 @@ struct Args {
     #[arg(long)]
     update_only: bool,
 
+    /// Run only the real installer scenario (build and execute console installers)
+    #[arg(long)]
+    installers_only: bool,
+
     /// Number of sequential deltas to apply in the update scenario
     #[arg(long, default_value = "10")]
     num_deltas: usize,
@@ -114,8 +118,16 @@ fn main() {
         eprintln!("Error: --update-only requires diff-enabled runs (do not pass --skip-diff)");
         std::process::exit(1);
     }
+    if args.update_only && args.installers_only {
+        eprintln!("Error: --update-only cannot be combined with --installers-only");
+        std::process::exit(1);
+    }
     if args.update_only && args.skip_update_scenario {
         eprintln!("Error: --update-only cannot be combined with --skip-update-scenario");
+        std::process::exit(1);
+    }
+    if args.installers_only && args.skip_installers {
+        eprintln!("Error: --installers-only cannot be combined with --skip-installers");
         std::process::exit(1);
     }
 
@@ -136,6 +148,8 @@ fn main() {
     }
     if args.skip_installers {
         log!(json_mode, "  (installers: SKIPPED)");
+    } else if args.installers_only {
+        log!(json_mode, "  (installers: real installer scenario only)");
     }
 
     if !args.skip_diff && !args.skip_classic_diff && args.scale > 0.3 {
@@ -173,7 +187,7 @@ fn main() {
     log!(json_mode, "");
     log!(json_mode, "Running benchmarks...");
 
-    if !args.update_only {
+    if !args.update_only && !args.installers_only {
         // 1. Archive create (per zstd level)
         let archive_results = runner::run_archive_create(&generated.v1_dir, &args.zstd_levels);
 
@@ -319,7 +333,7 @@ fn main() {
     }
 
     // 9. Real-world update scenario
-    if !args.skip_diff && !args.skip_update_scenario {
+    if !args.installers_only && !args.skip_diff && !args.skip_update_scenario {
         log!(json_mode, "");
         log!(json_mode, "Update scenario (real update manager chain)...");
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -350,7 +364,33 @@ fn main() {
     }
 
     // 10-11. Installers
-    if !args.update_only && !args.skip_installers {
+    if args.installers_only {
+        log!(json_mode, "");
+        log!(json_mode, "Installer scenario (real console installer build + run)...");
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let installer_results = rt
+            .block_on(runner::run_installer_scenario(
+                work_dir,
+                args.scale,
+                args.seed,
+                args.pack_zstd_level,
+                args.pack_max_threads,
+                args.pack_memory_mb,
+            ))
+            .expect("installer scenario");
+        for result in &installer_results {
+            log!(
+                json_mode,
+                "  {} {}",
+                report::format_duration(result.duration),
+                result.name
+            );
+        }
+        results.extend(installer_results);
+    } else if !args.update_only && !args.skip_installers {
         let online_result = runner::run_installer_online(&generated.v1_dir);
         log!(
             json_mode,

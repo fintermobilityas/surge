@@ -107,3 +107,27 @@ This combination tracks:
 - chunked diff drift
 - real updater drift for long localized chains
 - real updater drift for broad-churn chains
+
+## Release KPI Coverage
+
+The long-chain benchmark now also breaks out publisher-side release KPIs so CI can answer:
+
+- how long the first full package takes to build
+- how long later full packages take to rebuild
+- how long delta artifacts take to build
+- how long full and delta artifacts take to upload
+- how expensive release-index updates are
+- how large the resulting full, delta, installer, and download artifacts are
+
+These are the numbers to watch when asking whether Surge is getting faster to publish, not just faster to patch.
+
+## Installer KPI Coverage
+
+CI also tracks a dedicated real installer scenario at medium scale:
+
+- build an online console installer from a published release
+- run that installer end to end against the filesystem backend
+- build an offline console installer from the same release
+- run that installer end to end with bundled payload
+
+This is intentionally separate from the archive microbench so installer regressions are visible even when low-level zstd or diff timings look stable.

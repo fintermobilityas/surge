@@ -1,6 +1,6 @@
 # Performance Notes
 
-This directory is the persistent memory for pack, delta, and update-path benchmarking.
+This directory is the persistent memory for pack, delta, installer, and update-path benchmarking.
 
 Use these files when:
 

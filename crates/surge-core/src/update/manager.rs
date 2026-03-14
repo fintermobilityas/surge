@@ -26,7 +26,8 @@ use crate::releases::manifest::{
     ReleaseEntry, ReleaseIndex, decompress_release_index, get_delta_chain, get_releases_newer_than,
 };
 use crate::releases::restore::{
-    RestoreOptions, required_artifacts_for_index, restore_full_archive_for_version_with_options,
+    RestoreOptions, local_checkpoint_artifacts_for_index, required_artifacts_for_index,
+    restore_full_archive_for_version_with_options,
 };
 use crate::releases::version::compare_versions;
 use crate::storage::{StorageBackend, create_storage_backend};
@@ -1023,6 +1024,7 @@ impl UpdateManager {
         };
         if let Some(index) = prune_index {
             let mut retained_artifacts = required_artifacts_for_index(&index);
+            retained_artifacts.extend(local_checkpoint_artifacts_for_index(&index, 3));
             let warm_full_filename = latest.full_filename.trim();
             if !warm_full_filename.is_empty() {
                 retained_artifacts.insert(warm_full_filename.to_string());

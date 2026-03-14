@@ -175,6 +175,7 @@ impl InstallerType {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PackDeltaStrategy {
+    SparseFileOps,
     ArchiveChunkedBsdiff,
     ArchiveBsdiff,
 }
@@ -183,7 +184,8 @@ impl PackDeltaStrategy {
     #[must_use]
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
-            PACK_DEFAULT_DELTA_STRATEGY => Some(Self::ArchiveChunkedBsdiff),
+            PACK_DEFAULT_DELTA_STRATEGY => Some(Self::SparseFileOps),
+            "archive-chunked-bsdiff" => Some(Self::ArchiveChunkedBsdiff),
             "archive-bsdiff" => Some(Self::ArchiveBsdiff),
             _ => None,
         }
@@ -192,6 +194,7 @@ impl PackDeltaStrategy {
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::SparseFileOps => "sparse-file-ops",
             Self::ArchiveChunkedBsdiff => "archive-chunked-bsdiff",
             Self::ArchiveBsdiff => "archive-bsdiff",
         }
@@ -233,7 +236,7 @@ pub struct PackPolicy {
 impl Default for PackPolicy {
     fn default() -> Self {
         Self {
-            delta_strategy: PackDeltaStrategy::ArchiveChunkedBsdiff,
+            delta_strategy: PackDeltaStrategy::SparseFileOps,
             compression_format: PackCompressionFormat::Zstd,
             compression_level: PACK_DEFAULT_ZSTD_LEVEL,
             max_chain_length: PACK_DEFAULT_MAX_CHAIN_LENGTH,
@@ -472,7 +475,7 @@ impl SurgeManifest {
                     && PackDeltaStrategy::parse(strategy).is_none()
                 {
                     return Err(SurgeError::Config(format!(
-                        "Unsupported pack delta strategy '{strategy}'. Supported values: archive-chunked-bsdiff, archive-bsdiff"
+                        "Unsupported pack delta strategy '{strategy}'. Supported values: sparse-file-ops, archive-chunked-bsdiff, archive-bsdiff"
                     )));
                 }
                 if delta.max_chain_length == Some(0) {
@@ -916,7 +919,7 @@ apps:
         let manifest = SurgeManifest::parse(yaml).expect("manifest should parse");
         let policy = manifest.effective_pack_policy();
 
-        assert_eq!(policy.delta_strategy, PackDeltaStrategy::ArchiveChunkedBsdiff);
+        assert_eq!(policy.delta_strategy, PackDeltaStrategy::SparseFileOps);
         assert_eq!(policy.compression_level, PACK_DEFAULT_ZSTD_LEVEL);
         assert_eq!(policy.max_chain_length, PACK_DEFAULT_MAX_CHAIN_LENGTH);
         assert_eq!(policy.keep_latest_fulls, PACK_DEFAULT_KEEP_LATEST_FULLS);

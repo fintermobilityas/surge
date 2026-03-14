@@ -24,8 +24,8 @@ use surge_core::crypto::sha256::sha256_hex_file;
 use surge_core::error::{Result, SurgeError};
 use surge_core::releases::delta::patch_format_from_magic_prefix;
 use surge_core::releases::manifest::{
-    DeltaArtifact, PATCH_FORMAT_BSDIFF4, PATCH_FORMAT_CHUNKED_BSDIFF_V1, ReleaseEntry, ReleaseIndex,
-    compress_release_index, decompress_release_index,
+    DeltaArtifact, PATCH_FORMAT_BSDIFF4, PATCH_FORMAT_CHUNKED_BSDIFF_V1, PATCH_FORMAT_SPARSE_FILE_OPS_V1, ReleaseEntry,
+    ReleaseIndex, compress_release_index, decompress_release_index,
 };
 use surge_core::releases::restore::required_artifacts_for_index;
 use surge_core::releases::version::compare_versions;
@@ -320,6 +320,14 @@ async fn update_release_index(
     };
     let primary_delta = if delta_filename.trim().is_empty() {
         None
+    } else if delta_patch_format.eq_ignore_ascii_case(PATCH_FORMAT_SPARSE_FILE_OPS_V1) {
+        Some(DeltaArtifact::sparse_file_ops_zstd(
+            "primary",
+            "",
+            &delta_filename,
+            delta_size,
+            &delta_sha256,
+        ))
     } else if delta_patch_format.eq_ignore_ascii_case(PATCH_FORMAT_CHUNKED_BSDIFF_V1) {
         Some(DeltaArtifact::chunked_bsdiff_zstd(
             "primary",

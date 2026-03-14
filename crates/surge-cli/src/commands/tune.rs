@@ -141,7 +141,7 @@ fn build_candidates(zstd_levels: &[i32], delta_strategies: &[String]) -> Result<
     for raw in delta_strategies {
         let strategy = PackDeltaStrategy::parse(raw).ok_or_else(|| {
             SurgeError::Config(format!(
-                "Unsupported delta strategy '{raw}'. Supported values: archive-chunked-bsdiff, archive-bsdiff"
+                "Unsupported delta strategy '{raw}'. Supported values: sparse-file-ops, archive-chunked-bsdiff, archive-bsdiff"
             ))
         })?;
         if !strategies.contains(&strategy) {

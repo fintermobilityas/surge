@@ -8,10 +8,12 @@ use crate::error::{Result, SurgeError};
 use crate::releases::version::compare_versions;
 
 pub const DIFF_ALGORITHM_BSDIFF: &str = "bsdiff";
+pub const DIFF_ALGORITHM_FILE_OPS: &str = "file-ops";
 pub const PATCH_FORMAT_BSDIFF4: &str = "bsdiff4";
 pub const PATCH_FORMAT_CHUNKED_BSDIFF_V1: &str = "chunked-bsdiff-v1";
 pub const PATCH_FORMAT_BSDIFF4_ARCHIVE_V3: &str = "bsdiff4-archive-v3";
 pub const PATCH_FORMAT_CHUNKED_BSDIFF_ARCHIVE_V3: &str = "chunked-bsdiff-archive-v3";
+pub const PATCH_FORMAT_SPARSE_FILE_OPS_V1: &str = "sparse-file-ops-v1";
 pub const COMPRESSION_ZSTD: &str = "zstd";
 
 /// A single delta artifact descriptor.
@@ -36,17 +38,37 @@ pub struct DeltaArtifact {
 }
 
 impl DeltaArtifact {
-    fn with_format(id: &str, from_version: &str, patch_format: &str, filename: &str, size: i64, sha256: &str) -> Self {
+    fn with_algorithm_and_format(
+        id: &str,
+        from_version: &str,
+        algorithm: &str,
+        patch_format: &str,
+        filename: &str,
+        size: i64,
+        sha256: &str,
+    ) -> Self {
         Self {
             id: id.to_string(),
             from_version: from_version.to_string(),
-            algorithm: DIFF_ALGORITHM_BSDIFF.to_string(),
+            algorithm: algorithm.to_string(),
             patch_format: patch_format.to_string(),
             compression: COMPRESSION_ZSTD.to_string(),
             filename: filename.to_string(),
             size,
             sha256: sha256.to_string(),
         }
+    }
+
+    fn with_format(id: &str, from_version: &str, patch_format: &str, filename: &str, size: i64, sha256: &str) -> Self {
+        Self::with_algorithm_and_format(
+            id,
+            from_version,
+            DIFF_ALGORITHM_BSDIFF,
+            patch_format,
+            filename,
+            size,
+            sha256,
+        )
     }
 
     #[must_use]
@@ -93,6 +115,20 @@ impl DeltaArtifact {
             id,
             from_version,
             PATCH_FORMAT_CHUNKED_BSDIFF_ARCHIVE_V3,
+            filename,
+            size,
+            sha256,
+        )
+    }
+
+    /// Build a descriptor for the sparse file-ops + zstd delta format.
+    #[must_use]
+    pub fn sparse_file_ops_zstd(id: &str, from_version: &str, filename: &str, size: i64, sha256: &str) -> Self {
+        Self::with_algorithm_and_format(
+            id,
+            from_version,
+            DIFF_ALGORITHM_FILE_OPS,
+            PATCH_FORMAT_SPARSE_FILE_OPS_V1,
             filename,
             size,
             sha256,

@@ -9,18 +9,20 @@ use tracing::{debug, info, warn};
 
 use crate::archive::packer::ArchivePacker;
 use crate::config::constants::{RELEASES_FILE_COMPRESSED, SCHEMA_VERSION};
-use crate::config::manifest::{PackDeltaStrategy, ShortcutLocation, SurgeManifest};
+use crate::config::manifest::{PackDeltaStrategy, PackPolicy, ShortcutLocation, SurgeManifest};
 use crate::context::{Context, ResourceBudget};
 use crate::crypto::sha256::sha256_hex;
 use crate::diff::chunked::{ChunkedDiffOptions, DEFAULT_CHUNK_SIZE};
 use crate::error::{Result, SurgeError};
 use crate::platform::fs::write_file_atomic;
-use crate::releases::delta::{build_archive_bsdiff_patch, build_archive_chunked_patch};
+use crate::releases::delta::{build_archive_bsdiff_patch, build_archive_chunked_patch, build_sparse_file_patch};
 use crate::releases::manifest::{
-    DeltaArtifact, PATCH_FORMAT_BSDIFF4_ARCHIVE_V3, PATCH_FORMAT_CHUNKED_BSDIFF_ARCHIVE_V3, ReleaseEntry, ReleaseIndex,
-    compress_release_index, decompress_release_index,
+    DeltaArtifact, PATCH_FORMAT_BSDIFF4_ARCHIVE_V3, PATCH_FORMAT_CHUNKED_BSDIFF_ARCHIVE_V3,
+    PATCH_FORMAT_SPARSE_FILE_OPS_V1, ReleaseEntry, ReleaseIndex, compress_release_index, decompress_release_index,
 };
-use crate::releases::restore::{find_previous_release_for_rid, restore_full_archive_for_version};
+use crate::releases::restore::{
+    find_previous_release_for_rid, restore_full_archive_for_version, sorted_releases_for_rid,
+};
 use crate::storage::{StorageBackend, create_storage_backend};
 
 /// A built package artifact ready for upload.
@@ -92,7 +94,7 @@ pub struct PackBuilder {
     installers: Vec<String>,
     environment: BTreeMap<String, String>,
     artifacts_dir: PathBuf,
-    delta_strategy: PackDeltaStrategy,
+    pack_policy: PackPolicy,
     storage: Box<dyn StorageBackend>,
     artifacts: Vec<PackageArtifact>,
 }
@@ -170,7 +172,7 @@ impl PackBuilder {
             installers: target.installers.clone(),
             environment: target.environment.clone(),
             artifacts_dir: artifacts_path,
-            delta_strategy: pack_policy.delta_strategy,
+            pack_policy,
             storage,
             artifacts: Vec::new(),
         })
@@ -402,22 +404,44 @@ impl PackBuilder {
             .find(|a| !a.is_delta)
             .map(PackageArtifact::bytes)
             .ok_or_else(|| SurgeError::Pack("Full package not yet built".to_string()))?;
+        if should_publish_checkpoint_full(
+            &index,
+            &self.rid,
+            self.pack_policy.max_chain_length,
+            self.pack_policy.checkpoint_every,
+        ) {
+            info!(
+                app_id = %self.app_id,
+                version = %self.version,
+                rid = %self.rid,
+                "Skipping delta package and publishing a checkpoint full"
+            );
+            return Ok(None);
+        }
         let n_workers = budget.effective_zstd_workers();
+        let diff_options = chunked_diff_options(&budget, prev_data.len(), new_data.len());
 
-        let (patch, patch_format) = match self.delta_strategy {
-            PackDeltaStrategy::ArchiveChunkedBsdiff => {
-                let diff_options = chunked_diff_options(&budget, prev_data.len(), new_data.len());
-                (
-                    build_archive_chunked_patch(
-                        &prev_data,
-                        new_data,
-                        budget.zstd_compression_level,
-                        n_workers,
-                        &diff_options,
-                    )?,
-                    PATCH_FORMAT_CHUNKED_BSDIFF_ARCHIVE_V3.to_string(),
-                )
-            }
+        let (patch, patch_format) = match self.pack_policy.delta_strategy {
+            PackDeltaStrategy::SparseFileOps => (
+                build_sparse_file_patch(
+                    &prev_data,
+                    new_data,
+                    budget.zstd_compression_level,
+                    n_workers,
+                    &diff_options,
+                )?,
+                PATCH_FORMAT_SPARSE_FILE_OPS_V1.to_string(),
+            ),
+            PackDeltaStrategy::ArchiveChunkedBsdiff => (
+                build_archive_chunked_patch(
+                    &prev_data,
+                    new_data,
+                    budget.zstd_compression_level,
+                    n_workers,
+                    &diff_options,
+                )?,
+                PATCH_FORMAT_CHUNKED_BSDIFF_ARCHIVE_V3.to_string(),
+            ),
             PackDeltaStrategy::ArchiveBsdiff => (
                 build_archive_bsdiff_patch(&prev_data, new_data, budget.zstd_compression_level, n_workers)?,
                 PATCH_FORMAT_BSDIFF4_ARCHIVE_V3.to_string(),
@@ -430,6 +454,20 @@ impl PackBuilder {
         let sha256 = sha256_hex(&compressed);
         let size = i64::try_from(compressed.len())
             .map_err(|_| SurgeError::Archive(format!("Delta is too large: {} bytes", compressed.len())))?;
+        let full_size = i64::try_from(new_data.len())
+            .map_err(|_| SurgeError::Archive(format!("Archive is too large: {} bytes", new_data.len())))?;
+
+        if should_fallback_to_full(size, full_size) {
+            warn!(
+                app_id = %self.app_id,
+                version = %self.version,
+                rid = %self.rid,
+                delta_size = size,
+                full_size,
+                "Skipping pathological delta package and publishing a full checkpoint"
+            );
+            return Ok(None);
+        }
 
         Ok(Some(PackageArtifact {
             filename: delta_filename,
@@ -486,14 +524,27 @@ impl PackBuilder {
         };
         let mut entry = entry;
         let primary_delta = delta.map(|artifact| {
-            DeltaArtifact::with_patch_format(
-                "primary",
-                &artifact.from_version,
-                &artifact.patch_format,
-                &artifact.filename,
-                artifact.size,
-                &artifact.sha256,
-            )
+            if artifact
+                .patch_format
+                .eq_ignore_ascii_case(PATCH_FORMAT_SPARSE_FILE_OPS_V1)
+            {
+                DeltaArtifact::sparse_file_ops_zstd(
+                    "primary",
+                    &artifact.from_version,
+                    &artifact.filename,
+                    artifact.size,
+                    &artifact.sha256,
+                )
+            } else {
+                DeltaArtifact::with_patch_format(
+                    "primary",
+                    &artifact.from_version,
+                    &artifact.patch_format,
+                    &artifact.filename,
+                    artifact.size,
+                    &artifact.sha256,
+                )
+            }
         });
         entry.set_primary_delta(primary_delta);
 
@@ -513,6 +564,31 @@ impl PackBuilder {
 
         Ok(())
     }
+}
+
+fn should_publish_checkpoint_full(
+    index: &ReleaseIndex,
+    rid: &str,
+    max_chain_length: u32,
+    checkpoint_every: u32,
+) -> bool {
+    let releases = sorted_releases_for_rid(index, rid);
+    let mut deltas_since_checkpoint = 0u32;
+    for release in releases.iter().rev() {
+        if release.selected_delta().is_none() {
+            break;
+        }
+        deltas_since_checkpoint = deltas_since_checkpoint.saturating_add(1);
+    }
+
+    deltas_since_checkpoint >= max_chain_length || deltas_since_checkpoint.saturating_add(1) >= checkpoint_every
+}
+
+fn should_fallback_to_full(delta_size: i64, full_size: i64) -> bool {
+    if delta_size <= 0 || full_size <= 0 {
+        return false;
+    }
+    delta_size >= full_size
 }
 
 fn chunked_diff_options(budget: &ResourceBudget, older_len: usize, newer_len: usize) -> ChunkedDiffOptions {
@@ -902,6 +978,11 @@ mod tests {
         std::fs::create_dir_all(&store_root).unwrap();
         std::fs::create_dir_all(&artifacts_root).unwrap();
         std::fs::write(artifacts_root.join("payload.txt"), b"v3 payload").unwrap();
+        std::fs::write(
+            artifacts_root.join("stable.bin"),
+            deterministic_payload(2 * 1024 * 1024, 77),
+        )
+        .unwrap();
 
         let app_id = "demo";
         let rid = current_rid();
@@ -1065,6 +1146,11 @@ apps:
         );
 
         std::fs::write(artifacts_root.join("payload.txt"), b"v1 payload").expect("v1 payload should be written");
+        std::fs::write(
+            artifacts_root.join("stable.bin"),
+            deterministic_payload(2 * 1024 * 1024, 77),
+        )
+        .expect("stable payload should be written");
         let mut builder_v1 = PackBuilder::new(
             Arc::clone(&ctx),
             manifest_path.to_str().expect("manifest path utf8"),
@@ -1209,7 +1295,7 @@ apps:
             .find(|artifact| artifact.is_delta)
             .unwrap()
             .clone();
-        assert_eq!(delta_v2.patch_format, PATCH_FORMAT_CHUNKED_BSDIFF_ARCHIVE_V3);
+        assert_eq!(delta_v2.patch_format, PATCH_FORMAT_SPARSE_FILE_OPS_V1);
         assert!(delta_v2.bytes().len() * 100 < full_v2.bytes().len());
         builder_v2.push("stable", None).await.unwrap();
 
@@ -1235,7 +1321,7 @@ apps:
             .find(|artifact| artifact.is_delta)
             .unwrap()
             .clone();
-        assert_eq!(delta_v3.patch_format, PATCH_FORMAT_CHUNKED_BSDIFF_ARCHIVE_V3);
+        assert_eq!(delta_v3.patch_format, PATCH_FORMAT_SPARSE_FILE_OPS_V1);
         assert!(delta_v3.bytes().len() * 100 < full_v3.bytes().len());
         builder_v3.push("stable", None).await.unwrap();
 

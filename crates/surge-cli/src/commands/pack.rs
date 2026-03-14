@@ -723,12 +723,23 @@ fn build_installers_with_launcher(
                 delta_algorithm: if delta_filename.is_empty() {
                     String::new()
                 } else {
-                    surge_core::releases::manifest::DIFF_ALGORITHM_BSDIFF.to_string()
+                    match manifest.effective_pack_policy().delta_strategy {
+                        surge_core::config::manifest::PackDeltaStrategy::SparseFileOps => {
+                            surge_core::releases::manifest::DIFF_ALGORITHM_FILE_OPS.to_string()
+                        }
+                        surge_core::config::manifest::PackDeltaStrategy::ArchiveChunkedBsdiff
+                        | surge_core::config::manifest::PackDeltaStrategy::ArchiveBsdiff => {
+                            surge_core::releases::manifest::DIFF_ALGORITHM_BSDIFF.to_string()
+                        }
+                    }
                 },
                 delta_patch_format: if delta_filename.is_empty() {
                     String::new()
                 } else {
                     match manifest.effective_pack_policy().delta_strategy {
+                        surge_core::config::manifest::PackDeltaStrategy::SparseFileOps => {
+                            surge_core::releases::manifest::PATCH_FORMAT_SPARSE_FILE_OPS_V1.to_string()
+                        }
                         surge_core::config::manifest::PackDeltaStrategy::ArchiveChunkedBsdiff => {
                             surge_core::releases::manifest::PATCH_FORMAT_CHUNKED_BSDIFF_ARCHIVE_V3.to_string()
                         }

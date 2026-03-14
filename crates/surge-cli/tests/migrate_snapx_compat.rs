@@ -66,6 +66,21 @@ fn debug_output(output: &Output) -> String {
     )
 }
 
+fn deterministic_payload(size: usize, marker: u8) -> Vec<u8> {
+    let mut state = 0x1234_5678_9abc_def0u64;
+    let mut payload = Vec::with_capacity(size);
+    for _ in 0..size {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        payload.push((state & 0xff) as u8);
+    }
+    if let Some(first) = payload.first_mut() {
+        *first = marker;
+    }
+    payload
+}
+
 #[test]
 fn migrate_snapx_style_app_copies_full_and_delta_artifacts() {
     let tmp = tempfile::tempdir().unwrap();
@@ -98,10 +113,20 @@ fn migrate_snapx_style_app_copies_full_and_delta_artifacts() {
     std::fs::write(artifacts_v1.join("quasar"), b"#!/bin/sh\necho v1\n").unwrap();
     std::fs::write(artifacts_v1.join("icon.svg"), b"<svg></svg>").unwrap();
     std::fs::write(artifacts_v1.join("payload.txt"), b"payload-v1").unwrap();
+    std::fs::write(
+        artifacts_v1.join("stable.bin"),
+        deterministic_payload(2 * 1024 * 1024, 77),
+    )
+    .unwrap();
 
     std::fs::write(artifacts_v2.join("quasar"), b"#!/bin/sh\necho v2\n").unwrap();
     std::fs::write(artifacts_v2.join("icon.svg"), b"<svg></svg>").unwrap();
     std::fs::write(artifacts_v2.join("payload.txt"), b"payload-v2").unwrap();
+    std::fs::write(
+        artifacts_v2.join("stable.bin"),
+        deterministic_payload(2 * 1024 * 1024, 77),
+    )
+    .unwrap();
 
     let source_manifest_path_str = source_manifest_path.to_string_lossy().into_owned();
     let destination_manifest_path_str = destination_manifest_path.to_string_lossy().into_owned();

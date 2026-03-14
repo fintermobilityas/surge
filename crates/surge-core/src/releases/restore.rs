@@ -5,6 +5,7 @@ use std::path::Path;
 
 use crate::crypto::sha256::sha256_hex;
 use crate::error::{Result, SurgeError};
+use crate::platform::fs::write_file_atomic;
 use crate::releases::artifact_cache::{cache_path_for_key, cached_artifact_matches, fetch_or_reuse_file};
 use crate::releases::delta::{apply_delta_patch, decode_delta_patch, is_supported_delta};
 use crate::releases::manifest::{ReleaseEntry, ReleaseIndex};
@@ -238,9 +239,27 @@ pub async fn restore_full_archive_for_version_with_options(
             &restored,
             &format!("rebuilt full archive for {}", release.version),
         )?;
+        if let Some(cache_root) = options.cache_dir {
+            cache_restored_full_archive(cache_root, release, &restored)?;
+        }
     }
 
     Ok(restored)
+}
+
+fn cache_restored_full_archive(cache_root: &Path, release: &ReleaseEntry, restored: &[u8]) -> Result<()> {
+    let key = release.full_filename.trim();
+    if key.is_empty() {
+        return Ok(());
+    }
+
+    verify_expected_sha256(
+        &release.full_sha256,
+        restored,
+        &format!("cached rebuilt full archive for {}", release.version),
+    )?;
+    let cache_path = cache_path_for_key(cache_root, key)?;
+    write_file_atomic(&cache_path, restored)
 }
 
 async fn select_restore_candidate<'a>(
@@ -477,6 +496,27 @@ pub fn required_artifacts_for_index(index: &ReleaseIndex) -> BTreeSet<String> {
         extend_required_artifacts_for_sorted_releases(releases, &mut required);
     }
     required
+}
+
+#[must_use]
+pub fn local_checkpoint_artifacts_for_index(index: &ReleaseIndex, per_rid_limit: usize) -> BTreeSet<String> {
+    let mut by_rid: BTreeMap<&str, Vec<&ReleaseEntry>> = BTreeMap::new();
+    for release in &index.releases {
+        by_rid.entry(release.rid.as_str()).or_default().push(release);
+    }
+
+    let mut retained = BTreeSet::new();
+    for releases in by_rid.values_mut() {
+        releases.sort_by(|a, b| compare_versions(&a.version, &b.version));
+        for release in releases.iter().rev().take(per_rid_limit) {
+            let key = release.full_filename.trim();
+            if !key.is_empty() {
+                retained.insert(key.to_string());
+            }
+        }
+    }
+
+    retained
 }
 
 fn extend_required_artifacts_for_sorted_releases(releases: &[&ReleaseEntry], required: &mut BTreeSet<String>) {
@@ -1087,8 +1127,8 @@ mod tests {
 
         assert_eq!(restored, full_v2);
         assert!(
-            !cache_path_for_key(&cache_root, &v2.full_filename).unwrap().exists(),
-            "direct full should not be fetched when the cached graph can reconstruct the target"
+            cache_path_for_key(&cache_root, &v2.full_filename).unwrap().exists(),
+            "reconstructed full should be retained as a local checkpoint"
         );
     }
 

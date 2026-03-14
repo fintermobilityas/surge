@@ -7,6 +7,11 @@
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
+use std::{
+    fs,
+    io::{Read, Seek, SeekFrom, Write},
+    path::Path,
+};
 
 use crate::error::{Result, SurgeError};
 
@@ -270,6 +275,143 @@ pub fn chunked_bspatch(older: &[u8], patch: &[u8], opts: &ChunkedDiffOptions) ->
     Ok(output)
 }
 
+/// Create a chunked binary diff patch directly from two files without loading
+/// either file fully into memory.
+pub fn chunked_bsdiff_files(older_path: &Path, newer_path: &Path, opts: &ChunkedDiffOptions) -> Result<Vec<u8>> {
+    let chunk_size = opts.chunk_size;
+    if chunk_size == 0 {
+        return Err(SurgeError::Diff("chunk_size must be > 0".into()));
+    }
+
+    let old_size = usize::try_from(fs::metadata(older_path)?.len())
+        .map_err(|_| SurgeError::Diff("old file exceeds platform limits".into()))?;
+    let new_size = usize::try_from(fs::metadata(newer_path)?.len())
+        .map_err(|_| SurgeError::Diff("new file exceeds platform limits".into()))?;
+    let num_old_chunks = old_size.div_ceil(chunk_size);
+    let num_new_chunks = new_size.div_ceil(chunk_size);
+    let num_chunks = num_old_chunks.max(num_new_chunks);
+    let num_threads = opts.effective_threads();
+    let work_counter = AtomicUsize::new(0);
+    let results: Mutex<Vec<(usize, Vec<u8>)>> = Mutex::new(Vec::with_capacity(num_chunks));
+    let error: Mutex<Option<SurgeError>> = Mutex::new(None);
+
+    thread::scope(|scope| {
+        for _ in 0..num_threads {
+            scope.spawn(|| {
+                let mut old_file = match fs::File::open(older_path) {
+                    Ok(file) => file,
+                    Err(err) => {
+                        *lock_mutex(&error) = Some(SurgeError::Io(err));
+                        return;
+                    }
+                };
+                let mut new_file = match fs::File::open(newer_path) {
+                    Ok(file) => file,
+                    Err(err) => {
+                        *lock_mutex(&error) = Some(SurgeError::Io(err));
+                        return;
+                    }
+                };
+
+                loop {
+                    if lock_mutex(&error).is_some() {
+                        return;
+                    }
+
+                    let idx = work_counter.fetch_add(1, Ordering::Relaxed);
+                    if idx >= num_chunks {
+                        return;
+                    }
+
+                    let old_chunk_len = chunk_len_for_index(old_size, idx, chunk_size);
+                    let new_chunk_len = chunk_len_for_index(new_size, idx, chunk_size);
+                    let old_chunk = match read_chunk_at(&mut old_file, idx, chunk_size, old_chunk_len) {
+                        Ok(chunk) => chunk,
+                        Err(err) => {
+                            *lock_mutex(&error) = Some(err);
+                            return;
+                        }
+                    };
+                    let new_chunk = match read_chunk_at(&mut new_file, idx, chunk_size, new_chunk_len) {
+                        Ok(chunk) => chunk,
+                        Err(err) => {
+                            *lock_mutex(&error) = Some(err);
+                            return;
+                        }
+                    };
+
+                    let patch = if old_chunk.is_empty() {
+                        new_chunk
+                    } else if new_chunk.is_empty() {
+                        Vec::new()
+                    } else {
+                        match wrapper::bsdiff_buffers(&old_chunk, &new_chunk) {
+                            Ok(patch) => patch,
+                            Err(err) => {
+                                *lock_mutex(&error) = Some(err);
+                                return;
+                            }
+                        }
+                    };
+                    lock_mutex(&results).push((idx, patch));
+                }
+            });
+        }
+    });
+
+    if let Some(err) = into_inner(error) {
+        return Err(err);
+    }
+    let mut chunks = into_inner(results);
+    chunks.sort_by_key(|(idx, _)| *idx);
+    serialize_patch(old_size, new_size, chunk_size, &chunks)
+}
+
+/// Apply a chunked binary diff patch directly against a file, writing the
+/// reconstructed file to `output_path` without materializing the entire output
+/// in memory.
+pub fn chunked_bspatch_file(older_path: &Path, patch: &[u8], output_path: &Path) -> Result<()> {
+    let (old_size, new_size, chunk_size, chunk_patches) = deserialize_patch(patch)?;
+    let actual_old_size = usize::try_from(fs::metadata(older_path)?.len())
+        .map_err(|_| SurgeError::Diff("old file exceeds platform limits".into()))?;
+    if actual_old_size != old_size {
+        return Err(SurgeError::Diff(format!(
+            "old file size mismatch: expected {old_size}, got {actual_old_size}"
+        )));
+    }
+
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut old_file = fs::File::open(older_path)?;
+    let mut output = fs::File::create(output_path)?;
+    let mut bytes_written = 0usize;
+
+    for (idx, chunk_patch) in chunk_patches.iter().enumerate() {
+        let old_chunk_len = chunk_len_for_index(old_size, idx, chunk_size);
+        let old_chunk = read_exact_chunk(&mut old_file, old_chunk_len)?;
+        let new_chunk = if old_chunk.is_empty() {
+            (*chunk_patch).to_vec()
+        } else if chunk_patch.is_empty() {
+            Vec::new()
+        } else {
+            wrapper::bspatch_buffers(&old_chunk, chunk_patch)?
+        };
+        output.write_all(&new_chunk)?;
+        bytes_written = bytes_written.saturating_add(new_chunk.len());
+    }
+    output.flush()?;
+
+    if bytes_written != new_size {
+        return Err(SurgeError::Diff(format!(
+            "reconstructed size mismatch: expected {new_size}, got {bytes_written}"
+        )));
+    }
+
+    Ok(())
+}
+
 /// Patch format:
 ///   MAGIC (4 bytes) "CSDF"
 ///   VERSION (1 byte)
@@ -323,6 +465,31 @@ fn serialize_patch(
     }
 
     Ok(buf)
+}
+
+fn chunk_len_for_index(total_len: usize, chunk_idx: usize, chunk_size: usize) -> usize {
+    let start = chunk_idx.saturating_mul(chunk_size);
+    if start >= total_len {
+        0
+    } else {
+        (total_len - start).min(chunk_size)
+    }
+}
+
+fn read_exact_chunk(file: &mut fs::File, chunk_len: usize) -> Result<Vec<u8>> {
+    let mut chunk = vec![0u8; chunk_len];
+    if chunk_len == 0 {
+        return Ok(chunk);
+    }
+    file.read_exact(&mut chunk)?;
+    Ok(chunk)
+}
+
+fn read_chunk_at(file: &mut fs::File, chunk_idx: usize, chunk_size: usize, chunk_len: usize) -> Result<Vec<u8>> {
+    let start = u64::try_from(chunk_idx.saturating_mul(chunk_size))
+        .map_err(|_| SurgeError::Diff("chunk offset exceeds supported limits".into()))?;
+    file.seek(SeekFrom::Start(start))?;
+    read_exact_chunk(file, chunk_len)
 }
 
 fn read_u64_le(data: &[u8], offset: usize) -> Result<u64> {
@@ -461,5 +628,33 @@ mod tests {
         let patch = chunked_bsdiff(&old, &new, &opts).expect("bsdiff");
         let reconstructed = chunked_bspatch(&old, &patch, &opts).expect("bspatch");
         assert_eq!(reconstructed, new);
+    }
+
+    #[test]
+    fn test_chunked_file_roundtrip_avoids_full_in_memory_inputs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let old_path = tmp.path().join("old.bin");
+        let new_path = tmp.path().join("new.bin");
+        let rebuilt_path = tmp.path().join("rebuilt.bin");
+
+        let old = vec![7u8; 2 * 1024 * 1024];
+        let mut new = old.clone();
+        new[123] = 9;
+        new[1_234_567] = 3;
+        std::fs::write(&old_path, &old).expect("write old");
+        std::fs::write(&new_path, &new).expect("write new");
+
+        let patch = chunked_bsdiff_files(
+            &old_path,
+            &new_path,
+            &ChunkedDiffOptions {
+                chunk_size: 256 * 1024,
+                max_threads: 1,
+            },
+        )
+        .expect("build patch");
+        chunked_bspatch_file(&old_path, &patch, &rebuilt_path).expect("apply patch");
+
+        assert_eq!(std::fs::read(&rebuilt_path).expect("read rebuilt"), new);
     }
 }

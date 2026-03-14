@@ -20,7 +20,7 @@ pub const SCHEMA_VERSION: i32 = 1;
 pub const DEFAULT_ZSTD_LEVEL: i32 = 9;
 
 /// Default delta strategy used by `surge pack`.
-pub const PACK_DEFAULT_DELTA_STRATEGY: &str = "archive-chunked-bsdiff";
+pub const PACK_DEFAULT_DELTA_STRATEGY: &str = "sparse-file-ops";
 
 /// Default compression format used by `surge pack`.
 pub const PACK_DEFAULT_COMPRESSION_FORMAT: &str = "zstd";

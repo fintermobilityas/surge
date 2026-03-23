@@ -120,6 +120,7 @@ jobs:
             name: Linux x64
             cache_key: linux-artifacts
             artifact_name: linux-x64
+            build_strategy: host
             artifact_path: |
               target/release/libsurge.so
               target/release/surge
@@ -130,16 +131,14 @@ jobs:
             name: Linux arm64
             cache_key: linux-arm64-artifacts
             artifact_name: linux-arm64
-            artifact_path: |
-              target/release/libsurge.so
-              target/release/surge
-              target/release/surge-installer
-              target/release/surge-installer-ui
-              target/release/surge-supervisor
+            artifact_path: artifacts/linux-arm64
+            build_strategy: ubuntu18-container
+            glibc_max: "2.27"
           - os: windows-latest
             name: Windows x64
             cache_key: windows-artifacts
             artifact_name: win-x64
+            build_strategy: host
             artifact_path: |
               target/release/surge.dll
               target/release/surge.dll.lib
@@ -151,6 +150,7 @@ jobs:
             name: macOS
             cache_key: macos-artifacts
             artifact_name: osx-x64
+            build_strategy: host
             artifact_path: |
               target/release/libsurge.dylib
               target/release/surge
@@ -161,10 +161,34 @@ jobs:
       - uses: actions/checkout@v6
         with:
           submodules: true
+      - uses: actions/cache@v5
+        if: matrix.build_strategy == 'ubuntu18-container'
+        with:
+          path: |
+            .cargo-bionic
+            .rustup-bionic
+            target-bionic
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ matrix.cache_key }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'scripts/build-linux-arm64-ubuntu18.sh', 'scripts/check-glibc-baseline.sh', 'scripts/stage-toolchain-artifact.sh') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-${{ matrix.cache_key }}-
       - uses: Swatinem/rust-cache@v2
+        if: matrix.build_strategy != 'ubuntu18-container'
         with:
           key: ${{ matrix.cache_key }}
       - run: cargo build --release
+        if: matrix.build_strategy != 'ubuntu18-container'
+      - name: Build Linux arm64 artifacts in Ubuntu 18.04
+        if: matrix.build_strategy == 'ubuntu18-container'
+        run: ./scripts/build-linux-arm64-ubuntu18.sh --output artifacts/linux-arm64 --with-gui
+      - name: Validate Linux arm64 glibc baseline
+        if: matrix.build_strategy == 'ubuntu18-container'
+        run: |
+          ./scripts/check-glibc-baseline.sh --max "${{ matrix.glibc_max }}" \
+            artifacts/linux-arm64/surge \
+            artifacts/linux-arm64/surge-supervisor \
+            artifacts/linux-arm64/surge-installer \
+            artifacts/linux-arm64/surge-installer-ui \
+            artifacts/linux-arm64/libsurge.so
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
         with:

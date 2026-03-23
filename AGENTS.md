@@ -120,6 +120,11 @@ If the local environment cannot run a listed command, document the exact gap in 
 - Keep benchmark payload descriptions anonymized and generic; do not add private product names or file names to docs, workflow labels, or benchmark fixtures.
 - Keep `.github/workflows/benchmark.yml` aligned with `docs/performance/benchmark-profiles.md` and `docs/performance/pack-policy.md`.
 
+## Anonymized Communication
+- In agent-authored issues, PRs, plans, summaries, and troubleshooting notes, use fictional placeholder names for products, customers, sites, hosts, and environments by default.
+- Do not repeat real deployment names or hostname patterns such as `*-master` in user-facing prose when a fictional placeholder will do.
+- Keep real identifiers only when technically required for literal commands, file paths, workflow names, or source references.
+
 ## Releasing
 
 Versioning is managed by GitVersion (`GitVersion.yml`). The `next-version` field controls the base version.

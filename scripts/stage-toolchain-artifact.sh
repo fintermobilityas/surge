@@ -56,6 +56,7 @@ if [ "$with_gui" -eq 1 ]; then
 fi
 
 cargo build --release "${packages[@]}"
+target_dir="${CARGO_TARGET_DIR:-target}/release"
 
 case "$(uname -s | tr '[:upper:]' '[:lower:]')" in
   linux)
@@ -83,8 +84,8 @@ rm -rf "$output_dir"
 mkdir -p "$output_dir"
 
 for binary in "${binaries[@]}"; do
-  cp "target/release/${binary}" "$output_dir/"
+  cp "${target_dir}/${binary}" "$output_dir/"
 done
-cp "target/release/${native_runtime}" "$output_dir/"
+cp "${target_dir}/${native_runtime}" "$output_dir/"
 
 printf 'Staged Surge toolchain in %s\n' "$output_dir"

@@ -15,6 +15,7 @@ pub mod download;
 pub mod error;
 pub mod install;
 pub mod installer_bundle;
+pub mod installer_package;
 pub mod lock;
 pub mod pack;
 pub mod platform;

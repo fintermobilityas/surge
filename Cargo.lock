@@ -3123,6 +3123,7 @@ dependencies = [
  "surge-core",
  "tempfile",
  "tokio",
+ "zstd",
 ]
 
 [[package]]

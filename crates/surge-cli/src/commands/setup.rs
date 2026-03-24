@@ -1,20 +1,17 @@
-use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::logline;
-use surge_core::config::constants::RELEASES_FILE_COMPRESSED;
 use surge_core::config::installer::InstallerManifest;
 use surge_core::error::{Result, SurgeError};
 use surge_core::install::{self as core_install, InstallProfile};
-use surge_core::platform::paths::default_install_root;
-use surge_core::releases::artifact_cache::{cache_path_for_key, cached_artifact_matches, prune_cached_artifacts};
-use surge_core::releases::manifest::{ReleaseEntry, ReleaseIndex, decompress_release_index};
-use surge_core::releases::restore::{
-    RestoreOptions, RestoreProgress, required_artifacts_for_index, restore_full_archive_for_version_with_options,
+use surge_core::installer_package::{
+    InstallerPackageAcquisition, ResolveInstallerPackageOptions, ResolvedInstallerPackage,
+    prune_install_artifact_cache, resolve_installer_package,
 };
-use surge_core::storage::{self, StorageBackend};
+use surge_core::platform::paths::default_install_root;
+use surge_core::releases::restore::RestoreProgress;
 
 const PACKAGE_PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(10);
 const PACKAGE_PROGRESS_PERCENT_STEP: u64 = 10;
@@ -194,178 +191,68 @@ pub async fn execute(dir: &Path, no_start: bool) -> Result<()> {
 /// artifact cache, then release-graph reconstruction/download into that cache.
 async fn resolve_package(dir: &Path, manifest: &InstallerManifest, install_root: &Path) -> Result<ResolvedPackage> {
     let full_filename = manifest.release.full_filename.trim();
-    if full_filename.is_empty() {
-        return Err(SurgeError::Config(
-            "Installer manifest has no full_filename in release section".to_string(),
-        ));
-    }
+    let download_progress = Mutex::new(ProgressReporter::new("Downloading package..."));
+    let restore_progress = Mutex::new(ProgressReporter::new("Preparing package..."));
 
-    let payload_path = dir.join("payload").join(full_filename);
-    if payload_path.is_file() {
-        logline::info(&format!("Using bundled payload: {}", payload_path.display()));
-        return Ok(ResolvedPackage {
-            path: payload_path,
-            required_artifacts: None,
-        });
-    }
-
-    let artifact_cache_dir = install_artifact_cache_dir(install_root);
-    std::fs::create_dir_all(&artifact_cache_dir)?;
-    let cached_package_path = cache_path_for_key(&artifact_cache_dir, full_filename)?;
-    let storage_config = build_storage_config_from_manifest(dir, manifest)?;
-    let backend = storage::create_storage_backend(&storage_config)?;
-    let index = match fetch_release_index(&*backend, manifest).await {
-        Ok(index) => index,
-        Err(error) if cached_package_path.is_file() => {
-            logline::warn(&format!(
-                "Could not fetch release index; using cached package '{}' without verification: {error}",
-                cached_package_path.display()
-            ));
-            return Ok(ResolvedPackage {
-                path: cached_package_path,
-                required_artifacts: None,
-            });
-        }
-        Err(error) => return Err(error),
-    };
-    let required_artifacts = index.as_ref().map(required_artifacts_for_index);
-
-    if let Some(index) = index.as_ref()
-        && let Some(release) = find_release_for_installer(index, manifest)
-    {
-        if cached_artifact_matches(&cached_package_path, &release.full_sha256)? {
-            logline::info(&format!(
-                "Using cached package from artifact cache: {}",
-                cached_package_path.display()
-            ));
-            return Ok(ResolvedPackage {
-                path: cached_package_path,
-                required_artifacts,
-            });
-        }
-
-        logline::info(&format!("Preparing package '{full_filename}' in artifact cache"));
-        let progress = Mutex::new(ProgressReporter::new("Preparing package..."));
-        let restored = restore_full_archive_for_version_with_options(
-            &*backend,
-            index,
-            &manifest.rid,
-            &manifest.version,
-            RestoreOptions {
-                cache_dir: Some(&artifact_cache_dir),
-                progress: Some(&|update| {
-                    let mut reporter = progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if let Some(message) = reporter.observe_restore(update) {
-                        logline::subtle(&message);
-                    }
-                }),
-            },
-        )
-        .await?;
-        std::fs::write(&cached_package_path, restored)?;
-        logline::success(&format!(
-            "Prepared '{}' in artifact cache ({})",
-            full_filename,
-            file_size_label(&cached_package_path)
-        ));
-        return Ok(ResolvedPackage {
-            path: cached_package_path,
-            required_artifacts,
-        });
-    }
-
-    if cached_package_path.is_file() {
-        logline::warn(&format!(
-            "Release metadata for '{}' was not found; using cached package '{}'.",
-            full_filename,
-            cached_package_path.display()
-        ));
-        return Ok(ResolvedPackage {
-            path: cached_package_path,
-            required_artifacts,
-        });
-    }
-
-    logline::info(&format!("Downloading package '{full_filename}' into artifact cache"));
-    let progress = Mutex::new(ProgressReporter::new("Downloading package..."));
-
-    backend
-        .download_to_file(
-            full_filename,
-            &cached_package_path,
-            Some(&|done, total| {
-                let mut reporter = progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let package = resolve_installer_package(
+        dir,
+        manifest,
+        install_root,
+        ResolveInstallerPackageOptions {
+            download_progress: Some(&|done, total| {
+                let mut reporter = download_progress
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if let Some(message) = reporter.observe_bytes(done, total) {
                     logline::subtle(&message);
                 }
             }),
-        )
-        .await?;
+            restore_progress: Some(&|update| {
+                let mut reporter = restore_progress
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(message) = reporter.observe_restore(update) {
+                    logline::subtle(&message);
+                }
+            }),
+            stage: None,
+        },
+    )
+    .await?;
 
-    logline::success(&format!(
-        "Downloaded '{}' to artifact cache ({})",
-        full_filename,
-        file_size_label(&cached_package_path)
-    ));
-
-    Ok(ResolvedPackage {
-        path: cached_package_path,
-        required_artifacts,
-    })
-}
-
-fn build_storage_config_from_manifest(
-    dir: &Path,
-    manifest: &InstallerManifest,
-) -> Result<surge_core::context::StorageConfig> {
-    super::build_storage_config_from_installer_manifest(manifest, dir)
-}
-
-fn install_artifact_cache_dir(install_root: &Path) -> PathBuf {
-    install_root.join(".surge-cache").join("artifacts")
-}
-
-async fn fetch_release_index(
-    backend: &dyn StorageBackend,
-    manifest: &InstallerManifest,
-) -> Result<Option<ReleaseIndex>> {
-    let key = manifest.release_index_key.trim();
-    let key = if key.is_empty() { RELEASES_FILE_COMPRESSED } else { key };
-    match backend.get_object(key).await {
-        Ok(bytes) => {
-            let index = decompress_release_index(&bytes)?;
-            if !index.app_id.is_empty() && index.app_id != manifest.app_id {
-                return Err(SurgeError::NotFound(format!(
-                    "Release index belongs to app '{}' not '{}'",
-                    index.app_id, manifest.app_id
-                )));
-            }
-            Ok(Some(index))
+    match package.acquisition {
+        InstallerPackageAcquisition::BundledPayload => {
+            logline::info(&format!("Using bundled payload: {}", package.path().display()));
         }
-        Err(SurgeError::NotFound(_)) => Ok(None),
-        Err(e) => Err(e),
+        InstallerPackageAcquisition::ArtifactCache => {
+            logline::info(&format!(
+                "Using cached package from artifact cache: {}",
+                package.path().display()
+            ));
+        }
+        InstallerPackageAcquisition::PreparedArtifactCache => {
+            logline::success(&format!(
+                "Prepared '{}' in artifact cache ({})",
+                full_filename,
+                file_size_label(package.path())
+            ));
+        }
+        InstallerPackageAcquisition::ArtifactCacheFallback => {
+            logline::warn(&format!(
+                "Using cached package from artifact cache without release-index verification: {}",
+                package.path().display()
+            ));
+        }
+        InstallerPackageAcquisition::Downloaded => {
+            logline::success(&format!(
+                "Downloaded '{}' to artifact cache ({})",
+                full_filename,
+                file_size_label(package.path())
+            ));
+        }
     }
-}
 
-fn find_release_for_installer<'a>(index: &'a ReleaseIndex, manifest: &InstallerManifest) -> Option<&'a ReleaseEntry> {
-    index.releases.iter().find(|release| {
-        release.version == manifest.version
-            && release.full_filename.trim() == manifest.release.full_filename.trim()
-            && (release.rid.is_empty() || manifest.rid.is_empty() || release.rid == manifest.rid)
-    })
-}
-
-fn prune_install_artifact_cache(
-    install_root: &Path,
-    required_artifacts: &BTreeSet<String>,
-    warm_full_filename: &str,
-) -> Result<usize> {
-    let mut retained_artifacts = required_artifacts.clone();
-    let warm_full_filename = warm_full_filename.trim();
-    if !warm_full_filename.is_empty() {
-        retained_artifacts.insert(warm_full_filename.to_string());
-    }
-    prune_cached_artifacts(&install_artifact_cache_dir(install_root), &retained_artifacts)
+    Ok(package)
 }
 
 /// Kill any running process whose executable lives in the app directory.
@@ -405,16 +292,7 @@ fn file_size_label(path: &Path) -> String {
     }
 }
 
-struct ResolvedPackage {
-    path: PathBuf,
-    required_artifacts: Option<BTreeSet<String>>,
-}
-
-impl ResolvedPackage {
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
+type ResolvedPackage = ResolvedInstallerPackage;
 
 #[cfg(test)]
 mod tests {
@@ -605,9 +483,9 @@ mod tests {
             .await
             .expect("downloaded package");
 
-        assert!(package.path.is_file());
+        assert!(package.path().is_file());
         assert_eq!(
-            std::fs::read(&package.path).expect("downloaded bytes"),
+            std::fs::read(package.path()).expect("downloaded bytes"),
             std::fs::read(stored_archive).expect("stored bytes")
         );
         assert!(package.required_artifacts.is_some());

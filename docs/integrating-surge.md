@@ -189,6 +189,12 @@ At minimum, a green smoke should prove:
 
 If the app only implements prompt-first UX instead of `download_and_apply()`, the repo should still have one helper that exercises the lower-level apply path during smoke.
 
+If the app ships `online` or `online-gui` installers, include one additional clean-install check:
+
+- remove the existing install root
+- run the latest stable online installer directly
+- verify it can fresh-install the latest stable release even when storage retained an older full archive plus the latest delta
+
 ## 8. Common Failure Signatures
 
 These failures are worth documenting because they usually mean the same root cause.

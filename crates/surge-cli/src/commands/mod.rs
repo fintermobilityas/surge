@@ -19,6 +19,7 @@ pub(crate) use crate::prompts::{resolve_app_id, resolve_app_id_with_rid_hint, re
 
 use std::path::Path;
 
+#[cfg(test)]
 use surge_core::config::installer::InstallerManifest;
 use surge_core::config::manifest::SurgeManifest;
 use surge_core::context::{Context, StorageConfig, StorageProvider};
@@ -54,6 +55,7 @@ pub(crate) fn build_app_scoped_storage_context(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn build_storage_config_from_installer_manifest(
     manifest: &InstallerManifest,
     setup_dir: &Path,

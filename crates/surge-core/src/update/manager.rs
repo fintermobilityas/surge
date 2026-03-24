@@ -2719,16 +2719,16 @@ mod tests {
         let installed_file = install_root.join("app").join("payload.txt");
         assert!(installed_file.exists());
 
-        // The desktop id follows app_id so Linux app_id / desktop-file matching stays stable.
-        let desktop_file = applications_dir.join("test-app.desktop");
-        let startup_file = autostart_dir.join("test-app.desktop");
+        // Linux desktop matching follows the executable name / window class, not the scoped app id.
+        let desktop_file = applications_dir.join("demoapp.desktop");
+        let startup_file = autostart_dir.join("demoapp.desktop");
         assert!(desktop_file.exists());
         assert!(startup_file.exists());
 
         let desktop_content = std::fs::read_to_string(desktop_file).unwrap();
         assert!(desktop_content.contains("Icon="));
         assert!(desktop_content.contains("Name=demoapp"));
-        assert!(desktop_content.contains("StartupWMClass=test-app"));
+        assert!(desktop_content.contains("StartupWMClass=demoapp"));
         let stable_exe_path = install_root.join("app").join("demoapp");
         assert!(desktop_content.contains(stable_exe_path.to_string_lossy().as_ref()));
     }

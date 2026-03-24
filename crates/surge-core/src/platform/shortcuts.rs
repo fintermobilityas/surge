@@ -307,6 +307,8 @@ fn install_shortcuts_linux(
     environment: &BTreeMap<String, String>,
     paths: &LinuxShortcutPaths,
 ) -> Result<()> {
+    let legacy_file_names = linux_legacy_shortcut_file_names(app_id, name, exe_path);
+
     for rendered in render_linux_shortcut_files(
         app_id,
         name,
@@ -327,6 +329,15 @@ fn install_shortcuts_linux(
                 &paths.autostart_dir
             }
         };
+        for stale_file_name in &legacy_file_names {
+            if stale_file_name == &rendered.file_name {
+                continue;
+            }
+            let stale_shortcut_path = target_dir.join(stale_file_name);
+            if stale_shortcut_path.exists() {
+                std::fs::remove_file(stale_shortcut_path)?;
+            }
+        }
         let shortcut_path = target_dir.join(&rendered.file_name);
         crate::platform::fs::write_file_atomic(&shortcut_path, rendered.content.as_bytes())?;
         crate::platform::fs::make_executable(&shortcut_path)?;
@@ -450,24 +461,45 @@ fn escape_desktop_value(value: &str) -> String {
 }
 
 fn linux_desktop_id(app_id: &str, name: &str, exe_path: &Path) -> String {
-    let desktop_id_source = if app_id.trim().is_empty() {
-        exe_path.file_stem().and_then(std::ffi::OsStr::to_str).unwrap_or(name)
-    } else {
-        app_id
-    };
+    let desktop_id_source = exe_path
+        .file_stem()
+        .and_then(std::ffi::OsStr::to_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or(if app_id.trim().is_empty() {
+            Some(name)
+        } else {
+            Some(app_id)
+        })
+        .map_or(name, str::trim);
     sanitize_file_stem(desktop_id_source)
 }
 
 fn linux_startup_wm_class(app_id: &str, name: &str, exe_path: &Path) -> String {
-    if !app_id.trim().is_empty() {
+    let executable_stem = exe_path
+        .file_stem()
+        .and_then(std::ffi::OsStr::to_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    if let Some(file_name) = executable_stem {
+        file_name.to_string()
+    } else if !app_id.trim().is_empty() {
         app_id.trim().to_string()
-    } else if let Some(file_name) = exe_path.file_name().and_then(std::ffi::OsStr::to_str) {
-        file_name.trim().to_string()
-    } else if let Some(file_stem) = exe_path.file_stem().and_then(std::ffi::OsStr::to_str) {
-        file_stem.trim().to_string()
     } else {
         sanitize_file_stem(name)
     }
+}
+
+fn linux_legacy_shortcut_file_names(app_id: &str, name: &str, exe_path: &Path) -> Vec<String> {
+    let mut candidates = vec![
+        format!("{}.desktop", sanitize_file_stem(name)),
+        format!("{}.desktop", sanitize_file_stem(app_id)),
+        format!("{}.desktop", linux_desktop_id(app_id, name, exe_path)),
+    ];
+    candidates.sort();
+    candidates.dedup();
+    candidates
 }
 
 #[cfg(target_os = "windows")]
@@ -851,8 +883,8 @@ mod tests {
         )
         .unwrap();
 
-        let applications_shortcut = paths.applications_dir.join("demo-app.desktop");
-        let startup_shortcut = paths.autostart_dir.join("demo-app.desktop");
+        let applications_shortcut = paths.applications_dir.join("demoapp.desktop");
+        let startup_shortcut = paths.autostart_dir.join("demoapp.desktop");
         assert!(applications_shortcut.exists());
         assert!(startup_shortcut.exists());
 
@@ -862,7 +894,7 @@ mod tests {
         assert!(content.contains("Icon="));
         assert!(content.contains("Path="));
         assert!(content.contains("StartupNotify=true"));
-        assert!(content.contains("StartupWMClass=demo-app"));
+        assert!(content.contains("StartupWMClass=demoapp"));
     }
 
     #[test]
@@ -929,12 +961,12 @@ mod tests {
         );
 
         assert_eq!(rendered.len(), 2);
-        assert_eq!(rendered[0].file_name, "demo-app.desktop");
+        assert_eq!(rendered[0].file_name, "demoapp.desktop");
         assert!(rendered[0].content.contains("Exec=env DISPLAY=:0"));
-        assert!(rendered[0].content.contains("StartupWMClass=demo-app"));
+        assert!(rendered[0].content.contains("StartupWMClass=demoapp"));
         assert!(rendered[1].content.contains("surge-supervisor"));
         assert!(rendered[1].content.contains("--id demo-supervisor"));
-        assert!(rendered[1].content.contains("StartupWMClass=demo-app"));
+        assert!(rendered[1].content.contains("StartupWMClass=demoapp"));
     }
 
     #[test]
@@ -1046,5 +1078,52 @@ mod tests {
             desktop_entry.contains(&format!("Icon={}", fallback_icon.display())),
             "desktop entry should reference fallback icon: {desktop_entry}"
         );
+    }
+
+    #[test]
+    fn test_install_shortcuts_linux_removes_stale_legacy_desktop_entries() {
+        let _shortcut_env_lock = lock_test_shortcut_environment();
+        let tmp = tempfile::tempdir().unwrap();
+        let install_root = tmp.path().join("install");
+        let app_dir = install_root.join("app");
+        std::fs::create_dir_all(&app_dir).unwrap();
+
+        let exe_path = app_dir.join("horizon");
+        std::fs::write(&exe_path, b"#!/bin/sh\necho hi\n").unwrap();
+        crate::platform::fs::make_executable(&exe_path).unwrap();
+
+        let icon_path = app_dir.join("icon.png");
+        std::fs::write(&icon_path, b"png").unwrap();
+
+        let paths = LinuxShortcutPaths {
+            applications_dir: tmp.path().join("applications"),
+            autostart_dir: tmp.path().join("autostart"),
+        };
+        std::fs::create_dir_all(&paths.applications_dir).unwrap();
+        std::fs::create_dir_all(&paths.autostart_dir).unwrap();
+        std::fs::write(paths.applications_dir.join("Horizon.desktop"), b"legacy").unwrap();
+        std::fs::write(paths.applications_dir.join("horizon-linux-x64.desktop"), b"legacy").unwrap();
+        std::fs::write(paths.autostart_dir.join("Horizon.desktop"), b"legacy").unwrap();
+        std::fs::write(paths.autostart_dir.join("horizon-linux-x64.desktop"), b"legacy").unwrap();
+
+        install_shortcuts_linux(
+            "horizon-linux-x64",
+            "Horizon",
+            &exe_path,
+            &icon_path,
+            "",
+            &install_root,
+            &[ShortcutLocation::Desktop, ShortcutLocation::Startup],
+            &BTreeMap::new(),
+            &paths,
+        )
+        .unwrap();
+
+        assert!(paths.applications_dir.join("horizon.desktop").exists());
+        assert!(paths.autostart_dir.join("horizon.desktop").exists());
+        assert!(!paths.applications_dir.join("Horizon.desktop").exists());
+        assert!(!paths.applications_dir.join("horizon-linux-x64.desktop").exists());
+        assert!(!paths.autostart_dir.join("Horizon.desktop").exists());
+        assert!(!paths.autostart_dir.join("horizon-linux-x64.desktop").exists());
     }
 }

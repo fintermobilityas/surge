@@ -96,6 +96,14 @@ If the local environment cannot run a listed command, document the exact gap in 
 ## Dependencies
 - When adding new dependencies, always check crates.io for the latest stable version before specifying a version in `Cargo.toml`. Never assume a version number from memory.
 
+## Integrating Surge Into Other App Repos
+- Treat `docs/integrating-surge.md` as the shared playbook for future app integrations. It is written for both humans and agents.
+- Default to released Surge tags for app integrations. Use local checkout or pinned-commit overrides only while validating an unmerged Surge fix.
+- If an app repo integrates `surge-core`, treat that as a runtime dependency as well as a publishing dependency; do not reduce it to "CLI only" in smoke or release guidance.
+- App repos should expose wrapper scripts for local filesystem smoke and Windows Azure smoke. Agents should use those wrappers instead of ad hoc `surge pack` / `surge push` commands.
+- If a Rust app temporarily overrides `surge-core`, prefer a local `file://` Git source pinned to the exact Surge commit instead of a raw crate path. This preserves workspace dependency resolution in clean and cross-platform smoke runs.
+- If a failure is in Surge itself, fix it upstream in this repo first, release a new tag, then update the app repo. Do not normalize long-lived downstream patches.
+
 ## CLI Logging Output
 - For `surge-cli` command output (including progress/status updates), use the existing `logline` facility in `crates/surge-cli/src/logline.rs`.
 - Do not introduce alternative output paths for status/progress (for example ad-hoc `println!`-driven progress UIs) when `logline` can represent the same information.

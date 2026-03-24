@@ -12,6 +12,7 @@
   <a href="#why-surge">Why Surge</a> &bull;
   <a href="#5-minute-setup">5-Minute Setup</a> &bull;
   <a href="#cicd-integration">CI/CD</a> &bull;
+  <a href="docs/integrating-surge.md">App Playbook</a> &bull;
   <a href="#how-it-works">How It Works</a> &bull;
   <a href="#features">Features</a> &bull;
   <a href="#integration">Integration</a> &bull;
@@ -520,6 +521,9 @@ Use whatever you already have.
 | Local filesystem | `filesystem` | For testing or air-gapped environments. `bucket` = root directory path |
 
 ## Integration
+
+For a production app integration checklist, smoke expectations, and guidance for both humans and agents, see
+[docs/integrating-surge.md](docs/integrating-surge.md).
 
 Surge is a native shared library (`libsurge.so` / `surge.dll` / `libsurge.dylib`) with a C ABI. You don't need Rust in your project.
 

@@ -2,65 +2,46 @@
 set -euo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-gitversion_file="$repo_root/GitVersion.yml"
-cargo_file="$repo_root/Cargo.toml"
+source "$repo_root/scripts/version-lib.sh"
 
-next_version="$(
-  awk -F': *' '/^next-version:/ {print $2; exit}' "$gitversion_file" \
-    | tr -d '[:space:]"'
-)"
+workspace_version="$(workspace_base_version)"
+surge_core_version="$(workspace_surge_core_version)"
 
-workspace_version="$(
-  awk '
-    /^\[workspace\.package\]$/ { in_section = 1; next }
-    /^\[/ { in_section = 0 }
-    in_section && $1 == "version" {
-      value = $3
-      gsub(/"/, "", value)
-      print value
-      exit
-    }
-  ' "$cargo_file"
-)"
-
-surge_core_dep_version="$(
-  awk '
-    /^\[workspace\.dependencies\]$/ { in_section = 1; next }
-    /^\[/ { in_section = 0 }
-    in_section && $1 == "surge-core" {
-      if (match($0, /version[[:space:]]*=[[:space:]]*"[^"]+"/)) {
-        value = substr($0, RSTART, RLENGTH)
-        split(value, parts, "\"")
-        print parts[2]
-      }
-      exit
-    }
-  ' "$cargo_file"
-)"
-
-if [[ -z "$next_version" || -z "$workspace_version" || -z "$surge_core_dep_version" ]]; then
-  echo "Failed to parse version values from GitVersion.yml/Cargo.toml." >&2
+if [[ -z "$workspace_version" || -z "$surge_core_version" ]]; then
+  echo "Failed to parse version values from Cargo.toml." >&2
   exit 1
 fi
 
-if [[ "$workspace_version" != "$next_version" ]]; then
+failed=0
+
+if [[ "$workspace_version" != "$surge_core_version" ]]; then
   cat <<EOF >&2
 Version mismatch:
-  GitVersion.yml next-version:     $next_version
-  Cargo.toml workspace version:    $workspace_version
-Update [workspace.package].version in Cargo.toml to match GitVersion.yml.
+  Cargo.toml [workspace.package].version:          $workspace_version
+  Cargo.toml [workspace.dependencies].surge-core:  $surge_core_version
+Update Cargo.toml so the workspace package version and surge-core workspace dependency version match.
 EOF
+  failed=1
+fi
+
+# Check Cargo.lock is in sync
+lock_file="$repo_root/Cargo.lock"
+if [[ -f "$lock_file" ]]; then
+  for crate in surge-core surge-cli surge-ffi surge-supervisor surge-installer surge-installer-ui; do
+    lock_version=$(awk -v pkg="$crate" '
+      /^\[\[package\]\]/ { in_pkg = 0 }
+      $0 == "name = \"" pkg "\"" { in_pkg = 1; next }
+      in_pkg && /^version = / { gsub(/"/, "", $3); print $3; exit }
+    ' "$lock_file")
+    if [[ -n "$lock_version" && "$lock_version" != "$workspace_version" ]]; then
+      echo "Cargo.lock version mismatch: $crate is $lock_version, expected $workspace_version. Run 'cargo check' to regenerate." >&2
+      failed=1
+    fi
+  done
+fi
+
+if [[ "$failed" -eq 1 ]]; then
   exit 1
 fi
 
-if [[ "$surge_core_dep_version" != "$next_version" ]]; then
-  cat <<EOF >&2
-Version mismatch:
-  GitVersion.yml next-version:                   $next_version
-  Cargo.toml workspace surge-core dep version:   $surge_core_dep_version
-Update [workspace.dependencies].surge-core version to match GitVersion.yml.
-EOF
-  exit 1
-fi
-
-echo "Version sync check passed: $next_version"
+echo "Version sync check passed: $workspace_version"

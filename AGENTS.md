@@ -40,6 +40,8 @@ dotnet build dotnet/Surge.slnx --configuration Release
 dotnet test dotnet/Surge.slnx --configuration Release
 ```
 
+- Run the workspace validation commands non-interactively. Do not allocate a TTY/PTY for `cargo test --workspace` or the chained pre-push validation suite, because prompt-path tests can wait on an interactive terminal and hang the run.
+
 ## Mandatory Pre-Push Validation
 Before any push, run the same quality gates CI uses. Do not push if any command fails.
 

@@ -491,6 +491,7 @@ fn linux_startup_wm_class(app_id: &str, name: &str, exe_path: &Path) -> String {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn linux_legacy_shortcut_file_names(app_id: &str, name: &str, exe_path: &Path) -> Vec<String> {
     let mut candidates = vec![
         format!("{}.desktop", sanitize_file_stem(name)),

@@ -127,22 +127,31 @@ If the local environment cannot run a listed command, document the exact gap in 
 
 ## Releasing
 
-Versioning is managed by GitVersion (`GitVersion.yml`). The `next-version` field controls the base version.
+Versioning is tag-driven. The single source of truth is `[workspace.package].version` in `Cargo.toml`.
 
-### Cutting a release
-1. Merge `develop` → `main` (creates the release, e.g. `0.3.0`).
-2. **Immediately** bump `next-version` in `GitVersion.yml` on `develop` to the next minor (e.g. `0.4.0`).
-3. When changing version baselines, also bump Cargo values in `Cargo.toml` in the same PR/commit series:
+### Version scripts
+- `scripts/version-lib.sh` — shared helpers for reading/writing workspace versions.
+- `scripts/check-version-sync.sh` — CI guard: ensures `[workspace.package].version`, `[workspace.dependencies].surge-core` version, and `Cargo.lock` entries all match.
+- `scripts/next-version.sh <alpha|beta|stable>` — suggests the next tag for a given channel by scanning existing git tags.
+- `scripts/set-release-version.sh <version>` — rewrites `Cargo.toml` to the exact release version (including prerelease suffixes) and updates `Cargo.lock`. Used in the release workflow.
+
+### Cutting a prerelease
+1. Run `./scripts/next-version.sh alpha` (or `beta`) to get the next tag (e.g. `v0.4.0-alpha.1`).
+2. Create a GitHub Release with that tag, marking it as a prerelease.
+3. The release workflow validates the tag, builds artifacts, publishes packages, and uploads assets.
+
+### Cutting a stable release
+1. Run `./scripts/next-version.sh stable` to get the tag (e.g. `v0.4.0`).
+2. Create a GitHub Release with that tag (not marked as prerelease).
+3. The release workflow validates, builds, publishes, and uploads.
+4. After a stable release, bump `Cargo.toml` to the next release line in a normal PR before cutting more prereleases:
    - `[workspace.package].version`
    - `[workspace.dependencies].surge-core` version
-4. Commit and push to `develop`.
 
-If step 2 is skipped, develop will keep producing preview versions under the *old* release number (e.g. `0.3.0-preview.N` instead of `0.4.0-preview.N`).
-
-CI enforces this with `./scripts/check-version-sync.sh`, which requires `GitVersion.yml` `next-version` to match both Cargo values above.
+If step 4 is skipped, `next-version.sh` will refuse to produce new tags until the version is bumped.
 
 ### Major version bumps
-For a major release (e.g. `1.0.0`), manually set `next-version` to the target version before merging to main.
+For a major release (e.g. `1.0.0`), manually set `[workspace.package].version` and `[workspace.dependencies].surge-core` version to the target before creating the release.
 
 ## Commit & Pull Request Guidelines
 - Use concise imperative commit messages, optionally scoped (examples: `feat(cli): ...`, `fix(core): ...`, `ci: ...`).

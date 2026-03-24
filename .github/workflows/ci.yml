@@ -2,9 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [main, develop]
+    branches: [main]
   pull_request:
-    branches: [main, develop]
+    branches: [main]
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -15,27 +16,20 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
-  version:
-    name: Version
+  version-sync:
+    name: Version Sync
     runs-on: ubuntu-latest
     outputs:
-      semver: ${{ steps.gitversion.outputs.semVer }}
-      major: ${{ steps.gitversion.outputs.major }}
-      minor: ${{ steps.gitversion.outputs.minor }}
-      patch: ${{ steps.gitversion.outputs.patch }}
-      prerelease: ${{ steps.gitversion.outputs.preReleaseLabel }}
-      nuget: ${{ steps.gitversion.outputs.semVer }}
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-      - name: Verify GitVersion and Cargo baseline versions are aligned
+      - name: Verify workspace versions are aligned
         run: ./scripts/check-version-sync.sh
-      - uses: gittools/actions/gitversion/setup@v4.4.2
-        with:
-          versionSpec: '6.x'
-      - id: gitversion
-        uses: gittools/actions/gitversion/execute@v4.4.2
+      - id: version
+        name: Read workspace version
+        run: |
+          source ./scripts/version-lib.sh
+          echo "version=$(workspace_base_version)" >> "$GITHUB_OUTPUT"
 
   fmt:
     name: rustfmt
@@ -110,7 +104,7 @@ jobs:
 
   rust-artifacts:
     name: Rust artifacts (${{ matrix.name }})
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -198,7 +192,7 @@ jobs:
   dotnet:
     name: .NET
     runs-on: ubuntu-latest
-    needs: [version]
+    needs: [version-sync]
     defaults:
       run:
         working-directory: dotnet
@@ -216,206 +210,5 @@ jobs:
           restore-keys: nuget-
       - run: dotnet restore
       - run: dotnet format --verify-no-changes --verbosity diagnostic
-      - run: dotnet build --no-restore --configuration Release -p:Version=${{ needs.version.outputs.semver }}
+      - run: dotnet build --no-restore --configuration Release -p:Version=${{ needs.version-sync.outputs.version }}
       - run: dotnet test --no-build --configuration Release --verbosity normal
-
-  nuget:
-    name: Publish NuGet
-    runs-on: ubuntu-latest
-    needs: [version, clippy, clippy-strict, rust-test, rust-artifacts, dotnet]
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
-    defaults:
-      run:
-        working-directory: dotnet
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: true
-      - uses: actions/setup-dotnet@v5
-        with:
-          dotnet-version: '10.0.x'
-      - uses: actions/cache@v5
-        with:
-          path: ~/.nuget/packages
-          key: nuget-${{ hashFiles('dotnet/Directory.Packages.props') }}
-          restore-keys: nuget-
-      - name: Pack
-        run: dotnet pack Surge.NET/Surge.NET.csproj --configuration Release -p:Version=${{ needs.version.outputs.nuget }} --output ../nupkgs
-      - name: Push to NuGet
-        run: dotnet nuget push ../nupkgs/*.nupkg --source nuget.org --api-key ${{ secrets.PETERSUNDE_NUGET_ORG_API_KEY }} --skip-duplicate
-
-  cargo-crates-io-publish:
-    name: Publish Cargo (crates.io)
-    runs-on: ubuntu-latest
-    needs: [version, clippy, clippy-strict, rust-test, rust-artifacts, dotnet]
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
-    env:
-      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: true
-      - uses: Swatinem/rust-cache@v2
-      - name: Validate crates.io API token
-        run: |
-          if [ -z "${CARGO_REGISTRY_TOKEN}" ]; then
-            echo "CARGO_REGISTRY_TOKEN secret is required for crates.io publish."
-            exit 1
-          fi
-      - name: Set version
-        run: |
-          sed -i 's/^version = ".*"/version = "${{ needs.version.outputs.semver }}"/' Cargo.toml
-          sed -i -E 's|surge-core = \{ path = "crates/surge-core", version = ".*"(, registry = "surge")? \}|surge-core = { path = "crates/surge-core", version = "${{ needs.version.outputs.semver }}" }|' Cargo.toml
-          cargo generate-lockfile
-      - name: Publish surge-core to crates.io
-        run: cargo publish -p surge-core --allow-dirty
-      - name: Publish surge-cli to crates.io
-        run: |
-          for attempt in $(seq 1 10); do
-            if cargo publish -p surge-cli --allow-dirty; then
-              exit 0
-            fi
-            if [ "${attempt}" -eq 10 ]; then
-              echo "Failed to publish surge-cli after waiting for surge-core to sync on crates.io."
-              exit 1
-            fi
-            sleep $((attempt * 5))
-          done
-
-  cargo-cloudsmith-publish:
-    name: Publish Cargo (Cloudsmith)
-    runs-on: ubuntu-latest
-    needs: [version, clippy, clippy-strict, rust-test, rust-artifacts, dotnet]
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
-    env:
-      CLOUDSMITH_API_KEY: ${{ secrets.CLOUDSMITH_API_KEY }}
-      CLOUDSMITH_NAMESPACE: finter-as
-      CLOUDSMITH_REPOSITORY: surge
-      CARGO_REGISTRIES_SURGE_INDEX: sparse+https://cargo.cloudsmith.io/finter-as/surge/
-      CARGO_REGISTRIES_SURGE_TOKEN: ${{ secrets.CLOUDSMITH_API_KEY }}
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: true
-      - uses: Swatinem/rust-cache@v2
-      - name: Validate Cloudsmith API key
-        run: |
-          if [ -z "${CLOUDSMITH_API_KEY}" ]; then
-            echo "CLOUDSMITH_API_KEY secret is required for cargo publish."
-            exit 1
-          fi
-      - name: Set version
-        run: |
-          sed -i 's/^version = ".*"/version = "${{ needs.version.outputs.semver }}"/' Cargo.toml
-          sed -i -E 's|surge-core = \{ path = "crates/surge-core", version = ".*"(, registry = "surge")? \}|surge-core = { path = "crates/surge-core", version = "${{ needs.version.outputs.semver }}", registry = "surge" }|' Cargo.toml
-          cargo generate-lockfile
-      - name: Install Cloudsmith CLI
-        run: |
-          python3 -m pip install --upgrade pip
-          python3 -m pip install cloudsmith-cli
-      - name: Ensure Cloudsmith repository exists
-        run: |
-          if ! cloudsmith repos list "${CLOUDSMITH_NAMESPACE}" --output-format json --api-key "${CLOUDSMITH_API_KEY}" | jq -e --arg slug "${CLOUDSMITH_REPOSITORY}" '.data[] | select(.slug == $slug)' >/dev/null; then
-            cat > cloudsmith-repo.json <<EOF
-          {"name":"surge","description":"Public Cargo registry for Surge pre-releases","repository_type_str":"Public","slug":"surge"}
-          EOF
-            cloudsmith repos create "${CLOUDSMITH_NAMESPACE}" cloudsmith-repo.json --api-key "${CLOUDSMITH_API_KEY}"
-          fi
-      - name: Publish surge-core to Cloudsmith Cargo registry
-        run: |
-          cargo publish -p surge-core --registry surge --allow-dirty
-      - name: Publish surge-supervisor to Cloudsmith Cargo registry
-        run: |
-          for attempt in $(seq 1 10); do
-            if cargo publish -p surge-supervisor --registry surge --allow-dirty; then
-              exit 0
-            fi
-            if [ "${attempt}" -eq 10 ]; then
-              echo "Failed to publish surge-supervisor after waiting for surge-core to sync in registry."
-              exit 1
-            fi
-            sleep $((attempt * 5))
-          done
-      - name: Publish surge-installer to Cloudsmith Cargo registry
-        run: |
-          for attempt in $(seq 1 10); do
-            if cargo publish -p surge-installer --registry surge --allow-dirty; then
-              exit 0
-            fi
-            if [ "${attempt}" -eq 10 ]; then
-              echo "Failed to publish surge-installer after waiting for surge-core to sync in registry."
-              exit 1
-            fi
-            sleep $((attempt * 5))
-          done
-      - name: Publish surge-installer-ui to Cloudsmith Cargo registry
-        run: |
-          for attempt in $(seq 1 10); do
-            if cargo publish -p surge-installer-ui --registry surge --allow-dirty; then
-              exit 0
-            fi
-            if [ "${attempt}" -eq 10 ]; then
-              echo "Failed to publish surge-installer-ui after waiting for surge-core to sync in registry."
-              exit 1
-            fi
-            sleep $((attempt * 5))
-          done
-      - name: Publish surge-cli to Cloudsmith Cargo registry
-        run: |
-          for attempt in $(seq 1 10); do
-            if cargo publish -p surge-cli --registry surge --allow-dirty; then
-              exit 0
-            fi
-            if [ "${attempt}" -eq 10 ]; then
-              echo "Failed to publish surge-cli after waiting for surge-core to sync in registry."
-              exit 1
-            fi
-            sleep $((attempt * 5))
-          done
-
-  release:
-    name: Release
-    runs-on: ubuntu-latest
-    needs:
-      - version
-      - clippy
-      - clippy-strict
-      - rust-test
-      - rust-artifacts
-      - dotnet
-      - nuget
-      - cargo-crates-io-publish
-      - cargo-cloudsmith-publish
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v8
-        with:
-          path: artifacts
-
-      - name: Package release assets
-        run: |
-          cd artifacts
-          tar czf ../surge-linux-x64.tar.gz -C linux-x64 .
-          tar czf ../surge-linux-arm64.tar.gz -C linux-arm64 .
-          tar czf ../surge-osx-x64.tar.gz -C osx-x64 .
-          cd win-x64 && zip -r ../../surge-win-x64.zip . && cd ..
-
-      - name: Create release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v${{ needs.version.outputs.semver }}
-          name: v${{ needs.version.outputs.semver }}
-          draft: ${{ github.ref == 'refs/heads/main' }}
-          prerelease: ${{ github.ref == 'refs/heads/develop' }}
-          generate_release_notes: true
-          files: |
-            surge-linux-x64.tar.gz
-            surge-linux-arm64.tar.gz
-            surge-osx-x64.tar.gz
-            surge-win-x64.zip
-            include/surge/surge_api.h

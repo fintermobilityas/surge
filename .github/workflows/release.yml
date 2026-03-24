@@ -1,0 +1,365 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.release.tag_name }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+permissions:
+  contents: write
+
+jobs:
+  validate-release:
+    name: Validate Release
+    runs-on: ubuntu-latest
+    outputs:
+      release_version: ${{ steps.validate.outputs.release_version }}
+      is_prerelease: ${{ steps.validate.outputs.is_prerelease }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          fetch-depth: 0
+          submodules: true
+
+      - name: Verify workspace versions are aligned
+        run: ./scripts/check-version-sync.sh
+
+      - id: validate
+        name: Validate tag and release metadata
+        run: |
+          source ./scripts/version-lib.sh
+
+          tag_name="${{ github.event.release.tag_name }}"
+          release_prerelease="${{ github.event.release.prerelease }}"
+
+          if [[ "$tag_name" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            release_version="${BASH_REMATCH[1]}"
+            tag_prerelease="false"
+          elif [[ "$tag_name" =~ ^v([0-9]+\.[0-9]+\.[0-9]+-(alpha|beta)\.[0-9]+)$ ]]; then
+            release_version="${BASH_REMATCH[1]}"
+            tag_prerelease="true"
+          else
+            echo "::error::Unsupported release tag: ${tag_name}"
+            exit 1
+          fi
+
+          if [[ "$release_prerelease" != "$tag_prerelease" ]]; then
+            echo "::error::GitHub Release prerelease flag does not match tag ${tag_name}."
+            exit 1
+          fi
+
+          repo_base_version="$(workspace_base_version)"
+          tag_base_version="${release_version%%-*}"
+
+          if [[ "$repo_base_version" != "$tag_base_version" ]]; then
+            echo "::error::Cargo.toml base version ${repo_base_version} does not match release line ${tag_base_version}."
+            exit 1
+          fi
+
+          echo "Validated release: tag=${tag_name} version=${release_version} prerelease=${tag_prerelease}"
+
+          echo "release_version=${release_version}" >> "$GITHUB_OUTPUT"
+          echo "is_prerelease=${tag_prerelease}" >> "$GITHUB_OUTPUT"
+          echo "## Release validation" >> "$GITHUB_STEP_SUMMARY"
+          echo "Tag: \`${tag_name}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Version: \`${release_version}\`" >> "$GITHUB_STEP_SUMMARY"
+
+  build-artifacts:
+    name: Artifacts (${{ matrix.name }})
+    needs: validate-release
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: Linux x64
+            cache_key: linux-release-artifacts
+            artifact_name: linux-x64
+            build_strategy: host
+            artifact_path: |
+              target/release/libsurge.so
+              target/release/surge
+              target/release/surge-installer
+              target/release/surge-installer-ui
+              target/release/surge-supervisor
+          - os: ubuntu-24.04-arm
+            name: Linux arm64
+            cache_key: linux-arm64-release-artifacts
+            artifact_name: linux-arm64
+            artifact_path: artifacts/linux-arm64
+            build_strategy: ubuntu18-container
+            glibc_max: "2.27"
+          - os: windows-latest
+            name: Windows x64
+            cache_key: windows-release-artifacts
+            artifact_name: win-x64
+            build_strategy: host
+            artifact_path: |
+              target/release/surge.dll
+              target/release/surge.dll.lib
+              target/release/surge.exe
+              target/release/surge-installer.exe
+              target/release/surge-installer-ui.exe
+              target/release/surge-supervisor.exe
+          - os: macos-latest
+            name: macOS
+            cache_key: macos-release-artifacts
+            artifact_name: osx-x64
+            build_strategy: host
+            artifact_path: |
+              target/release/libsurge.dylib
+              target/release/surge
+              target/release/surge-installer
+              target/release/surge-installer-ui
+              target/release/surge-supervisor
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          submodules: true
+      - name: Set release version
+        shell: bash
+        run: ./scripts/set-release-version.sh "${{ needs.validate-release.outputs.release_version }}"
+      - uses: actions/cache@v5
+        if: matrix.build_strategy == 'ubuntu18-container'
+        with:
+          path: |
+            .cargo-bionic
+            .rustup-bionic
+            target-bionic
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ matrix.cache_key }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'scripts/build-linux-arm64-ubuntu18.sh', 'scripts/check-glibc-baseline.sh', 'scripts/stage-toolchain-artifact.sh') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-${{ matrix.cache_key }}-
+      - uses: Swatinem/rust-cache@v2
+        if: matrix.build_strategy != 'ubuntu18-container'
+        with:
+          key: ${{ matrix.cache_key }}
+      - run: cargo build --release
+        if: matrix.build_strategy != 'ubuntu18-container'
+      - name: Build Linux arm64 artifacts in Ubuntu 18.04
+        if: matrix.build_strategy == 'ubuntu18-container'
+        run: ./scripts/build-linux-arm64-ubuntu18.sh --output artifacts/linux-arm64 --with-gui
+      - name: Validate Linux arm64 glibc baseline
+        if: matrix.build_strategy == 'ubuntu18-container'
+        run: |
+          ./scripts/check-glibc-baseline.sh --max "${{ matrix.glibc_max }}" \
+            artifacts/linux-arm64/surge \
+            artifacts/linux-arm64/surge-supervisor \
+            artifacts/linux-arm64/surge-installer \
+            artifacts/linux-arm64/surge-installer-ui \
+            artifacts/linux-arm64/libsurge.so
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_path }}
+
+  publish-nuget:
+    name: Publish NuGet
+    needs: [validate-release, build-artifacts]
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dotnet
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          submodules: true
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '10.0.x'
+      - uses: actions/cache@v5
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ hashFiles('dotnet/Directory.Packages.props') }}
+          restore-keys: nuget-
+      - name: Pack
+        run: dotnet pack Surge.NET/Surge.NET.csproj --configuration Release -p:Version=${{ needs.validate-release.outputs.release_version }} --output ../nupkgs
+      - name: Push to NuGet
+        run: dotnet nuget push ../nupkgs/*.nupkg --source nuget.org --api-key ${{ secrets.PETERSUNDE_NUGET_ORG_API_KEY }} --skip-duplicate
+
+  publish-cargo-crates-io:
+    name: Publish Cargo (crates.io)
+    needs: [validate-release, build-artifacts]
+    runs-on: ubuntu-latest
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          submodules: true
+      - uses: Swatinem/rust-cache@v2
+      - name: Validate crates.io API token
+        run: |
+          if [ -z "${CARGO_REGISTRY_TOKEN}" ]; then
+            echo "CARGO_REGISTRY_TOKEN secret is required for crates.io publish."
+            exit 1
+          fi
+      - name: Set release version
+        run: ./scripts/set-release-version.sh "${{ needs.validate-release.outputs.release_version }}"
+      - name: Publish surge-core to crates.io
+        run: cargo publish -p surge-core --allow-dirty
+      - name: Publish surge-cli to crates.io
+        run: |
+          for attempt in $(seq 1 10); do
+            if cargo publish -p surge-cli --allow-dirty; then
+              exit 0
+            fi
+            if [ "${attempt}" -eq 10 ]; then
+              echo "Failed to publish surge-cli after waiting for surge-core to sync on crates.io."
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
+
+  publish-cargo-cloudsmith:
+    name: Publish Cargo (Cloudsmith)
+    needs: [validate-release, build-artifacts]
+    runs-on: ubuntu-latest
+    env:
+      CLOUDSMITH_API_KEY: ${{ secrets.CLOUDSMITH_API_KEY }}
+      CLOUDSMITH_NAMESPACE: finter-as
+      CLOUDSMITH_REPOSITORY: surge
+      CARGO_REGISTRIES_SURGE_INDEX: sparse+https://cargo.cloudsmith.io/finter-as/surge/
+      CARGO_REGISTRIES_SURGE_TOKEN: ${{ secrets.CLOUDSMITH_API_KEY }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          submodules: true
+      - uses: Swatinem/rust-cache@v2
+      - name: Validate Cloudsmith API key
+        run: |
+          if [ -z "${CLOUDSMITH_API_KEY}" ]; then
+            echo "CLOUDSMITH_API_KEY secret is required for cargo publish."
+            exit 1
+          fi
+      - name: Set release version
+        run: |
+          source ./scripts/version-lib.sh
+          version="${{ needs.validate-release.outputs.release_version }}"
+
+          sed -i 's/^version = ".*"/version = "'"$version"'"/' Cargo.toml
+          sed -i -E 's|surge-core = \{ path = "crates/surge-core", version = ".*"(, registry = "surge")? \}|surge-core = { path = "crates/surge-core", version = "'"$version"'", registry = "surge" }|' Cargo.toml
+          cargo generate-lockfile
+      - name: Install Cloudsmith CLI
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install cloudsmith-cli
+      - name: Ensure Cloudsmith repository exists
+        run: |
+          if ! cloudsmith repos list "${CLOUDSMITH_NAMESPACE}" --output-format json --api-key "${CLOUDSMITH_API_KEY}" | jq -e --arg slug "${CLOUDSMITH_REPOSITORY}" '.data[] | select(.slug == $slug)' >/dev/null; then
+            cat > cloudsmith-repo.json <<EOF
+          {"name":"surge","description":"Public Cargo registry for Surge pre-releases","repository_type_str":"Public","slug":"surge"}
+          EOF
+            cloudsmith repos create "${CLOUDSMITH_NAMESPACE}" cloudsmith-repo.json --api-key "${CLOUDSMITH_API_KEY}"
+          fi
+      - name: Publish surge-core to Cloudsmith Cargo registry
+        run: cargo publish -p surge-core --registry surge --allow-dirty
+      - name: Publish surge-supervisor to Cloudsmith Cargo registry
+        run: |
+          for attempt in $(seq 1 10); do
+            if cargo publish -p surge-supervisor --registry surge --allow-dirty; then
+              exit 0
+            fi
+            if [ "${attempt}" -eq 10 ]; then
+              echo "Failed to publish surge-supervisor after waiting for surge-core to sync in registry."
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
+      - name: Publish surge-installer to Cloudsmith Cargo registry
+        run: |
+          for attempt in $(seq 1 10); do
+            if cargo publish -p surge-installer --registry surge --allow-dirty; then
+              exit 0
+            fi
+            if [ "${attempt}" -eq 10 ]; then
+              echo "Failed to publish surge-installer after waiting for surge-core to sync in registry."
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
+      - name: Publish surge-installer-ui to Cloudsmith Cargo registry
+        run: |
+          for attempt in $(seq 1 10); do
+            if cargo publish -p surge-installer-ui --registry surge --allow-dirty; then
+              exit 0
+            fi
+            if [ "${attempt}" -eq 10 ]; then
+              echo "Failed to publish surge-installer-ui after waiting for surge-core to sync in registry."
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
+      - name: Publish surge-cli to Cloudsmith Cargo registry
+        run: |
+          for attempt in $(seq 1 10); do
+            if cargo publish -p surge-cli --registry surge --allow-dirty; then
+              exit 0
+            fi
+            if [ "${attempt}" -eq 10 ]; then
+              echo "Failed to publish surge-cli after waiting for surge-core to sync in registry."
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
+
+  upload-release-assets:
+    name: Upload Release Assets
+    needs: [validate-release, build-artifacts]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Collect and verify release assets
+        run: |
+          mkdir -p release-assets
+
+          required_dirs=(linux-x64 linux-arm64 win-x64 osx-x64)
+          for dir in "${required_dirs[@]}"; do
+            if [ ! -d "artifacts/$dir" ]; then
+              echo "::error::Missing required artifact directory: $dir"
+              exit 1
+            fi
+          done
+
+          cd artifacts
+          tar czf ../release-assets/surge-linux-x64.tar.gz -C linux-x64 .
+          tar czf ../release-assets/surge-linux-arm64.tar.gz -C linux-arm64 .
+          tar czf ../release-assets/surge-osx-x64.tar.gz -C osx-x64 .
+          cd win-x64 && zip -r ../../release-assets/surge-win-x64.zip . && cd ..
+
+      - name: Generate checksums
+        run: |
+          cd release-assets
+          sha256sum *.tar.gz *.zip | tee SHA256SUMS.txt
+
+      - name: Upload assets to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" \
+            release-assets/* \
+            include/surge/surge_api.h \
+            --repo "${{ github.repository }}" \
+            --clobber

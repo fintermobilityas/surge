@@ -11,6 +11,7 @@ Surge is a Cargo workspace plus a .NET wrapper:
 - `dotnet/`: managed wrapper and tests (`Surge.NET`, `Surge.NET.Tests`).
 - `include/surge/`: public C headers.
 - `vendor/bsdiff/`: required submodule for C bsdiff backend.
+- `crates/surge-core/vendor/`: committed publishable snapshot generated from `vendor/bsdiff` for `surge-core` builds and crates.io packaging.
 - `assets/`, `demoapp/`: examples and fixtures.
 
 ### Installer Types
@@ -43,6 +44,7 @@ dotnet test dotnet/Surge.slnx --configuration Release
 Before any push, run the same quality gates CI uses. Do not push if any command fails.
 
 ```bash
+./scripts/sync-surge-core-vendor.sh --check
 ./scripts/check-version-sync.sh
 cargo fmt --all -- --check
 RUSTFLAGS="-D warnings" cargo test --workspace
@@ -54,6 +56,8 @@ dotnet test dotnet/Surge.slnx --configuration Release
 ```
 
 If the local environment cannot run a listed command, document the exact gap in the PR and run it in CI before merge.
+
+- When updating `vendor/bsdiff` or anything under `crates/surge-core/vendor/`, regenerate the publishable snapshot with `./scripts/sync-surge-core-vendor.sh` before running the checks above.
 
 ## Rust Quality Bar (Best Practices)
 - Prefer self-documenting code: clear types, names, and small functions over explanatory comments.

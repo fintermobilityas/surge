@@ -152,12 +152,12 @@ Versioning is tag-driven. The single source of truth is `[workspace.package].ver
 ### Cutting a prerelease
 1. Run `./scripts/next-version.sh alpha` (or `beta`) to get the next tag (e.g. `v0.4.0-alpha.1`).
 2. Create a GitHub Release with that tag, marking it as a prerelease.
-3. The release workflow validates the tag, builds artifacts, publishes packages, and uploads assets.
+3. The release workflow validates the tag, builds artifacts, publishes `Surge.NET` to NuGet and Rust crates to crates.io, and uploads assets.
 
 ### Cutting a stable release
 1. Run `./scripts/next-version.sh stable` to get the tag (e.g. `v0.4.0`).
 2. Create a GitHub Release with that tag (not marked as prerelease).
-3. The release workflow validates, builds, publishes, and uploads.
+3. The release workflow validates, builds artifacts, publishes `Surge.NET` to NuGet and Rust crates to crates.io, and uploads assets.
 4. After a stable release, bump `Cargo.toml` to the next release line in a normal PR before cutting more prereleases:
    - `[workspace.package].version`
    - `[workspace.dependencies].surge-core` version

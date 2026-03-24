@@ -31,6 +31,16 @@ jobs:
           source ./scripts/version-lib.sh
           echo "version=$(workspace_base_version)" >> "$GITHUB_OUTPUT"
 
+  vendor-sync:
+    name: Vendor Sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+      - name: Verify surge-core vendor snapshot
+        run: ./scripts/sync-surge-core-vendor.sh --check
+
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest

@@ -49,6 +49,7 @@ pub fn install_shortcuts(
     let install_root = app_dir.parent().unwrap_or(app_dir);
 
     install_shortcuts_impl(
+        app_id,
         display_name,
         &exe_path,
         icon_path.as_deref(),
@@ -134,6 +135,7 @@ fn resolve_target_path(app_dir: &Path, relative_or_absolute: &str) -> Result<Pat
 
 #[cfg(target_os = "linux")]
 fn install_shortcuts_impl(
+    app_id: &str,
     name: &str,
     exe_path: &Path,
     icon_path: Option<&Path>,
@@ -146,6 +148,7 @@ fn install_shortcuts_impl(
     if let Some(paths) = test_shortcut_paths_override() {
         let effective_icon = icon_path.unwrap_or(exe_path);
         return install_shortcuts_linux(
+            app_id,
             name,
             exe_path,
             effective_icon,
@@ -160,6 +163,7 @@ fn install_shortcuts_impl(
     let paths = LinuxShortcutPaths::for_current_user()?;
     let effective_icon = icon_path.unwrap_or(exe_path);
     install_shortcuts_linux(
+        app_id,
         name,
         exe_path,
         effective_icon,
@@ -173,6 +177,7 @@ fn install_shortcuts_impl(
 
 #[cfg(target_os = "windows")]
 fn install_shortcuts_impl(
+    _app_id: &str,
     name: &str,
     exe_path: &Path,
     icon_path: Option<&Path>,
@@ -195,6 +200,7 @@ fn install_shortcuts_impl(
 
 #[cfg(target_os = "macos")]
 fn install_shortcuts_impl(
+    _app_id: &str,
     name: &str,
     exe_path: &Path,
     icon_path: Option<&Path>,
@@ -216,6 +222,7 @@ fn install_shortcuts_impl(
 
 #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 fn install_shortcuts_impl(
+    _app_id: &str,
     _name: &str,
     _exe_path: &Path,
     _icon_path: Option<&Path>,
@@ -253,8 +260,21 @@ impl LinuxShortcutPaths {
 static TEST_SHORTCUT_PATHS_OVERRIDE: std::sync::Mutex<Option<LinuxShortcutPaths>> = std::sync::Mutex::new(None);
 
 #[cfg(all(test, target_os = "linux"))]
+static TEST_SHORTCUT_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(all(test, target_os = "linux"))]
 fn test_shortcut_paths_override() -> Option<LinuxShortcutPaths> {
     TEST_SHORTCUT_PATHS_OVERRIDE.lock().ok()?.clone()
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn lock_test_shortcut_environment() -> tokio::sync::MutexGuard<'static, ()> {
+    TEST_SHORTCUT_ENV_LOCK.blocking_lock()
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) async fn lock_test_shortcut_environment_async() -> tokio::sync::MutexGuard<'static, ()> {
+    TEST_SHORTCUT_ENV_LOCK.lock().await
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -277,6 +297,7 @@ pub(crate) fn clear_test_shortcut_paths_override() {
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 fn install_shortcuts_linux(
+    app_id: &str,
     name: &str,
     exe_path: &Path,
     icon_path: &Path,
@@ -287,6 +308,7 @@ fn install_shortcuts_linux(
     paths: &LinuxShortcutPaths,
 ) -> Result<()> {
     for rendered in render_linux_shortcut_files(
+        app_id,
         name,
         exe_path,
         icon_path,
@@ -314,6 +336,7 @@ fn install_shortcuts_linux(
 }
 
 pub fn render_linux_shortcut_files(
+    app_id: &str,
     name: &str,
     exe_path: &Path,
     icon_path: &Path,
@@ -322,7 +345,7 @@ pub fn render_linux_shortcut_files(
     shortcuts: &[ShortcutLocation],
     environment: &BTreeMap<String, String>,
 ) -> Vec<LinuxShortcutFile> {
-    let file_name = format!("{}.desktop", sanitize_file_stem(name));
+    let file_name = format!("{}.desktop", linux_desktop_id(app_id, name, exe_path));
     let mut desktop_entry: Option<String> = None;
     let mut startup_entry: Option<String> = None;
     let mut rendered = Vec::new();
@@ -330,11 +353,21 @@ pub fn render_linux_shortcut_files(
     for location in shortcuts {
         let content = match location {
             ShortcutLocation::Desktop | ShortcutLocation::StartMenu => desktop_entry
-                .get_or_insert_with(|| build_desktop_entry_linux(name, exe_path, icon_path, install_root, environment))
+                .get_or_insert_with(|| {
+                    build_desktop_entry_linux(app_id, name, exe_path, icon_path, install_root, environment)
+                })
                 .clone(),
             ShortcutLocation::Startup => startup_entry
                 .get_or_insert_with(|| {
-                    build_startup_entry_linux(name, exe_path, icon_path, supervisor_id, install_root, environment)
+                    build_startup_entry_linux(
+                        app_id,
+                        name,
+                        exe_path,
+                        icon_path,
+                        supervisor_id,
+                        install_root,
+                        environment,
+                    )
                 })
                 .clone(),
         };
@@ -349,6 +382,7 @@ pub fn render_linux_shortcut_files(
 }
 
 fn build_desktop_entry_linux(
+    app_id: &str,
     name: &str,
     exe_path: &Path,
     icon_path: &Path,
@@ -356,17 +390,19 @@ fn build_desktop_entry_linux(
     environment: &BTreeMap<String, String>,
 ) -> String {
     let display_name = escape_desktop_value(name);
+    let startup_wm_class = escape_desktop_value(&linux_startup_wm_class(app_id, name, exe_path));
     let icon = escape_desktop_value(&icon_path.to_string_lossy());
     let working_dir = escape_desktop_value(&install_root.to_string_lossy());
     let exe = escape_desktop_value(&exe_path.to_string_lossy());
     let exec_line = build_exec_line_linux(&format!("\"{exe}\""), environment);
 
     format!(
-        "[Desktop Entry]\nType=Application\nVersion=1.0\nName={display_name}\n{exec_line}\nIcon={icon}\nPath={working_dir}\nTerminal=false\n"
+        "[Desktop Entry]\nType=Application\nVersion=1.0\nName={display_name}\n{exec_line}\nIcon={icon}\nPath={working_dir}\nTerminal=false\nStartupNotify=true\nStartupWMClass={startup_wm_class}\n"
     )
 }
 
 fn build_startup_entry_linux(
+    app_id: &str,
     name: &str,
     exe_path: &Path,
     icon_path: &Path,
@@ -375,6 +411,7 @@ fn build_startup_entry_linux(
     environment: &BTreeMap<String, String>,
 ) -> String {
     let display_name = escape_desktop_value(name);
+    let startup_wm_class = escape_desktop_value(&linux_startup_wm_class(app_id, name, exe_path));
     let icon = escape_desktop_value(&icon_path.to_string_lossy());
 
     let exec_command = if supervisor_id.trim().is_empty() {
@@ -391,7 +428,7 @@ fn build_startup_entry_linux(
     let exec_line = build_exec_line_linux(&exec_command, environment);
 
     format!(
-        "[Desktop Entry]\nType=Application\nVersion=1.0\nName={display_name}\n{exec_line}\nIcon={icon}\nTerminal=false\n"
+        "[Desktop Entry]\nType=Application\nVersion=1.0\nName={display_name}\n{exec_line}\nIcon={icon}\nTerminal=false\nStartupWMClass={startup_wm_class}\n"
     )
 }
 
@@ -410,6 +447,27 @@ fn build_exec_line_linux(command: &str, environment: &BTreeMap<String, String>) 
 
 fn escape_desktop_value(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', " ")
+}
+
+fn linux_desktop_id(app_id: &str, name: &str, exe_path: &Path) -> String {
+    let desktop_id_source = if app_id.trim().is_empty() {
+        exe_path.file_stem().and_then(std::ffi::OsStr::to_str).unwrap_or(name)
+    } else {
+        app_id
+    };
+    sanitize_file_stem(desktop_id_source)
+}
+
+fn linux_startup_wm_class(app_id: &str, name: &str, exe_path: &Path) -> String {
+    if !app_id.trim().is_empty() {
+        app_id.trim().to_string()
+    } else if let Some(file_name) = exe_path.file_name().and_then(std::ffi::OsStr::to_str) {
+        file_name.trim().to_string()
+    } else if let Some(file_stem) = exe_path.file_stem().and_then(std::ffi::OsStr::to_str) {
+        file_stem.trim().to_string()
+    } else {
+        sanitize_file_stem(name)
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -758,6 +816,7 @@ mod tests {
 
     #[test]
     fn test_install_shortcuts_linux_writes_desktop_and_startup_files() {
+        let _shortcut_env_lock = lock_test_shortcut_environment();
         let tmp = tempfile::tempdir().unwrap();
         let install_root = tmp.path().join("install");
         let app_dir = install_root.join("app");
@@ -776,6 +835,7 @@ mod tests {
         };
 
         install_shortcuts_linux(
+            "demo-app",
             "Demo App",
             &exe_path,
             &icon_path,
@@ -791,8 +851,8 @@ mod tests {
         )
         .unwrap();
 
-        let applications_shortcut = paths.applications_dir.join("Demo-App.desktop");
-        let startup_shortcut = paths.autostart_dir.join("Demo-App.desktop");
+        let applications_shortcut = paths.applications_dir.join("demo-app.desktop");
+        let startup_shortcut = paths.autostart_dir.join("demo-app.desktop");
         assert!(applications_shortcut.exists());
         assert!(startup_shortcut.exists());
 
@@ -801,10 +861,13 @@ mod tests {
         assert!(content.contains("Exec=\""));
         assert!(content.contains("Icon="));
         assert!(content.contains("Path="));
+        assert!(content.contains("StartupNotify=true"));
+        assert!(content.contains("StartupWMClass=demo-app"));
     }
 
     #[test]
     fn test_install_shortcuts_linux_with_env_vars() {
+        let _shortcut_env_lock = lock_test_shortcut_environment();
         let tmp = tempfile::tempdir().unwrap();
         let install_root = tmp.path().join("install");
         let app_dir = install_root.join("app");
@@ -827,6 +890,7 @@ mod tests {
 
         install_shortcuts_linux(
             "demoapp",
+            "demoapp",
             &exe_path,
             &icon_path,
             "",
@@ -846,6 +910,7 @@ mod tests {
 
     #[test]
     fn test_render_linux_shortcut_files_emits_application_and_autostart_entries() {
+        let _shortcut_env_lock = lock_test_shortcut_environment();
         let install_root = PathBuf::from("/home/demo/.local/share/demoapp");
         let exe_path = install_root.join("app").join("demoapp");
         let icon_path = install_root.join("app").join("icon.png");
@@ -853,6 +918,7 @@ mod tests {
         env.insert("DISPLAY".to_string(), ":0".to_string());
 
         let rendered = render_linux_shortcut_files(
+            "demo-app",
             "Demo App",
             &exe_path,
             &icon_path,
@@ -863,14 +929,17 @@ mod tests {
         );
 
         assert_eq!(rendered.len(), 2);
-        assert_eq!(rendered[0].file_name, "Demo-App.desktop");
+        assert_eq!(rendered[0].file_name, "demo-app.desktop");
         assert!(rendered[0].content.contains("Exec=env DISPLAY=:0"));
+        assert!(rendered[0].content.contains("StartupWMClass=demo-app"));
         assert!(rendered[1].content.contains("surge-supervisor"));
         assert!(rendered[1].content.contains("--id demo-supervisor"));
+        assert!(rendered[1].content.contains("StartupWMClass=demo-app"));
     }
 
     #[test]
     fn test_install_shortcuts_linux_startup_with_supervisor() {
+        let _shortcut_env_lock = lock_test_shortcut_environment();
         let tmp = tempfile::tempdir().unwrap();
         let install_root = tmp.path().join("install");
         let app_dir = install_root.join("app");
@@ -892,6 +961,7 @@ mod tests {
         env.insert("MY_VAR".to_string(), "my_value".to_string());
 
         install_shortcuts_linux(
+            "demoapp",
             "demoapp",
             &exe_path,
             &icon_path,
@@ -920,6 +990,7 @@ mod tests {
 
     #[test]
     fn test_install_shortcuts_missing_main_exe_is_error() {
+        let _shortcut_env_lock = lock_test_shortcut_environment();
         let tmp = tempfile::tempdir().unwrap();
         let app_dir = tmp.path().join("app-1.0.0");
         std::fs::create_dir_all(&app_dir).unwrap();
@@ -941,6 +1012,7 @@ mod tests {
 
     #[test]
     fn test_install_shortcuts_falls_back_to_bundled_surge_icon() {
+        let _shortcut_env_lock = lock_test_shortcut_environment();
         let tmp = tempfile::tempdir().unwrap();
         let install_root = tmp.path().join("install");
         let app_dir = install_root.join("app");

@@ -2371,6 +2371,7 @@ async fn deploy_remote_app_copy_for_tailscale(
         let icon_path =
             remote_linux_shortcut_icon_path(&stage_app_dir, &active_app_dir, app_id, main_exe_name, &release.icon);
         let rendered = surge_core::platform::shortcuts::render_linux_shortcut_files(
+            app_id,
             release.display_name(app_id),
             &active_app_dir.join(main_exe_name),
             &icon_path,

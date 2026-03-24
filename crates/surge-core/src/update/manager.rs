@@ -1367,8 +1367,20 @@ mod tests {
     use crate::context::StorageProvider;
     use crate::diff::wrapper::bsdiff_buffers;
     #[cfg(target_os = "linux")]
-    use crate::platform::shortcuts::{clear_test_shortcut_paths_override, set_test_shortcut_paths_override};
+    use crate::platform::shortcuts::{
+        clear_test_shortcut_paths_override, lock_test_shortcut_environment_async, set_test_shortcut_paths_override,
+    };
     use crate::releases::manifest::{DeltaArtifact, ReleaseEntry, ReleaseIndex, compress_release_index};
+
+    #[cfg(target_os = "linux")]
+    struct ShortcutPathsOverrideGuard;
+
+    #[cfg(target_os = "linux")]
+    impl Drop for ShortcutPathsOverrideGuard {
+        fn drop(&mut self) {
+            clear_test_shortcut_paths_override();
+        }
+    }
 
     fn make_entry(version: &str, channel: &str, os: &str, rid: &str) -> ReleaseEntry {
         ReleaseEntry {
@@ -2624,14 +2636,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_download_and_apply_full_installs_shortcuts() {
-        struct ShortcutPathsOverrideGuard;
-
-        impl Drop for ShortcutPathsOverrideGuard {
-            fn drop(&mut self) {
-                clear_test_shortcut_paths_override();
-            }
-        }
-
+        let _shortcut_env_lock = lock_test_shortcut_environment_async().await;
         let tmp = tempfile::tempdir().unwrap();
         let applications_dir = tmp
             .path()
@@ -2714,15 +2719,16 @@ mod tests {
         let installed_file = install_root.join("app").join("payload.txt");
         assert!(installed_file.exists());
 
-        // name is empty so display_name falls back to main_exe ("demoapp")
-        let desktop_file = applications_dir.join("demoapp.desktop");
-        let startup_file = autostart_dir.join("demoapp.desktop");
+        // The desktop id follows app_id so Linux app_id / desktop-file matching stays stable.
+        let desktop_file = applications_dir.join("test-app.desktop");
+        let startup_file = autostart_dir.join("test-app.desktop");
         assert!(desktop_file.exists());
         assert!(startup_file.exists());
 
         let desktop_content = std::fs::read_to_string(desktop_file).unwrap();
         assert!(desktop_content.contains("Icon="));
         assert!(desktop_content.contains("Name=demoapp"));
+        assert!(desktop_content.contains("StartupWMClass=test-app"));
         let stable_exe_path = install_root.join("app").join("demoapp");
         assert!(desktop_content.contains(stable_exe_path.to_string_lossy().as_ref()));
     }

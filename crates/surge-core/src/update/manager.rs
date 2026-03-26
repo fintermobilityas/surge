@@ -1,6 +1,6 @@
 //! Update manager: check for updates, download, verify, and apply them.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -14,8 +14,9 @@ use crate::context::Context;
 use crate::crypto::sha256::{sha256_hex, sha256_hex_file};
 use crate::error::{Result, SurgeError};
 use crate::install::{InstallProfile, RuntimeManifestMetadata, storage_provider_manifest_name, write_runtime_manifest};
+use crate::pack::builder::build_canonical_archive_from_directory;
 use crate::platform::detect::current_rid;
-use crate::platform::fs::{atomic_rename, copy_directory};
+use crate::platform::fs::{atomic_rename, copy_directory, write_file_atomic};
 use crate::platform::process::{current_pid, spawn_detached, spawn_process, supervisor_binary_name};
 use crate::platform::shortcuts::install_shortcuts;
 use crate::releases::artifact_cache::{
@@ -26,7 +27,7 @@ use crate::releases::manifest::{
     ReleaseEntry, ReleaseIndex, decompress_release_index, get_delta_chain, get_releases_newer_than,
 };
 use crate::releases::restore::{
-    RestoreOptions, local_checkpoint_artifacts_for_index, required_artifacts_for_index,
+    RestoreOptions, find_release_for_version_rid, local_checkpoint_artifacts_for_index, required_artifacts_for_index,
     restore_full_archive_for_version_with_options,
 };
 use crate::releases::version::compare_versions;
@@ -669,7 +670,14 @@ impl UpdateManager {
                 decompress_release_index(&data)?
             };
             let rid = current_rid();
-            let mut rebuilt_archive = restore_full_archive_for_version_with_options(
+            let current_release =
+                find_release_for_version_rid(&index, &rid, &self.current_version).ok_or_else(|| {
+                    SurgeError::Update(format!(
+                        "Current release {} ({rid}) was not found in the release index",
+                        self.current_version
+                    ))
+                })?;
+            let mut rebuilt_archive = match restore_full_archive_for_version_with_options(
                 self.storage.as_ref(),
                 &index,
                 &rid,
@@ -680,12 +688,22 @@ impl UpdateManager {
                 },
             )
             .await
-            .map_err(|e| {
-                SurgeError::Update(format!(
-                    "Failed to restore base full archive for {}: {e}",
-                    self.current_version
-                ))
-            })?;
+            {
+                Ok(archive) => archive,
+                Err(restore_err) => synthesize_current_full_archive_from_installed_app(
+                    &self.install_dir,
+                    &self.current_version,
+                    current_release,
+                    &artifact_cache_dir,
+                    &self.ctx,
+                )
+                .map_err(|fallback_err| {
+                    SurgeError::Update(format!(
+                        "Failed to restore base full archive for {}: {restore_err}; installed-app fallback failed: {fallback_err}",
+                        self.current_version
+                    ))
+                })?,
+            };
 
             let mut apply_delta_items_done = 0i64;
             let mut apply_delta_bytes_done = 0i64;
@@ -1100,6 +1118,98 @@ fn find_previous_app_dir(install_dir: &Path, current_version: &str) -> Option<Pa
     find_latest_app_dir(install_dir).ok()
 }
 
+fn synthesize_current_full_archive_from_installed_app(
+    install_dir: &Path,
+    current_version: &str,
+    current_release: &ReleaseEntry,
+    artifact_cache_dir: &Path,
+    ctx: &Arc<Context>,
+) -> Result<Vec<u8>> {
+    let app_dir = find_previous_app_dir(install_dir, current_version).ok_or_else(|| {
+        SurgeError::NotFound(format!(
+            "No active installed app directory was found for current version {current_version}"
+        ))
+    })?;
+
+    let mut excluded_relative_paths = BTreeSet::new();
+    excluded_relative_paths.insert(crate::install::RUNTIME_MANIFEST_RELATIVE_PATH.to_string());
+    excluded_relative_paths.insert(crate::install::LEGACY_RUNTIME_MANIFEST_RELATIVE_PATH.to_string());
+    if runtime_state_dir_contains_only_manifests(&app_dir)? {
+        excluded_relative_paths.insert(".surge".to_string());
+    }
+
+    let budget = ctx.resource_budget();
+    let archive = build_canonical_archive_from_directory(
+        &app_dir,
+        budget.zstd_compression_level,
+        budget.effective_zstd_workers(),
+        &excluded_relative_paths,
+    )?;
+
+    let mut cache_path = None;
+    if !current_release.full_sha256.trim().is_empty() {
+        let actual_sha256 = sha256_hex(&archive);
+        if actual_sha256 == current_release.full_sha256 {
+            cache_path = Some(cache_path_for_key(artifact_cache_dir, &current_release.full_filename)?);
+        } else {
+            warn!(
+                version = %current_release.version,
+                expected_sha256 = %current_release.full_sha256,
+                actual_sha256 = %actual_sha256,
+                "Installed app content reproduced the current package payload but not the original compressed full archive bytes; using synthesized archive for in-flight delta application without caching it"
+            );
+        }
+    }
+
+    if let Some(cache_path) = cache_path {
+        write_file_atomic(&cache_path, &archive)?;
+        debug!(
+            version = %current_release.version,
+            app_dir = %app_dir.display(),
+            cache_path = %cache_path.display(),
+            "Rebuilt current full archive from installed app content"
+        );
+    }
+    Ok(archive)
+}
+
+fn runtime_state_dir_contains_only_manifests(app_dir: &Path) -> Result<bool> {
+    let surge_dir = app_dir.join(".surge");
+    if !surge_dir.exists() {
+        return Ok(false);
+    }
+    if !surge_dir.is_dir() {
+        return Ok(false);
+    }
+
+    let allowed = BTreeSet::from([
+        crate::install::RUNTIME_MANIFEST_RELATIVE_PATH.to_string(),
+        crate::install::LEGACY_RUNTIME_MANIFEST_RELATIVE_PATH.to_string(),
+    ]);
+    let mut stack = vec![surge_dir];
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(&dir)?.collect::<std::result::Result<Vec<_>, std::io::Error>>()?;
+        for entry in entries {
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path)?;
+            if metadata.is_dir() {
+                stack.push(path);
+                continue;
+            }
+
+            let relative = path
+                .strip_prefix(app_dir)
+                .map_err(|e| SurgeError::Update(format!("Failed to relativize installed app path: {e}")))?;
+            let relative = relative.to_string_lossy().replace('\\', "/");
+            if !allowed.contains(&relative) {
+                return Ok(false);
+            }
+        }
+    }
+
+    Ok(true)
+}
+
 async fn request_supervisor_shutdown(install_dir: &Path, supervisor_id: &str) -> Result<()> {
     request_supervisor_shutdown_with_timeout(
         install_dir,
@@ -1365,11 +1475,13 @@ mod tests {
     #[cfg(target_os = "linux")]
     use crate::config::manifest::ShortcutLocation;
     use crate::context::StorageProvider;
+    use crate::diff::chunked::ChunkedDiffOptions;
     use crate::diff::wrapper::bsdiff_buffers;
     #[cfg(target_os = "linux")]
     use crate::platform::shortcuts::{
         clear_test_shortcut_paths_override, lock_test_shortcut_environment_async, set_test_shortcut_paths_override,
     };
+    use crate::releases::delta::build_sparse_file_patch;
     use crate::releases::manifest::{DeltaArtifact, ReleaseEntry, ReleaseIndex, compress_release_index};
 
     #[cfg(target_os = "linux")]
@@ -2549,6 +2661,174 @@ mod tests {
 
         let installed = std::fs::read_to_string(install_root.join("app").join("payload.txt")).unwrap();
         assert_eq!(installed, "v3 payload");
+    }
+
+    #[tokio::test]
+    async fn test_download_and_apply_delta_rebuilds_current_full_from_installed_app_when_cache_chain_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("store");
+        let install_root = tmp.path().join("install");
+        std::fs::create_dir_all(&store_root).unwrap();
+        std::fs::create_dir_all(&install_root).unwrap();
+
+        let rid = current_rid();
+        let os = current_os_label_for_tests();
+
+        let source_v2 = tmp.path().join("source-v2");
+        let source_v3 = tmp.path().join("source-v3");
+        std::fs::create_dir_all(&source_v2).unwrap();
+        std::fs::create_dir_all(&source_v3).unwrap();
+        std::fs::write(source_v2.join("payload.txt"), "v2 payload").unwrap();
+        std::fs::write(source_v3.join("payload.txt"), "v3 payload").unwrap();
+
+        let mut packer_v2 = ArchivePacker::new(3).unwrap();
+        packer_v2.add_directory(&source_v2, "").unwrap();
+        let full_v2 = packer_v2.finalize().unwrap();
+
+        let mut packer_v3 = ArchivePacker::new(3).unwrap();
+        packer_v3.add_directory(&source_v3, "").unwrap();
+        let full_v3 = packer_v3.finalize().unwrap();
+
+        let patch_v3 = build_sparse_file_patch(&full_v2, &full_v3, 3, 0, &ChunkedDiffOptions::default()).unwrap();
+        let delta_v3 = zstd::encode_all(patch_v3.as_slice(), 3).unwrap();
+
+        let full_v2_name = format!("test-app-1.1.0-{rid}-full.tar.zst");
+        let full_v3_name = format!("test-app-1.2.0-{rid}-full.tar.zst");
+        let delta_v3_name = format!("test-app-1.2.0-{rid}-delta.tar.zst");
+
+        std::fs::write(store_root.join(&delta_v3_name), &delta_v3).unwrap();
+
+        let index = ReleaseIndex {
+            app_id: "test-app".to_string(),
+            releases: vec![
+                ReleaseEntry {
+                    version: "1.1.0".to_string(),
+                    channels: vec!["stable".to_string()],
+                    os: os.clone(),
+                    rid: rid.clone(),
+                    is_genesis: true,
+                    full_filename: full_v2_name.clone(),
+                    full_size: full_v2.len() as i64,
+                    full_sha256: sha256_hex(&full_v2),
+                    deltas: Vec::new(),
+                    preferred_delta_id: String::new(),
+                    created_utc: chrono::Utc::now().to_rfc3339(),
+                    release_notes: String::new(),
+                    name: String::new(),
+                    main_exe: "test-app".to_string(),
+                    install_directory: "test-app".to_string(),
+                    supervisor_id: String::new(),
+                    icon: String::new(),
+                    shortcuts: Vec::new(),
+                    persistent_assets: Vec::new(),
+                    installers: Vec::new(),
+                    environment: std::collections::BTreeMap::new(),
+                },
+                ReleaseEntry {
+                    version: "1.2.0".to_string(),
+                    channels: vec!["stable".to_string()],
+                    os,
+                    rid: rid.clone(),
+                    is_genesis: false,
+                    full_filename: full_v3_name,
+                    full_size: full_v3.len() as i64,
+                    full_sha256: sha256_hex(&full_v3),
+                    deltas: vec![DeltaArtifact::sparse_file_ops_zstd(
+                        "primary",
+                        "1.1.0",
+                        &delta_v3_name,
+                        delta_v3.len() as i64,
+                        &sha256_hex(&delta_v3),
+                    )],
+                    preferred_delta_id: "primary".to_string(),
+                    created_utc: chrono::Utc::now().to_rfc3339(),
+                    release_notes: String::new(),
+                    name: String::new(),
+                    main_exe: "test-app".to_string(),
+                    install_directory: "test-app".to_string(),
+                    supervisor_id: String::new(),
+                    icon: String::new(),
+                    shortcuts: Vec::new(),
+                    persistent_assets: Vec::new(),
+                    installers: Vec::new(),
+                    environment: std::collections::BTreeMap::new(),
+                },
+            ],
+            ..ReleaseIndex::default()
+        };
+
+        let compressed = compress_release_index(&index, DEFAULT_ZSTD_LEVEL).unwrap();
+        std::fs::write(store_root.join(RELEASES_FILE_COMPRESSED), compressed).unwrap();
+
+        let active_app_dir = install_root.join("app");
+        std::fs::create_dir_all(active_app_dir.join(".surge")).unwrap();
+        std::fs::write(active_app_dir.join("payload.txt"), "v2 payload").unwrap();
+        std::fs::write(
+            active_app_dir.join(crate::install::RUNTIME_MANIFEST_RELATIVE_PATH),
+            "id: test-app\nversion: 1.1.0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            active_app_dir.join(crate::install::LEGACY_RUNTIME_MANIFEST_RELATIVE_PATH),
+            "id: test-app\nversion: 1.1.0\n",
+        )
+        .unwrap();
+
+        let ctx = Arc::new(Context::new());
+        ctx.set_storage(
+            StorageProvider::Filesystem,
+            store_root.to_str().unwrap(),
+            "",
+            "",
+            "",
+            "",
+        );
+
+        let current_release = find_release_for_version_rid(&index, &rid, "1.1.0").unwrap();
+        let artifact_cache_dir = install_root.join(".surge-cache").join("artifacts");
+        let synthesized = synthesize_current_full_archive_from_installed_app(
+            &install_root,
+            "1.1.0",
+            current_release,
+            &artifact_cache_dir,
+            &ctx,
+        )
+        .unwrap();
+
+        let full_extract = tempfile::tempdir().unwrap();
+        crate::archive::extractor::extract_to(&full_v2, full_extract.path(), None).unwrap();
+        let synth_extract = tempfile::tempdir().unwrap();
+        crate::archive::extractor::extract_to(&synthesized, synth_extract.path(), None).unwrap();
+        let mut repacked_full = ArchivePacker::new(3).unwrap();
+        repacked_full.add_directory(full_extract.path(), "").unwrap();
+        let repacked_full = repacked_full.finalize().unwrap();
+        let mut repacked_synth = ArchivePacker::new(3).unwrap();
+        repacked_synth.add_directory(synth_extract.path(), "").unwrap();
+        let repacked_synth = repacked_synth.finalize().unwrap();
+        assert_eq!(repacked_synth, repacked_full);
+
+        let delta = index.releases[1].selected_delta().unwrap();
+        let decoded = decode_delta_patch(&delta_v3, &delta).unwrap();
+        let rebuilt = apply_delta_patch(&synthesized, &decoded, &delta).unwrap();
+        assert_eq!(rebuilt, full_v3);
+
+        let mut manager =
+            UpdateManager::new(ctx, "test-app", "1.1.0", "stable", install_root.to_str().unwrap()).unwrap();
+        let info = manager.check_for_updates().await.unwrap().unwrap();
+        assert_eq!(info.apply_strategy, ApplyStrategy::Delta);
+        assert_eq!(info.apply_releases.len(), 1);
+        assert_eq!(info.apply_releases[0].version, "1.2.0");
+        assert_eq!(info.apply_releases[0].full_sha256, sha256_hex(&full_v3));
+        manager
+            .download_and_apply(&info, None::<fn(ProgressInfo)>)
+            .await
+            .unwrap();
+
+        let installed = std::fs::read_to_string(install_root.join("app").join("payload.txt")).unwrap();
+        assert_eq!(installed, "v3 payload");
+
+        let cached_current_full = install_root.join(".surge-cache").join("artifacts").join(&full_v2_name);
+        assert!(!cached_current_full.exists());
     }
 
     #[tokio::test]

@@ -11,6 +11,12 @@ updates:
     schedule:
       interval: daily
       time: "04:00"
+    groups:
+      egui-stack:
+        patterns:
+          - "eframe"
+          - "egui"
+          - "egui*"
 
   - package-ecosystem: "github-actions"
     directory: "/"

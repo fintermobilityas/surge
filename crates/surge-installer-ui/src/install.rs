@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::time::Duration;
 
+use eframe::egui;
+
 use surge_core::config::installer::InstallerManifest;
 use surge_core::config::manifest::ShortcutLocation;
 use surge_core::install::{self as core_install, InstallProfile, InstallProgress, InstallProgressStage};

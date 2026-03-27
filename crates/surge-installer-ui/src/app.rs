@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 
-use egui::{Align2, Color32, CornerRadius, FontId, Id, Pos2, RichText, Shape, Stroke, StrokeKind, Vec2};
+use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Id, Pos2, RichText, Shape, Stroke, StrokeKind, Vec2};
 
 use surge_core::config::installer::InstallerManifest;
 use surge_core::install as core_install;
@@ -202,10 +202,10 @@ impl InstallerApp {
 
     // -- Welcome ---------------------------------------------------------------
 
-    fn render_welcome(&mut self, ctx: &egui::Context) {
+    fn render_welcome(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(BG))
-            .show(ctx, |ui| {
+            .show_inside(ui, |ui| {
                 let h = ui.available_height();
                 ui.vertical_centered(|ui| {
                     ui.add_space(h * 0.10);
@@ -269,18 +269,20 @@ impl InstallerApp {
 
     // -- Installing ------------------------------------------------------------
 
-    fn render_installing(&mut self, ctx: &egui::Context) {
+    fn render_installing(&mut self, ui: &mut egui::Ui) {
         let (target, status_text) = match &self.screen {
             Screen::Installing { progress, status } => (*progress, status.clone()),
             _ => return,
         };
         let name = self.manifest.runtime.name.clone();
 
-        let animated = ctx.animate_value_with_time(Id::new("install_progress"), target, 0.3);
+        let animated = ui
+            .ctx()
+            .animate_value_with_time(Id::new("install_progress"), target, 0.3);
 
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(BG))
-            .show(ctx, |ui| {
+            .show_inside(ui, |ui| {
                 let h = ui.available_height();
                 ui.vertical_centered(|ui| {
                     ui.add_space(h * 0.18);
@@ -314,12 +316,12 @@ impl InstallerApp {
                 });
             });
 
-        ctx.request_repaint();
+        ui.ctx().request_repaint();
     }
 
     // -- Complete --------------------------------------------------------------
 
-    fn render_complete(&mut self, ctx: &egui::Context) {
+    fn render_complete(&mut self, ui: &mut egui::Ui) {
         let install_root = match &self.screen {
             Screen::Complete { install_root } => install_root.clone(),
             _ => return,
@@ -327,7 +329,7 @@ impl InstallerApp {
 
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(BG))
-            .show(ctx, |ui| {
+            .show_inside(ui, |ui| {
                 let h = ui.available_height();
                 ui.vertical_centered(|ui| {
                     ui.add_space(h * 0.13);
@@ -395,14 +397,14 @@ impl InstallerApp {
 
     // -- Error -----------------------------------------------------------------
 
-    fn render_error(&self, ctx: &egui::Context) {
+    fn render_error(&self, ui: &mut egui::Ui) {
         let Screen::Error(error_msg) = &self.screen else {
             return;
         };
 
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(BG))
-            .show(ctx, |ui| {
+            .show_inside(ui, |ui| {
                 let h = ui.available_height();
                 ui.vertical_centered(|ui| {
                     ui.add_space(h * 0.12);
@@ -445,14 +447,14 @@ impl InstallerApp {
 }
 
 impl eframe::App for InstallerApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_progress();
 
         match &self.screen {
-            Screen::Welcome => self.render_welcome(ctx),
-            Screen::Installing { .. } => self.render_installing(ctx),
-            Screen::Complete { .. } => self.render_complete(ctx),
-            Screen::Error(_) => self.render_error(ctx),
+            Screen::Welcome => self.render_welcome(ui),
+            Screen::Installing { .. } => self.render_installing(ui),
+            Screen::Complete { .. } => self.render_complete(ui),
+            Screen::Error(_) => self.render_error(ui),
         }
     }
 }

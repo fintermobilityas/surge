@@ -6,6 +6,8 @@ mod install;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
+use eframe::egui;
+
 use surge_core::archive::extractor::extract_to;
 use surge_core::config::installer::InstallerManifest;
 use surge_core::error::{Result, SurgeError};

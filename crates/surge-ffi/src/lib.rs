@@ -445,6 +445,7 @@ pub unsafe extern "C" fn surge_update_manager_create(
             app_id: app_id_s,
             current_version: version_s,
             channel: channel_s,
+            release_retention_limit: 1,
             install_dir: install_s,
         });
 
@@ -520,6 +521,31 @@ pub unsafe extern "C" fn surge_update_manager_set_current_version(
     }))
 }
 
+/// Change the number of old app versions retained after successful updates.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn surge_update_manager_set_release_retention_limit(
+    mgr: *mut SurgeUpdateManagerHandle,
+    release_retention_limit: c_int,
+) -> i32 {
+    if mgr.is_null() {
+        return SURGE_ERROR;
+    }
+
+    catch_ffi(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: `mgr` is checked non-null above.
+        let mgr_ref = unsafe { &mut *mgr };
+        clear_shared_error(&mgr_ref.ctx, &mgr_ref.last_error);
+
+        if release_retention_limit < 0 {
+            let e = surge_core::error::SurgeError::Config("release_retention_limit cannot be negative".into());
+            return set_shared_error(&mgr_ref.ctx, &mgr_ref.last_error, &e);
+        }
+
+        mgr_ref.release_retention_limit = usize::try_from(release_retention_limit).unwrap_or(usize::MAX);
+        SURGE_OK
+    }))
+}
+
 /// Check for available updates.
 ///
 /// Returns `SURGE_OK` if updates are available, `SURGE_NOT_FOUND` if up-to-date.
@@ -555,6 +581,7 @@ pub unsafe extern "C" fn surge_update_check(
             Ok(m) => m,
             Err(e) => return set_shared_error(&mgr_ref.ctx, &mgr_ref.last_error, &e),
         };
+        update_mgr.set_release_retention_limit(mgr_ref.release_retention_limit);
 
         let result = mgr_ref.runtime.block_on(update_mgr.check_for_updates());
 
@@ -632,7 +659,7 @@ pub unsafe extern "C" fn surge_update_download_and_apply(
             return set_shared_error(&mgr_ref.ctx, &mgr_ref.last_error, &e);
         }
 
-        let update_mgr = match UpdateManager::new(
+        let mut update_mgr = match UpdateManager::new(
             mgr_ref.ctx.clone(),
             &mgr_ref.app_id,
             &mgr_ref.current_version,
@@ -642,6 +669,7 @@ pub unsafe extern "C" fn surge_update_download_and_apply(
             Ok(m) => m,
             Err(e) => return set_shared_error(&mgr_ref.ctx, &mgr_ref.last_error, &e),
         };
+        update_mgr.set_release_retention_limit(mgr_ref.release_retention_limit);
 
         // Map core ProgressInfo → SurgeProgressFfi via the C callback.
         // Handle Some/None explicitly to give the compiler a concrete type
@@ -1528,6 +1556,44 @@ mod tests {
             .unwrap_or_default()
             .to_string();
         assert!(msg.contains("channel"));
+
+        unsafe {
+            surge_update_manager_destroy(mgr);
+            surge_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn manager_set_release_retention_limit_updates_context_last_error() {
+        let ctx = surge_context_create();
+        assert!(!ctx.is_null());
+
+        let app_id = CString::new("demo").unwrap();
+        let version = CString::new("1.0.0").unwrap();
+        let channel = CString::new("stable").unwrap();
+        let install_dir = CString::new("/tmp/demo").unwrap();
+
+        let mgr = unsafe {
+            surge_update_manager_create(
+                ctx,
+                app_id.as_ptr(),
+                version.as_ptr(),
+                channel.as_ptr(),
+                install_dir.as_ptr(),
+            )
+        };
+        assert!(!mgr.is_null());
+
+        let rc = unsafe { surge_update_manager_set_release_retention_limit(mgr, -1) };
+        assert_ne!(rc, SURGE_OK);
+
+        let last = unsafe { surge_context_last_error(ctx) };
+        assert!(!last.is_null());
+        let msg = unsafe { CStr::from_ptr((*last).message) }
+            .to_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(msg.contains("release_retention_limit"));
 
         unsafe {
             surge_update_manager_destroy(mgr);

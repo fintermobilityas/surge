@@ -114,6 +114,7 @@ pub struct SurgeUpdateManagerHandle {
     pub app_id: String,
     pub current_version: String,
     pub channel: String,
+    pub release_retention_limit: usize,
     pub install_dir: String,
 }
 

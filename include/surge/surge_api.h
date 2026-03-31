@@ -230,6 +230,15 @@ SURGE_API surge_result SURGE_CALL surge_update_manager_set_current_version(surge
                                                                            const char* current_version);
 
 /**
+ * Change how many old app versions are retained after successful updates.
+ * @param mgr                     Manager handle.
+ * @param release_retention_limit Maximum number of `app-*` snapshots to keep.
+ * @return SURGE_OK on success.
+ */
+SURGE_API surge_result SURGE_CALL surge_update_manager_set_release_retention_limit(surge_update_manager* mgr,
+                                                                                   int32_t release_retention_limit);
+
+/**
  * Check for available updates.
  * @param mgr  Manager handle.
  * @param info [out] Receives a pointer to release information.

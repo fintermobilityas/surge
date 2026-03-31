@@ -16,11 +16,22 @@ namespace Surge
         private bool _disposed;
         private string _channel = "stable";
         private string _currentVersion = "0.0.0";
+        private int _releaseRetentionLimit = 1;
 
         /// <summary>
-        /// Maximum number of old releases to retain on disk after updating.
+        /// Maximum number of old installed versions to retain on disk after updating.
         /// </summary>
-        public int ReleaseRetentionLimit { get; set; } = 1;
+        public int ReleaseRetentionLimit
+        {
+            get => _releaseRetentionLimit;
+            set
+            {
+                if (value < 0)
+                    throw new ArgumentOutOfRangeException(nameof(ReleaseRetentionLimit), value, "Release retention limit cannot be negative.");
+
+                _releaseRetentionLimit = value;
+            }
+        }
 
         /// <summary>
         /// Create a new update manager. Requires that <see cref="SurgeApp.Current"/>
@@ -193,6 +204,7 @@ namespace Surge
                     try
                     {
                         cancellationToken.ThrowIfCancellationRequested();
+                        ApplyReleaseRetentionLimit();
 
                         // Build releases list
                         int count = NativeMethods.ReleasesCount(releasesInfoPtr);
@@ -360,6 +372,16 @@ namespace Surge
             }
 
             _currentVersion = version;
+        }
+
+        private void ApplyReleaseRetentionLimit()
+        {
+            int result = NativeMethods.UpdateManagerSetReleaseRetentionLimit(_nativeMgr, _releaseRetentionLimit);
+            if (result != 0)
+            {
+                var errorMsg = GetLastError();
+                throw new SurgeException(result, errorMsg ?? "Failed to set release retention limit.");
+            }
         }
 
         private static string? GetContextLastError(IntPtr nativeCtx)

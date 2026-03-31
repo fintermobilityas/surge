@@ -107,6 +107,9 @@ namespace Surge
         [LibraryImport(LibName, EntryPoint = "surge_update_manager_set_current_version", StringMarshalling = StringMarshalling.Utf8)]
         internal static partial int UpdateManagerSetCurrentVersion(IntPtr mgr, string currentVersion);
 
+        [LibraryImport(LibName, EntryPoint = "surge_update_manager_set_release_retention_limit")]
+        internal static partial int UpdateManagerSetReleaseRetentionLimit(IntPtr mgr, int releaseRetentionLimit);
+
         [LibraryImport(LibName, EntryPoint = "surge_update_check")]
         internal static partial int UpdateCheck(IntPtr mgr, out IntPtr info);
 
@@ -265,6 +268,9 @@ namespace Surge
 
         [DllImport(LibName, EntryPoint = "surge_update_manager_set_current_version", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
         internal static extern int UpdateManagerSetCurrentVersion(IntPtr mgr, string currentVersion);
+
+        [DllImport(LibName, EntryPoint = "surge_update_manager_set_release_retention_limit", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int UpdateManagerSetReleaseRetentionLimit(IntPtr mgr, int releaseRetentionLimit);
 
         [DllImport(LibName, EntryPoint = "surge_update_check", CallingConvention = CallingConvention.Cdecl)]
         internal static extern int UpdateCheck(IntPtr mgr, out IntPtr info);

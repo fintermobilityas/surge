@@ -16,7 +16,7 @@ use crate::error::{Result, SurgeError};
 use crate::install::{InstallProfile, RuntimeManifestMetadata, storage_provider_manifest_name, write_runtime_manifest};
 use crate::pack::builder::build_canonical_archive_from_directory;
 use crate::platform::detect::current_rid;
-use crate::platform::fs::{atomic_rename, copy_directory, write_file_atomic};
+use crate::platform::fs::{atomic_rename, copy_directory, list_directories, write_file_atomic};
 use crate::platform::process::{current_pid, spawn_detached, spawn_process, supervisor_binary_name};
 use crate::platform::shortcuts::install_shortcuts;
 use crate::releases::artifact_cache::{
@@ -193,12 +193,15 @@ pub struct UpdateInfo {
     pub apply_strategy: ApplyStrategy,
 }
 
+const DEFAULT_RELEASE_RETENTION_LIMIT: usize = 1;
+
 /// Manages checking for and applying application updates.
 pub struct UpdateManager {
     ctx: Arc<Context>,
     app_id: String,
     current_version: String,
     channel: String,
+    release_retention_limit: usize,
     install_dir: PathBuf,
     storage: Box<dyn StorageBackend>,
     cached_index: Option<ReleaseIndex>,
@@ -278,6 +281,7 @@ impl UpdateManager {
             app_id: app_id.to_string(),
             current_version: current_version.to_string(),
             channel: channel.to_string(),
+            release_retention_limit: DEFAULT_RELEASE_RETENTION_LIMIT,
             install_dir: PathBuf::from(install_dir),
             storage,
             cached_index: None,
@@ -309,6 +313,12 @@ impl UpdateManager {
         &self.current_version
     }
 
+    /// Return the number of versioned app snapshots retained after updates.
+    #[must_use]
+    pub fn release_retention_limit(&self) -> usize {
+        self.release_retention_limit
+    }
+
     /// Update the local version baseline used for update checks.
     pub fn set_current_version(&mut self, version: &str) -> Result<()> {
         let normalized = version.trim();
@@ -318,6 +328,11 @@ impl UpdateManager {
         self.current_version = normalized.to_string();
         self.cached_index = None;
         Ok(())
+    }
+
+    /// Update the number of old app snapshots retained after successful updates.
+    pub fn set_release_retention_limit(&mut self, limit: usize) {
+        self.release_retention_limit = limit;
     }
 
     /// Check for available updates on the configured channel.
@@ -1025,6 +1040,19 @@ impl UpdateManager {
                 let _ = tokio::fs::remove_dir_all(&previous_swap_dir).await;
             }
         }
+        match prune_version_snapshots(&self.install_dir, self.release_retention_limit) {
+            Ok(0) => {}
+            Ok(pruned) => {
+                debug!(
+                    pruned,
+                    retained = self.release_retention_limit,
+                    "Pruned stale installed app version snapshots"
+                );
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to prune installed app version snapshots");
+            }
+        }
 
         // Clean up staging directory
         if staging_dir.exists() {
@@ -1102,6 +1130,35 @@ fn normalize_os_label(raw: &str) -> String {
         "linux" => "linux".to_string(),
         other => other.to_string(),
     }
+}
+
+fn app_snapshot_version(dir_name: &str) -> Option<&str> {
+    let version = dir_name.strip_prefix("app-")?;
+    if version.is_empty() || !version.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(version)
+}
+
+fn prune_version_snapshots(install_dir: &Path, keep_latest: usize) -> Result<usize> {
+    let mut snapshots: Vec<(String, PathBuf)> = list_directories(install_dir)?
+        .into_iter()
+        .filter_map(|dir_name| {
+            let version = app_snapshot_version(&dir_name)?.to_string();
+            let path = install_dir.join(&dir_name);
+            Some((version, path))
+        })
+        .collect();
+
+    snapshots.sort_by(|(left, _), (right, _)| compare_versions(right, left));
+
+    let mut pruned = 0usize;
+    for (_, path) in snapshots.into_iter().skip(keep_latest) {
+        std::fs::remove_dir_all(path)?;
+        pruned = pruned.saturating_add(1);
+    }
+
+    Ok(pruned)
 }
 
 fn find_previous_app_dir(install_dir: &Path, current_version: &str) -> Option<PathBuf> {
@@ -1610,11 +1667,14 @@ mod tests {
         let mut manager = UpdateManager::new(ctx, "app", "1.0.0", "stable", tmp.path().to_str().unwrap()).unwrap();
         assert_eq!(manager.channel(), "stable");
         assert_eq!(manager.current_version(), "1.0.0");
+        assert_eq!(manager.release_retention_limit(), 1);
 
         manager.set_channel("test").unwrap();
         manager.set_current_version("1.1.0").unwrap();
+        manager.set_release_retention_limit(0);
         assert_eq!(manager.channel(), "test");
         assert_eq!(manager.current_version(), "1.1.0");
+        assert_eq!(manager.release_retention_limit(), 0);
 
         let err = manager.set_channel("  ").unwrap_err();
         assert!(err.to_string().contains("channel cannot be empty"));
@@ -2911,6 +2971,170 @@ mod tests {
 
         assert!(!install_root.join(".surge-app-next").exists());
         assert!(!install_root.join(".surge-app-prev").exists());
+    }
+
+    #[tokio::test]
+    async fn test_download_and_apply_prunes_old_version_snapshots_to_retention_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("store");
+        let install_root = tmp.path().join("install");
+        std::fs::create_dir_all(&store_root).unwrap();
+        std::fs::create_dir_all(&install_root).unwrap();
+
+        let current_app_dir = install_root.join("app");
+        std::fs::create_dir_all(&current_app_dir).unwrap();
+        std::fs::write(current_app_dir.join("payload.txt"), "old payload").unwrap();
+        std::fs::create_dir_all(install_root.join("app-0.9.0")).unwrap();
+        std::fs::create_dir_all(install_root.join("app-0.8.0")).unwrap();
+        std::fs::create_dir_all(install_root.join("app-backup")).unwrap();
+
+        let rid = current_rid();
+        let full_filename = format!("test-app-1.1.0-{rid}-full.tar.zst");
+        let full_path = store_root.join(&full_filename);
+
+        let mut packer = ArchivePacker::new(3).unwrap();
+        packer.add_buffer("payload.txt", b"new payload", 0o644).unwrap();
+        packer.finalize_to_file(&full_path).unwrap();
+
+        let full_size = std::fs::metadata(&full_path).unwrap().len() as i64;
+        let full_sha256 = sha256_hex_file(&full_path).unwrap();
+
+        let index = ReleaseIndex {
+            app_id: "test-app".to_string(),
+            releases: vec![ReleaseEntry {
+                version: "1.1.0".to_string(),
+                channels: vec!["stable".to_string()],
+                os: current_os_label_for_tests(),
+                rid: rid.clone(),
+                is_genesis: true,
+                full_filename: full_filename.clone(),
+                full_size,
+                full_sha256,
+                deltas: Vec::new(),
+                preferred_delta_id: String::new(),
+                created_utc: chrono::Utc::now().to_rfc3339(),
+                release_notes: String::new(),
+                name: String::new(),
+                main_exe: "test-app".to_string(),
+                install_directory: "test-app".to_string(),
+                supervisor_id: String::new(),
+                icon: String::new(),
+                shortcuts: Vec::new(),
+                persistent_assets: Vec::new(),
+                installers: Vec::new(),
+                environment: std::collections::BTreeMap::new(),
+            }],
+            ..ReleaseIndex::default()
+        };
+
+        let compressed = compress_release_index(&index, DEFAULT_ZSTD_LEVEL).unwrap();
+        std::fs::write(store_root.join(RELEASES_FILE_COMPRESSED), compressed).unwrap();
+
+        let ctx = Arc::new(Context::new());
+        ctx.set_storage(
+            StorageProvider::Filesystem,
+            store_root.to_str().unwrap(),
+            "",
+            "",
+            "",
+            "",
+        );
+
+        let mut manager =
+            UpdateManager::new(ctx, "test-app", "1.0.0", "stable", install_root.to_str().unwrap()).unwrap();
+        manager.set_release_retention_limit(1);
+
+        let info = manager.check_for_updates().await.unwrap().unwrap();
+        manager
+            .download_and_apply(&info, None::<fn(ProgressInfo)>)
+            .await
+            .unwrap();
+
+        assert!(install_root.join("app").is_dir());
+        assert!(install_root.join("app-1.0.0").is_dir());
+        assert!(!install_root.join("app-0.9.0").exists());
+        assert!(!install_root.join("app-0.8.0").exists());
+        assert!(install_root.join("app-backup").is_dir());
+    }
+
+    #[tokio::test]
+    async fn test_download_and_apply_with_zero_retention_removes_version_snapshots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("store");
+        let install_root = tmp.path().join("install");
+        std::fs::create_dir_all(&store_root).unwrap();
+        std::fs::create_dir_all(&install_root).unwrap();
+
+        let current_app_dir = install_root.join("app");
+        std::fs::create_dir_all(&current_app_dir).unwrap();
+        std::fs::write(current_app_dir.join("payload.txt"), "old payload").unwrap();
+        std::fs::create_dir_all(install_root.join("app-0.9.0")).unwrap();
+
+        let rid = current_rid();
+        let full_filename = format!("test-app-1.1.0-{rid}-full.tar.zst");
+        let full_path = store_root.join(&full_filename);
+
+        let mut packer = ArchivePacker::new(3).unwrap();
+        packer.add_buffer("payload.txt", b"new payload", 0o644).unwrap();
+        packer.finalize_to_file(&full_path).unwrap();
+
+        let full_size = std::fs::metadata(&full_path).unwrap().len() as i64;
+        let full_sha256 = sha256_hex_file(&full_path).unwrap();
+
+        let index = ReleaseIndex {
+            app_id: "test-app".to_string(),
+            releases: vec![ReleaseEntry {
+                version: "1.1.0".to_string(),
+                channels: vec!["stable".to_string()],
+                os: current_os_label_for_tests(),
+                rid: rid.clone(),
+                is_genesis: true,
+                full_filename: full_filename.clone(),
+                full_size,
+                full_sha256,
+                deltas: Vec::new(),
+                preferred_delta_id: String::new(),
+                created_utc: chrono::Utc::now().to_rfc3339(),
+                release_notes: String::new(),
+                name: String::new(),
+                main_exe: "test-app".to_string(),
+                install_directory: "test-app".to_string(),
+                supervisor_id: String::new(),
+                icon: String::new(),
+                shortcuts: Vec::new(),
+                persistent_assets: Vec::new(),
+                installers: Vec::new(),
+                environment: std::collections::BTreeMap::new(),
+            }],
+            ..ReleaseIndex::default()
+        };
+
+        let compressed = compress_release_index(&index, DEFAULT_ZSTD_LEVEL).unwrap();
+        std::fs::write(store_root.join(RELEASES_FILE_COMPRESSED), compressed).unwrap();
+
+        let ctx = Arc::new(Context::new());
+        ctx.set_storage(
+            StorageProvider::Filesystem,
+            store_root.to_str().unwrap(),
+            "",
+            "",
+            "",
+            "",
+        );
+
+        let mut manager =
+            UpdateManager::new(ctx, "test-app", "1.0.0", "stable", install_root.to_str().unwrap()).unwrap();
+        manager.set_release_retention_limit(0);
+
+        let info = manager.check_for_updates().await.unwrap().unwrap();
+        manager
+            .download_and_apply(&info, None::<fn(ProgressInfo)>)
+            .await
+            .unwrap();
+
+        assert!(install_root.join("app").is_dir());
+        assert!(!install_root.join("app-1.0.0").exists());
+        assert!(!install_root.join("app-0.9.0").exists());
     }
 
     #[cfg(target_os = "linux")]

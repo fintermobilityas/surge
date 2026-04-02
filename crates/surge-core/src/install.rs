@@ -1,17 +1,21 @@
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use serde::Serialize;
+use tracing::warn;
 
 use crate::archive::extractor::extract_file_to_with_progress;
 use crate::config::installer::InstallerManifest;
 use crate::config::manifest::ShortcutLocation;
 use crate::context::StorageProvider;
 use crate::error::{Result, SurgeError};
+use crate::platform::fs::{copy_directory, list_directories};
 use crate::platform::paths::default_install_root;
 use crate::platform::process::{ProcessHandle, spawn_detached};
 use crate::platform::shortcuts::install_shortcuts;
+use crate::releases::version::compare_versions;
+use crate::supervisor::stub::find_latest_app_dir;
 
 pub const RUNTIME_MANIFEST_RELATIVE_PATH: &str = ".surge/runtime.yml";
 pub const LEGACY_RUNTIME_MANIFEST_RELATIVE_PATH: &str = ".surge/surge.yml";
@@ -51,6 +55,7 @@ pub struct InstallProfile<'a> {
     pub supervisor_id: &'a str,
     pub icon: &'a str,
     pub shortcuts: &'a [ShortcutLocation],
+    pub persistent_assets: &'a [String],
     pub environment: &'a BTreeMap<String, String>,
 }
 
@@ -112,6 +117,7 @@ impl<'a> InstallProfile<'a> {
         supervisor_id: &'a str,
         icon: &'a str,
         shortcuts: &'a [ShortcutLocation],
+        persistent_assets: &'a [String],
         environment: &'a BTreeMap<String, String>,
     ) -> Self {
         Self {
@@ -122,6 +128,7 @@ impl<'a> InstallProfile<'a> {
             supervisor_id,
             icon,
             shortcuts,
+            persistent_assets,
             environment,
         }
     }
@@ -136,6 +143,7 @@ impl<'a> InstallProfile<'a> {
             &manifest.runtime.supervisor_id,
             &manifest.runtime.icon,
             shortcuts,
+            &manifest.runtime.persistent_assets,
             &manifest.runtime.environment,
         )
     }
@@ -237,6 +245,11 @@ pub fn install_package_locally_at_root_with_progress(
     let active_app_dir = install_root.join("app");
     let next_app_dir = install_root.join(".surge-app-next");
     let previous_app_dir = install_root.join(".surge-app-prev");
+    let fallback_previous_app_dir = if active_app_dir.is_dir() {
+        None
+    } else {
+        find_latest_app_dir(install_root).ok()
+    };
 
     if next_app_dir.is_dir() {
         std::fs::remove_dir_all(&next_app_dir)?;
@@ -322,6 +335,17 @@ pub fn install_package_locally_at_root_with_progress(
         },
     );
 
+    let previous_app_dir_for_assets = if previous_app_dir.is_dir() {
+        Some(previous_app_dir.as_path())
+    } else {
+        fallback_previous_app_dir.as_deref()
+    };
+    if !profile.persistent_assets.is_empty()
+        && let Some(previous) = previous_app_dir_for_assets
+    {
+        copy_persistent_assets(previous, &active_app_dir, profile.persistent_assets)?;
+    }
+
     if !profile.shortcuts.is_empty() {
         emit_install_progress(
             progress,
@@ -367,8 +391,112 @@ pub fn install_package_locally_at_root_with_progress(
     if previous_app_dir.is_dir() {
         std::fs::remove_dir_all(previous_app_dir)?;
     }
+    if let Err(err) = prune_version_snapshots(install_root, 0) {
+        warn!(error = %err, "Failed to prune installed app version snapshots after install");
+    }
 
     Ok(())
+}
+
+fn app_snapshot_version(dir_name: &str) -> Option<&str> {
+    let version = dir_name.strip_prefix("app-")?;
+    if version.is_empty() || !version.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(version)
+}
+
+pub fn prune_version_snapshots(install_dir: &Path, keep_latest: usize) -> Result<usize> {
+    let mut snapshots: Vec<(String, PathBuf)> = list_directories(install_dir)?
+        .into_iter()
+        .filter_map(|dir_name| {
+            let version = app_snapshot_version(&dir_name)?.to_string();
+            let path = install_dir.join(&dir_name);
+            Some((version, path))
+        })
+        .collect();
+
+    snapshots.sort_by(|(left, _), (right, _)| compare_versions(right, left));
+
+    let mut pruned = 0usize;
+    for (_, path) in snapshots.into_iter().skip(keep_latest) {
+        std::fs::remove_dir_all(path)?;
+        pruned = pruned.saturating_add(1);
+    }
+
+    Ok(pruned)
+}
+
+pub fn copy_persistent_assets(previous_app_dir: &Path, new_app_dir: &Path, assets: &[String]) -> Result<()> {
+    for asset in assets {
+        let relative = validate_relative_persistent_asset_path(asset)?;
+        let source = previous_app_dir.join(&relative);
+        if !source.exists() {
+            continue;
+        }
+
+        let destination = new_app_dir.join(&relative);
+        if source.is_dir() {
+            if destination.exists() {
+                if destination.is_dir() {
+                    std::fs::remove_dir_all(&destination)?;
+                } else {
+                    std::fs::remove_file(&destination)?;
+                }
+            }
+            copy_directory(&source, &destination)?;
+        } else {
+            if let Some(parent) = destination.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            if destination.exists() && destination.is_dir() {
+                std::fs::remove_dir_all(&destination)?;
+            }
+            std::fs::copy(&source, &destination)?;
+        }
+    }
+
+    Ok(())
+}
+
+pub fn validate_relative_persistent_asset_path(raw: &str) -> Result<PathBuf> {
+    if raw.trim().is_empty() {
+        return Err(SurgeError::Update("Persistent asset path cannot be empty".to_string()));
+    }
+
+    let candidate = Path::new(raw);
+    if candidate.is_absolute() {
+        return Err(SurgeError::Update(format!(
+            "Persistent asset path must be relative: {raw}"
+        )));
+    }
+
+    let first_component = candidate
+        .components()
+        .next()
+        .and_then(|component| match component {
+            Component::Normal(value) => value.to_str(),
+            _ => None,
+        })
+        .unwrap_or_default();
+    if first_component.to_ascii_lowercase().starts_with("app-") {
+        return Err(SurgeError::Update(format!(
+            "Persistent asset path cannot start with 'app-': {raw}"
+        )));
+    }
+
+    for component in candidate.components() {
+        if matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        ) {
+            return Err(SurgeError::Update(format!(
+                "Persistent asset path cannot contain parent/root traversal: {raw}"
+            )));
+        }
+    }
+
+    Ok(candidate.to_path_buf())
 }
 
 /// Start the installed application, using the supervisor if configured.
@@ -534,6 +662,7 @@ fn verify_process_stays_running(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::archive::packer::ArchivePacker;
 
     #[test]
     fn storage_provider_manifest_name_maps_expected_values() {
@@ -559,6 +688,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("temp dir should exist");
         let environment = BTreeMap::new();
         let shortcuts: [ShortcutLocation; 0] = [];
+        let persistent_assets: [String; 0] = [];
         let profile = InstallProfile::new(
             "demo-app",
             "Demo App",
@@ -567,6 +697,7 @@ mod tests {
             "demo-supervisor",
             "",
             &shortcuts,
+            &persistent_assets,
             &environment,
         );
         let metadata =
@@ -586,5 +717,84 @@ mod tests {
         assert!(raw.contains("endpoint: https://example.invalid"));
         assert!(!raw.contains("region:"));
         assert_eq!(raw, legacy_raw);
+    }
+
+    #[test]
+    fn install_package_locally_preserves_declared_persistent_assets_and_prunes_snapshots() {
+        let tmp = tempfile::tempdir().expect("temp dir should exist");
+        let install_root = tmp.path().join("install-root");
+        let active_app_dir = install_root.join("app");
+        let package_path = tmp.path().join("package.tar.zst");
+        let environment = BTreeMap::new();
+        let shortcuts: [ShortcutLocation; 0] = [];
+        let persistent_assets = vec!["settings.json".to_string(), "state".to_string()];
+
+        std::fs::create_dir_all(active_app_dir.join("state")).expect("state dir should exist");
+        std::fs::create_dir_all(install_root.join("app-1.0.0")).expect("snapshot should exist");
+        std::fs::create_dir_all(install_root.join("app-0.9.0")).expect("snapshot should exist");
+        std::fs::write(active_app_dir.join("settings.json"), "persisted settings").expect("settings should exist");
+        std::fs::write(active_app_dir.join("state").join("cache.bin"), "persisted cache").expect("state should exist");
+        std::fs::write(active_app_dir.join("old.txt"), "remove me").expect("old file should exist");
+
+        let mut packer = ArchivePacker::new(3).expect("archive packer should be created");
+        packer
+            .add_buffer("demo", b"#!/bin/sh\necho demo\n", 0o755)
+            .expect("main executable should be added");
+        packer
+            .add_buffer("settings.json", b"packaged settings", 0o644)
+            .expect("settings should be added");
+        packer
+            .add_buffer("state/cache.bin", b"packaged cache", 0o644)
+            .expect("state should be added");
+        packer
+            .add_buffer("payload.txt", b"new payload", 0o644)
+            .expect("payload should be added");
+        packer
+            .finalize_to_file(&package_path)
+            .expect("archive should be written");
+
+        let profile = InstallProfile::new(
+            "demo-app",
+            "Demo App",
+            "demo",
+            "demo-install",
+            "",
+            "",
+            &shortcuts,
+            &persistent_assets,
+            &environment,
+        );
+
+        install_package_locally_at_root(&profile, &package_path, &install_root).expect("install should succeed");
+
+        let active_app_dir = install_root.join("app");
+        assert_eq!(
+            std::fs::read_to_string(active_app_dir.join("settings.json")).expect("settings should exist"),
+            "persisted settings"
+        );
+        assert_eq!(
+            std::fs::read_to_string(active_app_dir.join("state").join("cache.bin")).expect("state should exist"),
+            "persisted cache"
+        );
+        assert_eq!(
+            std::fs::read_to_string(active_app_dir.join("payload.txt")).expect("payload should exist"),
+            "new payload"
+        );
+        assert!(
+            !active_app_dir.join("old.txt").exists(),
+            "undeclared assets should be removed"
+        );
+        assert!(
+            !install_root.join("app-1.0.0").exists(),
+            "stale snapshot should be pruned"
+        );
+        assert!(
+            !install_root.join("app-0.9.0").exists(),
+            "stale snapshot should be pruned"
+        );
+        assert!(
+            !install_root.join(".surge-app-prev").exists(),
+            "temporary previous dir should be removed"
+        );
     }
 }

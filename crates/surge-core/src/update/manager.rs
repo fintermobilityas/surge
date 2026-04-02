@@ -1,7 +1,7 @@
 //! Update manager: check for updates, download, verify, and apply them.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -13,10 +13,13 @@ use crate::config::constants::RELEASES_FILE_COMPRESSED;
 use crate::context::Context;
 use crate::crypto::sha256::{sha256_hex, sha256_hex_file};
 use crate::error::{Result, SurgeError};
-use crate::install::{InstallProfile, RuntimeManifestMetadata, storage_provider_manifest_name, write_runtime_manifest};
+use crate::install::{
+    InstallProfile, RuntimeManifestMetadata, copy_persistent_assets, prune_version_snapshots,
+    storage_provider_manifest_name, write_runtime_manifest,
+};
 use crate::pack::builder::build_canonical_archive_from_directory;
 use crate::platform::detect::current_rid;
-use crate::platform::fs::{atomic_rename, copy_directory, list_directories, write_file_atomic};
+use crate::platform::fs::{atomic_rename, write_file_atomic};
 use crate::platform::process::{current_pid, spawn_detached, spawn_process, supervisor_binary_name};
 use crate::platform::shortcuts::install_shortcuts;
 use crate::releases::artifact_cache::{
@@ -985,6 +988,7 @@ impl UpdateManager {
             &latest.supervisor_id,
             &latest.icon,
             &latest.shortcuts,
+            &latest.persistent_assets,
             &latest.environment,
         );
         let runtime_manifest_metadata = RuntimeManifestMetadata::new(
@@ -1130,35 +1134,6 @@ fn normalize_os_label(raw: &str) -> String {
         "linux" => "linux".to_string(),
         other => other.to_string(),
     }
-}
-
-fn app_snapshot_version(dir_name: &str) -> Option<&str> {
-    let version = dir_name.strip_prefix("app-")?;
-    if version.is_empty() || !version.chars().next().is_some_and(|c| c.is_ascii_digit()) {
-        return None;
-    }
-    Some(version)
-}
-
-fn prune_version_snapshots(install_dir: &Path, keep_latest: usize) -> Result<usize> {
-    let mut snapshots: Vec<(String, PathBuf)> = list_directories(install_dir)?
-        .into_iter()
-        .filter_map(|dir_name| {
-            let version = app_snapshot_version(&dir_name)?.to_string();
-            let path = install_dir.join(&dir_name);
-            Some((version, path))
-        })
-        .collect();
-
-    snapshots.sort_by(|(left, _), (right, _)| compare_versions(right, left));
-
-    let mut pruned = 0usize;
-    for (_, path) in snapshots.into_iter().skip(keep_latest) {
-        std::fs::remove_dir_all(path)?;
-        pruned = pruned.saturating_add(1);
-    }
-
-    Ok(pruned)
 }
 
 fn find_previous_app_dir(install_dir: &Path, current_version: &str) -> Option<PathBuf> {
@@ -1448,78 +1423,6 @@ fn restart_supervisor_after_update(install_dir: &Path, active_app_dir: &Path, la
             );
         }
     }
-}
-
-fn copy_persistent_assets(previous_app_dir: &Path, new_app_dir: &Path, assets: &[String]) -> Result<()> {
-    for asset in assets {
-        let relative = validate_relative_persistent_asset_path(asset)?;
-        let source = previous_app_dir.join(&relative);
-        if !source.exists() {
-            continue;
-        }
-
-        let destination = new_app_dir.join(&relative);
-        if source.is_dir() {
-            if destination.exists() {
-                if destination.is_dir() {
-                    std::fs::remove_dir_all(&destination)?;
-                } else {
-                    std::fs::remove_file(&destination)?;
-                }
-            }
-            copy_directory(&source, &destination)?;
-        } else {
-            if let Some(parent) = destination.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            if destination.exists() && destination.is_dir() {
-                std::fs::remove_dir_all(&destination)?;
-            }
-            std::fs::copy(&source, &destination)?;
-        }
-    }
-
-    Ok(())
-}
-
-fn validate_relative_persistent_asset_path(raw: &str) -> Result<PathBuf> {
-    if raw.trim().is_empty() {
-        return Err(SurgeError::Update("Persistent asset path cannot be empty".to_string()));
-    }
-
-    let candidate = Path::new(raw);
-    if candidate.is_absolute() {
-        return Err(SurgeError::Update(format!(
-            "Persistent asset path must be relative: {raw}"
-        )));
-    }
-
-    let first_component = candidate
-        .components()
-        .next()
-        .and_then(|component| match component {
-            Component::Normal(value) => value.to_str(),
-            _ => None,
-        })
-        .unwrap_or_default();
-    if first_component.to_ascii_lowercase().starts_with("app-") {
-        return Err(SurgeError::Update(format!(
-            "Persistent asset path cannot start with 'app-': {raw}"
-        )));
-    }
-
-    for component in candidate.components() {
-        if matches!(
-            component,
-            Component::ParentDir | Component::RootDir | Component::Prefix(_)
-        ) {
-            return Err(SurgeError::Update(format!(
-                "Persistent asset path cannot contain parent/root traversal: {raw}"
-            )));
-        }
-    }
-
-    Ok(candidate.to_path_buf())
 }
 
 #[cfg(test)]

@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::IsTerminal;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -1109,6 +1109,7 @@ fn release_install_profile<'a>(app_id: &'a str, release: &'a ReleaseEntry) -> In
         &release.supervisor_id,
         &release.icon,
         &release.shortcuts,
+        &release.persistent_assets,
         &release.environment,
     )
 }
@@ -2123,7 +2124,7 @@ fn build_remote_app_copy_activation_script(
     let persistent_asset_commands = persistent_assets
         .iter()
         .map(|asset| {
-            validate_remote_persistent_asset_path(asset).map(|relative| {
+            core_install::validate_relative_persistent_asset_path(asset).map(|relative| {
                 format!(
                     "  copy_persistent_asset {}\n\\\n",
                     shell_single_quote(&relative.to_string_lossy())
@@ -2231,6 +2232,11 @@ fi\n\
 \n\
 rm -rf \"$previous_app_dir\"\n\
 \n\
+for snapshot_dir in \"$install_root\"/app-[0-9]*; do\n\
+  [ -d \"$snapshot_dir\" ] || continue\n\
+  rm -rf \"$snapshot_dir\"\n\
+done\n\
+\n\
 if [ -d \"$stage_dir/shortcuts/applications\" ]; then\n\
   mkdir -p \"$applications_dir\"\n\
   cp \"$stage_dir/shortcuts/applications/\"*.desktop \"$applications_dir/\" 2>/dev/null || true\n\
@@ -2263,47 +2269,6 @@ fi\n",
 
     Ok(script)
 }
-
-fn validate_remote_persistent_asset_path(raw: &str) -> Result<PathBuf> {
-    if raw.trim().is_empty() {
-        return Err(SurgeError::Config("Persistent asset path cannot be empty".to_string()));
-    }
-
-    let candidate = Path::new(raw);
-    if candidate.is_absolute() {
-        return Err(SurgeError::Config(format!(
-            "Persistent asset path must be relative: {raw}"
-        )));
-    }
-
-    let first_component = candidate
-        .components()
-        .next()
-        .and_then(|component| match component {
-            Component::Normal(value) => value.to_str(),
-            _ => None,
-        })
-        .unwrap_or_default();
-    if first_component.to_ascii_lowercase().starts_with("app-") {
-        return Err(SurgeError::Config(format!(
-            "Persistent asset path cannot start with 'app-': {raw}"
-        )));
-    }
-
-    for component in candidate.components() {
-        if matches!(
-            component,
-            Component::ParentDir | Component::RootDir | Component::Prefix(_)
-        ) {
-            return Err(SurgeError::Config(format!(
-                "Persistent asset path cannot contain parent/root traversal: {raw}"
-            )));
-        }
-    }
-
-    Ok(candidate.to_path_buf())
-}
-
 fn select_latest_remote_legacy_app_dir<I, S>(install_root: &Path, entries: I) -> Option<PathBuf>
 where
     I: IntoIterator<Item = S>,
@@ -3196,6 +3161,79 @@ mod tests {
         assert!(script.contains("--surge-first-run \"$version\""));
         assert!(script.contains("kill_matching \"$install_root/$main_exe\""));
         assert!(script.contains("kill_matching \"$install_root/app-\""));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_remote_app_copy_activation_script_preserves_persistent_assets_and_prunes_snapshots() {
+        let tmp = tempfile::tempdir().expect("temp dir should exist");
+        let install_root = tmp.path().join("install-root");
+        let active_app_dir = install_root.join("app");
+        let stage_app_dir = install_root.join(".surge-transfer-stage").join("app");
+        let stale_snapshot = install_root.join("app-1.0.0");
+        let older_snapshot = install_root.join("app-0.9.0");
+        let persistent_assets = vec!["settings.json".to_string(), "state".to_string()];
+
+        std::fs::create_dir_all(active_app_dir.join("state")).expect("state dir should exist");
+        std::fs::create_dir_all(&stage_app_dir).expect("stage app dir should exist");
+        std::fs::create_dir_all(&stale_snapshot).expect("stale snapshot should exist");
+        std::fs::create_dir_all(&older_snapshot).expect("older snapshot should exist");
+        std::fs::write(active_app_dir.join("settings.json"), "persisted settings").expect("settings should exist");
+        std::fs::write(active_app_dir.join("state").join("cache.bin"), "persisted cache").expect("state should exist");
+        std::fs::write(active_app_dir.join("old.txt"), "remove me").expect("old file should exist");
+        std::fs::write(stage_app_dir.join("demoapp"), "#!/bin/sh\nexit 0\n").expect("demoapp should exist");
+        std::fs::write(stage_app_dir.join("settings.json"), "packaged settings").expect("settings should exist");
+        std::fs::create_dir_all(stage_app_dir.join("state")).expect("packaged state dir should exist");
+        std::fs::write(stage_app_dir.join("state").join("cache.bin"), "packaged cache")
+            .expect("packaged state should exist");
+        std::fs::write(stage_app_dir.join("payload.txt"), "new payload").expect("payload should exist");
+
+        let script = build_remote_app_copy_activation_script(
+            &install_root,
+            "demoapp",
+            "1.2.3",
+            &BTreeMap::new(),
+            &persistent_assets,
+            None,
+            true,
+        )
+        .expect("script should build");
+
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .env("HOME", tmp.path())
+            .status()
+            .expect("script should run");
+        assert!(status.success(), "script should succeed");
+
+        let active_app_dir = install_root.join("app");
+        assert_eq!(
+            std::fs::read_to_string(active_app_dir.join("settings.json")).expect("settings should exist"),
+            "persisted settings"
+        );
+        assert_eq!(
+            std::fs::read_to_string(active_app_dir.join("state").join("cache.bin")).expect("state should exist"),
+            "persisted cache"
+        );
+        assert_eq!(
+            std::fs::read_to_string(active_app_dir.join("payload.txt")).expect("payload should exist"),
+            "new payload"
+        );
+        assert!(
+            !active_app_dir.join("old.txt").exists(),
+            "undeclared assets should be removed"
+        );
+        assert!(!stale_snapshot.exists(), "stale snapshot should be pruned");
+        assert!(!older_snapshot.exists(), "older snapshot should be pruned");
+        assert!(
+            !install_root.join(".surge-transfer-stage").exists(),
+            "transfer stage should be cleaned up"
+        );
+        assert!(
+            !install_root.join(".surge-app-prev").exists(),
+            "previous app dir should be removed"
+        );
     }
 
     #[test]

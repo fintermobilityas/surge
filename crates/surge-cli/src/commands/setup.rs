@@ -465,6 +465,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_preserves_persistent_assets_and_prunes_stale_snapshots() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let installer_dir = temp_dir.path().join("installer");
+        let payload_dir = installer_dir.join("payload");
+        let install_root = temp_dir.path().join("installed-app");
+        let active_app_dir = install_root.join("app");
+        let store_root = temp_dir.path().join("store");
+        let full_filename = "demo-app-1.2.3-full.tar.zst";
+
+        std::fs::create_dir_all(active_app_dir.join("state")).expect("state dir should exist");
+        std::fs::create_dir_all(payload_dir.parent().expect("payload parent")).expect("payload parent should exist");
+        std::fs::create_dir_all(install_root.join("app-1.0.0")).expect("stale snapshot should exist");
+        std::fs::create_dir_all(install_root.join("app-0.9.0")).expect("stale snapshot should exist");
+        std::fs::write(active_app_dir.join("settings.json"), "persisted settings").expect("settings should exist");
+        std::fs::write(active_app_dir.join("state").join("cache.bin"), "persisted cache").expect("state should exist");
+        std::fs::write(active_app_dir.join("old.txt"), "remove me").expect("old file should exist");
+
+        let mut manifest = make_manifest(&install_root, &store_root, full_filename, "offline");
+        manifest.runtime.persistent_assets = vec!["settings.json".to_string(), "state".to_string()];
+        let installer_yaml = serde_yaml::to_string(&manifest).expect("installer yaml");
+        std::fs::write(installer_dir.join("installer.yml"), installer_yaml).expect("installer manifest");
+
+        let mut packer = ArchivePacker::new(3).expect("archive packer");
+        packer
+            .add_buffer("demoapp", b"#!/bin/sh\necho demo\n", 0o755)
+            .expect("demoapp entry");
+        packer
+            .add_buffer("settings.json", b"packaged settings", 0o644)
+            .expect("settings entry");
+        packer
+            .add_buffer("state/cache.bin", b"packaged cache", 0o644)
+            .expect("state entry");
+        packer
+            .add_buffer("payload.txt", b"bundled payload", 0o644)
+            .expect("payload entry");
+        packer
+            .finalize_to_file(&payload_dir.join(full_filename))
+            .expect("archive file");
+
+        execute(&installer_dir, true).await.expect("setup should succeed");
+
+        let active_app_dir = install_root.join("app");
+        assert_eq!(
+            std::fs::read_to_string(active_app_dir.join("settings.json")).expect("settings should exist"),
+            "persisted settings"
+        );
+        assert_eq!(
+            std::fs::read_to_string(active_app_dir.join("state").join("cache.bin")).expect("state should exist"),
+            "persisted cache"
+        );
+        assert_eq!(
+            std::fs::read_to_string(active_app_dir.join("payload.txt")).expect("payload should exist"),
+            "bundled payload"
+        );
+        assert!(
+            !active_app_dir.join("old.txt").exists(),
+            "undeclared assets should be removed"
+        );
+        assert!(
+            !install_root.join("app-1.0.0").exists(),
+            "stale snapshot should be pruned"
+        );
+        assert!(
+            !install_root.join("app-0.9.0").exists(),
+            "stale snapshot should be pruned"
+        );
+    }
+
+    #[tokio::test]
     async fn resolve_package_downloads_when_bundled_payload_is_missing() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let installer_dir = temp_dir.path().join("installer");

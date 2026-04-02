@@ -340,10 +340,10 @@ pub fn install_package_locally_at_root_with_progress(
     } else {
         fallback_previous_app_dir.as_deref()
     };
-    if !profile.persistent_assets.is_empty() {
-        if let Some(previous) = previous_app_dir_for_assets {
-            copy_persistent_assets(previous, &active_app_dir, profile.persistent_assets)?;
-        }
+    if !profile.persistent_assets.is_empty()
+        && let Some(previous) = previous_app_dir_for_assets
+    {
+        copy_persistent_assets(previous, &active_app_dir, profile.persistent_assets)?;
     }
 
     if !profile.shortcuts.is_empty() {

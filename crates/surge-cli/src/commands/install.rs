@@ -2278,12 +2278,9 @@ where
 
     for entry in entries {
         let name = entry.as_ref().trim();
-        let Some(version) = name.strip_prefix("app-") else {
+        let Some(version) = remote_legacy_snapshot_version(name) else {
             continue;
         };
-        if version.is_empty() {
-            continue;
-        }
 
         if best
             .as_ref()
@@ -2296,11 +2293,19 @@ where
     best.map(|(_, path)| path)
 }
 
+fn remote_legacy_snapshot_version(dir_name: &str) -> Option<&str> {
+    let version = dir_name.strip_prefix("app-")?;
+    if version.is_empty() || !version.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(version)
+}
+
 async fn detect_remote_legacy_app_dir(ssh_node: &str, install_root: &Path) -> Result<Option<PathBuf>> {
     let probe = format!(
         "install_root={}; \
 if [ -d \"$install_root\" ]; then \
-  for path in \"$install_root\"/app-*; do \
+  for path in \"$install_root\"/app-[0-9]*; do \
     if [ -d \"$path\" ]; then \
       basename \"$path\"; \
     fi; \
@@ -3267,6 +3272,16 @@ mod tests {
                 .expect("legacy app dir should be selected");
 
         assert_eq!(selected, install_root.join("app-1.0.1"));
+    }
+
+    #[test]
+    fn select_latest_remote_legacy_app_dir_ignores_non_version_directories() {
+        let install_root = Path::new("/home/demo/.local/share/demo");
+
+        let selected =
+            select_latest_remote_legacy_app_dir(install_root, ["app-backup", "app-staging", ".surge-app-prev"]);
+
+        assert_eq!(selected, None);
     }
 
     #[test]

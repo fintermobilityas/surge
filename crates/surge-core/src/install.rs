@@ -45,6 +45,57 @@ fn emit_install_progress(progress: Option<&InstallProgressCallback<'_>>, snapsho
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct RuntimeManifestSnapshot {
+    runtime_manifest: Option<Vec<u8>>,
+    legacy_runtime_manifest: Option<Vec<u8>>,
+}
+
+impl RuntimeManifestSnapshot {
+    fn capture(active_app_dir: &Path) -> Result<Self> {
+        Ok(Self {
+            runtime_manifest: read_optional_file(&active_app_dir.join(RUNTIME_MANIFEST_RELATIVE_PATH))?,
+            legacy_runtime_manifest: read_optional_file(&active_app_dir.join(LEGACY_RUNTIME_MANIFEST_RELATIVE_PATH))?,
+        })
+    }
+
+    fn restore(&self, active_app_dir: &Path) -> Result<()> {
+        restore_optional_file(
+            &active_app_dir.join(RUNTIME_MANIFEST_RELATIVE_PATH),
+            self.runtime_manifest.as_deref(),
+        )?;
+        restore_optional_file(
+            &active_app_dir.join(LEGACY_RUNTIME_MANIFEST_RELATIVE_PATH),
+            self.legacy_runtime_manifest.as_deref(),
+        )
+    }
+}
+
+fn read_optional_file(path: &Path) -> Result<Option<Vec<u8>>> {
+    if path.is_file() {
+        Ok(Some(std::fs::read(path)?))
+    } else {
+        Ok(None)
+    }
+}
+
+fn restore_optional_file(path: &Path, contents: Option<&[u8]>) -> Result<()> {
+    if let Some(contents) = contents {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, contents)?;
+    } else if path.exists() {
+        if path.is_dir() {
+            std::fs::remove_dir_all(path)?;
+        } else {
+            std::fs::remove_file(path)?;
+        }
+    }
+
+    Ok(())
+}
+
 /// Shared profile for installing a package locally, usable from both
 /// `surge install` (via `ReleaseEntry`) and `surge setup` (via `InstallerRuntime`).
 pub struct InstallProfile<'a> {
@@ -335,62 +386,76 @@ pub fn install_package_locally_at_root_with_progress(
         },
     );
 
-    let previous_app_dir_for_assets = if previous_app_dir.is_dir() {
-        Some(previous_app_dir.as_path())
-    } else {
-        fallback_previous_app_dir.as_deref()
-    };
-    if !profile.persistent_assets.is_empty()
-        && let Some(previous) = previous_app_dir_for_assets
-    {
-        copy_persistent_assets(previous, &active_app_dir, profile.persistent_assets)?;
-    }
+    let runtime_manifest_snapshot = RuntimeManifestSnapshot::capture(&active_app_dir)?;
+    let install_result = (|| -> Result<()> {
+        let previous_app_dir_for_assets = if previous_app_dir.is_dir() {
+            Some(previous_app_dir.as_path())
+        } else {
+            fallback_previous_app_dir.as_deref()
+        };
+        if !profile.persistent_assets.is_empty()
+            && let Some(previous) = previous_app_dir_for_assets
+        {
+            copy_persistent_assets(previous, &active_app_dir, profile.persistent_assets)?;
+        }
 
-    if !profile.shortcuts.is_empty() {
-        emit_install_progress(
-            progress,
-            InstallProgress {
-                stage: InstallProgressStage::Shortcuts,
-                phase_percent: 0,
-                bytes_done: 0,
-                bytes_total: 0,
-                items_done: 0,
-                items_total: 0,
-            },
-        );
-        let main_exe = profile.main_exe.trim();
-        if main_exe.is_empty() {
-            return Err(SurgeError::Config(format!(
-                "App '{}' has shortcuts configured but no main executable metadata",
-                profile.app_id
+        if !profile.shortcuts.is_empty() {
+            emit_install_progress(
+                progress,
+                InstallProgress {
+                    stage: InstallProgressStage::Shortcuts,
+                    phase_percent: 0,
+                    bytes_done: 0,
+                    bytes_total: 0,
+                    items_done: 0,
+                    items_total: 0,
+                },
+            );
+            let main_exe = profile.main_exe.trim();
+            if main_exe.is_empty() {
+                return Err(SurgeError::Config(format!(
+                    "App '{}' has shortcuts configured but no main executable metadata",
+                    profile.app_id
+                )));
+            }
+            install_shortcuts(
+                profile.app_id,
+                profile.display_name,
+                &active_app_dir,
+                main_exe,
+                profile.supervisor_id,
+                profile.icon,
+                profile.shortcuts,
+                profile.environment,
+            )?;
+            emit_install_progress(
+                progress,
+                InstallProgress {
+                    stage: InstallProgressStage::Shortcuts,
+                    phase_percent: 100,
+                    bytes_done: 0,
+                    bytes_total: 0,
+                    items_done: i64::try_from(profile.shortcuts.len()).unwrap_or(i64::MAX),
+                    items_total: i64::try_from(profile.shortcuts.len()).unwrap_or(i64::MAX),
+                },
+            );
+        }
+
+        if previous_app_dir.is_dir() {
+            std::fs::remove_dir_all(&previous_app_dir)?;
+        }
+
+        Ok(())
+    })();
+    if let Err(err) = install_result {
+        if let Err(restore_err) = runtime_manifest_snapshot.restore(&active_app_dir) {
+            return Err(SurgeError::Platform(format!(
+                "Failed to restore runtime manifests after install error '{err}': {restore_err}"
             )));
         }
-        install_shortcuts(
-            profile.app_id,
-            profile.display_name,
-            &active_app_dir,
-            main_exe,
-            profile.supervisor_id,
-            profile.icon,
-            profile.shortcuts,
-            profile.environment,
-        )?;
-        emit_install_progress(
-            progress,
-            InstallProgress {
-                stage: InstallProgressStage::Shortcuts,
-                phase_percent: 100,
-                bytes_done: 0,
-                bytes_total: 0,
-                items_done: i64::try_from(profile.shortcuts.len()).unwrap_or(i64::MAX),
-                items_total: i64::try_from(profile.shortcuts.len()).unwrap_or(i64::MAX),
-            },
-        );
+        return Err(err);
     }
 
-    if previous_app_dir.is_dir() {
-        std::fs::remove_dir_all(previous_app_dir)?;
-    }
     if let Err(err) = prune_version_snapshots(install_root, 0) {
         warn!(error = %err, "Failed to prune installed app version snapshots after install");
     }
@@ -795,6 +860,83 @@ mod tests {
         assert!(
             !install_root.join(".surge-app-prev").exists(),
             "temporary previous dir should be removed"
+        );
+    }
+
+    #[test]
+    fn install_package_locally_restores_runtime_manifests_when_post_copy_work_fails() {
+        let tmp = tempfile::tempdir().expect("temp dir should exist");
+        let install_root = tmp.path().join("install-root");
+        let active_app_dir = install_root.join("app");
+        let package_path = tmp.path().join("package.tar.zst");
+        let environment = BTreeMap::new();
+        let shortcuts = [ShortcutLocation::Desktop];
+        let persistent_assets = vec![".surge".to_string()];
+        let old_runtime_manifest = "id: demo-app\nversion: 1.0.0\nchannel: stable\n";
+        let new_runtime_manifest = "id: demo-app\nversion: 1.1.0\nchannel: beta\n";
+
+        std::fs::create_dir_all(active_app_dir.join(".surge")).expect(".surge dir should exist");
+        std::fs::write(
+            active_app_dir.join(RUNTIME_MANIFEST_RELATIVE_PATH),
+            old_runtime_manifest,
+        )
+        .expect("old runtime manifest should exist");
+        std::fs::write(
+            active_app_dir.join(LEGACY_RUNTIME_MANIFEST_RELATIVE_PATH),
+            old_runtime_manifest,
+        )
+        .expect("old legacy runtime manifest should exist");
+        std::fs::write(active_app_dir.join("payload.txt"), "old payload").expect("old payload should exist");
+
+        let mut packer = ArchivePacker::new(3).expect("archive packer should be created");
+        packer
+            .add_buffer(RUNTIME_MANIFEST_RELATIVE_PATH, new_runtime_manifest.as_bytes(), 0o644)
+            .expect("runtime manifest should be added");
+        packer
+            .add_buffer(
+                LEGACY_RUNTIME_MANIFEST_RELATIVE_PATH,
+                new_runtime_manifest.as_bytes(),
+                0o644,
+            )
+            .expect("legacy runtime manifest should be added");
+        packer
+            .add_buffer("payload.txt", b"new payload", 0o644)
+            .expect("payload should be added");
+        packer
+            .finalize_to_file(&package_path)
+            .expect("archive should be written");
+
+        let profile = InstallProfile::new(
+            "demo-app",
+            "Demo App",
+            "",
+            "demo-install",
+            "",
+            "",
+            &shortcuts,
+            &persistent_assets,
+            &environment,
+        );
+
+        let err = install_package_locally_at_root(&profile, &package_path, &install_root)
+            .expect_err("install should fail before shortcut creation");
+        assert!(
+            matches!(err, SurgeError::Config(ref message) if message.contains("shortcuts configured")),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(active_app_dir.join(RUNTIME_MANIFEST_RELATIVE_PATH))
+                .expect("runtime manifest should exist"),
+            new_runtime_manifest
+        );
+        assert_eq!(
+            std::fs::read_to_string(active_app_dir.join(LEGACY_RUNTIME_MANIFEST_RELATIVE_PATH))
+                .expect("legacy runtime manifest should exist"),
+            new_runtime_manifest
+        );
+        assert_eq!(
+            std::fs::read_to_string(active_app_dir.join("payload.txt")).expect("payload should exist"),
+            "new payload"
         );
     }
 }

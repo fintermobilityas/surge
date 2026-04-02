@@ -19,11 +19,15 @@ pub(crate) use crate::prompts::{resolve_app_id, resolve_app_id_with_rid_hint, re
 
 use std::path::Path;
 
+use surge_core::config::constants::RELEASES_FILE_COMPRESSED;
 #[cfg(test)]
 use surge_core::config::installer::InstallerManifest;
 use surge_core::config::manifest::SurgeManifest;
 use surge_core::context::{Context, StorageConfig, StorageProvider};
 use surge_core::error::{Result, SurgeError};
+use surge_core::releases::manifest::{ReleaseIndex, decompress_release_index};
+use surge_core::releases::restore::restore_full_archive_for_version;
+use surge_core::storage::StorageBackend;
 
 pub(crate) fn build_storage_config(
     manifest: &SurgeManifest,
@@ -90,6 +94,42 @@ pub(crate) fn ensure_mutating_storage_access(config: &StorageConfig, action: &st
         StorageProvider::GitHubReleases => Err(SurgeError::Config(format!(
             "Cannot {action}: GitHub Releases write access requires GITHUB_TOKEN or GH_TOKEN"
         ))),
+    }
+}
+
+pub(crate) async fn fetch_release_index(backend: &dyn StorageBackend) -> Result<ReleaseIndex> {
+    let data = backend.get_object(RELEASES_FILE_COMPRESSED).await?;
+    decompress_release_index(&data)
+}
+
+pub(crate) async fn ensure_release_full_artifact(
+    backend: &dyn StorageBackend,
+    index: &ReleaseIndex,
+    rid: &str,
+    version: &str,
+) -> Result<bool> {
+    let release = index
+        .releases
+        .iter()
+        .find(|release| release.rid == rid && release.version == version)
+        .ok_or_else(|| SurgeError::NotFound(format!("Release {version} ({rid}) not found in index")))?;
+    let full_filename = release.full_filename.trim();
+    if full_filename.is_empty() {
+        return Err(SurgeError::Storage(format!(
+            "Release {version} ({rid}) has no full artifact descriptor"
+        )));
+    }
+
+    match backend.head_object(full_filename).await {
+        Ok(_) => Ok(false),
+        Err(SurgeError::NotFound(_)) => {
+            let archive = restore_full_archive_for_version(backend, index, rid, version).await?;
+            backend
+                .put_object(full_filename, &archive, "application/octet-stream")
+                .await?;
+            Ok(true)
+        }
+        Err(err) => Err(err),
     }
 }
 

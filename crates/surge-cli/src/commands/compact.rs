@@ -9,9 +9,9 @@ use surge_core::config::constants::{DEFAULT_ZSTD_LEVEL, RELEASES_FILE_COMPRESSED
 use surge_core::config::manifest::SurgeManifest;
 use surge_core::error::{Result, SurgeError};
 use surge_core::releases::manifest::{compress_release_index, decompress_release_index};
-use surge_core::releases::restore::{required_artifacts_for_index, restore_full_archive_for_version};
+use surge_core::releases::restore::required_artifacts_for_index;
 use surge_core::releases::version::compare_versions;
-use surge_core::storage::{self, StorageBackend};
+use surge_core::storage;
 
 /// Compact a channel to a single latest full release and prune stale artifacts.
 ///
@@ -147,7 +147,7 @@ async fn compact_single(
     print_stage_done(theme, 3, TOTAL_STAGES, &format!("v{latest_version}"));
 
     print_stage(theme, 4, TOTAL_STAGES, "Ensuring latest full artifact exists");
-    let full_materialized = ensure_release_full_artifact(&*backend, &index, rid, &latest_version).await?;
+    let full_materialized = super::ensure_release_full_artifact(&*backend, &index, rid, &latest_version).await?;
     print_stage_done(
         theme,
         4,
@@ -316,37 +316,6 @@ fn referenced_artifacts(index: &surge_core::releases::manifest::ReleaseIndex) ->
         }
     }
     keys
-}
-
-async fn ensure_release_full_artifact(
-    backend: &dyn StorageBackend,
-    index: &surge_core::releases::manifest::ReleaseIndex,
-    rid: &str,
-    version: &str,
-) -> Result<bool> {
-    let release = index
-        .releases
-        .iter()
-        .find(|release| release.rid == rid && release.version == version)
-        .ok_or_else(|| SurgeError::NotFound(format!("Release {version} ({rid}) not found in index")))?;
-    let full_filename = release.full_filename.trim();
-    if full_filename.is_empty() {
-        return Err(SurgeError::Storage(format!(
-            "Release {version} ({rid}) has no full artifact descriptor"
-        )));
-    }
-
-    match backend.head_object(full_filename).await {
-        Ok(_) => Ok(false),
-        Err(SurgeError::NotFound(_)) => {
-            let archive = restore_full_archive_for_version(backend, index, rid, version).await?;
-            backend
-                .put_object(full_filename, &archive, "application/octet-stream")
-                .await?;
-            Ok(true)
-        }
-        Err(e) => Err(e),
-    }
 }
 
 #[cfg(test)]

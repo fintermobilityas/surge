@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::IsTerminal;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -2108,12 +2108,58 @@ fn build_remote_app_copy_activation_script(
     main_exe: &str,
     version: &str,
     environment: &BTreeMap<String, String>,
+    persistent_assets: &[String],
+    legacy_app_dir: Option<&Path>,
     no_start: bool,
-) -> String {
+) -> Result<String> {
     let install_root_quoted = shell_single_quote(&install_root.to_string_lossy());
     let main_exe_quoted = shell_single_quote(main_exe);
     let version_quoted = shell_single_quote(version);
     let exports = shell_export_lines(environment);
+    let legacy_app_dir_quoted =
+        legacy_app_dir.map_or_else(|| "''".to_string(), |path| shell_single_quote(&path.to_string_lossy()));
+    let runtime_manifest_relative_path = core_install::RUNTIME_MANIFEST_RELATIVE_PATH;
+    let legacy_runtime_manifest_relative_path = core_install::LEGACY_RUNTIME_MANIFEST_RELATIVE_PATH;
+    let persistent_asset_commands = persistent_assets
+        .iter()
+        .map(|asset| {
+            validate_remote_persistent_asset_path(asset).map(|relative| {
+                format!(
+                    "  copy_persistent_asset {}\n\\\n",
+                    shell_single_quote(&relative.to_string_lossy())
+                )
+            })
+        })
+        .collect::<Result<Vec<_>>>()?
+        .join("");
+    let persistent_asset_block = format!(
+        "legacy_app_dir={legacy_app_dir_quoted}\n\\\n\
+active_runtime_manifest=\"$active_app_dir/{runtime_manifest_relative_path}\"\n\\\n\
+active_legacy_runtime_manifest=\"$active_app_dir/{legacy_runtime_manifest_relative_path}\"\n\\\n\
+runtime_manifest_backup=\"$stage_dir/.surge-runtime-next.yml\"\n\\\n\
+legacy_runtime_manifest_backup=\"$stage_dir/.surge-surge-next.yml\"\n\\\n\
+\n\\\n\
+copy_persistent_asset() {{\n\\\n\
+  relative_path=\"$1\"\n\\\n\
+  source=\"$persistent_source_dir/$relative_path\"\n\\\n\
+  destination=\"$active_app_dir/$relative_path\"\n\\\n\
+  if [ ! -e \"$source\" ]; then\n\\\n\
+    return 0\n\\\n\
+  fi\n\\\n\
+  if [ -d \"$source\" ]; then\n\\\n\
+    rm -rf \"$destination\"\n\\\n\
+    mkdir -p \"$(dirname \"$destination\")\"\n\\\n\
+    cp -a \"$source\" \"$destination\"\n\\\n\
+  else\n\\\n\
+    mkdir -p \"$(dirname \"$destination\")\"\n\\\n\
+    if [ -d \"$destination\" ]; then\n\\\n\
+      rm -rf \"$destination\"\n\\\n\
+    fi\n\\\n\
+    cp -a \"$source\" \"$destination\"\n\\\n\
+  fi\n\\\n\
+}}\n\\\n\
+\n\\\n",
+    );
 
     let mut script = format!(
         "set -eu\n\
@@ -2126,6 +2172,7 @@ applications_dir=\"$HOME/.local/share/applications\"\n\
 autostart_dir=\"$HOME/.config/autostart\"\n\
 main_exe={main_exe_quoted}\n\
 version={version_quoted}\n\
+{persistent_asset_block}\
 \n\
 kill_matching() {{\n\
   pattern=\"$1\"\n\
@@ -2155,6 +2202,33 @@ if [ -d \"$active_app_dir\" ]; then\n\
   mv \"$active_app_dir\" \"$previous_app_dir\"\n\
 fi\n\
 mv \"$next_app_dir\" \"$active_app_dir\"\n\
+\n\
+if [ -n \"${{legacy_app_dir:-}}\" ] && [ -d \"$legacy_app_dir\" ] && [ ! -d \"$previous_app_dir\" ]; then\n\
+  persistent_source_dir=\"$legacy_app_dir\"\n\
+elif [ -d \"$previous_app_dir\" ]; then\n\
+  persistent_source_dir=\"$previous_app_dir\"\n\
+else\n\
+  persistent_source_dir=\"\"\n\
+fi\n\
+\n\
+if [ -n \"${{persistent_source_dir:-}}\" ]; then\n\
+  if [ -f \"$active_runtime_manifest\" ]; then\n\
+    cp \"$active_runtime_manifest\" \"$runtime_manifest_backup\"\n\
+  fi\n\
+  if [ -f \"$active_legacy_runtime_manifest\" ]; then\n\
+    cp \"$active_legacy_runtime_manifest\" \"$legacy_runtime_manifest_backup\"\n\
+  fi\n\
+{persistent_asset_commands}\
+  if [ -f \"$runtime_manifest_backup\" ]; then\n\
+    mkdir -p \"$(dirname \"$active_runtime_manifest\")\"\n\
+    cp \"$runtime_manifest_backup\" \"$active_runtime_manifest\"\n\
+  fi\n\
+  if [ -f \"$legacy_runtime_manifest_backup\" ]; then\n\
+    mkdir -p \"$(dirname \"$active_legacy_runtime_manifest\")\"\n\
+    cp \"$legacy_runtime_manifest_backup\" \"$active_legacy_runtime_manifest\"\n\
+  fi\n\
+fi\n\
+\n\
 rm -rf \"$previous_app_dir\"\n\
 \n\
 if [ -d \"$stage_dir/shortcuts/applications\" ]; then\n\
@@ -2187,7 +2261,95 @@ fi\n",
         );
     }
 
-    script
+    Ok(script)
+}
+
+fn validate_remote_persistent_asset_path(raw: &str) -> Result<PathBuf> {
+    if raw.trim().is_empty() {
+        return Err(SurgeError::Config("Persistent asset path cannot be empty".to_string()));
+    }
+
+    let candidate = Path::new(raw);
+    if candidate.is_absolute() {
+        return Err(SurgeError::Config(format!(
+            "Persistent asset path must be relative: {raw}"
+        )));
+    }
+
+    let first_component = candidate
+        .components()
+        .next()
+        .and_then(|component| match component {
+            Component::Normal(value) => value.to_str(),
+            _ => None,
+        })
+        .unwrap_or_default();
+    if first_component.to_ascii_lowercase().starts_with("app-") {
+        return Err(SurgeError::Config(format!(
+            "Persistent asset path cannot start with 'app-': {raw}"
+        )));
+    }
+
+    for component in candidate.components() {
+        if matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        ) {
+            return Err(SurgeError::Config(format!(
+                "Persistent asset path cannot contain parent/root traversal: {raw}"
+            )));
+        }
+    }
+
+    Ok(candidate.to_path_buf())
+}
+
+fn select_latest_remote_legacy_app_dir<I, S>(install_root: &Path, entries: I) -> Option<PathBuf>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut best: Option<(String, PathBuf)> = None;
+
+    for entry in entries {
+        let name = entry.as_ref().trim();
+        let Some(version) = name.strip_prefix("app-") else {
+            continue;
+        };
+        if version.is_empty() {
+            continue;
+        }
+
+        if best
+            .as_ref()
+            .is_none_or(|(best_version, _)| compare_versions(version, best_version) == std::cmp::Ordering::Greater)
+        {
+            best = Some((version.to_string(), install_root.join(name)));
+        }
+    }
+
+    best.map(|(_, path)| path)
+}
+
+async fn detect_remote_legacy_app_dir(ssh_node: &str, install_root: &Path) -> Result<Option<PathBuf>> {
+    let probe = format!(
+        "install_root={}; \
+if [ -d \"$install_root\" ]; then \
+  for path in \"$install_root\"/app-*; do \
+    if [ -d \"$path\" ]; then \
+      basename \"$path\"; \
+    fi; \
+  done; \
+fi",
+        shell_single_quote(&install_root.to_string_lossy()),
+    );
+    let command = format!("sh -c {}", shell_single_quote(&probe));
+    let output = run_tailscale_capture(&["ssh", ssh_node, command.as_str()]).await?;
+
+    Ok(select_latest_remote_legacy_app_dir(
+        install_root,
+        output.lines().map(str::trim).filter(|line| !line.is_empty()),
+    ))
 }
 
 async fn detect_remote_home_directory(ssh_node: &str) -> Result<PathBuf> {
@@ -2366,6 +2528,11 @@ async fn deploy_remote_app_copy_for_tailscale(
     let install_profile = release_install_profile(app_id, release);
     let runtime_manifest = release_runtime_manifest_metadata(release, channel, storage_config);
     core_install::write_runtime_manifest(&stage_app_dir, &install_profile, &runtime_manifest)?;
+    let legacy_app_dir = if release.persistent_assets.is_empty() {
+        None
+    } else {
+        detect_remote_legacy_app_dir(ssh_target, &install_root).await?
+    };
 
     if !release.shortcuts.is_empty() {
         let icon_path =
@@ -2399,8 +2566,10 @@ mkdir -p \"$install_root\"; rm -rf \"$stage_dir\"; mkdir -p \"$stage_dir\"; tar 
         main_exe_name,
         &release.version,
         &runtime_environment,
+        &release.persistent_assets,
+        legacy_app_dir.as_deref(),
         no_start,
-    );
+    )?;
     let ssh_command = format!("sh -lc {}", shell_single_quote(&activation_script));
     logline::info(&format!("Activating remote install on '{file_target}'..."));
     run_tailscale_streaming(&["ssh", ssh_target, ssh_command.as_str()], "remote").await
@@ -3015,8 +3184,11 @@ mod tests {
             "demoapp",
             "1.2.3",
             &environment,
+            &[],
+            None,
             false,
-        );
+        )
+        .expect("script should build");
 
         assert!(script.contains("export DISPLAY=':0'"));
         assert!(script.contains("export DBUS_SESSION_BUS_ADDRESS='unix:path=/run/user/1000/bus'"));
@@ -3024,6 +3196,39 @@ mod tests {
         assert!(script.contains("--surge-first-run \"$version\""));
         assert!(script.contains("kill_matching \"$install_root/$main_exe\""));
         assert!(script.contains("kill_matching \"$install_root/app-\""));
+    }
+
+    #[test]
+    fn build_remote_app_copy_activation_script_restores_runtime_metadata_after_persistent_copy() {
+        let script = build_remote_app_copy_activation_script(
+            Path::new("/home/demo/.local/share/demo"),
+            "demoapp",
+            "1.2.3",
+            &BTreeMap::new(),
+            &["settings.json".to_string(), ".surge".to_string()],
+            Some(Path::new("/home/demo/.local/share/demo/app-1.2.2")),
+            true,
+        )
+        .expect("script should build");
+
+        assert!(script.contains("legacy_app_dir='/home/demo/.local/share/demo/app-1.2.2'"));
+        assert!(script.contains("persistent_source_dir=\"$legacy_app_dir\""));
+        assert!(script.contains("copy_persistent_asset 'settings.json'"));
+        assert!(script.contains("copy_persistent_asset '.surge'"));
+        assert!(script.contains("runtime_manifest_backup=\"$stage_dir/.surge-runtime-next.yml\""));
+        assert!(script.contains("legacy_runtime_manifest_backup=\"$stage_dir/.surge-surge-next.yml\""));
+        assert!(script.contains("cp \"$runtime_manifest_backup\" \"$active_runtime_manifest\""));
+        assert!(script.contains("cp \"$legacy_runtime_manifest_backup\" \"$active_legacy_runtime_manifest\""));
+    }
+
+    #[test]
+    fn select_latest_remote_legacy_app_dir_uses_semver_ordering() {
+        let install_root = Path::new("/home/demo/.local/share/demo");
+        let selected =
+            select_latest_remote_legacy_app_dir(install_root, ["app-1.0.1-alpha.1", "app-1.0.1", "app-0.9.9"])
+                .expect("legacy app dir should be selected");
+
+        assert_eq!(selected, install_root.join("app-1.0.1"));
     }
 
     #[test]

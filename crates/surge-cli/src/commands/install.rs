@@ -1109,6 +1109,7 @@ fn release_install_profile<'a>(app_id: &'a str, release: &'a ReleaseEntry) -> In
         &release.supervisor_id,
         &release.icon,
         &release.shortcuts,
+        &release.persistent_assets,
         &release.environment,
     )
 }

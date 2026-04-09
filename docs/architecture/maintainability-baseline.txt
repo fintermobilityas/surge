@@ -9,7 +9,6 @@
 727 crates/surge-core/src/install.rs
 1130 crates/surge-core/src/platform/shortcuts.rs
 782 crates/surge-core/src/releases/delta.rs
-625 crates/surge-core/src/releases/restore.rs
 604 crates/surge-core/src/storage/azure.rs
 840 crates/surge-core/src/storage/gcs.rs
 760 crates/surge-installer-ui/src/app.rs

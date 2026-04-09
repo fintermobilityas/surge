@@ -10,6 +10,7 @@ use std::time::Instant;
 use crate::logline;
 use crate::prompts;
 use indicatif::{ProgressBar, ProgressStyle};
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
@@ -154,6 +155,22 @@ struct AppInstallTargetOption {
 struct RemoteInstallState {
     version: String,
     channel: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct RemoteStagedPayloadIdentity {
+    app_id: String,
+    version: String,
+    channel: String,
+    rid: String,
+    full_filename: String,
+    full_sha256: String,
+    install_directory: String,
+    supervisor_id: String,
+    storage_provider: String,
+    storage_bucket: String,
+    storage_region: String,
+    storage_endpoint: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -515,11 +532,12 @@ pub async fn execute(
                     );
                 }
                 let host_can_build_installer = host_can_build_installer_locally(&selected_rid);
-                let has_matching_pre_staged_version = if host_can_build_installer
+                let has_matching_pre_staged_payload = if host_can_build_installer
                     && installer_mode == RemoteInstallerMode::Offline
                     && !behavior.stage.is_stage()
                 {
-                    remote_staged_version_matches_release(ssh_target, &app_id, release).await?
+                    remote_staged_payload_matches_release(ssh_target, &app_id, release, &channel, &storage_config)
+                        .await?
                 } else {
                     false
                 };
@@ -527,7 +545,7 @@ pub async fn execute(
                     host_can_build_installer,
                     installer_mode,
                     behavior.stage.is_stage(),
-                    has_matching_pre_staged_version,
+                    has_matching_pre_staged_payload,
                 );
                 if matches!(transfer_strategy, RemoteTailscaleTransferStrategy::AppCopy) {
                     deploy_remote_app_copy_for_tailscale(
@@ -2531,6 +2549,7 @@ async fn deploy_remote_app_copy_for_tailscale(
     let install_root = remote_install_root(&remote_home, app_id, &release.install_directory)?;
     let active_app_dir = install_root.join("app");
     let runtime_environment = build_remote_runtime_environment(release, launch_env);
+    let staged_payload_identity = remote_staged_payload_identity(app_id, release, channel, storage_config);
     let main_exe_name = if release.main_exe.trim().is_empty() {
         app_id
     } else {
@@ -2540,13 +2559,14 @@ async fn deploy_remote_app_copy_for_tailscale(
     // When not staging, check if a previous --stage run already transferred
     // the correct version. If so, skip re-transfer and go straight to activation.
     if !stage
-        && let Some(staged_version) = check_remote_staged_version(ssh_target, &install_root).await
-        && staged_version == release.version
+        && let Some(remote_staged_payload) = check_remote_staged_payload_identity(ssh_target, &install_root).await
+        && remote_staged_payload == staged_payload_identity
     {
         logline::success(&format!(
             "Using pre-staged payload for '{app_id}' v{} on '{file_target}'.",
             release.version
         ));
+        stop_remote_supervisor_if_running(ssh_target, &install_root, &release.supervisor_id).await?;
         let legacy_app_dir = if release.persistent_assets.is_empty() {
             None
         } else {
@@ -2602,6 +2622,11 @@ async fn deploy_remote_app_copy_for_tailscale(
     let install_profile = release_install_profile(app_id, release);
     let runtime_manifest = release_runtime_manifest_metadata(release, channel, storage_config);
     core_install::write_runtime_manifest(&stage_app_dir, &install_profile, &runtime_manifest)?;
+    std::fs::write(
+        stage_root.join(".surge-staged-release.json"),
+        serde_json::to_vec(&staged_payload_identity)
+            .map_err(|e| SurgeError::Config(format!("Failed to serialize remote staged payload identity: {e}")))?,
+    )?;
     let legacy_app_dir = if release.persistent_assets.is_empty() {
         None
     } else {
@@ -2636,17 +2661,10 @@ mkdir -p \"$install_root\"; rm -rf \"$stage_dir\"; mkdir -p \"$stage_dir\"; tar 
     stream_directory_to_tailscale_node_with_command(ssh_target, &stage_root, &transfer_command).await?;
 
     if stage {
-        // Write a version marker so the next install can detect what was staged
-        let marker_cmd = format!(
-            "echo {} > {}/.surge-transfer-stage/.surge-staged-version",
-            shell_single_quote(&release.version),
-            shell_single_quote(&install_root.to_string_lossy())
-        );
-        let ssh_command = format!("sh -lc {}", shell_single_quote(&marker_cmd));
-        run_tailscale_streaming(&["ssh", ssh_target, ssh_command.as_str()], "remote").await?;
         return Ok(());
     }
 
+    stop_remote_supervisor_if_running(ssh_target, &install_root, &release.supervisor_id).await?;
     let activation_script = build_remote_app_copy_activation_script(
         &install_root,
         main_exe_name,
@@ -2678,10 +2696,10 @@ fn select_remote_tailscale_transfer_strategy(
     host_can_build_installer: bool,
     installer_mode: RemoteInstallerMode,
     stage: bool,
-    has_matching_pre_staged_version: bool,
+    has_matching_pre_staged_payload: bool,
 ) -> RemoteTailscaleTransferStrategy {
     if !host_can_build_installer
-        || matches!(installer_mode, RemoteInstallerMode::Offline) && (stage || has_matching_pre_staged_version)
+        || matches!(installer_mode, RemoteInstallerMode::Offline) && (stage || has_matching_pre_staged_payload)
     {
         RemoteTailscaleTransferStrategy::AppCopy
     } else {
@@ -2838,25 +2856,58 @@ fn parse_remote_install_state(output: &str) -> Option<RemoteInstallState> {
     version.map(|version| RemoteInstallState { version, channel })
 }
 
-async fn check_remote_staged_version(ssh_node: &str, install_root: &Path) -> Option<String> {
+fn remote_staged_payload_identity(
+    app_id: &str,
+    release: &ReleaseEntry,
+    channel: &str,
+    storage_config: &surge_core::context::StorageConfig,
+) -> RemoteStagedPayloadIdentity {
+    RemoteStagedPayloadIdentity {
+        app_id: app_id.trim().to_string(),
+        version: release.version.trim().to_string(),
+        channel: channel.trim().to_string(),
+        rid: release.rid.trim().to_string(),
+        full_filename: release.full_filename.trim().to_string(),
+        full_sha256: release.full_sha256.trim().to_string(),
+        install_directory: release.install_directory.trim().to_string(),
+        supervisor_id: release.supervisor_id.trim().to_string(),
+        storage_provider: core_install::storage_provider_manifest_name(storage_config.provider).to_string(),
+        storage_bucket: storage_config.bucket.trim().to_string(),
+        storage_region: storage_config.region.trim().to_string(),
+        storage_endpoint: storage_config.endpoint.trim().to_string(),
+    }
+}
+
+fn parse_remote_staged_payload_identity(output: &str) -> Option<RemoteStagedPayloadIdentity> {
+    serde_json::from_str(output.trim()).ok()
+}
+
+async fn check_remote_staged_payload_identity(
+    ssh_node: &str,
+    install_root: &Path,
+) -> Option<RemoteStagedPayloadIdentity> {
     let probe = format!(
-        "cat {}/.surge-transfer-stage/.surge-staged-version 2>/dev/null",
+        "cat {}/.surge-transfer-stage/.surge-staged-release.json 2>/dev/null",
         shell_single_quote(&install_root.to_string_lossy())
     );
     let command = format!("sh -c {}", shell_single_quote(&probe));
     match run_tailscale_capture(&["ssh", ssh_node, command.as_str()]).await {
-        Ok(output) => {
-            let version = output.trim().to_string();
-            if version.is_empty() { None } else { Some(version) }
-        }
+        Ok(output) => parse_remote_staged_payload_identity(&output),
         Err(_) => None,
     }
 }
 
-async fn remote_staged_version_matches_release(ssh_node: &str, app_id: &str, release: &ReleaseEntry) -> Result<bool> {
+async fn remote_staged_payload_matches_release(
+    ssh_node: &str,
+    app_id: &str,
+    release: &ReleaseEntry,
+    channel: &str,
+    storage_config: &surge_core::context::StorageConfig,
+) -> Result<bool> {
     let remote_home = detect_remote_home_directory(ssh_node).await?;
     let install_root = remote_install_root(&remote_home, app_id, &release.install_directory)?;
-    Ok(check_remote_staged_version(ssh_node, &install_root).await.as_deref() == Some(release.version.as_str()))
+    let expected = remote_staged_payload_identity(app_id, release, channel, storage_config);
+    Ok(check_remote_staged_payload_identity(ssh_node, &install_root).await == Some(expected))
 }
 
 async fn warn_if_remote_stage_cleanup_fails(ssh_node: &str, app_id: &str, release: &ReleaseEntry) {
@@ -2873,11 +2924,47 @@ async fn cleanup_remote_staged_payload(ssh_node: &str, app_id: &str, release: &R
     run_tailscale_streaming(&["ssh", ssh_node, ssh_command.as_str()], "remote").await
 }
 
+async fn stop_remote_supervisor_if_running(ssh_node: &str, install_root: &Path, supervisor_id: &str) -> Result<()> {
+    let Some(stop_command) = build_remote_stop_supervisor_command(install_root, supervisor_id) else {
+        return Ok(());
+    };
+
+    logline::info(&format!(
+        "Stopping remote supervisor '{}' before activation...",
+        supervisor_id.trim()
+    ));
+    let ssh_command = format!("sh -lc {}", shell_single_quote(&stop_command));
+    run_tailscale_streaming(&["ssh", ssh_node, ssh_command.as_str()], "remote").await
+}
+
 fn build_remote_stage_cleanup_command(install_root: &Path) -> String {
     format!(
         "install_root={}; rm -rf \"$install_root/.surge-transfer-stage\"",
         shell_single_quote(&install_root.to_string_lossy())
     )
+}
+
+fn build_remote_stop_supervisor_command(install_root: &Path, supervisor_id: &str) -> Option<String> {
+    let supervisor_id = supervisor_id.trim();
+    if supervisor_id.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "install_root={}; supervisor_id={}; pid_file=\"$install_root/.surge-supervisor-$supervisor_id.pid\"; \
+if [ ! -d \"$install_root\" ] || [ ! -f \"$pid_file\" ]; then exit 0; fi; \
+pid=\"$(tr -d '[:space:]' < \"$pid_file\")\"; \
+case \"$pid\" in ''|*[!0-9]*) echo \"Invalid PID in supervisor PID file: $pid_file\" >&2; exit 1 ;; esac; \
+kill \"$pid\"; \
+i=0; \
+while [ -f \"$pid_file\" ]; do \
+  if [ \"$i\" -ge 200 ]; then echo \"Timed out waiting for supervisor '$supervisor_id' to exit\" >&2; exit 1; fi; \
+  sleep 0.1; \
+  i=$((i + 1)); \
+done",
+        shell_single_quote(&install_root.to_string_lossy()),
+        shell_single_quote(supervisor_id)
+    ))
 }
 
 async fn detect_remote_launch_environment(ssh_node: &str) -> RemoteLaunchEnvironment {
@@ -3507,6 +3594,50 @@ mod tests {
             command,
             "install_root='/home/demo/apps/customer'\"'\"'s app'; rm -rf \"$install_root/.surge-transfer-stage\""
         );
+    }
+
+    #[test]
+    fn remote_staged_payload_identity_changes_when_channel_or_artifact_changes() {
+        let mut entry = release("1.2.3", "stable", "linux-arm64", "demo.tar.zst");
+        entry.full_sha256 = "sha256-a".to_string();
+        entry.install_directory = "demo".to_string();
+        entry.supervisor_id = "demo-supervisor".to_string();
+
+        let baseline = remote_staged_payload_identity("demo", &entry, "stable", &storage_config("/srv/releases"));
+        let promoted = remote_staged_payload_identity("demo", &entry, "beta", &storage_config("/srv/releases"));
+
+        let mut rebuilt_release = entry.clone();
+        rebuilt_release.full_sha256 = "sha256-b".to_string();
+        let rebuilt =
+            remote_staged_payload_identity("demo", &rebuilt_release, "stable", &storage_config("/srv/releases"));
+
+        assert_ne!(baseline, promoted);
+        assert_ne!(baseline, rebuilt);
+    }
+
+    #[test]
+    fn parse_remote_staged_payload_identity_round_trips_json() {
+        let mut entry = release("1.2.3", "stable", "linux-arm64", "demo.tar.zst");
+        entry.full_sha256 = "sha256-a".to_string();
+        entry.install_directory = "demo".to_string();
+        entry.supervisor_id = "demo-supervisor".to_string();
+
+        let identity = remote_staged_payload_identity("demo", &entry, "stable", &storage_config("/srv/releases"));
+        let encoded = serde_json::to_string(&identity).expect("staged identity should serialize");
+
+        assert_eq!(parse_remote_staged_payload_identity(&encoded), Some(identity));
+        assert_eq!(parse_remote_staged_payload_identity("not-json"), None);
+    }
+
+    #[test]
+    fn build_remote_stop_supervisor_command_quotes_install_root() {
+        let command =
+            build_remote_stop_supervisor_command(Path::new("/home/demo/apps/customer's app"), "demo-supervisor")
+                .expect("supervisor command should exist");
+
+        assert!(command.contains("install_root='/home/demo/apps/customer'\"'\"'s app'"));
+        assert!(command.contains("supervisor_id='demo-supervisor'"));
+        assert!(command.contains("pid_file=\"$install_root/.surge-supervisor-$supervisor_id.pid\""));
     }
 
     #[test]

@@ -50,6 +50,17 @@ jobs:
       - run: rustup component add rustfmt
       - run: cargo fmt --all -- --check
 
+  maintainability:
+    name: maintainability (advisory)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Run maintainability guardrail (non-blocking)
+        run: |
+          ./scripts/check-maintainability.sh || {
+            echo "::warning::Maintainability guardrail detected a new oversized Rust source file or growth in an existing hotspot."
+          }
+
   clippy:
     name: clippy
     runs-on: ubuntu-latest

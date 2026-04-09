@@ -1,0 +1,18 @@
+# Maximum allowed production-line counts for current oversized Rust source files.
+# Format: <max_lines> <path>
+605 crates/surge-bench/src/payload.rs
+1013 crates/surge-bench/src/runner.rs
+3455 crates/surge-cli/src/commands/install.rs
+1189 crates/surge-cli/src/commands/pack.rs
+835 crates/surge-cli/src/main.rs
+861 crates/surge-core/src/config/manifest.rs
+727 crates/surge-core/src/install.rs
+990 crates/surge-core/src/pack/builder.rs
+1130 crates/surge-core/src/platform/shortcuts.rs
+782 crates/surge-core/src/releases/delta.rs
+625 crates/surge-core/src/releases/restore.rs
+604 crates/surge-core/src/storage/azure.rs
+840 crates/surge-core/src/storage/gcs.rs
+1428 crates/surge-core/src/update/manager.rs
+1491 crates/surge-ffi/src/lib.rs
+760 crates/surge-installer-ui/src/app.rs

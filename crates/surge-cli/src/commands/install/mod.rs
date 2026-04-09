@@ -1,5 +1,7 @@
 #![allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 
+mod profile;
+mod releases;
 mod resolution;
 mod selection;
 
@@ -7,7 +9,6 @@ use std::collections::BTreeMap;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::logline;
@@ -18,6 +19,10 @@ use tokio::process::Command;
 
 pub(crate) use self::resolution::selected_install_manifest_path;
 
+use self::profile::{
+    build_rid_candidates, derive_base_rid, detect_local_profile, warn_if_local_rid_looks_incompatible,
+};
+use self::releases::{ArchiveAcquisition, download_release_archive, fetch_release_index, select_release};
 use self::resolution::{
     build_storage_config_with_overrides, build_storage_config_without_manifest, load_install_manifest_if_available,
     resolve_install_app_id_without_manifest, resolve_tailscale_rid_without_manifest,
@@ -35,10 +40,9 @@ use surge_core::config::manifest::SurgeManifest;
 use surge_core::error::{Result, SurgeError};
 use surge_core::install::{self as core_install, InstallProfile};
 use surge_core::releases::artifact_cache::{CacheFetchOutcome, cache_path_for_key, fetch_or_reuse_file};
-use surge_core::releases::manifest::{ReleaseEntry, ReleaseIndex, decompress_release_index};
-use surge_core::releases::restore::{RestoreOptions, RestoreProgress, restore_full_archive_for_version_with_options};
+use surge_core::releases::manifest::{ReleaseEntry, ReleaseIndex};
 use surge_core::releases::version::compare_versions;
-use surge_core::storage::{self, StorageBackend, TransferProgress};
+use surge_core::storage::{self, StorageBackend};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StorageOverrides<'a> {
@@ -75,27 +79,6 @@ impl InstallMode {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RuntimeProfile {
-    os: String,
-    arch: String,
-    gpu: String,
-}
-
-impl RuntimeProfile {
-    fn has_nvidia_gpu(&self) -> bool {
-        let gpu = self.gpu.trim().to_ascii_lowercase();
-        gpu == "nvidia" || gpu == "true" || gpu == "yes"
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RidSignature {
-    os: &'static str,
-    arch: &'static str,
-    has_gpu_hint: bool,
-}
-
 fn ensure_supported_tailscale_rid(rid: &str) -> Result<()> {
     match infer_os_from_rid(rid) {
         Some(os) if os == "linux" => Ok(()),
@@ -129,13 +112,6 @@ impl RemoteLaunchEnvironment {
 enum InstallTarget {
     Local,
     Tailscale { ssh_target: String, file_target: String },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ArchiveAcquisition {
-    ReusedLocal,
-    Downloaded,
-    Reconstructed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1251,314 +1227,6 @@ fn make_spinner(message: &str) -> Option<ProgressBar> {
     spinner.set_message(message.to_string());
     spinner.enable_steady_tick(std::time::Duration::from_millis(80));
     Some(spinner)
-}
-
-async fn fetch_release_index(backend: &dyn StorageBackend) -> Result<(ReleaseIndex, bool)> {
-    match backend.get_object(RELEASES_FILE_COMPRESSED).await {
-        Ok(data) => Ok((decompress_release_index(&data)?, true)),
-        Err(SurgeError::NotFound(_)) => Ok((ReleaseIndex::default(), false)),
-        Err(e) => Err(e),
-    }
-}
-
-async fn download_release_archive(
-    backend: &dyn StorageBackend,
-    index: &ReleaseIndex,
-    release: &ReleaseEntry,
-    rid_candidates: &[String],
-    full_filename: &str,
-    destination: &Path,
-) -> Result<ArchiveAcquisition> {
-    struct FetchProgressUi {
-        verify_spinner: Option<ProgressBar>,
-        transfer_bar: Option<ProgressBar>,
-    }
-
-    let expected_sha256 = release.full_sha256.trim();
-    let ui_state = Arc::new(Mutex::new(FetchProgressUi {
-        verify_spinner: if destination.is_file() && !expected_sha256.is_empty() {
-            make_spinner("Verifying cached package integrity")
-        } else {
-            None
-        },
-        transfer_bar: None,
-    }));
-    let ui_state_for_progress = Arc::clone(&ui_state);
-    let total_hint = u64::try_from(release.full_size.max(0)).unwrap_or(0);
-    let transfer_progress: Box<TransferProgress> = Box::new(move |done: u64, total: u64| {
-        let mut ui = ui_state_for_progress
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(spinner) = ui.verify_spinner.take() {
-            spinner.finish_and_clear();
-        }
-        if ui.transfer_bar.is_none() {
-            let initial_total = if total > 0 { total } else { total_hint };
-            ui.transfer_bar = make_progress_bar("Fetching full package", initial_total);
-        }
-        if let Some(bar) = ui.transfer_bar.as_ref() {
-            if total > 0 {
-                bar.set_length(total);
-            }
-            bar.set_position(done);
-        }
-    });
-    let fetch_result = fetch_or_reuse_file(
-        backend,
-        full_filename,
-        destination,
-        &release.full_sha256,
-        Some(transfer_progress.as_ref()),
-    )
-    .await;
-    let (verify_spinner, direct_fetch_bar) = {
-        let mut ui = ui_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        (ui.verify_spinner.take(), ui.transfer_bar.take())
-    };
-    if let Some(spinner) = verify_spinner {
-        spinner.finish_and_clear();
-    }
-    if let Some(bar) = direct_fetch_bar {
-        bar.finish_and_clear();
-    }
-
-    match fetch_result {
-        Ok(CacheFetchOutcome::ReusedLocal) => Ok(ArchiveAcquisition::ReusedLocal),
-        Ok(CacheFetchOutcome::DownloadedFresh | CacheFetchOutcome::DownloadedAfterInvalidLocal) => {
-            Ok(ArchiveAcquisition::Downloaded)
-        }
-        Err(SurgeError::NotFound(_)) => {
-            let restore_rid = if release.rid.trim().is_empty() {
-                rid_candidates.first().map_or("", String::as_str)
-            } else {
-                release.rid.as_str()
-            };
-            let restore_bar = make_progress_bar("Rebuilding full package from release graph", 0);
-            let restore_bar_for_progress = restore_bar.clone();
-            let progress = |p: RestoreProgress| {
-                if let Some(bar) = &restore_bar_for_progress {
-                    if p.bytes_total > 0 {
-                        bar.set_length(u64::try_from(p.bytes_total).unwrap_or(0));
-                        bar.set_position(u64::try_from(p.bytes_done).unwrap_or(0));
-                    } else if p.items_total > 0 {
-                        bar.set_length(u64::try_from(p.items_total).unwrap_or(0));
-                        bar.set_position(u64::try_from(p.items_done).unwrap_or(0));
-                    }
-                    bar.set_message(format!(
-                        "Rebuilding full package from release graph ({}/{})",
-                        p.items_done, p.items_total
-                    ));
-                } else {
-                    logline::subtle(&format!(
-                        "  Rebuilding full package from release graph [{}/{}] {} / {} bytes",
-                        p.items_done, p.items_total, p.bytes_done, p.bytes_total
-                    ));
-                }
-            };
-            let rebuilt = restore_full_archive_for_version_with_options(
-                backend,
-                index,
-                restore_rid,
-                &release.version,
-                RestoreOptions {
-                    cache_dir: destination.parent(),
-                    progress: Some(&progress),
-                },
-            )
-            .await?;
-            if let Some(bar) = &restore_bar {
-                bar.finish_and_clear();
-            }
-            std::fs::write(destination, rebuilt)?;
-            Ok(ArchiveAcquisition::Reconstructed)
-        }
-        Err(e) => Err(e),
-    }
-}
-
-fn select_release<'a>(
-    releases: &'a [ReleaseEntry],
-    channel: &str,
-    version: Option<&str>,
-    rid_candidates: &[String],
-    selected_os: Option<&str>,
-) -> Option<&'a ReleaseEntry> {
-    let mut eligible: Vec<&ReleaseEntry> = releases
-        .iter()
-        .filter(|release| release.channels.iter().any(|c| c == channel))
-        .collect();
-
-    if let Some(version) = version.map(str::trim).filter(|v| !v.is_empty()) {
-        eligible.retain(|release| release.version == version);
-    }
-
-    if let Some(os) = selected_os.map(str::trim).filter(|value| !value.is_empty()) {
-        let os = os.to_ascii_lowercase();
-        eligible.retain(|release| release_os(release).is_some_and(|release_os| release_os == os));
-    }
-
-    if eligible.is_empty() {
-        return None;
-    }
-
-    for rid in rid_candidates {
-        let mut by_rid: Vec<&ReleaseEntry> = eligible.iter().copied().filter(|release| release.rid == *rid).collect();
-        by_rid.sort_by(|a, b| compare_versions(&b.version, &a.version));
-        if let Some(best) = by_rid.first() {
-            return Some(*best);
-        }
-    }
-
-    let mut generic: Vec<&ReleaseEntry> = eligible
-        .iter()
-        .copied()
-        .filter(|release| release.rid.trim().is_empty())
-        .collect();
-    generic.sort_by(|a, b| compare_versions(&b.version, &a.version));
-    generic.first().copied()
-}
-
-fn release_os(release: &ReleaseEntry) -> Option<String> {
-    if let Some(os) = normalize_release_os(&release.os) {
-        return Some(os.to_string());
-    }
-    infer_os_from_rid(&release.rid)
-}
-
-fn normalize_release_os(raw: &str) -> Option<&'static str> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "linux" => Some("linux"),
-        "win" | "windows" => Some("windows"),
-        "osx" | "macos" | "darwin" => Some("macos"),
-        _ => None,
-    }
-}
-
-fn detect_local_profile() -> RuntimeProfile {
-    let os = std::env::consts::OS.to_string();
-    let arch = std::env::consts::ARCH.to_string();
-    let gpu = if has_local_nvidia_gpu() {
-        "nvidia".to_string()
-    } else {
-        "none".to_string()
-    };
-    RuntimeProfile { os, arch, gpu }
-}
-
-fn has_local_nvidia_gpu() -> bool {
-    std::process::Command::new("nvidia-smi")
-        .arg("-L")
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
-}
-
-fn warn_if_local_rid_looks_incompatible(rid: &str, profile: &RuntimeProfile) {
-    for warning in local_rid_incompatibility_warnings(rid, profile) {
-        logline::warn(&warning);
-    }
-}
-
-fn local_rid_incompatibility_warnings(rid: &str, profile: &RuntimeProfile) -> Vec<String> {
-    let Some(selected) = parse_rid_signature(rid) else {
-        return Vec::new();
-    };
-    let Some(local_os) = normalize_os(&profile.os) else {
-        return Vec::new();
-    };
-    let Some(local_arch) = normalize_arch(&profile.arch) else {
-        return Vec::new();
-    };
-
-    let mut warnings = Vec::new();
-    if selected.os != local_os {
-        warnings.push(format!(
-            "Selected RID '{rid}' targets OS '{}', but local host OS appears '{}'.",
-            selected.os, local_os
-        ));
-    }
-    if selected.arch != local_arch {
-        warnings.push(format!(
-            "Selected RID '{rid}' targets architecture '{}', but local host architecture appears '{}'.",
-            selected.arch, local_arch
-        ));
-    }
-    if selected.has_gpu_hint && !profile.has_nvidia_gpu() {
-        warnings.push(format!(
-            "Selected RID '{rid}' implies GPU acceleration, but no local NVIDIA GPU was detected."
-        ));
-    }
-    warnings
-}
-
-fn parse_rid_signature(rid: &str) -> Option<RidSignature> {
-    let mut parts = rid.trim().split('-');
-    let raw_os = parts.next()?.trim().to_ascii_lowercase();
-    let os = match raw_os.as_str() {
-        "linux" => "linux",
-        "win" | "windows" => "win",
-        "osx" | "macos" | "darwin" => "osx",
-        _ => normalize_os(raw_os.as_str())?,
-    };
-    let arch = normalize_arch(parts.next()?)?;
-    let has_gpu_hint = parts.any(|part| {
-        let part = part.trim().to_ascii_lowercase();
-        part == "cuda" || part == "nvidia" || part == "gpu"
-    });
-    Some(RidSignature { os, arch, has_gpu_hint })
-}
-
-fn derive_base_rid(profile: &RuntimeProfile) -> Option<String> {
-    let os = normalize_os(&profile.os)?;
-    let arch = normalize_arch(&profile.arch)?;
-    Some(format!("{os}-{arch}"))
-}
-
-fn normalize_os(raw: &str) -> Option<&'static str> {
-    let os = raw.trim().to_ascii_lowercase();
-    if os.contains("linux") {
-        Some("linux")
-    } else if os.contains("darwin") || os.contains("mac") {
-        Some("osx")
-    } else if os.contains("windows") || os.contains("mingw") || os.contains("msys") {
-        Some("win")
-    } else {
-        None
-    }
-}
-
-fn normalize_arch(raw: &str) -> Option<&'static str> {
-    let arch = raw.trim().to_ascii_lowercase();
-    if arch == "x86_64" || arch == "amd64" || arch == "x64" {
-        Some("x64")
-    } else if arch == "aarch64" || arch == "arm64" {
-        Some("arm64")
-    } else if arch == "x86" || arch == "i386" || arch == "i686" {
-        Some("x86")
-    } else {
-        None
-    }
-}
-
-fn build_rid_candidates(base_rid: &str, nvidia_gpu: bool) -> Vec<String> {
-    let mut candidates: Vec<String> = Vec::new();
-    let mut push_unique = |candidate: String| {
-        if !candidates.iter().any(|existing| existing == &candidate) {
-            candidates.push(candidate);
-        }
-    };
-
-    if nvidia_gpu {
-        push_unique(format!("{base_rid}-nvidia"));
-        push_unique(format!("{base_rid}-cuda"));
-        push_unique(format!("{base_rid}-gpu"));
-    }
-    push_unique(base_rid.to_string());
-    if !nvidia_gpu {
-        push_unique(format!("{base_rid}-cpu"));
-    }
-
-    candidates
 }
 
 fn shell_single_quote(raw: &str) -> String {
@@ -2978,6 +2646,10 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
 
+    use super::profile::{
+        RuntimeProfile, build_rid_candidates, derive_base_rid, local_rid_incompatibility_warnings, parse_rid_signature,
+    };
+    use super::releases::{ArchiveAcquisition, download_release_archive, select_release};
     use super::resolution::{
         build_storage_config_without_manifest, resolve_install_app_id_without_manifest,
         resolve_tailscale_rid_without_manifest,

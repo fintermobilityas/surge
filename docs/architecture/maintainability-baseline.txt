@@ -15,5 +15,5 @@
 604 crates/surge-core/src/storage/azure.rs
 840 crates/surge-core/src/storage/gcs.rs
 1428 crates/surge-core/src/update/manager.rs
-1168 crates/surge-ffi/src/lib.rs
+770 crates/surge-ffi/src/lib.rs
 760 crates/surge-installer-ui/src/app.rs

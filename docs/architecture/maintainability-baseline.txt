@@ -2,7 +2,7 @@
 # Format: <max_lines> <path>
 605 crates/surge-bench/src/payload.rs
 1013 crates/surge-bench/src/runner.rs
-2974 crates/surge-cli/src/commands/install/mod.rs
+2642 crates/surge-cli/src/commands/install/mod.rs
 1189 crates/surge-cli/src/commands/pack.rs
 835 crates/surge-cli/src/main.rs
 861 crates/surge-core/src/config/manifest.rs

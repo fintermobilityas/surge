@@ -2,8 +2,8 @@
 # Format: <max_lines> <path>
 605 crates/surge-bench/src/payload.rs
 1013 crates/surge-bench/src/runner.rs
-803 crates/surge-cli/src/commands/install/mod.rs
-1852 crates/surge-cli/src/commands/install/remote.rs
+813 crates/surge-cli/src/commands/install/mod.rs
+1860 crates/surge-cli/src/commands/install/remote.rs
 1189 crates/surge-cli/src/commands/pack.rs
 835 crates/surge-cli/src/main.rs
 861 crates/surge-core/src/config/manifest.rs
@@ -15,5 +15,5 @@
 604 crates/surge-core/src/storage/azure.rs
 840 crates/surge-core/src/storage/gcs.rs
 1428 crates/surge-core/src/update/manager.rs
-1491 crates/surge-ffi/src/lib.rs
+1168 crates/surge-ffi/src/lib.rs
 760 crates/surge-installer-ui/src/app.rs

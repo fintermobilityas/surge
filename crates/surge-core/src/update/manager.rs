@@ -1,6 +1,9 @@
 //! Update manager: check for updates, download, verify, and apply them.
 
-use std::collections::{BTreeMap, BTreeSet};
+mod progress;
+mod release_index;
+
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -26,151 +29,21 @@ use crate::releases::artifact_cache::{
     CacheFetchOutcome, cache_path_for_key, fetch_or_reuse_file, prune_cached_artifacts,
 };
 use crate::releases::delta::{apply_delta_patch, decode_delta_patch, is_supported_delta};
-use crate::releases::manifest::{
-    ReleaseEntry, ReleaseIndex, decompress_release_index, get_delta_chain, get_releases_newer_than,
-};
+use crate::releases::manifest::{ReleaseEntry, ReleaseIndex, decompress_release_index};
 use crate::releases::restore::{
     RestoreOptions, find_release_for_version_rid, local_checkpoint_artifacts_for_index, required_artifacts_for_index,
     restore_full_archive_for_version_with_options,
 };
-use crate::releases::version::compare_versions;
 use crate::storage::{StorageBackend, create_storage_backend};
-use crate::storage_config::append_prefix;
 use crate::supervisor::state::{read_restart_args, supervisor_pid_file, supervisor_stop_file};
 use crate::supervisor::stub::find_latest_app_dir;
 
-/// Progress information for update operations.
-#[derive(Debug, Clone)]
-pub struct ProgressInfo {
-    /// Current phase (1 = check, 2 = download, 3 = verify, 4 = extract, 5 = apply_delta, 6 = finalize).
-    pub phase: i32,
-    /// Percentage complete within the current phase (0-100).
-    pub phase_percent: i32,
-    /// Overall percentage complete (0-100).
-    pub total_percent: i32,
-    /// Bytes processed so far in this phase.
-    pub bytes_done: i64,
-    /// Total bytes expected in this phase.
-    pub bytes_total: i64,
-    /// Items processed so far in this phase.
-    pub items_done: i64,
-    /// Total items expected in this phase.
-    pub items_total: i64,
-    /// Current processing speed in bytes per second.
-    pub speed_bytes_per_sec: f64,
-}
-
-impl Default for ProgressInfo {
-    fn default() -> Self {
-        Self {
-            phase: 0,
-            phase_percent: 0,
-            total_percent: 0,
-            bytes_done: 0,
-            bytes_total: 0,
-            items_done: 0,
-            items_total: 0,
-            speed_bytes_per_sec: 0.0,
-        }
-    }
-}
-
-fn emit_progress<F>(progress: Option<&Arc<F>>, progress_info: ProgressInfo)
-where
-    F: Fn(ProgressInfo) + Send + Sync,
-{
-    if let Some(cb) = progress {
-        cb(progress_info);
-    }
-}
-
-fn clamp_progress_percent(done: i64, total: i64) -> i32 {
-    if total > 0 {
-        ((done.saturating_mul(100)) / total).clamp(0, 100) as i32
-    } else {
-        0
-    }
-}
-
-fn clamp_progress_percent_u64(done: u64, total: u64) -> i32 {
-    if total > 0 {
-        ((done.saturating_mul(100)) / total).clamp(0, 100) as i32
-    } else {
-        0
-    }
-}
-
-fn saturating_i64_from_u64(value: u64) -> i64 {
-    i64::try_from(value).unwrap_or(i64::MAX)
-}
-
-fn phase_total_percent(phase_start: i32, phase_span: i32, phase_percent: i32) -> i32 {
-    phase_start + phase_percent.clamp(0, 100) * phase_span / 100
-}
-
-#[allow(clippy::cast_precision_loss)]
-fn average_speed_bytes_per_sec(bytes_done: u64, started_at: Instant) -> f64 {
-    let elapsed = started_at.elapsed().as_secs_f64();
-    if elapsed > 0.0 {
-        bytes_done as f64 / elapsed
-    } else {
-        0.0
-    }
-}
-
-#[derive(Debug, Clone)]
-struct ArtifactDownload {
-    key: String,
-    sha256: String,
-    size: i64,
-}
-
-#[derive(Debug)]
-struct DownloadProgressState {
-    started_at: Instant,
-    bytes_by_artifact: BTreeMap<String, u64>,
-    bytes_done: u64,
-    items_done: i64,
-}
-
-impl DownloadProgressState {
-    fn new() -> Self {
-        Self {
-            started_at: Instant::now(),
-            bytes_by_artifact: BTreeMap::new(),
-            bytes_done: 0,
-            items_done: 0,
-        }
-    }
-
-    fn observe_artifact_bytes(&mut self, key: &str, done: u64) {
-        let previous = self.bytes_by_artifact.insert(key.to_string(), done).unwrap_or(0);
-        self.bytes_done = self.bytes_done.saturating_add(done.saturating_sub(previous));
-    }
-
-    fn finish_artifact(&mut self, key: &str, total: u64) {
-        self.observe_artifact_bytes(key, total);
-        self.items_done = self.items_done.saturating_add(1);
-    }
-
-    fn snapshot(&self, total_bytes: u64, total_items: i64) -> ProgressInfo {
-        let phase_percent = if total_bytes > 0 {
-            clamp_progress_percent_u64(self.bytes_done, total_bytes)
-        } else {
-            clamp_progress_percent(self.items_done, total_items.max(1))
-        };
-        ProgressInfo {
-            phase: 2,
-            phase_percent,
-            total_percent: 10 + phase_percent * 30 / 100,
-            bytes_done: saturating_i64_from_u64(self.bytes_done),
-            bytes_total: saturating_i64_from_u64(total_bytes),
-            items_done: self.items_done,
-            items_total: total_items,
-            speed_bytes_per_sec: average_speed_bytes_per_sec(self.bytes_done, self.started_at),
-        }
-    }
-}
+pub use self::progress::ProgressInfo;
+use self::progress::{
+    ArtifactDownload, DownloadProgressState, average_speed_bytes_per_sec, clamp_progress_percent,
+    clamp_progress_percent_u64, emit_progress, phase_total_percent, saturating_i64_from_u64,
+};
+use self::release_index::{load_release_index as load_release_index_impl, resolve_update_info};
 
 /// Strategy used when applying an update.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -212,47 +85,7 @@ pub struct UpdateManager {
 
 impl UpdateManager {
     async fn load_release_index(&mut self) -> Result<ReleaseIndex> {
-        match self.storage.get_object(RELEASES_FILE_COMPRESSED).await {
-            Ok(data) => decompress_release_index(&data),
-            Err(SurgeError::NotFound(_)) => {
-                let base_prefix = self.ctx.storage_config().prefix;
-                let scoped_prefix = append_prefix(&base_prefix, &self.app_id);
-                if scoped_prefix == base_prefix {
-                    return Err(SurgeError::NotFound(format!(
-                        "Release index '{RELEASES_FILE_COMPRESSED}' not found"
-                    )));
-                }
-
-                debug!(
-                    app_id = %self.app_id,
-                    base_prefix = %base_prefix,
-                    scoped_prefix = %scoped_prefix,
-                    "Release index not found on configured prefix; trying app-scoped prefix"
-                );
-
-                let mut scoped_config = self.ctx.storage_config();
-                scoped_config.prefix = scoped_prefix.clone();
-                let scoped_backend = create_storage_backend(&scoped_config)?;
-
-                match scoped_backend.get_object(RELEASES_FILE_COMPRESSED).await {
-                    Ok(data) => {
-                        info!(
-                            app_id = %self.app_id,
-                            scoped_prefix = %scoped_prefix,
-                            "Using app-scoped storage prefix for update checks"
-                        );
-                        self.ctx.set_storage_prefix(&scoped_prefix);
-                        self.storage = scoped_backend;
-                        decompress_release_index(&data)
-                    }
-                    Err(SurgeError::NotFound(_)) => Err(SurgeError::NotFound(format!(
-                        "Release index '{RELEASES_FILE_COMPRESSED}' not found on configured or app-scoped prefix"
-                    ))),
-                    Err(e) => Err(e),
-                }
-            }
-            Err(e) => Err(e),
-        }
+        load_release_index_impl(self).await
     }
 
     /// Create a new update manager.
@@ -353,83 +186,8 @@ impl UpdateManager {
             "Checking for updates"
         );
 
-        // Download release index
         let index = self.load_release_index().await?;
-        let current_rid = current_rid();
-        let current_os = normalize_os_label(current_rid.split('-').next().unwrap_or_default());
-
-        if !index.app_id.is_empty() && index.app_id != self.app_id {
-            return Err(SurgeError::Update(format!(
-                "Release index app_id '{}' does not match requested app '{}'",
-                index.app_id, self.app_id
-            )));
-        }
-
-        // Keep only releases compatible with our channel/platform.
-        let mut compatible_index = index.clone();
-        compatible_index.releases.retain(|release| {
-            release.channels.iter().any(|c| c == &self.channel)
-                && compare_versions(&release.version, &self.current_version) == std::cmp::Ordering::Greater
-                && release_matches_rid(release, &current_rid)
-                && release_matches_os(release, &current_os)
-        });
-
-        // Find newer releases on our channel
-        let newer = get_releases_newer_than(&compatible_index, &self.current_version, &self.channel);
-
-        if newer.is_empty() {
-            debug!("No updates available");
-            self.cached_index = Some(index);
-            return Ok(None);
-        }
-
-        let latest = newer
-            .last()
-            .map(|release| (*release).clone())
-            .ok_or_else(|| SurgeError::Update("No latest release found".to_string()))?;
-        let latest_version = latest.version.clone();
-
-        // Check if a delta chain exists
-        let delta_chain = get_delta_chain(&compatible_index, &self.current_version, &latest_version, &self.channel);
-
-        let available_releases: Vec<ReleaseEntry> = newer.into_iter().cloned().collect();
-        let supported_delta_chain = delta_chain.filter(|chain| {
-            chain
-                .iter()
-                .all(|release| release.selected_delta().is_some_and(|delta| is_supported_delta(&delta)))
-        });
-
-        let (apply_releases, apply_strategy, download_size) = if let Some(chain) = supported_delta_chain {
-            let selected: Vec<ReleaseEntry> = chain.into_iter().cloned().collect();
-            let size = selected
-                .iter()
-                .filter_map(ReleaseEntry::selected_delta)
-                .map(|delta| delta.size)
-                .sum();
-            (selected, ApplyStrategy::Delta, size)
-        } else {
-            (vec![latest.clone()], ApplyStrategy::Full, latest.full_size)
-        };
-        let delta_available = matches!(apply_strategy, ApplyStrategy::Delta);
-
-        info!(
-            latest_version = %latest_version,
-            delta_available,
-            download_size,
-            releases_count = available_releases.len(),
-            "Updates available"
-        );
-
-        self.cached_index = Some(index);
-
-        Ok(Some(UpdateInfo {
-            available_releases,
-            latest_version,
-            delta_available,
-            download_size,
-            apply_releases,
-            apply_strategy,
-        }))
+        resolve_update_info(self, index)
     }
 
     /// Download and apply an update.
@@ -595,7 +353,7 @@ impl UpdateManager {
                     let state = download_progress_state
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    average_speed_bytes_per_sec(state.bytes_done, state.started_at)
+                    average_speed_bytes_per_sec(state.bytes_done(), state.started_at())
                 },
             },
         );
@@ -1119,23 +877,6 @@ impl UpdateManager {
     }
 }
 
-fn release_matches_rid(release: &ReleaseEntry, current_rid: &str) -> bool {
-    release.rid.is_empty() || release.rid == current_rid
-}
-
-fn release_matches_os(release: &ReleaseEntry, current_os: &str) -> bool {
-    release.os.is_empty() || normalize_os_label(&release.os) == current_os
-}
-
-fn normalize_os_label(raw: &str) -> String {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "windows" | "win" => "win".to_string(),
-        "macos" | "osx" | "darwin" => "osx".to_string(),
-        "linux" => "linux".to_string(),
-        other => other.to_string(),
-    }
-}
-
 fn find_previous_app_dir(install_dir: &Path, current_version: &str) -> Option<PathBuf> {
     let active = install_dir.join("app");
     if active.is_dir() {
@@ -1489,7 +1230,7 @@ mod tests {
     fn current_os_label_for_tests() -> String {
         let rid = current_rid();
         let raw = rid.split('-').next().unwrap_or_default();
-        normalize_os_label(raw)
+        release_index::normalize_os_label(raw)
     }
 
     fn pseudo_random_bytes(len: usize) -> Vec<u8> {
@@ -1587,17 +1328,17 @@ mod tests {
 
     #[test]
     fn test_os_normalization() {
-        assert_eq!(normalize_os_label("windows"), "win");
-        assert_eq!(normalize_os_label("win"), "win");
-        assert_eq!(normalize_os_label("macos"), "osx");
-        assert_eq!(normalize_os_label("linux"), "linux");
+        assert_eq!(release_index::normalize_os_label("windows"), "win");
+        assert_eq!(release_index::normalize_os_label("win"), "win");
+        assert_eq!(release_index::normalize_os_label("macos"), "osx");
+        assert_eq!(release_index::normalize_os_label("linux"), "linux");
     }
 
     #[test]
     fn test_release_rid_filter() {
         let release = make_entry("1.0.0", "stable", "linux", "linux-x64");
-        assert!(release_matches_rid(&release, "linux-x64"));
-        assert!(!release_matches_rid(&release, "win-x64"));
+        assert!(release_index::release_matches_rid(&release, "linux-x64"));
+        assert!(!release_index::release_matches_rid(&release, "win-x64"));
     }
 
     #[tokio::test]

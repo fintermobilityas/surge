@@ -17,6 +17,7 @@ use surge_core::config::installer::{
 };
 use surge_core::config::manifest::{AppConfig, InstallerType, SurgeManifest, TargetConfig};
 use surge_core::context::Context;
+use surge_core::crypto::sha256::sha256_hex_file;
 use surge_core::error::{Result, SurgeError};
 use surge_core::installer_bundle;
 use surge_core::pack::builder::PackBuilder;
@@ -698,6 +699,7 @@ fn build_installers_with_launcher(
         } else {
             InstallerUi::Console
         };
+        let full_sha256 = sha256_hex_file(full_package_path)?;
         let manifest_payload = InstallerManifest {
             schema: 1,
             format: "surge-installer-v1".to_string(),
@@ -719,6 +721,7 @@ fn build_installers_with_launcher(
             },
             release: InstallerRelease {
                 full_filename: full_filename.clone(),
+                full_sha256: full_sha256.clone(),
                 delta_filename: delta_filename.clone(),
                 delta_algorithm: if delta_filename.is_empty() {
                     String::new()

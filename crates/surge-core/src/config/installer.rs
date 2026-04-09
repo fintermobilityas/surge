@@ -46,6 +46,8 @@ pub struct InstallerStorage {
 pub struct InstallerRelease {
     pub full_filename: String,
     #[serde(default)]
+    pub full_sha256: String,
+    #[serde(default)]
     pub delta_filename: String,
     #[serde(default)]
     pub delta_algorithm: String,

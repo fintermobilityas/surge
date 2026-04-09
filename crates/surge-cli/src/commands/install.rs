@@ -41,19 +41,24 @@ pub struct InstallBehavior {
     pub plan_only: bool,
     pub no_start: bool,
     pub force: bool,
-    pub stage: StageBehavior,
+    pub mode: InstallMode,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum StageBehavior {
+pub enum InstallMode {
     #[default]
     Install,
     StageOnly,
+    VerifyStage,
 }
 
-impl StageBehavior {
+impl InstallMode {
     fn is_stage(self) -> bool {
         matches!(self, Self::StageOnly)
+    }
+
+    fn is_verify_stage(self) -> bool {
+        matches!(self, Self::VerifyStage)
     }
 }
 
@@ -135,7 +140,50 @@ enum RemoteInstallerMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RemoteTailscaleTransferStrategy {
     AppCopy,
+    StagedInstallerCache,
     Installer { prefer_published: bool },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteHostInstallerAvailability {
+    Available,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteTailscaleOperation {
+    Stage,
+    Install,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteTailscaleCachedState {
+    None,
+    AppCopyPayload,
+    InstallerCache,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerifiedRemoteStage {
+    AppCopyPayload,
+    InstallerCache,
+}
+
+impl VerifiedRemoteStage {
+    fn description(self) -> &'static str {
+        match self {
+            Self::AppCopyPayload => "staged app payload",
+            Self::InstallerCache => "staged installer cache",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RemoteTailscaleTransferInputs {
+    host_installer_availability: RemoteHostInstallerAvailability,
+    installer_mode: RemoteInstallerMode,
+    operation: RemoteTailscaleOperation,
+    cached_state: RemoteTailscaleCachedState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -413,6 +461,39 @@ pub async fn execute(
         )));
     }
 
+    if behavior.mode.is_verify_stage() {
+        match &install_target {
+            InstallTarget::Local => {
+                return Err(SurgeError::Config(
+                    "--verify-stage requires 'tailscale' install method".to_string(),
+                ));
+            }
+            InstallTarget::Tailscale {
+                ssh_target,
+                file_target,
+            } => {
+                let verified_stage = verify_remote_stage_readiness(
+                    ssh_target,
+                    file_target,
+                    &app_id,
+                    &selected_rid,
+                    release,
+                    &channel,
+                    &storage_config,
+                )
+                .await?;
+                logline::success(&format!(
+                    "Verified {} is ready for '{}' v{} on '{}'.",
+                    verified_stage.description(),
+                    app_id,
+                    release.version,
+                    file_target
+                ));
+                return Ok(());
+            }
+        }
+    }
+
     if behavior.plan_only {
         match &install_target {
             InstallTarget::Local => {
@@ -532,21 +613,42 @@ pub async fn execute(
                     );
                 }
                 let host_can_build_installer = host_can_build_installer_locally(&selected_rid);
-                let has_matching_pre_staged_payload = if host_can_build_installer
+                let has_matching_pre_staged_app_copy_payload = if host_can_build_installer
                     && installer_mode == RemoteInstallerMode::Offline
-                    && !behavior.stage.is_stage()
+                    && !behavior.mode.is_stage()
                 {
                     remote_staged_payload_matches_release(ssh_target, &app_id, release, &channel, &storage_config)
                         .await?
                 } else {
                     false
                 };
-                let transfer_strategy = select_remote_tailscale_transfer_strategy(
-                    host_can_build_installer,
+                let has_matching_pre_staged_installer_cache =
+                    if installer_mode == RemoteInstallerMode::Online && !behavior.mode.is_stage() {
+                        remote_staged_installer_matches_release(ssh_target, &app_id, release, &channel, &storage_config)
+                            .await?
+                    } else {
+                        false
+                    };
+                let transfer_strategy = select_remote_tailscale_transfer_strategy(RemoteTailscaleTransferInputs {
+                    host_installer_availability: if host_can_build_installer {
+                        RemoteHostInstallerAvailability::Available
+                    } else {
+                        RemoteHostInstallerAvailability::Unavailable
+                    },
                     installer_mode,
-                    behavior.stage.is_stage(),
-                    has_matching_pre_staged_payload,
-                );
+                    operation: if behavior.mode.is_stage() {
+                        RemoteTailscaleOperation::Stage
+                    } else {
+                        RemoteTailscaleOperation::Install
+                    },
+                    cached_state: if has_matching_pre_staged_installer_cache {
+                        RemoteTailscaleCachedState::InstallerCache
+                    } else if has_matching_pre_staged_app_copy_payload {
+                        RemoteTailscaleCachedState::AppCopyPayload
+                    } else {
+                        RemoteTailscaleCachedState::None
+                    },
+                });
                 if matches!(transfer_strategy, RemoteTailscaleTransferStrategy::AppCopy) {
                     deploy_remote_app_copy_for_tailscale(
                         &*backend,
@@ -563,13 +665,13 @@ pub async fn execute(
                         &rid_candidates,
                         full_filename,
                         behavior.no_start,
-                        behavior.stage.is_stage(),
+                        behavior.mode.is_stage(),
                     )
                     .await?;
-                    if !behavior.stage.is_stage() {
+                    if !behavior.mode.is_stage() {
                         warn_if_remote_stage_cleanup_fails(ssh_target, &app_id, release).await;
                     }
-                    if behavior.stage.is_stage() {
+                    if behavior.mode.is_stage() {
                         logline::success(&format!(
                             "Staged '{app_id}' v{} on tailscale node '{file_target}'.",
                             release.version
@@ -577,6 +679,12 @@ pub async fn execute(
                     } else {
                         logline::success(&format!("Installed '{app_id}' on tailscale node '{file_target}'."));
                     }
+                    return Ok(());
+                }
+                if matches!(transfer_strategy, RemoteTailscaleTransferStrategy::StagedInstallerCache) {
+                    run_remote_staged_installer_setup(ssh_target, file_target, &app_id, release, behavior.no_start)
+                        .await?;
+                    logline::success(&format!("Installed '{app_id}' on tailscale node '{file_target}'."));
                     return Ok(());
                 }
                 let published_installer_plan = if let Some(manifest) = manifest.as_ref() {
@@ -705,20 +813,20 @@ pub async fn execute(
                 .await?;
 
                 let no_start_flag = if behavior.no_start { " --no-start" } else { "" };
-                let stage_flag = if behavior.stage.is_stage() { " --stage" } else { "" };
+                let stage_flag = if behavior.mode.is_stage() { " --stage" } else { "" };
                 let run_cmd =
                     format!("/tmp/.surge-installer{no_start_flag}{stage_flag} && rm -f /tmp/.surge-installer");
                 let ssh_command = format!("sh -lc {}", shell_single_quote(&run_cmd));
-                if behavior.stage.is_stage() {
+                if behavior.mode.is_stage() {
                     logline::info(&format!("Running installer in stage mode on '{file_target}'..."));
                 } else {
                     logline::info(&format!("Running installer on '{file_target}'..."));
                 }
                 run_tailscale_streaming(&["ssh", ssh_target, ssh_command.as_str()], "remote").await?;
-                if !behavior.stage.is_stage() {
+                if !behavior.mode.is_stage() {
                     warn_if_remote_stage_cleanup_fails(ssh_target, &app_id, release).await;
                 }
-                if behavior.stage.is_stage() {
+                if behavior.mode.is_stage() {
                     logline::success(&format!(
                         "Staged '{app_id}' v{} on tailscale node '{file_target}'.",
                         release.version
@@ -2009,6 +2117,7 @@ fn build_remote_installer_manifest(
         },
         release: InstallerRelease {
             full_filename: release.full_filename.clone(),
+            full_sha256: release.full_sha256.clone(),
             delta_filename: String::new(),
             delta_algorithm: String::new(),
             delta_patch_format: String::new(),
@@ -2692,19 +2801,23 @@ fn select_remote_installer_mode(storage_config: &surge_core::context::StorageCon
     }
 }
 
-fn select_remote_tailscale_transfer_strategy(
-    host_can_build_installer: bool,
-    installer_mode: RemoteInstallerMode,
-    stage: bool,
-    has_matching_pre_staged_payload: bool,
-) -> RemoteTailscaleTransferStrategy {
-    if !host_can_build_installer
-        || matches!(installer_mode, RemoteInstallerMode::Offline) && (stage || has_matching_pre_staged_payload)
+fn select_remote_tailscale_transfer_strategy(inputs: RemoteTailscaleTransferInputs) -> RemoteTailscaleTransferStrategy {
+    if inputs.operation == RemoteTailscaleOperation::Install
+        && inputs.installer_mode == RemoteInstallerMode::Online
+        && inputs.cached_state == RemoteTailscaleCachedState::InstallerCache
+    {
+        return RemoteTailscaleTransferStrategy::StagedInstallerCache;
+    }
+
+    if inputs.host_installer_availability == RemoteHostInstallerAvailability::Unavailable
+        || matches!(inputs.installer_mode, RemoteInstallerMode::Offline)
+            && (inputs.operation == RemoteTailscaleOperation::Stage
+                || inputs.cached_state == RemoteTailscaleCachedState::AppCopyPayload)
     {
         RemoteTailscaleTransferStrategy::AppCopy
     } else {
         RemoteTailscaleTransferStrategy::Installer {
-            prefer_published: !stage,
+            prefer_published: inputs.operation == RemoteTailscaleOperation::Install,
         }
     }
 }
@@ -2897,6 +3010,21 @@ async fn check_remote_staged_payload_identity(
     }
 }
 
+async fn check_remote_staged_installer_identity(
+    ssh_node: &str,
+    install_root: &Path,
+) -> Option<RemoteStagedPayloadIdentity> {
+    let probe = format!(
+        "cat {}/.surge-cache/staged-installer/.surge-staged-release.json 2>/dev/null",
+        shell_single_quote(&install_root.to_string_lossy())
+    );
+    let command = format!("sh -c {}", shell_single_quote(&probe));
+    match run_tailscale_capture(&["ssh", ssh_node, command.as_str()]).await {
+        Ok(output) => parse_remote_staged_payload_identity(&output),
+        Err(_) => None,
+    }
+}
+
 async fn remote_staged_payload_matches_release(
     ssh_node: &str,
     app_id: &str,
@@ -2908,6 +3036,98 @@ async fn remote_staged_payload_matches_release(
     let install_root = remote_install_root(&remote_home, app_id, &release.install_directory)?;
     let expected = remote_staged_payload_identity(app_id, release, channel, storage_config);
     Ok(check_remote_staged_payload_identity(ssh_node, &install_root).await == Some(expected))
+}
+
+async fn remote_staged_installer_matches_release(
+    ssh_node: &str,
+    app_id: &str,
+    release: &ReleaseEntry,
+    channel: &str,
+    storage_config: &surge_core::context::StorageConfig,
+) -> Result<bool> {
+    let remote_home = detect_remote_home_directory(ssh_node).await?;
+    let install_root = remote_install_root(&remote_home, app_id, &release.install_directory)?;
+    let expected = remote_staged_payload_identity(app_id, release, channel, storage_config);
+    Ok(check_remote_staged_installer_identity(ssh_node, &install_root).await == Some(expected))
+}
+
+async fn verify_remote_stage_readiness(
+    ssh_node: &str,
+    file_target: &str,
+    app_id: &str,
+    selected_rid: &str,
+    release: &ReleaseEntry,
+    channel: &str,
+    storage_config: &surge_core::context::StorageConfig,
+) -> Result<VerifiedRemoteStage> {
+    let remote_home = detect_remote_home_directory(ssh_node).await?;
+    let install_root = remote_install_root(&remote_home, app_id, &release.install_directory)?;
+    let expected = remote_staged_payload_identity(app_id, release, channel, storage_config);
+    let app_copy_matches =
+        check_remote_staged_payload_identity(ssh_node, &install_root).await == Some(expected.clone());
+    let app_copy_ready = if app_copy_matches {
+        remote_staged_app_copy_files_exist(ssh_node, &install_root).await?
+    } else {
+        false
+    };
+    let installer_cache_matches =
+        check_remote_staged_installer_identity(ssh_node, &install_root).await == Some(expected.clone());
+    let installer_cache_ready = if installer_cache_matches {
+        remote_staged_installer_cache_files_exist(ssh_node, &install_root, release).await?
+    } else {
+        false
+    };
+
+    match select_remote_installer_mode(storage_config) {
+        RemoteInstallerMode::Offline => {
+            if app_copy_ready {
+                return Ok(VerifiedRemoteStage::AppCopyPayload);
+            }
+        }
+        RemoteInstallerMode::Online => {
+            if installer_cache_ready {
+                return Ok(VerifiedRemoteStage::InstallerCache);
+            }
+            if !host_can_build_installer_locally(selected_rid) && app_copy_ready {
+                return Ok(VerifiedRemoteStage::AppCopyPayload);
+            }
+        }
+    }
+
+    let selected_rid = if selected_rid.trim().is_empty() {
+        "<generic>"
+    } else {
+        selected_rid
+    };
+    if app_copy_matches || installer_cache_matches {
+        return Err(SurgeError::NotFound(format!(
+            "Node '{file_target}' has a staged marker for '{app_id}' v{} on channel '{channel}' (rid '{selected_rid}'), but the staged payload is incomplete or would not be reused by the next install from this host.",
+            release.version
+        )));
+    }
+
+    Err(SurgeError::NotFound(format!(
+        "Node '{file_target}' is not staged for '{app_id}' v{} on channel '{channel}' (rid '{selected_rid}').",
+        release.version
+    )))
+}
+
+async fn run_remote_staged_installer_setup(
+    ssh_node: &str,
+    file_target: &str,
+    app_id: &str,
+    release: &ReleaseEntry,
+    no_start: bool,
+) -> Result<()> {
+    let remote_home = detect_remote_home_directory(ssh_node).await?;
+    let install_root = remote_install_root(&remote_home, app_id, &release.install_directory)?;
+    let setup_command = build_remote_staged_installer_setup_command(&install_root, no_start);
+    let ssh_command = format!("sh -lc {}", shell_single_quote(&setup_command));
+    logline::info(&format!(
+        "Using pre-staged installer cache for '{app_id}' v{} on '{file_target}'.",
+        release.version
+    ));
+    run_tailscale_streaming(&["ssh", ssh_node, ssh_command.as_str()], "remote").await
 }
 
 async fn warn_if_remote_stage_cleanup_fails(ssh_node: &str, app_id: &str, release: &ReleaseEntry) {
@@ -2944,6 +3164,64 @@ fn build_remote_stage_cleanup_command(install_root: &Path) -> String {
     )
 }
 
+async fn remote_staged_app_copy_files_exist(ssh_node: &str, install_root: &Path) -> Result<bool> {
+    let stage_root = install_root.join(".surge-transfer-stage");
+    let marker = stage_root.join(".surge-staged-release.json");
+    let app_dir = stage_root.join("app");
+    remote_paths_exist(ssh_node, &[app_dir.as_path()], &[marker.as_path()]).await
+}
+
+async fn remote_staged_installer_cache_files_exist(
+    ssh_node: &str,
+    install_root: &Path,
+    release: &ReleaseEntry,
+) -> Result<bool> {
+    let stage_dir = install_root.join(".surge-cache").join("staged-installer");
+    let marker = stage_dir.join(".surge-staged-release.json");
+    let installer_manifest = stage_dir.join("installer.yml");
+    let surge_bin = stage_dir.join("surge");
+    let artifact_cache_dir = install_root.join(".surge-cache").join("artifacts");
+    let cached_package = cache_path_for_key(&artifact_cache_dir, release.full_filename.trim())?;
+    remote_paths_exist(
+        ssh_node,
+        &[stage_dir.as_path()],
+        &[
+            marker.as_path(),
+            installer_manifest.as_path(),
+            surge_bin.as_path(),
+            cached_package.as_path(),
+        ],
+    )
+    .await
+}
+
+async fn remote_paths_exist(ssh_node: &str, required_dirs: &[&Path], required_files: &[&Path]) -> Result<bool> {
+    let probe = build_remote_paths_exist_probe(required_dirs, required_files);
+    let command = format!("sh -c {}", shell_single_quote(&probe));
+    Ok(run_tailscale_capture(&["ssh", ssh_node, command.as_str()])
+        .await?
+        .trim()
+        == "ready")
+}
+
+fn build_remote_paths_exist_probe(required_dirs: &[&Path], required_files: &[&Path]) -> String {
+    let mut checks = Vec::new();
+    for path in required_dirs {
+        checks.push(format!("[ -d {} ]", shell_single_quote(&path.to_string_lossy())));
+    }
+    for path in required_files {
+        checks.push(format!("[ -f {} ]", shell_single_quote(&path.to_string_lossy())));
+    }
+    if checks.is_empty() {
+        "printf 'ready'".to_string()
+    } else {
+        format!(
+            "if {}; then printf 'ready'; else printf 'missing'; fi",
+            checks.join(" && ")
+        )
+    }
+}
+
 fn build_remote_stop_supervisor_command(install_root: &Path, supervisor_id: &str) -> Option<String> {
     let supervisor_id = supervisor_id.trim();
     if supervisor_id.is_empty() {
@@ -2965,6 +3243,23 @@ done",
         shell_single_quote(&install_root.to_string_lossy()),
         shell_single_quote(supervisor_id)
     ))
+}
+
+fn build_remote_staged_installer_setup_command(install_root: &Path, no_start: bool) -> String {
+    let no_start_flag = if no_start { " --no-start" } else { "" };
+    format!(
+        "install_root={}; \
+stage_dir=\"$install_root/.surge-cache/staged-installer\"; \
+surge_bin=\"$stage_dir/surge\"; \
+if [ ! -d \"$stage_dir\" ] || [ ! -f \"$stage_dir/installer.yml\" ] || [ ! -f \"$surge_bin\" ]; then \
+  echo \"Remote staged installer cache is missing required files\" >&2; \
+  exit 1; \
+fi; \
+chmod +x \"$surge_bin\" || true; \
+cd \"$stage_dir\"; \
+\"$surge_bin\" setup \"$stage_dir\"{no_start_flag}",
+        shell_single_quote(&install_root.to_string_lossy())
+    )
 }
 
 async fn detect_remote_launch_environment(ssh_node: &str) -> RemoteLaunchEnvironment {
@@ -3559,15 +3854,30 @@ mod tests {
     #[test]
     fn select_remote_tailscale_transfer_strategy_uses_app_copy_when_stage_reduces_transfer() {
         assert_eq!(
-            select_remote_tailscale_transfer_strategy(true, RemoteInstallerMode::Offline, true, false),
+            select_remote_tailscale_transfer_strategy(RemoteTailscaleTransferInputs {
+                host_installer_availability: RemoteHostInstallerAvailability::Available,
+                installer_mode: RemoteInstallerMode::Offline,
+                operation: RemoteTailscaleOperation::Stage,
+                cached_state: RemoteTailscaleCachedState::None,
+            }),
             RemoteTailscaleTransferStrategy::AppCopy
         );
         assert_eq!(
-            select_remote_tailscale_transfer_strategy(true, RemoteInstallerMode::Offline, false, true),
+            select_remote_tailscale_transfer_strategy(RemoteTailscaleTransferInputs {
+                host_installer_availability: RemoteHostInstallerAvailability::Available,
+                installer_mode: RemoteInstallerMode::Offline,
+                operation: RemoteTailscaleOperation::Install,
+                cached_state: RemoteTailscaleCachedState::AppCopyPayload,
+            }),
             RemoteTailscaleTransferStrategy::AppCopy
         );
         assert_eq!(
-            select_remote_tailscale_transfer_strategy(false, RemoteInstallerMode::Online, false, false),
+            select_remote_tailscale_transfer_strategy(RemoteTailscaleTransferInputs {
+                host_installer_availability: RemoteHostInstallerAvailability::Unavailable,
+                installer_mode: RemoteInstallerMode::Online,
+                operation: RemoteTailscaleOperation::Install,
+                cached_state: RemoteTailscaleCachedState::None,
+            }),
             RemoteTailscaleTransferStrategy::AppCopy
         );
     }
@@ -3575,14 +3885,37 @@ mod tests {
     #[test]
     fn select_remote_tailscale_transfer_strategy_disables_published_installers_for_stage_mode() {
         assert_eq!(
-            select_remote_tailscale_transfer_strategy(true, RemoteInstallerMode::Online, true, false),
+            select_remote_tailscale_transfer_strategy(RemoteTailscaleTransferInputs {
+                host_installer_availability: RemoteHostInstallerAvailability::Available,
+                installer_mode: RemoteInstallerMode::Online,
+                operation: RemoteTailscaleOperation::Stage,
+                cached_state: RemoteTailscaleCachedState::None,
+            }),
             RemoteTailscaleTransferStrategy::Installer {
                 prefer_published: false
             }
         );
         assert_eq!(
-            select_remote_tailscale_transfer_strategy(true, RemoteInstallerMode::Online, false, false),
+            select_remote_tailscale_transfer_strategy(RemoteTailscaleTransferInputs {
+                host_installer_availability: RemoteHostInstallerAvailability::Available,
+                installer_mode: RemoteInstallerMode::Online,
+                operation: RemoteTailscaleOperation::Install,
+                cached_state: RemoteTailscaleCachedState::None,
+            }),
             RemoteTailscaleTransferStrategy::Installer { prefer_published: true }
+        );
+    }
+
+    #[test]
+    fn select_remote_tailscale_transfer_strategy_prefers_staged_online_installer_cache() {
+        assert_eq!(
+            select_remote_tailscale_transfer_strategy(RemoteTailscaleTransferInputs {
+                host_installer_availability: RemoteHostInstallerAvailability::Available,
+                installer_mode: RemoteInstallerMode::Online,
+                operation: RemoteTailscaleOperation::Install,
+                cached_state: RemoteTailscaleCachedState::InstallerCache,
+            }),
+            RemoteTailscaleTransferStrategy::StagedInstallerCache
         );
     }
 
@@ -3594,6 +3927,30 @@ mod tests {
             command,
             "install_root='/home/demo/apps/customer'\"'\"'s app'; rm -rf \"$install_root/.surge-transfer-stage\""
         );
+    }
+
+    #[test]
+    fn build_remote_staged_installer_setup_command_quotes_install_root() {
+        let command = build_remote_staged_installer_setup_command(Path::new("/home/demo/apps/customer's app"), true);
+
+        assert!(command.contains("install_root='/home/demo/apps/customer'\"'\"'s app'"));
+        assert!(command.contains("stage_dir=\"$install_root/.surge-cache/staged-installer\""));
+        assert!(command.contains("\"$surge_bin\" setup \"$stage_dir\" --no-start"));
+    }
+
+    #[test]
+    fn build_remote_paths_exist_probe_quotes_paths() {
+        let dir = Path::new("/home/demo/apps/customer's app/.surge-transfer-stage/app");
+        let file = Path::new("/home/demo/apps/customer's app/.surge-transfer-stage/.surge-staged-release.json");
+
+        let probe = build_remote_paths_exist_probe(&[dir], &[file]);
+
+        assert!(probe.contains("[ -d '/home/demo/apps/customer'\"'\"'s app/.surge-transfer-stage/app' ]"));
+        assert!(probe.contains(
+            "[ -f '/home/demo/apps/customer'\"'\"'s app/.surge-transfer-stage/.surge-staged-release.json' ]"
+        ));
+        assert!(probe.contains("printf 'ready'"));
+        assert!(probe.contains("printf 'missing'"));
     }
 
     #[test]
@@ -3727,6 +4084,7 @@ mod tests {
             },
             release: InstallerRelease {
                 full_filename: "demo.tar.zst".to_string(),
+                full_sha256: String::new(),
                 delta_filename: String::new(),
                 delta_algorithm: String::new(),
                 delta_patch_format: String::new(),
@@ -3920,7 +4278,7 @@ mod tests {
                 plan_only: false,
                 no_start: true,
                 force: false,
-                stage: StageBehavior::Install,
+                mode: InstallMode::Install,
             },
             &download_dir,
             StorageOverrides::default(),

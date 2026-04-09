@@ -431,6 +431,10 @@ struct InstallStageOptions {
     /// Pre-stage packages on remote nodes without activating (tailscale method only)
     #[arg(long)]
     stage: bool,
+
+    /// Verify that the selected release is already staged and ready for the next tailscale install
+    #[arg(long, conflicts_with = "stage")]
+    verify_stage: bool,
 }
 
 fn init_tracing(verbose: bool) {
@@ -779,6 +783,11 @@ async fn run(cli: Cli) -> surge_core::error::Result<()> {
                             "--stage requires 'tailscale' install method".to_string(),
                         ));
                     }
+                    if options.stage_options.verify_stage {
+                        return Err(surge_core::error::SurgeError::Config(
+                            "--verify-stage requires 'tailscale' install method".to_string(),
+                        ));
+                    }
                     None
                 }
                 InstallMethod::Tailscale => Some(node.as_deref().ok_or_else(|| {
@@ -801,10 +810,12 @@ async fn run(cli: Cli) -> surge_core::error::Result<()> {
                     plan_only: options.plan_only,
                     no_start: options.no_start,
                     force: options.force,
-                    stage: if options.stage_options.stage {
-                        commands::install::StageBehavior::StageOnly
+                    mode: if options.stage_options.verify_stage {
+                        commands::install::InstallMode::VerifyStage
+                    } else if options.stage_options.stage {
+                        commands::install::InstallMode::StageOnly
                     } else {
-                        commands::install::StageBehavior::Install
+                        commands::install::InstallMode::Install
                     },
                 },
                 &options.download_dir,
@@ -869,5 +880,27 @@ mod tests {
         };
 
         assert!(options.force);
+    }
+
+    #[test]
+    fn install_verify_stage_flag_parses() {
+        let cli = Cli::try_parse_from(["surge", "install", "tailscale", "my-node", "--verify-stage"])
+            .expect("install command with --verify-stage should parse");
+
+        let Commands::Install { options, .. } = cli.command else {
+            panic!("expected install command");
+        };
+
+        assert!(options.stage_options.verify_stage);
+    }
+
+    #[test]
+    fn install_verify_stage_conflicts_with_stage() {
+        let Err(err) = Cli::try_parse_from(["surge", "install", "tailscale", "my-node", "--stage", "--verify-stage"])
+        else {
+            panic!("--verify-stage should conflict with --stage");
+        };
+
+        assert!(err.to_string().contains("--stage"));
     }
 }

@@ -295,7 +295,7 @@ fn persist_staged_installer_cache(dir: &Path, manifest: &InstallerManifest, inst
         return Ok(());
     }
 
-    let surge_binary_name = if cfg!(windows) { "surge.exe" } else { "surge" };
+    let surge_binary_name = staged_installer_binary_name();
     let surge_binary_path = dir.join(surge_binary_name);
     if !surge_binary_path.is_file() {
         return Err(SurgeError::Config(format!(
@@ -349,6 +349,10 @@ fn persist_staged_installer_cache(dir: &Path, manifest: &InstallerManifest, inst
     ));
 
     Ok(())
+}
+
+fn staged_installer_binary_name() -> &'static str {
+    if cfg!(windows) { "surge.exe" } else { "surge" }
 }
 
 /// Kill any running process whose executable lives in the app directory.
@@ -859,8 +863,9 @@ mod tests {
         write_release_index(&store_root, &manifest, &stored_archive);
         let installer_yaml = serde_yaml::to_string(&manifest).expect("installer yaml");
         std::fs::write(installer_dir.join("installer.yml"), installer_yaml).expect("installer manifest");
-        std::fs::write(installer_dir.join("surge"), b"#!/bin/sh\nexit 0\n").expect("surge stub");
-        make_executable(&installer_dir.join("surge")).expect("surge stub should be executable");
+        let surge_binary = installer_dir.join(staged_installer_binary_name());
+        std::fs::write(&surge_binary, b"#!/bin/sh\nexit 0\n").expect("surge stub");
+        make_executable(&surge_binary).expect("surge stub should be executable");
 
         execute(&installer_dir, true, true)
             .await
@@ -868,7 +873,7 @@ mod tests {
 
         let staged_installer_dir = install_root.join(".surge-cache").join("staged-installer");
         assert!(
-            staged_installer_dir.join("surge").is_file(),
+            staged_installer_dir.join(staged_installer_binary_name()).is_file(),
             "online stage should persist the surge helper"
         );
         assert!(

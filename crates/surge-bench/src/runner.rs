@@ -226,6 +226,7 @@ fn installer_manifest(
         },
         release: InstallerRelease {
             full_filename: full_filename.to_string(),
+            full_sha256: String::new(),
             delta_filename: String::new(),
             delta_algorithm: String::new(),
             delta_patch_format: String::new(),

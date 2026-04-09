@@ -7,10 +7,12 @@ use surge_core::config::installer::InstallerManifest;
 use surge_core::error::{Result, SurgeError};
 use surge_core::install::{self as core_install, InstallProfile};
 use surge_core::installer_package::{
-    InstallerPackageAcquisition, ResolveInstallerPackageOptions, ResolvedInstallerPackage,
+    InstallerPackageAcquisition, ResolveInstallerPackageOptions, ResolvedInstallerPackage, install_artifact_cache_dir,
     prune_install_artifact_cache, resolve_installer_package,
 };
+use surge_core::platform::fs::make_executable;
 use surge_core::platform::paths::default_install_root;
+use surge_core::releases::artifact_cache::cache_path_for_key;
 use surge_core::releases::restore::RestoreProgress;
 
 const PACKAGE_PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(10);
@@ -107,7 +109,7 @@ fn percent(done: u64, total: u64) -> u64 {
 ///
 /// This is called either directly via `surge setup [dir]` or auto-detected when
 /// warp extracts the bundle and runs `surge` with no arguments.
-pub async fn execute(dir: &Path, no_start: bool) -> Result<()> {
+pub async fn execute(dir: &Path, no_start: bool, stage: bool) -> Result<()> {
     let manifest_path = dir.join("installer.yml");
     if !manifest_path.is_file() {
         return Err(SurgeError::Config(format!(
@@ -125,6 +127,19 @@ pub async fn execute(dir: &Path, no_start: bool) -> Result<()> {
     ));
 
     let install_root = default_install_root(&manifest.app_id, &manifest.runtime.install_directory)?;
+
+    if stage {
+        let package = resolve_package(dir, &manifest, &install_root).await?;
+        ensure_stage_cache_entry(&package, &manifest, &install_root)?;
+        persist_staged_installer_cache(dir, &manifest, &install_root)?;
+        logline::success(&format!(
+            "Staged '{}' v{} in artifact cache at '{}'",
+            manifest.app_id,
+            manifest.version,
+            install_root.display()
+        ));
+        return Ok(());
+    }
 
     if let Err(e) = super::stop_supervisor(&install_root, &manifest.runtime.supervisor_id).await {
         logline::warn(&format!("Could not stop supervisor: {e}"));
@@ -255,6 +270,91 @@ async fn resolve_package(dir: &Path, manifest: &InstallerManifest, install_root:
     Ok(package)
 }
 
+fn ensure_stage_cache_entry(
+    package: &ResolvedPackage,
+    manifest: &InstallerManifest,
+    install_root: &Path,
+) -> Result<()> {
+    if package.acquisition != InstallerPackageAcquisition::BundledPayload {
+        return Ok(());
+    }
+
+    let artifact_cache_dir = install_artifact_cache_dir(install_root);
+    std::fs::create_dir_all(&artifact_cache_dir)?;
+    let cached_package_path = cache_path_for_key(&artifact_cache_dir, manifest.release.full_filename.trim())?;
+    std::fs::copy(package.path(), &cached_package_path)?;
+    logline::info(&format!(
+        "Copied bundled payload into artifact cache: {}",
+        cached_package_path.display()
+    ));
+    Ok(())
+}
+
+fn persist_staged_installer_cache(dir: &Path, manifest: &InstallerManifest, install_root: &Path) -> Result<()> {
+    if !manifest.installer_type.trim().eq_ignore_ascii_case("online") {
+        return Ok(());
+    }
+
+    let surge_binary_name = staged_installer_binary_name();
+    let surge_binary_path = dir.join(surge_binary_name);
+    if !surge_binary_path.is_file() {
+        return Err(SurgeError::Config(format!(
+            "Online stage cache is missing embedded surge binary '{}'",
+            surge_binary_path.display()
+        )));
+    }
+
+    let installer_manifest_path = dir.join("installer.yml");
+    if !installer_manifest_path.is_file() {
+        return Err(SurgeError::Config(format!(
+            "Online stage cache is missing installer manifest '{}'",
+            installer_manifest_path.display()
+        )));
+    }
+
+    let staged_installer_dir = install_root.join(".surge-cache").join("staged-installer");
+    if staged_installer_dir.exists() {
+        std::fs::remove_dir_all(&staged_installer_dir)?;
+    }
+    std::fs::create_dir_all(&staged_installer_dir)?;
+
+    let cached_surge_binary = staged_installer_dir.join(surge_binary_name);
+    std::fs::copy(&surge_binary_path, &cached_surge_binary)?;
+    make_executable(&cached_surge_binary)?;
+    std::fs::copy(&installer_manifest_path, staged_installer_dir.join("installer.yml"))?;
+
+    let staged_identity = serde_json::json!({
+        "app_id": manifest.app_id.trim(),
+        "version": manifest.version.trim(),
+        "channel": manifest.channel.trim(),
+        "rid": manifest.rid.trim(),
+        "full_filename": manifest.release.full_filename.trim(),
+        "full_sha256": manifest.release.full_sha256.trim(),
+        "install_directory": manifest.runtime.install_directory.trim(),
+        "supervisor_id": manifest.runtime.supervisor_id.trim(),
+        "storage_provider": manifest.storage.provider.trim(),
+        "storage_bucket": manifest.storage.bucket.trim(),
+        "storage_region": manifest.storage.region.trim(),
+        "storage_endpoint": manifest.storage.endpoint.trim(),
+    });
+    std::fs::write(
+        staged_installer_dir.join(".surge-staged-release.json"),
+        serde_json::to_vec(&staged_identity)
+            .map_err(|e| SurgeError::Config(format!("Failed to serialize staged installer identity: {e}")))?,
+    )?;
+
+    logline::info(&format!(
+        "Persisted staged installer support files in '{}'.",
+        staged_installer_dir.display()
+    ));
+
+    Ok(())
+}
+
+fn staged_installer_binary_name() -> &'static str {
+    if cfg!(windows) { "surge.exe" } else { "surge" }
+}
+
 /// Kill any running process whose executable lives in the app directory.
 /// This catches orphaned app processes that outlived their supervisor.
 fn stop_running_app(install_root: &Path, main_exe: &str) {
@@ -334,6 +434,7 @@ mod tests {
             },
             release: InstallerRelease {
                 full_filename: full_filename.to_string(),
+                full_sha256: String::new(),
                 delta_filename: String::new(),
                 delta_algorithm: String::new(),
                 delta_patch_format: String::new(),
@@ -446,7 +547,9 @@ mod tests {
         std::fs::write(installer_dir.join("installer.yml"), installer_yaml).expect("installer manifest");
         write_archive(&payload_dir.join(full_filename), b"bundled payload");
 
-        execute(&installer_dir, true).await.expect("setup should succeed");
+        execute(&installer_dir, true, false)
+            .await
+            .expect("setup should succeed");
 
         let active_app_dir = install_root.join("app");
         assert_eq!(
@@ -504,7 +607,9 @@ mod tests {
             .finalize_to_file(&payload_dir.join(full_filename))
             .expect("archive file");
 
-        execute(&installer_dir, true).await.expect("setup should succeed");
+        execute(&installer_dir, true, false)
+            .await
+            .expect("setup should succeed");
 
         let active_app_dir = install_root.join("app");
         assert_eq!(
@@ -581,7 +686,9 @@ mod tests {
         let installer_yaml = serde_yaml::to_string(&manifest).expect("installer yaml");
         std::fs::write(installer_dir.join("installer.yml"), installer_yaml).expect("installer manifest");
 
-        execute(&installer_dir, true).await.expect("setup should succeed");
+        execute(&installer_dir, true, false)
+            .await
+            .expect("setup should succeed");
 
         assert!(!stale_path.exists(), "stale cache entry should be pruned");
         assert!(
@@ -681,7 +788,9 @@ mod tests {
 
         write_release_index_entries(&store_root, &manifest.app_id, vec![base_release, target_release]);
 
-        execute(&installer_dir, true).await.expect("setup should succeed");
+        execute(&installer_dir, true, false)
+            .await
+            .expect("setup should succeed");
 
         let artifact_cache = install_root.join(".surge-cache").join("artifacts");
         assert!(
@@ -695,6 +804,89 @@ mod tests {
         assert!(
             artifact_cache.join(target_full_filename).is_file(),
             "installed target full should remain as a warm cache entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_stage_persists_bundled_payload_in_artifact_cache_without_installing() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let installer_dir = temp_dir.path().join("installer");
+        let payload_dir = installer_dir.join("payload");
+        let install_root = temp_dir.path().join("installed-app");
+        let store_root = temp_dir.path().join("store");
+        let full_filename = "demo-app-1.2.3-full.tar.zst";
+        let bundled_payload = payload_dir.join(full_filename);
+
+        std::fs::create_dir_all(&payload_dir).expect("payload dir");
+        std::fs::create_dir_all(&store_root).expect("store dir");
+
+        let manifest = make_manifest(&install_root, &store_root, full_filename, "offline");
+        let installer_yaml = serde_yaml::to_string(&manifest).expect("installer yaml");
+        std::fs::write(installer_dir.join("installer.yml"), installer_yaml).expect("installer manifest");
+        write_archive(&bundled_payload, b"bundled payload");
+        let bundled_archive = std::fs::read(&bundled_payload).expect("bundled payload should exist");
+
+        execute(&installer_dir, true, true)
+            .await
+            .expect("setup stage should succeed");
+
+        let cached_package = install_root.join(".surge-cache").join("artifacts").join(full_filename);
+        assert!(
+            cached_package.is_file(),
+            "bundled payload should be copied into the artifact cache"
+        );
+        assert_eq!(
+            std::fs::read(&cached_package).expect("cached package should exist"),
+            bundled_archive
+        );
+        assert!(
+            !install_root.join("app").exists(),
+            "stage mode should not activate the install"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_stage_persists_online_installer_cache_without_installing() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let installer_dir = temp_dir.path().join("installer");
+        let install_root = temp_dir.path().join("installed-app");
+        let store_root = temp_dir.path().join("store");
+        let full_filename = "demo-app-1.2.3-full.tar.zst";
+        let stored_archive = store_root.join(full_filename);
+
+        std::fs::create_dir_all(&installer_dir).expect("installer dir");
+        std::fs::create_dir_all(&store_root).expect("store dir");
+        write_archive(&stored_archive, b"downloaded payload");
+
+        let mut manifest = make_manifest(&install_root, &store_root, full_filename, "online");
+        manifest.release.full_sha256 = sha256_hex(&std::fs::read(&stored_archive).expect("stored bytes"));
+        write_release_index(&store_root, &manifest, &stored_archive);
+        let installer_yaml = serde_yaml::to_string(&manifest).expect("installer yaml");
+        std::fs::write(installer_dir.join("installer.yml"), installer_yaml).expect("installer manifest");
+        let surge_binary = installer_dir.join(staged_installer_binary_name());
+        std::fs::write(&surge_binary, b"#!/bin/sh\nexit 0\n").expect("surge stub");
+        make_executable(&surge_binary).expect("surge stub should be executable");
+
+        execute(&installer_dir, true, true)
+            .await
+            .expect("setup stage should succeed");
+
+        let staged_installer_dir = install_root.join(".surge-cache").join("staged-installer");
+        assert!(
+            staged_installer_dir.join(staged_installer_binary_name()).is_file(),
+            "online stage should persist the surge helper"
+        );
+        assert!(
+            staged_installer_dir.join("installer.yml").is_file(),
+            "online stage should persist the installer manifest"
+        );
+        let staged_identity = std::fs::read_to_string(staged_installer_dir.join(".surge-staged-release.json"))
+            .expect("staged identity should exist");
+        assert!(staged_identity.contains("\"version\":\"1.2.3\""));
+        assert!(staged_identity.contains(&manifest.release.full_sha256));
+        assert!(
+            !install_root.join("app").exists(),
+            "stage mode should not activate the install"
         );
     }
 }

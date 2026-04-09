@@ -260,6 +260,10 @@ enum Commands {
         /// Do not start the application after installation
         #[arg(long)]
         no_start: bool,
+
+        /// Only cache the package locally without installing (used by --stage)
+        #[arg(long)]
+        stage: bool,
     },
 
     /// Print SHA-256 hash of a file
@@ -390,6 +394,9 @@ struct InstallOptions {
     #[arg(long)]
     no_start: bool,
 
+    #[command(flatten)]
+    stage_options: InstallStageOptions,
+
     /// Reinstall even if the selected version/channel is already installed on the target
     #[arg(long)]
     force: bool,
@@ -417,6 +424,17 @@ struct InstallOptions {
     /// Override storage prefix from application manifest
     #[arg(long)]
     prefix: Option<String>,
+}
+
+#[derive(Args, Clone)]
+struct InstallStageOptions {
+    /// Pre-stage packages on remote nodes without activating (tailscale method only)
+    #[arg(long)]
+    stage: bool,
+
+    /// Verify that the selected release is already staged and ready for the next tailscale install
+    #[arg(long, conflicts_with = "stage")]
+    verify_stage: bool,
 }
 
 fn init_tracing(verbose: bool) {
@@ -456,7 +474,7 @@ fn main() -> ExitCode {
                         return ExitCode::FAILURE;
                     }
                 };
-                return match rt.block_on(commands::setup::execute(&installer_dir, false)) {
+                return match rt.block_on(commands::setup::execute(&installer_dir, false, false)) {
                     Ok(()) => ExitCode::SUCCESS,
                     Err(e) => {
                         logline::error_chain(&e);
@@ -737,7 +755,7 @@ async fn run(cli: Cli) -> surge_core::error::Result<()> {
             }
         }
 
-        Commands::Setup { dir, no_start } => commands::setup::execute(&dir, no_start).await,
+        Commands::Setup { dir, no_start, stage } => commands::setup::execute(&dir, no_start, stage).await,
 
         Commands::Sha256 { file } => {
             let hash = surge_core::crypto::sha256::sha256_hex_file(&file)?;
@@ -760,6 +778,16 @@ async fn run(cli: Cli) -> surge_core::error::Result<()> {
                             "--node/--node-user require 'tailscale' install method".to_string(),
                         ));
                     }
+                    if options.stage_options.stage {
+                        return Err(surge_core::error::SurgeError::Config(
+                            "--stage requires 'tailscale' install method".to_string(),
+                        ));
+                    }
+                    if options.stage_options.verify_stage {
+                        return Err(surge_core::error::SurgeError::Config(
+                            "--verify-stage requires 'tailscale' install method".to_string(),
+                        ));
+                    }
                     None
                 }
                 InstallMethod::Tailscale => Some(node.as_deref().ok_or_else(|| {
@@ -778,9 +806,18 @@ async fn run(cli: Cli) -> surge_core::error::Result<()> {
                 options.channel.as_deref(),
                 options.rid.as_deref(),
                 options.version.as_deref(),
-                options.plan_only,
-                options.no_start,
-                options.force,
+                commands::install::InstallBehavior {
+                    plan_only: options.plan_only,
+                    no_start: options.no_start,
+                    force: options.force,
+                    mode: if options.stage_options.verify_stage {
+                        commands::install::InstallMode::VerifyStage
+                    } else if options.stage_options.stage {
+                        commands::install::InstallMode::StageOnly
+                    } else {
+                        commands::install::InstallMode::Install
+                    },
+                },
                 &options.download_dir,
                 commands::install::StorageOverrides {
                     provider: options.provider.as_deref(),
@@ -843,5 +880,27 @@ mod tests {
         };
 
         assert!(options.force);
+    }
+
+    #[test]
+    fn install_verify_stage_flag_parses() {
+        let cli = Cli::try_parse_from(["surge", "install", "tailscale", "my-node", "--verify-stage"])
+            .expect("install command with --verify-stage should parse");
+
+        let Commands::Install { options, .. } = cli.command else {
+            panic!("expected install command");
+        };
+
+        assert!(options.stage_options.verify_stage);
+    }
+
+    #[test]
+    fn install_verify_stage_conflicts_with_stage() {
+        let Err(err) = Cli::try_parse_from(["surge", "install", "tailscale", "my-node", "--stage", "--verify-stage"])
+        else {
+            panic!("--verify-stage should conflict with --stage");
+        };
+
+        assert!(err.to_string().contains("--stage"));
     }
 }

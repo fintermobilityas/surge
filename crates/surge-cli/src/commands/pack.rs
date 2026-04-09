@@ -1,46 +1,41 @@
 #![allow(clippy::too_many_lines)]
 
+mod installers;
+mod launchers;
+mod progress;
+mod resolution;
+mod upload;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
-use crate::formatters::{format_byte_progress, format_bytes, format_duration};
+use self::installers::build_installers;
+pub(crate) use self::launchers::{
+    ensure_host_compatible_rid, find_installer_launcher_for_rid, find_surge_binary_for_rid, surge_binary_name_for_rid,
+};
+#[cfg(test)]
+pub(crate) use self::launchers::{
+    set_surge_installer_launcher_override_for_test, set_surge_installer_ui_launcher_override_for_test,
+};
+use self::progress::{file_size_label, pack_build_phase_message, print_stage, print_stage_done};
+pub(crate) use self::resolution::{configure_context, default_artifacts_dir};
+use self::resolution::{resolve_installer_package, write_package_manifest};
+use self::upload::{build_installer_upload_backend, upload_installers_to_storage};
+use crate::formatters::format_duration;
 use crate::logline;
 use crate::ui::UiTheme;
-use surge_core::archive::packer::ArchivePacker;
-use surge_core::config::constants::{PACK_DEFAULT_MAX_MEMORY_BYTES, RELEASES_FILE_COMPRESSED};
-use surge_core::config::installer::{
-    InstallerManifest, InstallerRelease, InstallerRuntime, InstallerStorage, InstallerUi,
-};
-use surge_core::config::manifest::{AppConfig, InstallerType, SurgeManifest, TargetConfig};
-use surge_core::context::Context;
-use surge_core::crypto::sha256::sha256_hex_file;
+use surge_core::config::manifest::SurgeManifest;
 use surge_core::error::{Result, SurgeError};
-use surge_core::installer_bundle;
 use surge_core::pack::builder::PackBuilder;
 use surge_core::releases::artifact_cache::{CacheFetchOutcome, fetch_or_reuse_file};
-use surge_core::releases::manifest::{ReleaseEntry, ReleaseIndex, decompress_release_index};
 use surge_core::releases::restore::{
-    RestoreArtifactSpec, RestoreOptions, plan_full_archive_restore, restore_full_archive_for_version_with_options,
+    RestoreOptions, plan_full_archive_restore, restore_full_archive_for_version_with_options,
 };
-use surge_core::releases::version::compare_versions;
-use surge_core::storage::{self, StorageBackend};
 use surge_core::storage_config::build_storage_config;
-
-#[derive(Debug, Clone)]
-struct ResolvedInstallerPackage {
-    app_id: String,
-    rid: String,
-    default_channel: String,
-    selected_version: String,
-    full_key: String,
-    full_sha256: String,
-    local_full_name: String,
-    artifacts_dir: PathBuf,
-}
 
 /// Build release packages (full + delta) for a given app version and RID.
 pub async fn execute(
@@ -431,761 +426,6 @@ pub async fn execute_installers_only(
 
     Ok(())
 }
-
-async fn resolve_installer_package(
-    manifest: &SurgeManifest,
-    manifest_path: &Path,
-    app_id: Option<&str>,
-    version: Option<&str>,
-    rid: Option<&str>,
-    artifacts_dir: Option<&Path>,
-) -> Result<(Box<dyn StorageBackend>, ReleaseIndex, ResolvedInstallerPackage)> {
-    let app_id = super::resolve_app_id_with_rid_hint(manifest, app_id, rid)?;
-    let rid = super::resolve_rid(manifest, &app_id, rid)?;
-    let (app, _) = manifest
-        .find_app_with_target(&app_id, &rid)
-        .ok_or_else(|| SurgeError::Config(format!("No target {rid} found for app {app_id}")))?;
-    let default_channel = default_channel_for_app(manifest, app);
-    let storage_config = super::build_app_scoped_storage_config(manifest, manifest_path, &app_id)?;
-    let backend = storage::create_storage_backend(&storage_config)?;
-    let index = fetch_release_index(&*backend).await?;
-    if !index.app_id.is_empty() && index.app_id != app_id {
-        return Err(SurgeError::NotFound(format!(
-            "Release index belongs to app '{}' not '{}'",
-            index.app_id, app_id
-        )));
-    }
-    let selected_release =
-        select_release_for_installers(&index.releases, &default_channel, version, &rid).ok_or_else(|| {
-            SurgeError::NotFound(format!(
-                "No release found for app '{}' rid '{}' on channel '{}'{}",
-                app_id,
-                rid,
-                default_channel,
-                version.map_or_else(String::new, |v| format!(" and version '{v}'"))
-            ))
-        })?;
-    let full_key = selected_release.full_filename.trim();
-    if full_key.is_empty() {
-        return Err(SurgeError::Pack(format!(
-            "Selected release {} for {}/{} does not define a full package filename",
-            selected_release.version, app_id, rid
-        )));
-    }
-    let local_full_name = Path::new(full_key)
-        .file_name()
-        .and_then(std::ffi::OsStr::to_str)
-        .ok_or_else(|| SurgeError::Pack(format!("Invalid full package key: {full_key}")))?
-        .to_string();
-    let artifacts_dir = artifacts_dir.map_or_else(
-        || default_artifacts_dir(manifest_path, &app_id, &rid, &selected_release.version),
-        PathBuf::from,
-    );
-
-    Ok((
-        backend,
-        index,
-        ResolvedInstallerPackage {
-            app_id,
-            rid,
-            default_channel,
-            selected_version: selected_release.version.clone(),
-            full_key: full_key.to_string(),
-            full_sha256: selected_release.full_sha256.clone(),
-            local_full_name,
-            artifacts_dir,
-        },
-    ))
-}
-
-fn write_package_manifest(path: &Path, specs: &[RestoreArtifactSpec]) -> Result<()> {
-    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut manifest = String::new();
-    for spec in specs {
-        manifest.push_str(spec.sha256.trim());
-        manifest.push(' ');
-        manifest.push_str(spec.key.trim());
-        manifest.push('\n');
-    }
-    std::fs::write(path, manifest)?;
-    Ok(())
-}
-
-fn build_installer_upload_backend(manifest: &SurgeManifest) -> Result<Box<dyn StorageBackend>> {
-    let storage_config = build_storage_config(manifest)?;
-    super::ensure_mutating_storage_access(&storage_config, "upload installers")?;
-    storage::create_storage_backend(&storage_config)
-}
-
-async fn upload_installers_to_storage(backend: &dyn StorageBackend, installer_paths: &[PathBuf]) -> Result<()> {
-    for installer_path in installer_paths {
-        let filename = installer_path
-            .file_name()
-            .and_then(std::ffi::OsStr::to_str)
-            .ok_or_else(|| {
-                SurgeError::Pack(format!(
-                    "Invalid installer path (missing filename): {}",
-                    installer_path.display()
-                ))
-            })?;
-        let key = format!("installers/{filename}");
-        upload_installer_with_feedback(backend, &key, installer_path).await?;
-    }
-
-    Ok(())
-}
-
-async fn upload_installer_with_feedback(backend: &dyn StorageBackend, key: &str, source_path: &Path) -> Result<u64> {
-    let total_bytes = std::fs::metadata(source_path)?.len();
-    logline::subtle(&format!("  Uploading installer {key} ({})", format_bytes(total_bytes)));
-
-    let started = Instant::now();
-    let upload_running = Arc::new(AtomicBool::new(true));
-    let bytes_done = Arc::new(AtomicU64::new(0));
-
-    let upload_running_for_heartbeat = Arc::clone(&upload_running);
-    let bytes_done_for_heartbeat = Arc::clone(&bytes_done);
-    let key_for_heartbeat = key.to_string();
-    let heartbeat = thread::spawn(move || {
-        while upload_running_for_heartbeat.load(Ordering::Relaxed) {
-            thread::sleep(Duration::from_secs(5));
-            if !upload_running_for_heartbeat.load(Ordering::Relaxed) {
-                break;
-            }
-
-            let uploaded = bytes_done_for_heartbeat.load(Ordering::Relaxed).min(total_bytes);
-            let progress = if uploaded == 0 {
-                format!(
-                    "uploaded 0 B / {} (elapsed {})",
-                    format_bytes(total_bytes),
-                    format_duration(started.elapsed())
-                )
-            } else {
-                format!(
-                    "{} (elapsed {})",
-                    format_byte_progress(uploaded, total_bytes, "uploaded"),
-                    format_duration(started.elapsed())
-                )
-            };
-            logline::subtle(&format!("      {key_for_heartbeat}: {progress}"));
-        }
-    });
-
-    let bytes_done_for_progress = Arc::clone(&bytes_done);
-    let progress = move |done: u64, _total: u64| {
-        bytes_done_for_progress.store(done.min(total_bytes), Ordering::Relaxed);
-    };
-
-    let upload_result = backend.upload_from_file(key, source_path, Some(&progress)).await;
-    bytes_done.store(total_bytes, Ordering::Relaxed);
-    upload_running.store(false, Ordering::Relaxed);
-    let _ = heartbeat.join();
-    upload_result?;
-
-    logline::subtle(&format!(
-        "      {key}: {} in {}",
-        format_byte_progress(total_bytes, total_bytes, "uploaded"),
-        format_duration(started.elapsed())
-    ));
-
-    Ok(total_bytes)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn build_installers(
-    manifest: &SurgeManifest,
-    app: &AppConfig,
-    target: &TargetConfig,
-    app_id: &str,
-    rid: &str,
-    version: &str,
-    manifest_root: &Path,
-    artifacts_dir: &Path,
-    output_dir: &Path,
-    full_package_path: &Path,
-) -> Result<Vec<PathBuf>> {
-    build_installers_with_launcher(
-        manifest,
-        app,
-        target,
-        app_id,
-        rid,
-        version,
-        manifest_root,
-        artifacts_dir,
-        output_dir,
-        full_package_path,
-        None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn build_installers_with_launcher(
-    manifest: &SurgeManifest,
-    app: &AppConfig,
-    target: &TargetConfig,
-    app_id: &str,
-    rid: &str,
-    version: &str,
-    manifest_root: &Path,
-    artifacts_dir: &Path,
-    output_dir: &Path,
-    full_package_path: &Path,
-    launcher_override: Option<&Path>,
-) -> Result<Vec<PathBuf>> {
-    let installer_types = parse_installer_types(&target.installers, app_id, rid)?;
-    if installer_types.is_empty() {
-        return Ok(Vec::new());
-    }
-    ensure_host_compatible_rid(rid)?;
-
-    let default_channel = default_channel_for_app(manifest, app);
-
-    let installers_dir = output_dir
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("installers")
-        .join(app_id)
-        .join(rid);
-    std::fs::create_dir_all(&installers_dir)?;
-
-    let full_filename = full_package_path
-        .file_name()
-        .map(|name| name.to_string_lossy().to_string())
-        .ok_or_else(|| {
-            SurgeError::Pack(format!(
-                "Invalid full package path (missing filename): {}",
-                full_package_path.display()
-            ))
-        })?;
-    let expected_delta_filename = format!("{app_id}-{version}-{rid}-delta.tar.zst");
-    let delta_filename = if output_dir.join(&expected_delta_filename).is_file() {
-        expected_delta_filename
-    } else {
-        String::new()
-    };
-
-    let icon_asset = resolve_installer_icon_asset(&target.icon, artifacts_dir, manifest_root)?;
-
-    let requires_console_launcher = installer_types.iter().any(|installer_type| !installer_type.is_gui());
-    let console_launcher = if requires_console_launcher {
-        Some(find_installer_launcher_for_rid(rid, launcher_override)?)
-    } else {
-        None
-    };
-    let gui_launcher = if installer_types.iter().any(|t| t.is_gui()) {
-        Some(find_gui_installer_launcher_for_rid(rid)?)
-    } else {
-        None
-    };
-    let surge_binary = find_surge_binary_for_rid(rid)?;
-    let surge_binary_name = surge_binary_name_for_rid(rid).to_string();
-
-    let mut generated = Vec::with_capacity(installer_types.len());
-    for installer_type in installer_types {
-        let installer_suffix = installer_type.as_str();
-        let installer_ext = if rid.starts_with("win-") { "exe" } else { "bin" };
-        let installer_filename = format!("Setup-{rid}-{app_id}-{default_channel}-{installer_suffix}.{installer_ext}");
-        let installer_path = installers_dir.join(&installer_filename);
-
-        let staging_dir =
-            tempfile::tempdir().map_err(|e| SurgeError::Pack(format!("Failed to create staging directory: {e}")))?;
-        let staging = staging_dir.path();
-
-        let ui_mode = if installer_type.is_gui() {
-            InstallerUi::Egui
-        } else {
-            InstallerUi::Console
-        };
-        let full_sha256 = sha256_hex_file(full_package_path)?;
-        let manifest_payload = InstallerManifest {
-            schema: 1,
-            format: "surge-installer-v1".to_string(),
-            ui: ui_mode,
-            installer_type: installer_type.as_str().to_string(),
-            app_id: app_id.to_string(),
-            rid: rid.to_string(),
-            version: version.to_string(),
-            channel: default_channel.clone(),
-            generated_utc: chrono::Utc::now().to_rfc3339(),
-            headless_default_if_no_display: true,
-            release_index_key: RELEASES_FILE_COMPRESSED.to_string(),
-            storage: InstallerStorage {
-                provider: manifest.storage.provider.clone(),
-                bucket: manifest.storage.bucket.clone(),
-                region: manifest.storage.region.clone(),
-                endpoint: manifest.storage.endpoint.clone(),
-                prefix: installer_storage_prefix(manifest, app_id),
-            },
-            release: InstallerRelease {
-                full_filename: full_filename.clone(),
-                full_sha256: full_sha256.clone(),
-                delta_filename: delta_filename.clone(),
-                delta_algorithm: if delta_filename.is_empty() {
-                    String::new()
-                } else {
-                    match manifest.effective_pack_policy().delta_strategy {
-                        surge_core::config::manifest::PackDeltaStrategy::SparseFileOps => {
-                            surge_core::releases::manifest::DIFF_ALGORITHM_FILE_OPS.to_string()
-                        }
-                        surge_core::config::manifest::PackDeltaStrategy::ArchiveChunkedBsdiff
-                        | surge_core::config::manifest::PackDeltaStrategy::ArchiveBsdiff => {
-                            surge_core::releases::manifest::DIFF_ALGORITHM_BSDIFF.to_string()
-                        }
-                    }
-                },
-                delta_patch_format: if delta_filename.is_empty() {
-                    String::new()
-                } else {
-                    match manifest.effective_pack_policy().delta_strategy {
-                        surge_core::config::manifest::PackDeltaStrategy::SparseFileOps => {
-                            surge_core::releases::manifest::PATCH_FORMAT_SPARSE_FILE_OPS_V1.to_string()
-                        }
-                        surge_core::config::manifest::PackDeltaStrategy::ArchiveChunkedBsdiff => {
-                            surge_core::releases::manifest::PATCH_FORMAT_CHUNKED_BSDIFF_ARCHIVE_V3.to_string()
-                        }
-                        surge_core::config::manifest::PackDeltaStrategy::ArchiveBsdiff => {
-                            surge_core::releases::manifest::PATCH_FORMAT_BSDIFF4_ARCHIVE_V3.to_string()
-                        }
-                    }
-                },
-                delta_compression: if delta_filename.is_empty() {
-                    String::new()
-                } else {
-                    surge_core::releases::manifest::COMPRESSION_ZSTD.to_string()
-                },
-            },
-            runtime: InstallerRuntime {
-                name: app.effective_name(),
-                main_exe: app.effective_main_exe(),
-                install_directory: app.effective_install_directory(),
-                supervisor_id: app.supervisor_id.clone(),
-                icon: target.icon.clone(),
-                shortcuts: target.shortcuts.clone(),
-                persistent_assets: target.persistent_assets.clone(),
-                installers: target.installers.clone(),
-                environment: target.environment.clone(),
-            },
-        };
-        let manifest_yaml = serde_yaml::to_string(&manifest_payload)?;
-        std::fs::write(staging.join("installer.yml"), manifest_yaml.as_bytes())?;
-
-        std::fs::copy(&surge_binary, staging.join(&surge_binary_name))?;
-
-        if let Some((source, _)) = &icon_asset {
-            let assets_dir = staging.join("assets");
-            std::fs::create_dir_all(&assets_dir)?;
-            if let Some(filename) = source.file_name() {
-                std::fs::copy(source, assets_dir.join(filename))?;
-            }
-        }
-
-        if installer_type.is_offline() {
-            let payload_dir = staging.join("payload");
-            std::fs::create_dir_all(&payload_dir)?;
-            std::fs::copy(full_package_path, payload_dir.join(&full_filename))?;
-        }
-
-        let payload_archive = tempfile::NamedTempFile::new()
-            .map_err(|e| SurgeError::Pack(format!("Failed to create installer payload archive temp file: {e}")))?;
-        let pack_policy = manifest.effective_pack_policy();
-        let mut payload_packer = ArchivePacker::new(pack_policy.compression_level)?;
-        payload_packer.add_directory(staging, "")?;
-        payload_packer.finalize_to_file(payload_archive.path())?;
-        let launcher = if installer_type.is_gui() {
-            gui_launcher
-                .as_ref()
-                .ok_or_else(|| SurgeError::Pack("GUI installer launcher was not resolved".to_string()))?
-        } else {
-            console_launcher
-                .as_ref()
-                .ok_or_else(|| SurgeError::Pack("Console installer launcher was not resolved".to_string()))?
-        };
-        installer_bundle::write_embedded_installer(launcher, payload_archive.path(), &installer_path)?;
-        surge_core::platform::fs::make_executable(&installer_path)?;
-        generated.push(installer_path);
-    }
-
-    Ok(generated)
-}
-
-fn resolve_installer_icon_asset(
-    icon: &str,
-    artifacts_dir: &Path,
-    manifest_root: &Path,
-) -> Result<Option<(PathBuf, String)>> {
-    let icon = icon.trim();
-    if icon.is_empty() {
-        return Ok(None);
-    }
-
-    let icon_path = Path::new(icon);
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    if icon_path.is_absolute() {
-        candidates.push(icon_path.to_path_buf());
-    } else {
-        candidates.push(artifacts_dir.join(icon_path));
-        candidates.push(manifest_root.join(icon_path));
-        if let Some(parent) = manifest_root.parent() {
-            candidates.push(parent.join(icon_path));
-        }
-    }
-
-    let source = candidates.into_iter().find(|candidate| candidate.is_file());
-    let Some(source) = source else {
-        return Ok(None);
-    };
-
-    let archive_name = source
-        .file_name()
-        .map(|name| format!("assets/{}", name.to_string_lossy()))
-        .ok_or_else(|| SurgeError::Pack(format!("Invalid icon path: {}", source.display())))?;
-    Ok(Some((source, archive_name)))
-}
-
-fn parse_installer_types(installers: &[String], app_id: &str, rid: &str) -> Result<Vec<InstallerType>> {
-    installers
-        .iter()
-        .map(|installer| {
-            InstallerType::parse(installer).ok_or_else(|| {
-                SurgeError::Config(format!(
-                    "Unsupported installer '{installer}' for app '{app_id}' target '{rid}'. Supported values: online, offline, online-gui, offline-gui"
-                ))
-            })
-        })
-        .collect()
-}
-
-async fn fetch_release_index(backend: &dyn StorageBackend) -> Result<ReleaseIndex> {
-    match backend.get_object(RELEASES_FILE_COMPRESSED).await {
-        Ok(data) => decompress_release_index(&data),
-        Err(SurgeError::NotFound(_)) => Ok(ReleaseIndex::default()),
-        Err(e) => Err(e),
-    }
-}
-
-fn select_release_for_installers(
-    releases: &[ReleaseEntry],
-    channel: &str,
-    version: Option<&str>,
-    rid: &str,
-) -> Option<ReleaseEntry> {
-    let mut eligible: Vec<&ReleaseEntry> = releases
-        .iter()
-        .filter(|release| release.channels.iter().any(|c| c == channel))
-        .collect();
-
-    if let Some(requested) = version.map(str::trim).filter(|value| !value.is_empty()) {
-        eligible.retain(|release| release.version == requested);
-    }
-
-    if eligible.is_empty() {
-        return None;
-    }
-
-    let mut by_rid: Vec<&ReleaseEntry> = eligible.iter().copied().filter(|release| release.rid == rid).collect();
-    by_rid.sort_by(|a, b| compare_versions(&b.version, &a.version));
-    if let Some(release) = by_rid.first() {
-        return Some((*release).clone());
-    }
-
-    let mut generic: Vec<&ReleaseEntry> = eligible
-        .iter()
-        .copied()
-        .filter(|release| release.rid.trim().is_empty())
-        .collect();
-    generic.sort_by(|a, b| compare_versions(&b.version, &a.version));
-    generic.first().map(|release| (*release).clone())
-}
-
-fn default_channel_for_app(manifest: &SurgeManifest, app: &AppConfig) -> String {
-    app.channels
-        .first()
-        .cloned()
-        .or_else(|| manifest.channels.first().map(|channel| channel.name.clone()))
-        .unwrap_or_else(|| "stable".to_string())
-}
-
-fn installer_storage_prefix(manifest: &SurgeManifest, app_id: &str) -> String {
-    if manifest.apps.len() > 1 {
-        super::append_prefix(&manifest.storage.prefix, app_id)
-    } else {
-        manifest.storage.prefix.clone()
-    }
-}
-
-std::thread_local! {
-    static SURGE_INSTALLER_LAUNCHER_OVERRIDE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
-    static SURGE_INSTALLER_UI_LAUNCHER_OVERRIDE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
-}
-
-#[cfg(test)]
-pub(crate) fn set_surge_installer_launcher_override_for_test(path: &Path) {
-    SURGE_INSTALLER_LAUNCHER_OVERRIDE.with(|cell| {
-        *cell.borrow_mut() = Some(path.to_path_buf());
-    });
-}
-
-#[cfg(test)]
-pub(crate) fn set_surge_installer_ui_launcher_override_for_test(path: &Path) {
-    SURGE_INSTALLER_UI_LAUNCHER_OVERRIDE.with(|cell| {
-        *cell.borrow_mut() = Some(path.to_path_buf());
-    });
-}
-
-pub(crate) fn find_installer_launcher_for_rid(rid: &str, override_path: Option<&Path>) -> Result<PathBuf> {
-    find_launcher_for_rid(
-        rid,
-        override_path,
-        SURGE_INSTALLER_LAUNCHER_OVERRIDE.with(|cell| cell.borrow().clone()),
-        "SURGE_INSTALLER_LAUNCHER",
-        installer_launcher_name_for_rid,
-        Some("installer launcher"),
-        "Installer launcher",
-        "surge-installer",
-    )
-}
-
-fn find_gui_installer_launcher_for_rid(rid: &str) -> Result<PathBuf> {
-    find_launcher_for_rid(
-        rid,
-        None,
-        SURGE_INSTALLER_UI_LAUNCHER_OVERRIDE.with(|cell| cell.borrow().clone()),
-        "SURGE_INSTALLER_UI_LAUNCHER",
-        gui_installer_launcher_name_for_rid,
-        None,
-        "GUI installer launcher",
-        "surge-installer-ui",
-    )
-}
-
-fn find_launcher_for_rid(
-    rid: &str,
-    override_path: Option<&Path>,
-    thread_override: Option<PathBuf>,
-    env_var: &str,
-    launcher_name_for_rid: fn(&str) -> &'static str,
-    override_label: Option<&str>,
-    not_found_label: &str,
-    build_binary: &str,
-) -> Result<PathBuf> {
-    ensure_host_compatible_rid(rid)?;
-    if let Some(path) = override_path {
-        if path.is_file() {
-            return Ok(path.to_path_buf());
-        }
-        let label = override_label.unwrap_or("launcher");
-        return Err(SurgeError::Pack(format!(
-            "Provided {label} path '{}' does not exist",
-            path.display()
-        )));
-    }
-
-    if let Some(path) = thread_override
-        && path.is_file()
-    {
-        return Ok(path);
-    }
-
-    if let Ok(path) = std::env::var(env_var) {
-        let candidate = PathBuf::from(&path);
-        if candidate.is_file() {
-            return Ok(candidate);
-        }
-        return Err(SurgeError::Pack(format!(
-            "{env_var} points to '{}' which does not exist",
-            candidate.display()
-        )));
-    }
-
-    let launcher_name = launcher_name_for_rid(rid);
-    if let Ok(current_exe) = std::env::current_exe()
-        && let Some(parent) = current_exe.parent()
-    {
-        let candidate = parent.join(launcher_name);
-        if candidate.is_file() {
-            return Ok(candidate);
-        }
-    }
-
-    if let Ok(found) = which::which(launcher_name) {
-        return Ok(found);
-    }
-
-    Err(SurgeError::Pack(format!(
-        "{not_found_label} '{launcher_name}' not found. Use the official Surge release bundle for this platform, place '{build_binary}' next to surge, add it to PATH, or set {env_var}."
-    )))
-}
-
-pub(crate) fn find_surge_binary_for_rid(rid: &str) -> Result<PathBuf> {
-    ensure_host_compatible_rid(rid)?;
-    if let Ok(path) = std::env::var("SURGE_INSTALLER_BINARY") {
-        let candidate = PathBuf::from(path);
-        if candidate.is_file() {
-            return Ok(candidate);
-        }
-        return Err(SurgeError::Pack(format!(
-            "SURGE_INSTALLER_BINARY points to '{}' which does not exist",
-            candidate.display()
-        )));
-    }
-
-    let current_exe = std::env::current_exe()
-        .map_err(|e| SurgeError::Pack(format!("Failed to determine current executable path: {e}")))?;
-    if !current_exe.is_file() {
-        return Err(SurgeError::Pack(format!(
-            "Current executable path does not exist: {}",
-            current_exe.display()
-        )));
-    }
-
-    let parent = current_exe.parent().ok_or_else(|| {
-        SurgeError::Pack(format!(
-            "Failed to resolve executable directory for {}",
-            current_exe.display()
-        ))
-    })?;
-
-    let candidate = parent.join(surge_binary_name_for_rid(rid));
-    if candidate.is_file() {
-        return Ok(candidate);
-    }
-
-    // current_exe is known to exist (checked above), use it as fallback.
-    Ok(current_exe)
-}
-
-pub(crate) fn surge_binary_name_for_rid(rid: &str) -> &'static str {
-    if rid.starts_with("win-") || rid.starts_with("windows-") {
-        "surge.exe"
-    } else {
-        "surge"
-    }
-}
-
-fn installer_launcher_name_for_rid(rid: &str) -> &'static str {
-    if rid.starts_with("win-") || rid.starts_with("windows-") {
-        "surge-installer.exe"
-    } else {
-        "surge-installer"
-    }
-}
-
-fn gui_installer_launcher_name_for_rid(rid: &str) -> &'static str {
-    if rid.starts_with("win-") || rid.starts_with("windows-") {
-        "surge-installer-ui.exe"
-    } else {
-        "surge-installer-ui"
-    }
-}
-
-pub(crate) fn ensure_host_compatible_rid(rid: &str) -> Result<()> {
-    let target = parse_rid(rid).ok_or_else(|| {
-        SurgeError::Pack(format!(
-            "Unsupported target RID '{rid}'. Supported values use linux|win|windows|osx|macos and x86|x64|arm64."
-        ))
-    })?;
-    let host_rid = surge_core::platform::detect::current_rid();
-    let host = parse_rid(&host_rid).ok_or_else(|| {
-        SurgeError::Pack(format!(
-            "Unsupported host RID '{host_rid}'. Host-only installer generation is unavailable."
-        ))
-    })?;
-    if target != host {
-        return Err(SurgeError::Pack(format!(
-            "Installer generation is host-only. Requested target RID '{rid}', but current host RID is '{host_rid}'."
-        )));
-    }
-    Ok(())
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum RidOs {
-    Linux,
-    Windows,
-    MacOs,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum RidArch {
-    X86,
-    X64,
-    Arm64,
-}
-
-fn parse_rid(rid: &str) -> Option<(RidOs, RidArch)> {
-    let mut parts = rid.trim().split('-');
-    let raw_os = parts.next()?;
-    let raw_arch = parts.next()?;
-    let os = match raw_os {
-        "linux" => RidOs::Linux,
-        "win" | "windows" => RidOs::Windows,
-        "osx" | "macos" => RidOs::MacOs,
-        _ => return None,
-    };
-    let arch = match raw_arch {
-        "x86" => RidArch::X86,
-        "x64" => RidArch::X64,
-        "arm64" => RidArch::Arm64,
-        _ => return None,
-    };
-    Some((os, arch))
-}
-
-pub(crate) fn default_artifacts_dir(manifest_path: &Path, app_id: &str, rid: &str, version: &str) -> PathBuf {
-    manifest_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("artifacts")
-        .join(app_id)
-        .join(rid)
-        .join(version)
-}
-
-fn file_size_label(path: &Path) -> String {
-    match std::fs::metadata(path) {
-        Ok(meta) => format_bytes(meta.len()),
-        Err(_) => "unknown size".to_string(),
-    }
-}
-
-fn print_stage(theme: UiTheme, stage: usize, total: usize, text: &str) {
-    let _ = theme;
-    logline::info(&format!("[{stage}/{total}] {text}"));
-}
-
-fn print_stage_done(theme: UiTheme, stage: usize, total: usize, text: &str) {
-    let _ = theme;
-    logline::success(&format!("[{stage}/{total}] {text}"));
-}
-
-fn pack_build_phase_message(step_done: i32, step_count: i32) -> String {
-    if step_done <= 0 {
-        return format!("Packaging files (step 1/{step_count}: full archive)");
-    }
-    if step_done < step_count {
-        return format!("Packaging files (step {}/{}: delta package)", step_done + 1, step_count);
-    }
-    "Finalizing package artifacts".to_string()
-}
-
-pub(crate) fn configure_context(manifest_path: &Path, manifest: &SurgeManifest, app_id: &str) -> Result<Context> {
-    let ctx = super::build_app_scoped_storage_context(manifest, manifest_path, app_id)?;
-    let pack_policy = manifest.effective_pack_policy();
-    let mut budget = ctx.resource_budget();
-    let available_threads = std::thread::available_parallelism()
-        .map(std::num::NonZeroUsize::get)
-        .unwrap_or(1);
-
-    budget.max_threads = i32::try_from(available_threads).unwrap_or(i32::MAX);
-    budget.max_memory_bytes = PACK_DEFAULT_MAX_MEMORY_BYTES;
-    budget.zstd_compression_level = pack_policy.compression_level;
-    ctx.set_resource_budget(budget);
-    Ok(ctx)
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::cast_possible_wrap)]
@@ -1194,6 +434,7 @@ mod tests {
 
     use super::*;
     use surge_core::config::constants::DEFAULT_ZSTD_LEVEL;
+    use surge_core::config::constants::RELEASES_FILE_COMPRESSED;
     use surge_core::crypto::sha256::sha256_hex;
     use surge_core::diff::wrapper::bsdiff_buffers;
     use surge_core::installer_bundle::read_embedded_payload;
@@ -1202,11 +443,11 @@ mod tests {
     use surge_core::releases::manifest::{ReleaseEntry, ReleaseIndex, compress_release_index};
 
     fn set_installer_launcher_override(path: &Path) {
-        set_surge_installer_launcher_override_for_test(path);
+        super::set_surge_installer_launcher_override_for_test(path);
     }
 
     fn set_gui_installer_launcher_override(path: &Path) {
-        set_surge_installer_ui_launcher_override_for_test(path);
+        super::set_surge_installer_ui_launcher_override_for_test(path);
     }
 
     fn create_stub_installer_launcher(dir: &Path, rid: &str) -> PathBuf {
@@ -1761,7 +1002,7 @@ apps:
             .find_app_with_target(app_id, &rid)
             .expect("app/target should exist in manifest");
 
-        let installers = build_installers_with_launcher(
+        let installers = installers::build_installers_with_launcher(
             &manifest,
             app,
             &target,
@@ -1834,7 +1075,7 @@ apps:
             .expect("app/target should exist in manifest");
 
         let missing_console_launcher = tmp.path().join("missing-surge-installer");
-        let installers = build_installers_with_launcher(
+        let installers = installers::build_installers_with_launcher(
             &manifest,
             app,
             &target,
@@ -1897,7 +1138,7 @@ apps:
             .find_app_with_target(app_id, &rid)
             .expect("app/target should exist in manifest");
 
-        let installers = build_installers_with_launcher(
+        let installers = installers::build_installers_with_launcher(
             &manifest,
             app,
             &target,

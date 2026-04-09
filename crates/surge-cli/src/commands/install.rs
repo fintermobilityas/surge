@@ -548,6 +548,9 @@ pub async fn execute(
                         behavior.stage.is_stage(),
                     )
                     .await?;
+                    if !behavior.stage.is_stage() {
+                        warn_if_remote_stage_cleanup_fails(ssh_target, &app_id, release).await;
+                    }
                     if behavior.stage.is_stage() {
                         logline::success(&format!(
                             "Staged '{app_id}' v{} on tailscale node '{file_target}'.",
@@ -694,6 +697,9 @@ pub async fn execute(
                     logline::info(&format!("Running installer on '{file_target}'..."));
                 }
                 run_tailscale_streaming(&["ssh", ssh_target, ssh_command.as_str()], "remote").await?;
+                if !behavior.stage.is_stage() {
+                    warn_if_remote_stage_cleanup_fails(ssh_target, &app_id, release).await;
+                }
                 if behavior.stage.is_stage() {
                     logline::success(&format!(
                         "Staged '{app_id}' v{} on tailscale node '{file_target}'.",
@@ -2853,6 +2859,27 @@ async fn remote_staged_version_matches_release(ssh_node: &str, app_id: &str, rel
     Ok(check_remote_staged_version(ssh_node, &install_root).await.as_deref() == Some(release.version.as_str()))
 }
 
+async fn warn_if_remote_stage_cleanup_fails(ssh_node: &str, app_id: &str, release: &ReleaseEntry) {
+    if let Err(error) = cleanup_remote_staged_payload(ssh_node, app_id, release).await {
+        logline::warn(&format!("Could not remove stale remote staged payload: {error}"));
+    }
+}
+
+async fn cleanup_remote_staged_payload(ssh_node: &str, app_id: &str, release: &ReleaseEntry) -> Result<()> {
+    let remote_home = detect_remote_home_directory(ssh_node).await?;
+    let install_root = remote_install_root(&remote_home, app_id, &release.install_directory)?;
+    let cleanup_command = build_remote_stage_cleanup_command(&install_root);
+    let ssh_command = format!("sh -lc {}", shell_single_quote(&cleanup_command));
+    run_tailscale_streaming(&["ssh", ssh_node, ssh_command.as_str()], "remote").await
+}
+
+fn build_remote_stage_cleanup_command(install_root: &Path) -> String {
+    format!(
+        "install_root={}; rm -rf \"$install_root/.surge-transfer-stage\"",
+        shell_single_quote(&install_root.to_string_lossy())
+    )
+}
+
 async fn detect_remote_launch_environment(ssh_node: &str) -> RemoteLaunchEnvironment {
     let probe = remote_launch_environment_probe();
     let command = format!("sh -c {}", shell_single_quote(probe));
@@ -3469,6 +3496,16 @@ mod tests {
         assert_eq!(
             select_remote_tailscale_transfer_strategy(true, RemoteInstallerMode::Online, false, false),
             RemoteTailscaleTransferStrategy::Installer { prefer_published: true }
+        );
+    }
+
+    #[test]
+    fn build_remote_stage_cleanup_command_quotes_install_root() {
+        let command = build_remote_stage_cleanup_command(Path::new("/home/demo/apps/customer's app"));
+
+        assert_eq!(
+            command,
+            "install_root='/home/demo/apps/customer'\"'\"'s app'; rm -rf \"$install_root/.surge-transfer-stage\""
         );
     }
 

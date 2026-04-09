@@ -2,12 +2,12 @@
 
 mod apply;
 mod artifacts;
+mod lifecycle;
 mod progress;
 mod release_index;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use tracing::{debug, info, warn};
 
@@ -19,13 +19,12 @@ use crate::install::{
     storage_provider_manifest_name, write_runtime_manifest,
 };
 use crate::platform::fs::atomic_rename;
-use crate::platform::process::{current_pid, spawn_detached, spawn_process, supervisor_binary_name};
 use crate::platform::shortcuts::install_shortcuts;
 use crate::releases::artifact_cache::prune_cached_artifacts;
 use crate::releases::manifest::{ReleaseEntry, ReleaseIndex, decompress_release_index};
 use crate::releases::restore::{local_checkpoint_artifacts_for_index, required_artifacts_for_index};
 use crate::storage::{StorageBackend, create_storage_backend};
-use crate::supervisor::state::{read_restart_args, supervisor_pid_file, supervisor_stop_file};
+use crate::supervisor::state::supervisor_pid_file;
 
 use self::apply::materialize_update_payload;
 use self::artifacts::prepare_update_artifacts;
@@ -268,7 +267,7 @@ impl UpdateManager {
         let supervisor_was_running = !latest.supervisor_id.trim().is_empty()
             && supervisor_pid_file(&self.install_dir, &latest.supervisor_id).is_file();
 
-        request_supervisor_shutdown(&self.install_dir, &latest.supervisor_id).await?;
+        lifecycle::request_supervisor_shutdown(&self.install_dir, &latest.supervisor_id).await?;
 
         if next_app_dir.exists() {
             tokio::fs::remove_dir_all(&next_app_dir).await?;
@@ -429,10 +428,10 @@ impl UpdateManager {
             }
         }
 
-        invoke_post_update_hook(&self.install_dir, &active_app_dir, latest);
+        lifecycle::invoke_post_update_hook(&self.install_dir, &active_app_dir, latest);
 
         if supervisor_was_running {
-            restart_supervisor_after_update(&self.install_dir, &active_app_dir, latest);
+            lifecycle::restart_supervisor_after_update(&self.install_dir, &active_app_dir, latest);
         }
 
         emit_progress(
@@ -454,194 +453,12 @@ impl UpdateManager {
     }
 }
 
-async fn request_supervisor_shutdown(install_dir: &Path, supervisor_id: &str) -> Result<()> {
-    request_supervisor_shutdown_with_timeout(
-        install_dir,
-        supervisor_id,
-        Duration::from_secs(20),
-        Duration::from_millis(100),
-    )
-    .await
-}
-
-async fn request_supervisor_shutdown_with_timeout(
-    install_dir: &Path,
-    supervisor_id: &str,
-    timeout: Duration,
-    poll_interval: Duration,
-) -> Result<()> {
-    let supervisor_id = supervisor_id.trim();
-    if supervisor_id.is_empty() {
-        return Ok(());
-    }
-
-    let pid_file = supervisor_pid_file(install_dir, supervisor_id);
-    if !pid_file.is_file() {
-        return Ok(());
-    }
-
-    let stop_file = supervisor_stop_file(install_dir, supervisor_id);
-    tokio::fs::write(&stop_file, b"surge-update").await?;
-
-    let deadline = tokio::time::Instant::now() + timeout;
-    while pid_file.exists() {
-        if tokio::time::Instant::now() >= deadline {
-            return Err(SurgeError::Update(format!(
-                "Timed out waiting for supervisor '{supervisor_id}' to stop before applying update"
-            )));
-        }
-        tokio::time::sleep(poll_interval).await;
-    }
-
-    let _ = tokio::fs::remove_file(&stop_file).await;
-    Ok(())
-}
-
-fn invoke_post_update_hook(install_dir: &Path, active_app_dir: &Path, latest: &ReleaseEntry) {
-    let main_exe = latest.main_exe.trim();
-    if main_exe.is_empty() {
-        return;
-    }
-
-    let exe_path = active_app_dir.join(main_exe);
-    if !exe_path.is_file() {
-        warn!(
-            exe = %exe_path.display(),
-            version = %latest.version,
-            "Skipping post-update lifecycle hook because the executable is missing"
-        );
-        return;
-    }
-
-    let lifecycle_args = [String::from("--surge-updated"), latest.version.clone()];
-    let lifecycle_args_refs: Vec<&str> = lifecycle_args.iter().map(String::as_str).collect();
-
-    match spawn_process(&exe_path, &lifecycle_args_refs, Some(install_dir), &latest.environment) {
-        Ok(mut handle) => wait_for_post_update_hook(&mut handle, &exe_path),
-        Err(e) => {
-            warn!(
-                exe = %exe_path.display(),
-                version = %latest.version,
-                error = %e,
-                "Failed to invoke post-update lifecycle hook (continuing)"
-            );
-        }
-    }
-}
-
-fn wait_for_post_update_hook(handle: &mut crate::platform::process::ProcessHandle, exe_path: &Path) {
-    let check_interval = Duration::from_millis(100);
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
-
-    while std::time::Instant::now() < deadline {
-        if !handle.poll_running() {
-            match handle.wait() {
-                Ok(result) if result.exit_code == 0 => {
-                    debug!(exe = %exe_path.display(), "Post-update lifecycle hook completed successfully");
-                }
-                Ok(result) => {
-                    warn!(
-                        exe = %exe_path.display(),
-                        exit_code = result.exit_code,
-                        "Post-update lifecycle hook exited non-zero (continuing)"
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        exe = %exe_path.display(),
-                        error = %e,
-                        "Failed waiting for post-update lifecycle hook (continuing)"
-                    );
-                }
-            }
-            return;
-        }
-
-        std::thread::sleep(check_interval);
-    }
-
-    warn!(
-        exe = %exe_path.display(),
-        "Post-update lifecycle hook exceeded timeout, terminating it (continuing)"
-    );
-    let _ = handle.kill();
-    let _ = handle.wait();
-}
-
-fn restart_supervisor_after_update(install_dir: &Path, active_app_dir: &Path, latest: &ReleaseEntry) {
-    let supervisor_id = latest.supervisor_id.trim();
-    if supervisor_id.is_empty() {
-        return;
-    }
-
-    let supervisor_path = active_app_dir.join(supervisor_binary_name());
-    if !supervisor_path.is_file() {
-        warn!(
-            supervisor = %supervisor_path.display(),
-            "Cannot restart supervisor after update because the bundled binary is missing"
-        );
-        return;
-    }
-
-    let exe_path = active_app_dir.join(&latest.main_exe);
-    if !exe_path.is_file() {
-        warn!(
-            exe = %exe_path.display(),
-            "Cannot restart supervisor after update because the application executable is missing"
-        );
-        return;
-    }
-
-    let restart_args = match read_restart_args(install_dir, supervisor_id) {
-        Ok(args) => args,
-        Err(e) => {
-            warn!(
-                supervisor_id,
-                error = %e,
-                "Failed reading stored supervisor restart arguments; restarting with no extra args"
-            );
-            Vec::new()
-        }
-    };
-
-    let install_dir_str = install_dir.to_string_lossy();
-    let pid_str = current_pid().to_string();
-    let exe_path_str = exe_path.to_string_lossy();
-    let mut args: Vec<&str> = vec![
-        "watch",
-        "--id",
-        supervisor_id,
-        "--dir",
-        &install_dir_str,
-        "--pid",
-        &pid_str,
-        "--exe",
-        &exe_path_str,
-    ];
-    if !restart_args.is_empty() {
-        args.push("--");
-        args.extend(restart_args.iter().map(String::as_str));
-    }
-
-    match spawn_detached(&supervisor_path, &args, Some(install_dir), &latest.environment) {
-        Ok(handle) => {
-            info!(pid = handle.pid(), supervisor_id, "Restarted supervisor after update");
-        }
-        Err(e) => {
-            warn!(
-                supervisor_id,
-                error = %e,
-                "Failed to restart supervisor after update (continuing)"
-            );
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::cast_possible_wrap)]
 
     use std::sync::Mutex;
+    use std::time::Duration;
 
     use super::*;
     use crate::archive::packer::ArchivePacker;
@@ -820,8 +637,10 @@ mod tests {
     #[tokio::test]
     async fn test_request_supervisor_shutdown_noop_when_supervisor_is_unknown() {
         let tmp = tempfile::tempdir().unwrap();
-        request_supervisor_shutdown(tmp.path(), "").await.unwrap();
-        request_supervisor_shutdown(tmp.path(), "missing").await.unwrap();
+        lifecycle::request_supervisor_shutdown(tmp.path(), "").await.unwrap();
+        lifecycle::request_supervisor_shutdown(tmp.path(), "missing")
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -846,7 +665,7 @@ mod tests {
             panic!("timed out waiting for stop file to be created");
         });
 
-        request_supervisor_shutdown_with_timeout(
+        lifecycle::request_supervisor_shutdown_with_timeout(
             install_dir,
             supervisor_id,
             Duration::from_secs(2),
@@ -868,7 +687,7 @@ mod tests {
         let stop_file = install_dir.join(format!(".surge-supervisor-{supervisor_id}.stop"));
         std::fs::write(&pid_file, "123").unwrap();
 
-        let err = request_supervisor_shutdown_with_timeout(
+        let err = lifecycle::request_supervisor_shutdown_with_timeout(
             install_dir,
             supervisor_id,
             Duration::from_millis(50),

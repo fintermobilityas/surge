@@ -14,51 +14,35 @@
 //! exports every function declared in `surge_api.h`.  All public symbols
 //! use `#[no_mangle] pub unsafe extern "C"` and catch panics at the boundary.
 
+mod context;
 mod handles;
+mod shared;
 mod utils;
 
 use std::collections::BTreeMap;
-use std::ffi::{CStr, c_char, c_int, c_void};
+use std::ffi::{c_char, c_int, c_void};
 use std::path::Path;
 use std::ptr;
-use std::sync::{Arc, Mutex};
 
-use surge_core::context::{Context, ResourceBudget, StorageProvider};
 use surge_core::diff::wrapper::{bsdiff_buffers, bspatch_buffers};
 use surge_core::lock::mutex::DistributedMutex;
 use surge_core::pack::builder::PackBuilder;
 use surge_core::supervisor::state::{supervisor_pid_file, supervisor_stop_file, write_restart_args};
 use surge_core::update::manager::{ProgressInfo, UpdateManager};
 
+pub use crate::context::{
+    surge_config_set_lock_server, surge_config_set_resource_budget, surge_config_set_storage, surge_context_create,
+    surge_context_destroy, surge_context_last_error,
+};
 use crate::handles::{
-    ReleaseEntryFfi, SurgeContextHandle, SurgeErrorFfi, SurgeErrorOwned, SurgePackContextHandle,
-    SurgeReleasesInfoHandle, SurgeUpdateManagerHandle,
+    ReleaseEntryFfi, SurgeContextHandle, SurgePackContextHandle, SurgeReleasesInfoHandle, SurgeUpdateManagerHandle,
+};
+use crate::shared::{
+    ProgressBridge, SURGE_CANCELLED, SURGE_ERROR, SURGE_NOT_FOUND, SURGE_OK, SURGE_PHASE_CHECK, SURGE_PHASE_DOWNLOAD,
+    SurgeEventCallback, SurgeProgressCallback, catch_ffi, clear_shared_error, collect_argv, cstr_to_string,
+    libc_malloc, make_pack_progress, set_ctx_error, set_shared_error, try_index, try_len, try_len_allow_zero,
 };
 use crate::utils::{lock_recover, to_lossy_cstring};
-
-// ---------------------------------------------------------------------------
-//  Result codes (mirrors surge_result in surge_api.h)
-// ---------------------------------------------------------------------------
-
-const SURGE_OK: i32 = 0;
-const SURGE_ERROR: i32 = -1;
-const SURGE_CANCELLED: i32 = -2;
-const SURGE_NOT_FOUND: i32 = -3;
-
-// ---------------------------------------------------------------------------
-//  Progress phases (mirrors surge_progress_phase in surge_api.h)
-// ---------------------------------------------------------------------------
-
-const SURGE_PHASE_CHECK: i32 = 0;
-const SURGE_PHASE_DOWNLOAD: i32 = 1;
-#[allow(dead_code)]
-const SURGE_PHASE_VERIFY: i32 = 2;
-#[allow(dead_code)]
-const SURGE_PHASE_EXTRACT: i32 = 3;
-#[allow(dead_code)]
-const SURGE_PHASE_APPLY_DELTA: i32 = 4;
-#[allow(dead_code)]
-const SURGE_PHASE_FINALIZE: i32 = 5;
 
 // ---------------------------------------------------------------------------
 //  #[repr(C)] structs matching surge_api.h
@@ -105,296 +89,6 @@ pub struct SurgeBspatchCtxFfi {
     pub patch: *const u8,
     pub patch_size: i64,
     pub status: i32,
-}
-
-type SurgeProgressCallback = Option<extern "C" fn(*const SurgeProgressFfi, *mut c_void)>;
-type SurgeEventCallback = Option<extern "C" fn(*const c_char, *mut c_void)>;
-
-// ---------------------------------------------------------------------------
-//  Helpers
-// ---------------------------------------------------------------------------
-
-/// # Safety
-///
-/// Only safe when the pointer is valid for the duration of the async call
-/// and only accessed from the calling thread (via `Runtime::block_on`).
-struct ProgressBridge {
-    cb: extern "C" fn(*const SurgeProgressFfi, *mut c_void),
-    user_data: usize,
-}
-
-impl ProgressBridge {
-    /// Core phases are 1-indexed; FFI phases are 0-indexed.
-    fn invoke(&self, pi: &ProgressInfo) {
-        let ffi = SurgeProgressFfi {
-            phase: pi.phase.saturating_sub(1),
-            phase_percent: pi.phase_percent,
-            total_percent: pi.total_percent,
-            bytes_done: pi.bytes_done,
-            bytes_total: pi.bytes_total,
-            items_done: pi.items_done,
-            items_total: pi.items_total,
-            speed_bytes_per_sec: pi.speed_bytes_per_sec,
-        };
-        (self.cb)(&ffi, self.user_data as *mut c_void);
-    }
-}
-
-fn make_pack_progress(phase: i32, items_done: i32, items_total: i32) -> SurgeProgressFfi {
-    let pct = if items_total > 0 {
-        items_done * 100 / items_total
-    } else {
-        0
-    };
-    SurgeProgressFfi {
-        phase,
-        phase_percent: pct,
-        total_percent: pct,
-        bytes_done: 0,
-        bytes_total: 0,
-        items_done: i64::from(items_done),
-        items_total: i64::from(items_total),
-        speed_bytes_per_sec: 0.0,
-    }
-}
-
-/// # Safety
-///
-/// `p` must be null or point to a valid NUL-terminated C string.
-unsafe fn cstr_to_string(p: *const c_char) -> String {
-    if p.is_null() {
-        String::new()
-    } else {
-        // SAFETY: Caller guarantees `p` is either null (handled above) or
-        // a valid NUL-terminated C string.
-        unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
-    }
-}
-
-fn catch_ffi<F: FnOnce() -> i32 + std::panic::UnwindSafe>(f: F) -> i32 {
-    match std::panic::catch_unwind(f) {
-        Ok(code) => code,
-        Err(_) => SURGE_ERROR,
-    }
-}
-
-fn set_ctx_error(handle: &SurgeContextHandle, e: &surge_core::error::SurgeError) -> i32 {
-    let code = e.error_code() as i32;
-    handle.set_last_error(code, &e.to_string());
-    handle.ctx.set_error(e);
-    code
-}
-
-fn set_shared_error(
-    ctx: &Arc<Context>,
-    last_error: &Arc<Mutex<Option<SurgeErrorOwned>>>,
-    e: &surge_core::error::SurgeError,
-) -> i32 {
-    let code = e.error_code() as i32;
-    let mut slot = lock_recover(last_error.as_ref());
-    *slot = Some(SurgeErrorOwned::new(code, &e.to_string()));
-    ctx.set_error(e);
-    code
-}
-
-fn clear_shared_error(ctx: &Arc<Context>, last_error: &Arc<Mutex<Option<SurgeErrorOwned>>>) {
-    let mut slot = lock_recover(last_error.as_ref());
-    *slot = None;
-    ctx.clear_error();
-}
-
-fn try_len(size: i64) -> Option<usize> {
-    usize::try_from(size).ok().filter(|len| *len > 0)
-}
-
-fn try_len_allow_zero(size: i64) -> Option<usize> {
-    usize::try_from(size).ok()
-}
-
-fn try_index(index: i32, len: usize) -> Option<usize> {
-    let idx = usize::try_from(index).ok()?;
-    if idx < len { Some(idx) } else { None }
-}
-
-/// # Safety
-///
-/// `argv` must point to at least `argc` elements when `argc > 0`, and each
-/// non-null element must be a valid NUL-terminated C string.
-unsafe fn collect_argv(argc: c_int, argv: *const *const c_char) -> Vec<String> {
-    let Ok(count) = usize::try_from(argc) else {
-        return Vec::new();
-    };
-    if count == 0 || argv.is_null() {
-        return Vec::new();
-    }
-
-    // SAFETY: Caller guarantees `argv` points to at least `count` entries.
-    let argv_slice = unsafe { std::slice::from_raw_parts(argv, count) };
-
-    let mut args = Vec::with_capacity(count);
-    for &arg_ptr in argv_slice {
-        if arg_ptr.is_null() {
-            continue;
-        }
-        // SAFETY: Caller guarantees each non-null argv element points to
-        // a valid NUL-terminated C string.
-        args.push(unsafe { cstr_to_string(arg_ptr) });
-    }
-    args
-}
-
-// =========================================================================
-//  1. Lifecycle (3 functions)
-// =========================================================================
-
-/// Create a new Surge context.
-///
-/// Returns a new context handle, or null on allocation/runtime failure.
-#[unsafe(no_mangle)]
-pub extern "C" fn surge_context_create() -> *mut SurgeContextHandle {
-    let result = std::panic::catch_unwind(|| {
-        let runtime = match tokio::runtime::Runtime::new() {
-            Ok(rt) => Arc::new(rt),
-            Err(_) => return ptr::null_mut(),
-        };
-
-        let ctx = Arc::new(Context::new());
-        let handle = Box::new(SurgeContextHandle {
-            ctx,
-            runtime,
-            last_error: std::sync::Mutex::new(None),
-            shared_last_error: Arc::new(std::sync::Mutex::new(None)),
-        });
-
-        Box::into_raw(handle)
-    });
-
-    result.unwrap_or(ptr::null_mut())
-}
-
-/// Destroy a Surge context and release all associated resources.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn surge_context_destroy(ctx: *mut SurgeContextHandle) {
-    if !ctx.is_null() {
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            drop(unsafe { Box::from_raw(ctx) });
-        }));
-    }
-}
-
-/// Retrieve the last error that occurred on `ctx`.
-///
-/// Returns a pointer to an internal `surge_error` struct, or null if no error.
-/// The pointer is valid until the next API call on the same context.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn surge_context_last_error(ctx: *const SurgeContextHandle) -> *const SurgeErrorFfi {
-    if ctx.is_null() {
-        return ptr::null();
-    }
-    let handle = unsafe { &*ctx };
-    handle.get_last_error()
-}
-
-// =========================================================================
-//  2. Configuration (3 functions)
-// =========================================================================
-
-/// Configure the cloud or local storage backend.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn surge_config_set_storage(
-    ctx: *mut SurgeContextHandle,
-    provider: i32,
-    bucket: *const c_char,
-    region: *const c_char,
-    access_key: *const c_char,
-    secret_key: *const c_char,
-    endpoint: *const c_char,
-) -> i32 {
-    if ctx.is_null() {
-        return SURGE_ERROR;
-    }
-
-    catch_ffi(std::panic::AssertUnwindSafe(|| {
-        // SAFETY: `ctx` is checked for non-null above and owned by this FFI
-        // layer for the duration of this call.
-        let handle = unsafe { &*ctx };
-        handle.clear_last_error();
-
-        let prov = if let Some(p) = StorageProvider::from_i32(provider) {
-            p
-        } else {
-            let e = surge_core::error::SurgeError::Config(format!("Invalid storage provider: {provider}"));
-            return set_ctx_error(handle, &e);
-        };
-
-        // SAFETY: C string pointers are nullable by API contract and each
-        // non-null pointer is expected to reference a valid NUL-terminated
-        // string for the duration of this call.
-        let (bucket_s, region_s, access_s, secret_s, endpoint_s) = unsafe {
-            (
-                cstr_to_string(bucket),
-                cstr_to_string(region),
-                cstr_to_string(access_key),
-                cstr_to_string(secret_key),
-                cstr_to_string(endpoint),
-            )
-        };
-
-        handle
-            .ctx
-            .set_storage(prov, &bucket_s, &region_s, &access_s, &secret_s, &endpoint_s);
-        SURGE_OK
-    }))
-}
-
-/// Configure the distributed lock server URL.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn surge_config_set_lock_server(ctx: *mut SurgeContextHandle, url: *const c_char) -> i32 {
-    if ctx.is_null() {
-        return SURGE_ERROR;
-    }
-
-    catch_ffi(std::panic::AssertUnwindSafe(|| {
-        // SAFETY: `ctx` is checked for non-null above and points to a live
-        // context handle while this call executes.
-        let handle = unsafe { &*ctx };
-        handle.clear_last_error();
-
-        // SAFETY: `url` follows the C API contract for nullable C strings.
-        let url_s = unsafe { cstr_to_string(url) };
-        handle.ctx.set_lock_server(&url_s);
-        SURGE_OK
-    }))
-}
-
-/// Set resource budget limits (memory, threads, bandwidth).
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn surge_config_set_resource_budget(
-    ctx: *mut SurgeContextHandle,
-    budget: *const SurgeResourceBudgetFfi,
-) -> i32 {
-    if ctx.is_null() || budget.is_null() {
-        return SURGE_ERROR;
-    }
-
-    catch_ffi(std::panic::AssertUnwindSafe(|| {
-        // SAFETY: `ctx` and `budget` are checked non-null above and both
-        // pointers are expected to reference initialized values by API
-        // contract.
-        let handle = unsafe { &*ctx };
-        handle.clear_last_error();
-
-        let b = unsafe { &*budget };
-        let rb = ResourceBudget {
-            max_memory_bytes: b.max_memory_bytes,
-            max_threads: b.max_threads,
-            max_concurrent_downloads: b.max_concurrent_downloads,
-            max_download_speed_bps: b.max_download_speed_bps,
-            zstd_compression_level: b.zstd_compression_level,
-        };
-        handle.ctx.set_resource_budget(rb);
-        SURGE_OK
-    }))
 }
 
 // =========================================================================
@@ -1471,58 +1165,11 @@ pub unsafe extern "C" fn surge_cancel(ctx: *mut SurgeContextHandle) -> i32 {
     }))
 }
 
-// =========================================================================
-//  Internal helpers
-// =========================================================================
-
-/// Thin wrapper around platform `malloc` for allocating buffers that C callers
-/// will free with `free()`.
-///
-/// Returns a pointer to `size` bytes of uninitialized memory, or null on failure.
-fn libc_malloc(size: usize) -> *mut u8 {
-    unsafe extern "C" {
-        fn malloc(size: usize) -> *mut c_void;
-    }
-    // SAFETY: Calling C `malloc` with any `usize` is valid; failure is
-    // reported with a null pointer and handled by callers.
-    unsafe { malloc(size).cast::<u8>() }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::ffi::CString;
+    use std::ffi::{CStr, CString};
 
     use super::*;
-
-    #[test]
-    fn try_len_rejects_invalid_values() {
-        assert_eq!(try_len(0), None);
-        assert_eq!(try_len(-1), None);
-    }
-
-    #[test]
-    fn try_len_accepts_positive_values() {
-        assert_eq!(try_len(1), Some(1));
-        assert_eq!(try_len(42), Some(42));
-    }
-
-    #[test]
-    fn try_index_bounds_checking() {
-        assert_eq!(try_index(-1, 3), None);
-        assert_eq!(try_index(0, 3), Some(0));
-        assert_eq!(try_index(2, 3), Some(2));
-        assert_eq!(try_index(3, 3), None);
-    }
-
-    #[test]
-    fn collect_argv_skips_null_entries() {
-        let arg0 = CString::new("--surge-first-run").unwrap();
-        let arg1 = CString::new("--surge-updated=1.2.3").unwrap();
-        let argv = [arg0.as_ptr(), std::ptr::null(), arg1.as_ptr()];
-
-        let args = unsafe { collect_argv(argv.len() as c_int, argv.as_ptr()) };
-        assert_eq!(args, vec!["--surge-first-run", "--surge-updated=1.2.3"]);
-    }
 
     #[test]
     fn manager_set_channel_updates_context_last_error() {

@@ -8,7 +8,6 @@
 835 crates/surge-cli/src/main.rs
 861 crates/surge-core/src/config/manifest.rs
 727 crates/surge-core/src/install.rs
-990 crates/surge-core/src/pack/builder.rs
 1130 crates/surge-core/src/platform/shortcuts.rs
 782 crates/surge-core/src/releases/delta.rs
 625 crates/surge-core/src/releases/restore.rs

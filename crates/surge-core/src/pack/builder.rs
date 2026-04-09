@@ -1,29 +1,25 @@
 //! Pack builder: create full and delta packages, upload to storage.
 
-use std::collections::{BTreeMap, BTreeSet};
+mod delta;
+mod full;
+mod release_index;
+mod staging;
+mod toolchain;
+
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tracing::{debug, info, warn};
 
-use crate::archive::packer::ArchivePacker;
-use crate::config::constants::{RELEASES_FILE_COMPRESSED, SCHEMA_VERSION};
-use crate::config::manifest::{PackDeltaStrategy, PackPolicy, ShortcutLocation, SurgeManifest};
-use crate::context::{Context, ResourceBudget};
-use crate::crypto::sha256::sha256_hex;
-use crate::diff::chunked::{ChunkedDiffOptions, DEFAULT_CHUNK_SIZE};
+use crate::config::manifest::{PackPolicy, ShortcutLocation, SurgeManifest};
+use crate::context::Context;
 use crate::error::{Result, SurgeError};
 use crate::platform::fs::write_file_atomic;
-use crate::releases::delta::{build_archive_bsdiff_patch, build_archive_chunked_patch, build_sparse_file_patch};
-use crate::releases::manifest::{
-    DeltaArtifact, PATCH_FORMAT_BSDIFF4_ARCHIVE_V3, PATCH_FORMAT_CHUNKED_BSDIFF_ARCHIVE_V3,
-    PATCH_FORMAT_SPARSE_FILE_OPS_V1, ReleaseEntry, ReleaseIndex, compress_release_index, decompress_release_index,
-};
-use crate::releases::restore::{
-    find_previous_release_for_rid, restore_full_archive_for_version, sorted_releases_for_rid,
-};
 use crate::storage::{StorageBackend, create_storage_backend};
+
+pub(crate) use self::staging::build_canonical_archive_from_directory;
 
 /// A built package artifact ready for upload.
 #[derive(Debug, Clone)]
@@ -340,651 +336,6 @@ impl PackBuilder {
             })
             .collect()
     }
-
-    /// Build the full tar.zst package.
-    fn build_full_package(&mut self) -> Result<PackageArtifact> {
-        let budget = self.ctx.resource_budget();
-        let filename = format!("{}-{}-{}-full.tar.zst", self.app_id, self.version, self.rid);
-        let n_workers = budget.effective_zstd_workers();
-        let mut bundled = Vec::new();
-
-        // Bundle surge-supervisor if supervisor_id is configured and not already in artifacts.
-        if !self.supervisor_id.trim().is_empty() {
-            let supervisor_name = supervisor_binary_name_for_rid(&self.rid);
-            if !self.artifacts_dir.join(supervisor_name).is_file() {
-                bundled.push(BundledArtifact {
-                    source: find_supervisor_binary(supervisor_name)?,
-                    archive_name: supervisor_name.to_string(),
-                });
-            }
-        }
-
-        if let Some(native_runtime) = resolve_surge_dotnet_native_runtime_bundle(&self.artifacts_dir, &self.rid)? {
-            bundled.push(native_runtime);
-        }
-
-        let staging_root = if bundled.is_empty() {
-            None
-        } else {
-            Some(materialize_canonical_pack_root(&self.artifacts_dir, &bundled)?)
-        };
-        let pack_root = staging_root
-            .as_ref()
-            .map_or(self.artifacts_dir.as_path(), tempfile::TempDir::path);
-
-        let mut packer = ArchivePacker::with_threads(budget.zstd_compression_level, n_workers)?;
-        packer.add_directory(pack_root, "")?;
-
-        let archive_bytes = packer.finalize()?;
-        let sha256 = sha256_hex(&archive_bytes);
-        let size = i64::try_from(archive_bytes.len())
-            .map_err(|_| SurgeError::Archive(format!("Archive is too large: {} bytes", archive_bytes.len())))?;
-
-        Ok(PackageArtifact {
-            filename,
-            size,
-            sha256,
-            is_delta: false,
-            from_version: String::new(),
-            patch_format: String::new(),
-            bytes: archive_bytes,
-        })
-    }
-
-    /// Attempt to build a delta package from the previous version.
-    ///
-    /// Returns `Ok(None)` if no previous version exists.
-    async fn build_delta_package(&self) -> Result<Option<PackageArtifact>> {
-        let data = match self.storage.get_object(RELEASES_FILE_COMPRESSED).await {
-            Ok(d) => d,
-            Err(SurgeError::NotFound(_)) => return Ok(None),
-            Err(e) => return Err(e),
-        };
-        let index = decompress_release_index(&data)?;
-
-        let Some(previous_release) = find_previous_release_for_rid(&index, &self.rid, &self.version) else {
-            return Ok(None);
-        };
-
-        let budget = self.ctx.resource_budget();
-        let prev_data =
-            restore_full_archive_for_version(self.storage.as_ref(), &index, &self.rid, &previous_release.version)
-                .await?;
-        let new_data = self
-            .artifacts
-            .iter()
-            .find(|a| !a.is_delta)
-            .map(PackageArtifact::bytes)
-            .ok_or_else(|| SurgeError::Pack("Full package not yet built".to_string()))?;
-        if should_publish_checkpoint_full(
-            &index,
-            &self.rid,
-            self.pack_policy.max_chain_length,
-            self.pack_policy.checkpoint_every,
-        ) {
-            info!(
-                app_id = %self.app_id,
-                version = %self.version,
-                rid = %self.rid,
-                "Skipping delta package and publishing a checkpoint full"
-            );
-            return Ok(None);
-        }
-        let n_workers = budget.effective_zstd_workers();
-        let diff_options = chunked_diff_options(&budget, prev_data.len(), new_data.len());
-
-        let (patch, patch_format) = match self.pack_policy.delta_strategy {
-            PackDeltaStrategy::SparseFileOps => (
-                build_sparse_file_patch(
-                    &prev_data,
-                    new_data,
-                    budget.zstd_compression_level,
-                    n_workers,
-                    &diff_options,
-                )?,
-                PATCH_FORMAT_SPARSE_FILE_OPS_V1.to_string(),
-            ),
-            PackDeltaStrategy::ArchiveChunkedBsdiff => (
-                build_archive_chunked_patch(
-                    &prev_data,
-                    new_data,
-                    budget.zstd_compression_level,
-                    n_workers,
-                    &diff_options,
-                )?,
-                PATCH_FORMAT_CHUNKED_BSDIFF_ARCHIVE_V3.to_string(),
-            ),
-            PackDeltaStrategy::ArchiveBsdiff => (
-                build_archive_bsdiff_patch(&prev_data, new_data, budget.zstd_compression_level, n_workers)?,
-                PATCH_FORMAT_BSDIFF4_ARCHIVE_V3.to_string(),
-            ),
-        };
-
-        let delta_filename = format!("{}-{}-{}-delta.tar.zst", self.app_id, self.version, self.rid);
-        let compressed = zstd_encode_mt(patch.as_slice(), budget.zstd_compression_level, n_workers)?;
-
-        let sha256 = sha256_hex(&compressed);
-        let size = i64::try_from(compressed.len())
-            .map_err(|_| SurgeError::Archive(format!("Delta is too large: {} bytes", compressed.len())))?;
-        let full_size = i64::try_from(new_data.len())
-            .map_err(|_| SurgeError::Archive(format!("Archive is too large: {} bytes", new_data.len())))?;
-
-        if should_fallback_to_full(size, full_size) {
-            warn!(
-                app_id = %self.app_id,
-                version = %self.version,
-                rid = %self.rid,
-                delta_size = size,
-                full_size,
-                "Skipping pathological delta package and publishing a full checkpoint"
-            );
-            return Ok(None);
-        }
-
-        Ok(Some(PackageArtifact {
-            filename: delta_filename,
-            size,
-            sha256,
-            is_delta: true,
-            from_version: previous_release.version.clone(),
-            patch_format,
-            bytes: compressed,
-        }))
-    }
-
-    /// Update the release index in storage with the new release entry.
-    async fn update_release_index(&self, channel: &str) -> Result<()> {
-        // Try to fetch existing index, create new one if not found
-        let mut index = match self.storage.get_object(RELEASES_FILE_COMPRESSED).await {
-            Ok(data) => decompress_release_index(&data)?,
-            Err(SurgeError::NotFound(_)) => ReleaseIndex {
-                schema: SCHEMA_VERSION,
-                app_id: self.app_id.clone(),
-                pack_id: String::new(),
-                last_write_utc: String::new(),
-                releases: Vec::new(),
-            },
-            Err(e) => return Err(e),
-        };
-
-        // Find the full and delta artifacts
-        let full = self.artifacts.iter().find(|a| !a.is_delta);
-        let delta = self.artifacts.iter().find(|a| a.is_delta);
-
-        let entry = ReleaseEntry {
-            version: self.version.clone(),
-            channels: vec![channel.to_string()],
-            os: detect_os_from_rid(&self.rid),
-            rid: self.rid.clone(),
-            is_genesis: index.releases.is_empty(),
-            full_filename: full.map_or(String::new(), |a| a.filename.clone()),
-            full_size: full.map_or(0, |a| a.size),
-            full_sha256: full.map_or(String::new(), |a| a.sha256.clone()),
-            deltas: Vec::new(),
-            preferred_delta_id: String::new(),
-            created_utc: chrono::Utc::now().to_rfc3339(),
-            release_notes: String::new(),
-            name: self.name.clone(),
-            main_exe: self.main_exe.clone(),
-            install_directory: self.install_directory.clone(),
-            supervisor_id: self.supervisor_id.clone(),
-            icon: self.icon.clone(),
-            shortcuts: self.shortcuts.clone(),
-            persistent_assets: self.persistent_assets.clone(),
-            installers: self.installers.clone(),
-            environment: self.environment.clone(),
-        };
-        let mut entry = entry;
-        let primary_delta = delta.map(|artifact| {
-            if artifact
-                .patch_format
-                .eq_ignore_ascii_case(PATCH_FORMAT_SPARSE_FILE_OPS_V1)
-            {
-                DeltaArtifact::sparse_file_ops_zstd(
-                    "primary",
-                    &artifact.from_version,
-                    &artifact.filename,
-                    artifact.size,
-                    &artifact.sha256,
-                )
-            } else {
-                DeltaArtifact::with_patch_format(
-                    "primary",
-                    &artifact.from_version,
-                    &artifact.patch_format,
-                    &artifact.filename,
-                    artifact.size,
-                    &artifact.sha256,
-                )
-            }
-        });
-        entry.set_primary_delta(primary_delta);
-
-        // Remove any existing entry for this version/RID pair and add the new one.
-        index
-            .releases
-            .retain(|r| !(r.version == self.version && r.rid == self.rid));
-        index.releases.push(entry);
-
-        index.last_write_utc = chrono::Utc::now().to_rfc3339();
-
-        let budget = self.ctx.resource_budget();
-        let compressed = compress_release_index(&index, budget.zstd_compression_level)?;
-        self.storage
-            .put_object(RELEASES_FILE_COMPRESSED, &compressed, "application/octet-stream")
-            .await?;
-
-        Ok(())
-    }
-}
-
-fn should_publish_checkpoint_full(
-    index: &ReleaseIndex,
-    rid: &str,
-    max_chain_length: u32,
-    checkpoint_every: u32,
-) -> bool {
-    let releases = sorted_releases_for_rid(index, rid);
-    let mut deltas_since_checkpoint = 0u32;
-    for release in releases.iter().rev() {
-        if release.selected_delta().is_none() {
-            break;
-        }
-        deltas_since_checkpoint = deltas_since_checkpoint.saturating_add(1);
-    }
-
-    deltas_since_checkpoint >= max_chain_length || deltas_since_checkpoint.saturating_add(1) >= checkpoint_every
-}
-
-fn should_fallback_to_full(delta_size: i64, full_size: i64) -> bool {
-    if delta_size <= 0 || full_size <= 0 {
-        return false;
-    }
-    delta_size >= full_size
-}
-
-fn chunked_diff_options(budget: &ResourceBudget, older_len: usize, newer_len: usize) -> ChunkedDiffOptions {
-    const MIN_CHUNK_SIZE: usize = 4 * 1024 * 1024;
-    const BYTES_PER_THREAD_FACTOR: usize = 12;
-
-    let requested_threads = usize::try_from(budget.max_threads).ok().unwrap_or(0);
-    let planning_threads = if requested_threads == 0 {
-        std::thread::available_parallelism()
-            .map(std::num::NonZeroUsize::get)
-            .unwrap_or(1)
-    } else {
-        requested_threads
-    };
-    let archive_len = older_len.max(newer_len).max(1);
-
-    let mut chunk_size = DEFAULT_CHUNK_SIZE.min(archive_len);
-    if let Ok(memory_budget) = usize::try_from(budget.max_memory_bytes)
-        && memory_budget > 0
-    {
-        let per_thread_budget = memory_budget / planning_threads.max(1);
-        let budget_chunk_size = per_thread_budget / BYTES_PER_THREAD_FACTOR;
-        chunk_size = chunk_size.min(budget_chunk_size.max(MIN_CHUNK_SIZE));
-    }
-    chunk_size = chunk_size.clamp(1, archive_len.max(MIN_CHUNK_SIZE));
-
-    let chunk_count = archive_len.div_ceil(chunk_size).max(1);
-
-    ChunkedDiffOptions {
-        chunk_size,
-        max_threads: if requested_threads == 0 {
-            0
-        } else {
-            requested_threads.min(chunk_count)
-        },
-    }
-}
-
-fn resolve_surge_dotnet_native_runtime_bundle(artifacts_path: &Path, rid: &str) -> Result<Option<BundledArtifact>> {
-    let host_rid = crate::platform::detect::current_rid();
-    let search_roots = surge_toolchain_search_roots(rid);
-    resolve_surge_dotnet_native_runtime_bundle_with_host(artifacts_path, rid, &host_rid, &search_roots)
-}
-
-fn resolve_surge_dotnet_native_runtime_bundle_with_host(
-    artifacts_path: &Path,
-    rid: &str,
-    host_rid: &str,
-    search_roots: &[PathBuf],
-) -> Result<Option<BundledArtifact>> {
-    if !artifacts_path.join("Surge.NET.dll").is_file() {
-        return Ok(None);
-    }
-
-    let candidates = native_library_candidates_for_rid(rid);
-    if candidates.iter().any(|name| artifacts_path.join(name).is_file()) {
-        return Ok(None);
-    }
-
-    ensure_host_compatible_toolchain_runtime_rid(rid, host_rid)?;
-
-    for root in search_roots {
-        for candidate in &candidates {
-            let source = root.join(candidate);
-            if source.is_file() {
-                return Ok(Some(BundledArtifact {
-                    source,
-                    archive_name: (*candidate).to_string(),
-                }));
-            }
-        }
-    }
-
-    Err(SurgeError::Pack(format!(
-        "Surge.NET.dll found in artifacts, but no native Surge runtime library for RID '{rid}' was found in the artifacts or next to an installed surge toolchain. Expected one of: {}. Use the official Surge release bundle for this platform or place the native runtime next to surge.",
-        candidates.join(", ")
-    )))
-}
-
-fn ensure_host_compatible_toolchain_runtime_rid(target_rid: &str, host_rid: &str) -> Result<()> {
-    let target = parse_rid(target_rid).ok_or_else(|| {
-        SurgeError::Pack(format!(
-            "Unsupported target RID '{target_rid}'. Supported values use linux|win|windows|osx|macos and x86|x64|arm64."
-        ))
-    })?;
-    let host = parse_rid(host_rid).ok_or_else(|| {
-        SurgeError::Pack(format!(
-            "Unsupported host RID '{host_rid}'. Host-only native runtime bundling is unavailable."
-        ))
-    })?;
-
-    if target != host {
-        return Err(SurgeError::Pack(format!(
-            "Surge.NET native runtime bundling is host-only. Requested target RID '{target_rid}', but current host RID is '{host_rid}'. Include the native runtime in the artifacts to pack cross-target."
-        )));
-    }
-
-    Ok(())
-}
-
-fn native_library_candidates_for_rid(rid: &str) -> Vec<&'static str> {
-    let os = rid.split('-').next().unwrap_or_default();
-    match os {
-        "linux" => vec!["libsurge.so", "surge.so"],
-        "osx" | "macos" => vec!["libsurge.dylib", "surge.dylib"],
-        "win" | "windows" => vec!["surge.dll", "libsurge.dll"],
-        _ => vec![
-            "libsurge.so",
-            "surge.so",
-            "libsurge.dylib",
-            "surge.dylib",
-            "surge.dll",
-            "libsurge.dll",
-        ],
-    }
-}
-
-fn surge_toolchain_search_roots(rid: &str) -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-
-    if let Ok(current_exe) = std::env::current_exe()
-        && let Some(parent) = current_exe.parent()
-    {
-        roots.push(parent.to_path_buf());
-    }
-
-    let surge_name = surge_binary_name_for_rid(rid);
-    if let Some(path_env) = std::env::var_os("PATH") {
-        for path_dir in std::env::split_paths(&path_env) {
-            if path_dir.join(surge_name).is_file() && !roots.iter().any(|existing| existing == &path_dir) {
-                roots.push(path_dir);
-            }
-        }
-    }
-
-    roots
-}
-
-/// Extract OS name from a RID string (e.g., "linux-x64" -> "linux").
-fn detect_os_from_rid(rid: &str) -> String {
-    rid.split('-').next().unwrap_or("unknown").to_string()
-}
-
-fn surge_binary_name_for_rid(rid: &str) -> &'static str {
-    match rid.split('-').next().unwrap_or_default() {
-        "win" | "windows" => "surge.exe",
-        _ => "surge",
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum RidOs {
-    Linux,
-    Windows,
-    MacOs,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum RidArch {
-    X86,
-    X64,
-    Arm64,
-}
-
-fn parse_rid(rid: &str) -> Option<(RidOs, RidArch)> {
-    let mut parts = rid.trim().split('-');
-    let raw_os = parts.next()?;
-    let raw_arch = parts.next()?;
-    let os = match raw_os {
-        "linux" => RidOs::Linux,
-        "win" | "windows" => RidOs::Windows,
-        "osx" | "macos" => RidOs::MacOs,
-        _ => return None,
-    };
-    let arch = match raw_arch {
-        "x86" => RidArch::X86,
-        "x64" => RidArch::X64,
-        "arm64" => RidArch::Arm64,
-        _ => return None,
-    };
-    Some((os, arch))
-}
-
-fn supervisor_binary_name() -> &'static str {
-    crate::platform::process::supervisor_binary_name()
-}
-
-fn supervisor_binary_name_for_rid(rid: &str) -> &'static str {
-    match rid.split('-').next().unwrap_or_default() {
-        "win" | "windows" => "surge-supervisor.exe",
-        "linux" | "osx" | "macos" => "surge-supervisor",
-        _ => supervisor_binary_name(),
-    }
-}
-
-/// Compress `data` with zstd, optionally using multi-threaded compression.
-fn zstd_encode_mt(data: &[u8], compression_level: i32, n_workers: u32) -> Result<Vec<u8>> {
-    if n_workers > 0 {
-        use std::io::Write;
-        let mut encoder = zstd::Encoder::new(Vec::new(), compression_level)
-            .map_err(|e| SurgeError::Archive(format!("Failed to create zstd encoder: {e}")))?;
-        encoder
-            .multithread(n_workers)
-            .map_err(|e| SurgeError::Archive(format!("Failed to enable multi-threaded zstd: {e}")))?;
-        encoder
-            .write_all(data)
-            .map_err(|e| SurgeError::Archive(format!("Failed to compress delta: {e}")))?;
-        encoder
-            .finish()
-            .map_err(|e| SurgeError::Archive(format!("Failed to finalize zstd encoder: {e}")))
-    } else {
-        zstd::encode_all(data, compression_level)
-            .map_err(|e| SurgeError::Archive(format!("Failed to compress delta: {e}")))
-    }
-}
-
-fn materialize_canonical_pack_root(source_root: &Path, bundled: &[BundledArtifact]) -> Result<tempfile::TempDir> {
-    let parent = source_root.parent().unwrap_or_else(|| Path::new("."));
-    let staging = tempfile::tempdir_in(parent)?;
-    mirror_tree(source_root, staging.path())?;
-    for artifact in bundled {
-        materialize_file_like(&artifact.source, &staging.path().join(&artifact.archive_name))?;
-    }
-    Ok(staging)
-}
-
-pub(crate) fn build_canonical_archive_from_directory(
-    source_root: &Path,
-    compression_level: i32,
-    n_workers: u32,
-    excluded_relative_paths: &BTreeSet<String>,
-) -> Result<Vec<u8>> {
-    let staging_root = if excluded_relative_paths.is_empty() {
-        None
-    } else {
-        Some(stage_directory_for_canonical_archive(
-            source_root,
-            excluded_relative_paths,
-        )?)
-    };
-    let pack_root = staging_root.as_ref().map_or(source_root, tempfile::TempDir::path);
-
-    let mut packer = ArchivePacker::with_threads(compression_level, n_workers)?;
-    packer.add_directory(pack_root, "")?;
-    packer.finalize()
-}
-
-fn stage_directory_for_canonical_archive(
-    source_root: &Path,
-    excluded_relative_paths: &BTreeSet<String>,
-) -> Result<tempfile::TempDir> {
-    let parent = source_root.parent().unwrap_or_else(|| Path::new("."));
-    let staging = tempfile::tempdir_in(parent)?;
-    mirror_tree_filtered(source_root, staging.path(), Path::new(""), excluded_relative_paths)?;
-    Ok(staging)
-}
-
-fn mirror_tree(source_root: &Path, dest_root: &Path) -> Result<()> {
-    std::fs::create_dir_all(dest_root)?;
-    let mut entries = std::fs::read_dir(source_root)?.collect::<std::result::Result<Vec<_>, std::io::Error>>()?;
-    entries.sort_by_key(std::fs::DirEntry::file_name);
-
-    for entry in entries {
-        let source = entry.path();
-        let dest = dest_root.join(entry.file_name());
-        let metadata = std::fs::symlink_metadata(&source)?;
-        let file_type = metadata.file_type();
-
-        if file_type.is_dir() {
-            mirror_tree(&source, &dest)?;
-        } else if file_type.is_file() || file_type.is_symlink() {
-            materialize_file_like(&source, &dest)?;
-        } else {
-            return Err(SurgeError::Pack(format!(
-                "Unsupported filesystem entry while staging full package: {}",
-                source.display()
-            )));
-        }
-    }
-
-    Ok(())
-}
-
-fn mirror_tree_filtered(
-    source_root: &Path,
-    dest_root: &Path,
-    relative_root: &Path,
-    excluded_relative_paths: &BTreeSet<String>,
-) -> Result<()> {
-    std::fs::create_dir_all(dest_root)?;
-    let mut entries = std::fs::read_dir(source_root)?.collect::<std::result::Result<Vec<_>, std::io::Error>>()?;
-    entries.sort_by_key(std::fs::DirEntry::file_name);
-
-    for entry in entries {
-        let relative_path = archive_child_path_for_staging(relative_root, &entry.file_name());
-        if excluded_relative_paths.contains(&archive_path_to_string_for_staging(&relative_path)) {
-            continue;
-        }
-
-        let source = entry.path();
-        let dest = dest_root.join(entry.file_name());
-        let metadata = std::fs::symlink_metadata(&source)?;
-        let file_type = metadata.file_type();
-
-        if file_type.is_dir() {
-            mirror_tree_filtered(&source, &dest, &relative_path, excluded_relative_paths)?;
-        } else if file_type.is_file() || file_type.is_symlink() {
-            materialize_file_like(&source, &dest)?;
-        } else {
-            return Err(SurgeError::Pack(format!(
-                "Unsupported filesystem entry while staging canonical archive: {}",
-                source.display()
-            )));
-        }
-    }
-
-    Ok(())
-}
-
-fn archive_child_path_for_staging(prefix: &Path, child_name: &std::ffi::OsStr) -> PathBuf {
-    if prefix.as_os_str().is_empty() {
-        PathBuf::from(child_name)
-    } else {
-        prefix.join(child_name)
-    }
-}
-
-fn archive_path_to_string_for_staging(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
-}
-
-fn materialize_file_like(source: &Path, dest: &Path) -> Result<()> {
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let metadata = std::fs::symlink_metadata(source)?;
-    if metadata.file_type().is_symlink() {
-        let target = std::fs::read_link(source)?;
-        create_symlink_for_staging(&target, dest)?;
-        return Ok(());
-    }
-
-    if let Err(err) = std::fs::hard_link(source, dest) {
-        std::fs::copy(source, dest).map_err(|copy_err| {
-            SurgeError::Pack(format!(
-                "Failed to stage bundled artifact '{}' via hard link ({err}) or copy ({copy_err})",
-                source.display()
-            ))
-        })?;
-    }
-
-    Ok(())
-}
-
-#[cfg(unix)]
-fn create_symlink_for_staging(target: &Path, dest: &Path) -> Result<()> {
-    std::os::unix::fs::symlink(target, dest)?;
-    Ok(())
-}
-
-#[cfg(windows)]
-fn create_symlink_for_staging(target: &Path, dest: &Path) -> Result<()> {
-    let metadata = std::fs::metadata(target)?;
-    if metadata.is_dir() {
-        std::os::windows::fs::symlink_dir(target, dest)?;
-    } else {
-        std::os::windows::fs::symlink_file(target, dest)?;
-    }
-    Ok(())
-}
-
-fn find_supervisor_binary(name: &str) -> Result<PathBuf> {
-    if let Ok(current_exe) = std::env::current_exe()
-        && let Some(parent) = current_exe.parent()
-    {
-        let candidate = parent.join(name);
-        if candidate.is_file() {
-            return Ok(candidate);
-        }
-    }
-    Err(SurgeError::Pack(format!(
-        "Supervisor binary '{name}' is required (supervisor_id is configured) but was not found next to the surge binary. Use the official Surge release bundle for this platform or place '{name}' next to surge."
-    )))
 }
 
 #[cfg(test)]
@@ -999,22 +350,34 @@ mod tests {
     use crate::crypto::sha256::sha256_hex;
     use crate::diff::wrapper::bsdiff_buffers;
     use crate::platform::detect::current_rid;
-    use crate::releases::manifest::{ReleaseEntry, ReleaseIndex, compress_release_index};
+    use crate::releases::manifest::{
+        DeltaArtifact, PATCH_FORMAT_SPARSE_FILE_OPS_V1, ReleaseEntry, ReleaseIndex, compress_release_index,
+        decompress_release_index,
+    };
     use crate::releases::restore::restore_full_archive_for_version;
 
     #[test]
     fn test_detect_os_from_rid() {
-        assert_eq!(detect_os_from_rid("linux-x64"), "linux");
-        assert_eq!(detect_os_from_rid("win-arm64"), "win");
-        assert_eq!(detect_os_from_rid("osx-x64"), "osx");
-        assert_eq!(detect_os_from_rid("unknown"), "unknown");
+        assert_eq!(release_index::detect_os_from_rid("linux-x64"), "linux");
+        assert_eq!(release_index::detect_os_from_rid("win-arm64"), "win");
+        assert_eq!(release_index::detect_os_from_rid("osx-x64"), "osx");
+        assert_eq!(release_index::detect_os_from_rid("unknown"), "unknown");
     }
 
     #[test]
     fn test_supervisor_binary_name_follows_target_rid() {
-        assert_eq!(supervisor_binary_name_for_rid("linux-x64"), "surge-supervisor");
-        assert_eq!(supervisor_binary_name_for_rid("osx-arm64"), "surge-supervisor");
-        assert_eq!(supervisor_binary_name_for_rid("win-x64"), "surge-supervisor.exe");
+        assert_eq!(
+            toolchain::supervisor_binary_name_for_rid("linux-x64"),
+            "surge-supervisor"
+        );
+        assert_eq!(
+            toolchain::supervisor_binary_name_for_rid("osx-arm64"),
+            "surge-supervisor"
+        );
+        assert_eq!(
+            toolchain::supervisor_binary_name_for_rid("win-x64"),
+            "surge-supervisor.exe"
+        );
     }
 
     #[test]
@@ -1036,15 +399,15 @@ mod tests {
     #[test]
     fn test_native_library_candidates_for_known_rids() {
         assert_eq!(
-            native_library_candidates_for_rid("linux-x64"),
+            toolchain::native_library_candidates_for_rid("linux-x64"),
             vec!["libsurge.so", "surge.so"]
         );
         assert_eq!(
-            native_library_candidates_for_rid("osx-arm64"),
+            toolchain::native_library_candidates_for_rid("osx-arm64"),
             vec!["libsurge.dylib", "surge.dylib"]
         );
         assert_eq!(
-            native_library_candidates_for_rid("win-x64"),
+            toolchain::native_library_candidates_for_rid("win-x64"),
             vec!["surge.dll", "libsurge.dll"]
         );
     }
@@ -1055,8 +418,9 @@ mod tests {
         let artifacts = tmp.path();
         std::fs::write(artifacts.join("Surge.NET.dll"), b"managed").expect("managed dll should be written");
 
-        let err = resolve_surge_dotnet_native_runtime_bundle_with_host(artifacts, "linux-x64", "linux-x64", &[])
-            .expect_err("validation should fail without native library");
+        let err =
+            toolchain::resolve_surge_dotnet_native_runtime_bundle_with_host(artifacts, "linux-x64", "linux-x64", &[])
+                .expect_err("validation should fail without native library");
         assert!(
             err.to_string().contains("Surge.NET.dll found in artifacts"),
             "unexpected error: {err}"
@@ -1070,8 +434,9 @@ mod tests {
         std::fs::write(artifacts.join("Surge.NET.dll"), b"managed").expect("managed dll should be written");
         std::fs::write(artifacts.join("libsurge.so"), b"native").expect("native lib should be written");
 
-        let bundled = resolve_surge_dotnet_native_runtime_bundle_with_host(artifacts, "linux-x64", "linux-x64", &[])
-            .expect("validation should pass with native library");
+        let bundled =
+            toolchain::resolve_surge_dotnet_native_runtime_bundle_with_host(artifacts, "linux-x64", "linux-x64", &[])
+                .expect("validation should pass with native library");
         assert!(bundled.is_none(), "existing artifact should not be rebundled");
     }
 
@@ -1086,10 +451,14 @@ mod tests {
         let bundled_path = toolchain.join("libsurge.so");
         std::fs::write(&bundled_path, b"native").expect("native lib should be written");
 
-        let bundled =
-            resolve_surge_dotnet_native_runtime_bundle_with_host(&artifacts, "linux-x64", "linux-x64", &[toolchain])
-                .expect("toolchain runtime should be accepted")
-                .expect("missing runtime should be bundled");
+        let bundled = toolchain::resolve_surge_dotnet_native_runtime_bundle_with_host(
+            &artifacts,
+            "linux-x64",
+            "linux-x64",
+            &[toolchain],
+        )
+        .expect("toolchain runtime should be accepted")
+        .expect("missing runtime should be bundled");
         assert_eq!(bundled.source, bundled_path);
         assert_eq!(bundled.archive_name, "libsurge.so");
     }
@@ -1101,8 +470,9 @@ mod tests {
         std::fs::create_dir_all(&artifacts).expect("artifacts dir should be created");
         std::fs::write(artifacts.join("Surge.NET.dll"), b"managed").expect("managed dll should be written");
 
-        let err = resolve_surge_dotnet_native_runtime_bundle_with_host(&artifacts, "win-x64", "linux-x64", &[])
-            .expect_err("cross-host runtime fallback should fail");
+        let err =
+            toolchain::resolve_surge_dotnet_native_runtime_bundle_with_host(&artifacts, "win-x64", "linux-x64", &[])
+                .expect_err("cross-host runtime fallback should fail");
         assert!(err.to_string().contains("host-only"));
     }
 
@@ -1153,7 +523,7 @@ mod tests {
         std::fs::write(&supervisor, b"supervisor").unwrap();
         std::fs::write(&native, b"native").unwrap();
 
-        let staging = materialize_canonical_pack_root(
+        let staging = staging::materialize_canonical_pack_root(
             &artifacts,
             &[
                 BundledArtifact {
@@ -1202,7 +572,7 @@ mod tests {
         legacy.add_file(&native, "libsurge.so").unwrap();
         let legacy_archive = legacy.finalize().unwrap();
 
-        let staging = materialize_canonical_pack_root(
+        let staging = staging::materialize_canonical_pack_root(
             &artifacts,
             &[
                 BundledArtifact {

@@ -15,7 +15,9 @@
 //! use `#[no_mangle] pub unsafe extern "C"` and catch panics at the boundary.
 
 mod context;
+mod diff;
 mod handles;
+mod pack;
 mod releases;
 mod shared;
 mod update;
@@ -26,31 +28,30 @@ use std::ffi::{c_char, c_int, c_void};
 use std::path::Path;
 use std::ptr;
 
-use surge_core::diff::wrapper::{bsdiff_buffers, bspatch_buffers};
 use surge_core::lock::mutex::DistributedMutex;
-use surge_core::pack::builder::PackBuilder;
 use surge_core::supervisor::state::{supervisor_pid_file, supervisor_stop_file, write_restart_args};
 
 pub use crate::context::{
     surge_config_set_lock_server, surge_config_set_resource_budget, surge_config_set_storage, surge_context_create,
     surge_context_destroy, surge_context_last_error,
 };
-use crate::handles::{SurgeContextHandle, SurgePackContextHandle};
+pub use crate::diff::{surge_bsdiff, surge_bsdiff_free, surge_bspatch, surge_bspatch_free};
+use crate::handles::SurgeContextHandle;
+pub use crate::pack::{surge_pack_build, surge_pack_create, surge_pack_destroy, surge_pack_push};
 pub use crate::releases::{
     surge_release_channel, surge_release_full_size, surge_release_is_genesis, surge_release_version,
     surge_releases_count, surge_releases_destroy,
 };
 use crate::shared::{
-    SURGE_CANCELLED, SURGE_ERROR, SURGE_OK, SURGE_PHASE_CHECK, SURGE_PHASE_DOWNLOAD, SurgeEventCallback,
-    SurgeProgressCallback, catch_ffi, clear_shared_error, collect_argv, cstr_to_string, libc_malloc,
-    make_pack_progress, set_ctx_error, set_shared_error, try_len, try_len_allow_zero,
+    SURGE_CANCELLED, SURGE_ERROR, SURGE_OK, SurgeEventCallback, catch_ffi, collect_argv, cstr_to_string, libc_malloc,
+    set_ctx_error,
 };
 pub use crate::update::{
     surge_update_check, surge_update_download_and_apply, surge_update_manager_create, surge_update_manager_destroy,
     surge_update_manager_set_channel, surge_update_manager_set_current_version,
     surge_update_manager_set_release_retention_limit,
 };
-use crate::utils::{lock_recover, to_lossy_cstring};
+use crate::utils::to_lossy_cstring;
 
 // ---------------------------------------------------------------------------
 //  #[repr(C)] structs matching surge_api.h
@@ -97,351 +98,6 @@ pub struct SurgeBspatchCtxFfi {
     pub patch: *const u8,
     pub patch_size: i64,
     pub status: i32,
-}
-
-// =========================================================================
-//  5. Binary diff / patch -- bsdiff / bspatch (4 functions)
-// =========================================================================
-
-/// Create a binary diff patch.
-///
-/// On success, `ctx->patch` and `ctx->patch_size` are set.
-/// Free the patch buffer with `surge_bsdiff_free`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn surge_bsdiff(ctx: *mut SurgeBsdiffCtxFfi) -> i32 {
-    if ctx.is_null() {
-        return SURGE_ERROR;
-    }
-
-    catch_ffi(std::panic::AssertUnwindSafe(|| {
-        let c = unsafe { &mut *ctx };
-
-        let Some(older_size) = try_len(c.older_size) else {
-            c.status = SURGE_ERROR;
-            return SURGE_ERROR;
-        };
-        let Some(newer_size) = try_len(c.newer_size) else {
-            c.status = SURGE_ERROR;
-            return SURGE_ERROR;
-        };
-        if c.older.is_null() || c.newer.is_null() {
-            c.status = SURGE_ERROR;
-            return SURGE_ERROR;
-        }
-
-        let older = unsafe { std::slice::from_raw_parts(c.older, older_size) };
-        let newer = unsafe { std::slice::from_raw_parts(c.newer, newer_size) };
-
-        match bsdiff_buffers(older, newer) {
-            Ok(patch) => {
-                let len = patch.len();
-                let boxed = patch.into_boxed_slice();
-                let ptr = Box::into_raw(boxed).cast::<u8>();
-                c.patch = ptr;
-                let Some(patch_size) = i64::try_from(len).ok() else {
-                    c.patch = ptr::null_mut();
-                    c.patch_size = 0;
-                    c.status = SURGE_ERROR;
-                    return SURGE_ERROR;
-                };
-                c.patch_size = patch_size;
-                c.status = SURGE_OK;
-                SURGE_OK
-            }
-            Err(e) => {
-                c.patch = ptr::null_mut();
-                c.patch_size = 0;
-                c.status = SURGE_ERROR;
-                tracing::error!("bsdiff failed: {e}");
-                SURGE_ERROR
-            }
-        }
-    }))
-}
-
-/// Apply a binary diff patch.
-///
-/// On success, `ctx->newer` and `ctx->newer_size` are set.
-/// Free the output buffer with `surge_bspatch_free`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn surge_bspatch(ctx: *mut SurgeBspatchCtxFfi) -> i32 {
-    if ctx.is_null() {
-        return SURGE_ERROR;
-    }
-
-    catch_ffi(std::panic::AssertUnwindSafe(|| {
-        let c = unsafe { &mut *ctx };
-
-        let Some(older_size) = try_len(c.older_size) else {
-            c.status = SURGE_ERROR;
-            return SURGE_ERROR;
-        };
-        let Some(patch_size) = try_len(c.patch_size) else {
-            c.status = SURGE_ERROR;
-            return SURGE_ERROR;
-        };
-        if c.older.is_null() || c.patch.is_null() {
-            c.status = SURGE_ERROR;
-            return SURGE_ERROR;
-        }
-
-        let older = unsafe { std::slice::from_raw_parts(c.older, older_size) };
-        let patch = unsafe { std::slice::from_raw_parts(c.patch, patch_size) };
-
-        match bspatch_buffers(older, patch) {
-            Ok(newer) => {
-                let len = newer.len();
-                let boxed = newer.into_boxed_slice();
-                let ptr = Box::into_raw(boxed).cast::<u8>();
-                c.newer = ptr;
-                let Some(newer_size) = i64::try_from(len).ok() else {
-                    c.newer = ptr::null_mut();
-                    c.newer_size = 0;
-                    c.status = SURGE_ERROR;
-                    return SURGE_ERROR;
-                };
-                c.newer_size = newer_size;
-                c.status = SURGE_OK;
-                SURGE_OK
-            }
-            Err(e) => {
-                c.newer = ptr::null_mut();
-                c.newer_size = 0;
-                c.status = SURGE_ERROR;
-                tracing::error!("bspatch failed: {e}");
-                SURGE_ERROR
-            }
-        }
-    }))
-}
-
-/// Free the patch buffer allocated by `surge_bsdiff`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn surge_bsdiff_free(ctx: *mut SurgeBsdiffCtxFfi) {
-    if ctx.is_null() {
-        return;
-    }
-
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let c = unsafe { &mut *ctx };
-        if !c.patch.is_null() {
-            let Some(patch_size) = try_len_allow_zero(c.patch_size) else {
-                c.patch = ptr::null_mut();
-                c.patch_size = 0;
-                return;
-            };
-            // Reconstruct the boxed slice and drop it.
-            let slice_ptr = core::ptr::slice_from_raw_parts_mut(c.patch, patch_size);
-            drop(unsafe { Box::from_raw(slice_ptr) });
-            c.patch = ptr::null_mut();
-            c.patch_size = 0;
-        }
-    }));
-}
-
-/// Free the newer buffer allocated by `surge_bspatch`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn surge_bspatch_free(ctx: *mut SurgeBspatchCtxFfi) {
-    if ctx.is_null() {
-        return;
-    }
-
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let c = unsafe { &mut *ctx };
-        if !c.newer.is_null() {
-            let Some(newer_size) = try_len_allow_zero(c.newer_size) else {
-                c.newer = ptr::null_mut();
-                c.newer_size = 0;
-                return;
-            };
-            let slice_ptr = core::ptr::slice_from_raw_parts_mut(c.newer, newer_size);
-            drop(unsafe { Box::from_raw(slice_ptr) });
-            c.newer = ptr::null_mut();
-            c.newer_size = 0;
-        }
-    }));
-}
-
-// =========================================================================
-//  6. Pack builder (4 functions)
-// =========================================================================
-
-/// Create a new pack context for building release packages.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn surge_pack_create(
-    ctx: *mut SurgeContextHandle,
-    manifest_path: *const c_char,
-    app_id: *const c_char,
-    rid: *const c_char,
-    version: *const c_char,
-    artifacts_dir: *const c_char,
-) -> *mut SurgePackContextHandle {
-    if ctx.is_null() {
-        return ptr::null_mut();
-    }
-
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        // SAFETY: `ctx` is checked non-null above.
-        let handle = unsafe { &*ctx };
-        handle.clear_last_error();
-
-        // SAFETY: string pointers follow this API's nullable C string
-        // contract.
-        let (manifest_s, app_id_s, rid_s, version_s, artifacts_s) = unsafe {
-            (
-                cstr_to_string(manifest_path),
-                cstr_to_string(app_id),
-                cstr_to_string(rid),
-                cstr_to_string(version),
-                cstr_to_string(artifacts_dir),
-            )
-        };
-
-        if manifest_s.is_empty() || app_id_s.is_empty() || version_s.is_empty() || artifacts_s.is_empty() {
-            let e = surge_core::error::SurgeError::Config(
-                "manifest_path, app_id, version, and artifacts_dir are required".into(),
-            );
-            set_ctx_error(handle, &e);
-            return ptr::null_mut();
-        }
-
-        let pack = Box::new(SurgePackContextHandle {
-            ctx: handle.ctx.clone(),
-            runtime: handle.runtime.clone(),
-            last_error: handle.shared_last_error.clone(),
-            manifest_path: manifest_s,
-            app_id: app_id_s,
-            rid: rid_s,
-            version: version_s,
-            artifacts_dir: artifacts_s,
-            builder: std::sync::Mutex::new(None),
-        });
-
-        Box::into_raw(pack)
-    }));
-
-    result.unwrap_or(ptr::null_mut())
-}
-
-/// Build release packages (full + delta).
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn surge_pack_build(
-    pack_ctx: *mut SurgePackContextHandle,
-    progress_cb: SurgeProgressCallback,
-    user_data: *mut c_void,
-) -> i32 {
-    if pack_ctx.is_null() {
-        return SURGE_ERROR;
-    }
-
-    catch_ffi(std::panic::AssertUnwindSafe(|| {
-        // SAFETY: `pack_ctx` is checked non-null above.
-        let pack = unsafe { &*pack_ctx };
-        clear_shared_error(&pack.ctx, &pack.last_error);
-
-        if pack.ctx.is_cancelled() {
-            return SURGE_CANCELLED;
-        }
-
-        let mut builder = match PackBuilder::new(
-            pack.ctx.clone(),
-            &pack.manifest_path,
-            &pack.app_id,
-            &pack.rid,
-            &pack.version,
-            &pack.artifacts_dir,
-        ) {
-            Ok(b) => b,
-            Err(e) => return set_shared_error(&pack.ctx, &pack.last_error, &e),
-        };
-
-        let progress_fn = progress_cb.map(|cb| {
-            move |done: i32, total: i32| {
-                let ffi = make_pack_progress(SURGE_PHASE_CHECK, done, total);
-                cb(&ffi, user_data);
-            }
-        });
-
-        let result = pack
-            .runtime
-            .block_on(builder.build(progress_fn.as_ref().map(|f| f as &dyn Fn(i32, i32))));
-
-        match result {
-            Ok(()) => {
-                // Store the builder so surge_pack_push can use it.
-                let mut slot = lock_recover(&pack.builder);
-                *slot = Some(builder);
-                SURGE_OK
-            }
-            Err(e) => set_shared_error(&pack.ctx, &pack.last_error, &e),
-        }
-    }))
-}
-
-/// Push built packages to the configured storage backend.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn surge_pack_push(
-    pack_ctx: *mut SurgePackContextHandle,
-    channel: *const c_char,
-    progress_cb: SurgeProgressCallback,
-    user_data: *mut c_void,
-) -> i32 {
-    if pack_ctx.is_null() {
-        return SURGE_ERROR;
-    }
-
-    catch_ffi(std::panic::AssertUnwindSafe(|| {
-        let pack = unsafe { &*pack_ctx };
-        clear_shared_error(&pack.ctx, &pack.last_error);
-
-        if pack.ctx.is_cancelled() {
-            return SURGE_CANCELLED;
-        }
-
-        // SAFETY: `channel` follows the nullable C string contract.
-        let channel_s = unsafe { cstr_to_string(channel) };
-
-        // Take the builder that was stored by surge_pack_build.
-        let builder = {
-            let mut slot = lock_recover(&pack.builder);
-            slot.take()
-        };
-
-        let builder = match builder {
-            Some(b) => b,
-            None => {
-                let e =
-                    surge_core::error::SurgeError::Pack("No builder available. Call surge_pack_build first.".into());
-                return set_shared_error(&pack.ctx, &pack.last_error, &e);
-            }
-        };
-
-        let progress_fn = progress_cb.map(|cb| {
-            move |done: i32, total: i32| {
-                let ffi = make_pack_progress(SURGE_PHASE_DOWNLOAD, done, total);
-                cb(&ffi, user_data);
-            }
-        });
-
-        let result = pack
-            .runtime
-            .block_on(builder.push(&channel_s, progress_fn.as_ref().map(|f| f as &dyn Fn(i32, i32))));
-
-        match result {
-            Ok(()) => SURGE_OK,
-            Err(e) => set_shared_error(&pack.ctx, &pack.last_error, &e),
-        }
-    }))
-}
-
-/// Destroy a pack context.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn surge_pack_destroy(pack_ctx: *mut SurgePackContextHandle) {
-    if !pack_ctx.is_null() {
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            drop(unsafe { Box::from_raw(pack_ctx) });
-        }));
-    }
 }
 
 // =========================================================================
@@ -765,121 +421,4 @@ pub unsafe extern "C" fn surge_cancel(ctx: *mut SurgeContextHandle) -> i32 {
         handle.ctx.cancel();
         SURGE_OK
     }))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::ffi::{CStr, CString};
-
-    #[test]
-    fn bspatch_free_releases_zero_length_buffer() {
-        let empty: Box<[u8]> = Vec::new().into_boxed_slice();
-        let ptr = Box::into_raw(empty).cast::<u8>();
-        let mut ctx = SurgeBspatchCtxFfi {
-            older: std::ptr::null(),
-            older_size: 0,
-            newer: ptr,
-            newer_size: 0,
-            patch: std::ptr::null(),
-            patch_size: 0,
-            status: 0,
-        };
-
-        unsafe { surge_bspatch_free(&mut ctx) };
-        assert!(ctx.newer.is_null());
-        assert_eq!(ctx.newer_size, 0);
-    }
-
-    #[test]
-    fn bsdiff_free_releases_zero_length_buffer() {
-        let empty: Box<[u8]> = Vec::new().into_boxed_slice();
-        let ptr = Box::into_raw(empty).cast::<u8>();
-        let mut ctx = SurgeBsdiffCtxFfi {
-            older: std::ptr::null(),
-            older_size: 0,
-            newer: std::ptr::null(),
-            newer_size: 0,
-            patch: ptr,
-            patch_size: 0,
-            status: 0,
-        };
-
-        unsafe { surge_bsdiff_free(&mut ctx) };
-        assert!(ctx.patch.is_null());
-        assert_eq!(ctx.patch_size, 0);
-    }
-
-    #[test]
-    fn pack_push_without_build_sets_context_error() {
-        let ctx = surge_context_create();
-        assert!(!ctx.is_null());
-
-        let manifest = CString::new("placeholder.yml").unwrap();
-        let app_id = CString::new("demo").unwrap();
-        let rid = CString::new("linux-x64").unwrap();
-        let version = CString::new("1.0.0").unwrap();
-        let artifacts = CString::new("artifacts").unwrap();
-
-        let pack = unsafe {
-            surge_pack_create(
-                ctx,
-                manifest.as_ptr(),
-                app_id.as_ptr(),
-                rid.as_ptr(),
-                version.as_ptr(),
-                artifacts.as_ptr(),
-            )
-        };
-        assert!(!pack.is_null());
-
-        let channel = CString::new("stable").unwrap();
-        let rc = unsafe { surge_pack_push(pack, channel.as_ptr(), None, std::ptr::null_mut()) };
-        assert_ne!(rc, SURGE_OK);
-
-        let last = unsafe { surge_context_last_error(ctx) };
-        assert!(!last.is_null());
-        let msg = unsafe { CStr::from_ptr((*last).message) }
-            .to_str()
-            .unwrap_or_default()
-            .to_string();
-        assert!(msg.contains("Call surge_pack_build first"));
-
-        unsafe {
-            surge_pack_destroy(pack);
-            surge_context_destroy(ctx);
-        }
-    }
-
-    #[test]
-    fn pack_handle_survives_context_destroy() {
-        let ctx = surge_context_create();
-        assert!(!ctx.is_null());
-
-        let manifest = CString::new("placeholder.yml").unwrap();
-        let app_id = CString::new("demo").unwrap();
-        let rid = CString::new("linux-x64").unwrap();
-        let version = CString::new("1.0.0").unwrap();
-        let artifacts = CString::new("artifacts").unwrap();
-
-        let pack = unsafe {
-            surge_pack_create(
-                ctx,
-                manifest.as_ptr(),
-                app_id.as_ptr(),
-                rid.as_ptr(),
-                version.as_ptr(),
-                artifacts.as_ptr(),
-            )
-        };
-        assert!(!pack.is_null());
-
-        unsafe { surge_context_destroy(ctx) };
-
-        let channel = CString::new("stable").unwrap();
-        let rc = unsafe { surge_pack_push(pack, channel.as_ptr(), None, std::ptr::null_mut()) };
-        assert_ne!(rc, SURGE_OK);
-
-        unsafe { surge_pack_destroy(pack) };
-    }
 }

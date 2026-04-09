@@ -35,6 +35,27 @@ pub struct StorageOverrides<'a> {
     pub prefix: Option<&'a str>,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct InstallBehavior {
+    pub plan_only: bool,
+    pub no_start: bool,
+    pub force: bool,
+    pub stage: StageBehavior,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum StageBehavior {
+    #[default]
+    Install,
+    StageOnly,
+}
+
+impl StageBehavior {
+    fn is_stage(self) -> bool {
+        matches!(self, Self::StageOnly)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RuntimeProfile {
     os: String,
@@ -110,6 +131,12 @@ enum RemoteInstallerMode {
     Offline,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteTailscaleTransferStrategy {
+    AppCopy,
+    Installer { prefer_published: bool },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InstallSelection {
     app_id: String,
@@ -144,9 +171,7 @@ pub async fn execute(
     channel: Option<&str>,
     rid: Option<&str>,
     version: Option<&str>,
-    plan_only: bool,
-    no_start: bool,
-    force: bool,
+    behavior: InstallBehavior,
     download_dir: &Path,
     overrides: StorageOverrides<'_>,
 ) -> Result<()> {
@@ -371,7 +396,7 @@ pub async fn execute(
         )));
     }
 
-    if plan_only {
+    if behavior.plan_only {
         match &install_target {
             InstallTarget::Local => {
                 logline::warn("Plan only mode: no download performed. Remove --plan-only to fetch the package.");
@@ -431,7 +456,7 @@ pub async fn execute(
                 active_app_dir.display()
             ));
 
-            if !no_start && !plan_only {
+            if !behavior.no_start && !behavior.plan_only {
                 let display_name = release.display_name(&app_id);
                 match auto_start_after_install(release, &app_id, &install_root, &active_app_dir) {
                     Ok(pid) => {
@@ -455,7 +480,7 @@ pub async fn execute(
             };
             let remote_state = check_remote_install_state(ssh_target, install_dir).await;
             let install_matches = remote_install_matches(remote_state.as_ref(), &release.version, &channel);
-            if should_skip_remote_install(install_matches, force) {
+            if should_skip_remote_install(install_matches, behavior.force) {
                 logline::success(&format!(
                     "'{app_id}' v{} ({channel}) is already installed on '{file_target}', skipping.",
                     release.version
@@ -489,7 +514,22 @@ pub async fn execute(
                         "No remote graphical session environment detected; install will default to headless startup.",
                     );
                 }
-                if !host_can_build_installer_locally(&selected_rid) {
+                let host_can_build_installer = host_can_build_installer_locally(&selected_rid);
+                let has_matching_pre_staged_version = if host_can_build_installer
+                    && installer_mode == RemoteInstallerMode::Offline
+                    && !behavior.stage.is_stage()
+                {
+                    remote_staged_version_matches_release(ssh_target, &app_id, release).await?
+                } else {
+                    false
+                };
+                let transfer_strategy = select_remote_tailscale_transfer_strategy(
+                    host_can_build_installer,
+                    installer_mode,
+                    behavior.stage.is_stage(),
+                    has_matching_pre_staged_version,
+                );
+                if matches!(transfer_strategy, RemoteTailscaleTransferStrategy::AppCopy) {
                     deploy_remote_app_copy_for_tailscale(
                         &*backend,
                         &index,
@@ -504,10 +544,18 @@ pub async fn execute(
                         &launch_env,
                         &rid_candidates,
                         full_filename,
-                        no_start,
+                        behavior.no_start,
+                        behavior.stage.is_stage(),
                     )
                     .await?;
-                    logline::success(&format!("Installed '{app_id}' on tailscale node '{file_target}'."));
+                    if behavior.stage.is_stage() {
+                        logline::success(&format!(
+                            "Staged '{app_id}' v{} on tailscale node '{file_target}'.",
+                            release.version
+                        ));
+                    } else {
+                        logline::success(&format!("Installed '{app_id}' on tailscale node '{file_target}'."));
+                    }
                     return Ok(());
                 }
                 let published_installer_plan = if let Some(manifest) = manifest.as_ref() {
@@ -528,22 +576,29 @@ pub async fn execute(
                         installer_mode,
                     )
                 };
-                let installer_path = if let Some(installer_path) = try_prepare_published_installer_for_tailscale(
-                    &*backend,
-                    download_dir,
-                    &published_installer_plan,
-                    &app_id,
-                    release,
-                    &channel,
-                    &storage_config,
-                    &launch_env,
-                    installer_mode,
-                )
-                .await?
-                {
+                let published_installer_path = if matches!(
+                    transfer_strategy,
+                    RemoteTailscaleTransferStrategy::Installer { prefer_published: true }
+                ) {
+                    try_prepare_published_installer_for_tailscale(
+                        &*backend,
+                        download_dir,
+                        &published_installer_plan,
+                        &app_id,
+                        release,
+                        &channel,
+                        &storage_config,
+                        &launch_env,
+                        installer_mode,
+                    )
+                    .await?
+                } else {
+                    None
+                };
+                let installer_path = if let Some(installer_path) = published_installer_path {
                     installer_path
                 } else if installer_mode == RemoteInstallerMode::Offline {
-                    if !host_can_build_installer_locally(&selected_rid) {
+                    if !host_can_build_installer {
                         return Err(missing_remote_installer_error(
                             &selected_rid,
                             &published_installer_plan,
@@ -596,7 +651,7 @@ pub async fn execute(
                         installer_mode,
                     )?
                 } else {
-                    if !host_can_build_installer_locally(&selected_rid) {
+                    if !host_can_build_installer {
                         return Err(missing_remote_installer_error(
                             &selected_rid,
                             &published_installer_plan,
@@ -628,12 +683,25 @@ pub async fn execute(
                 )
                 .await?;
 
-                let no_start_flag = if no_start { " --no-start" } else { "" };
-                let run_cmd = format!("/tmp/.surge-installer{no_start_flag} && rm -f /tmp/.surge-installer");
+                let no_start_flag = if behavior.no_start { " --no-start" } else { "" };
+                let stage_flag = if behavior.stage.is_stage() { " --stage" } else { "" };
+                let run_cmd =
+                    format!("/tmp/.surge-installer{no_start_flag}{stage_flag} && rm -f /tmp/.surge-installer");
                 let ssh_command = format!("sh -lc {}", shell_single_quote(&run_cmd));
-                logline::info(&format!("Running installer on '{file_target}'..."));
+                if behavior.stage.is_stage() {
+                    logline::info(&format!("Running installer in stage mode on '{file_target}'..."));
+                } else {
+                    logline::info(&format!("Running installer on '{file_target}'..."));
+                }
                 run_tailscale_streaming(&["ssh", ssh_target, ssh_command.as_str()], "remote").await?;
-                logline::success(&format!("Installed '{app_id}' on tailscale node '{file_target}'."));
+                if behavior.stage.is_stage() {
+                    logline::success(&format!(
+                        "Staged '{app_id}' v{} on tailscale node '{file_target}'.",
+                        release.version
+                    ));
+                } else {
+                    logline::success(&format!("Installed '{app_id}' on tailscale node '{file_target}'."));
+                }
             }
         }
     }
@@ -2451,7 +2519,47 @@ async fn deploy_remote_app_copy_for_tailscale(
     rid_candidates: &[String],
     full_filename: &str,
     no_start: bool,
+    stage: bool,
 ) -> Result<()> {
+    let remote_home = detect_remote_home_directory(ssh_target).await?;
+    let install_root = remote_install_root(&remote_home, app_id, &release.install_directory)?;
+    let active_app_dir = install_root.join("app");
+    let runtime_environment = build_remote_runtime_environment(release, launch_env);
+    let main_exe_name = if release.main_exe.trim().is_empty() {
+        app_id
+    } else {
+        release.main_exe.trim()
+    };
+
+    // When not staging, check if a previous --stage run already transferred
+    // the correct version. If so, skip re-transfer and go straight to activation.
+    if !stage
+        && let Some(staged_version) = check_remote_staged_version(ssh_target, &install_root).await
+        && staged_version == release.version
+    {
+        logline::success(&format!(
+            "Using pre-staged payload for '{app_id}' v{} on '{file_target}'.",
+            release.version
+        ));
+        let legacy_app_dir = if release.persistent_assets.is_empty() {
+            None
+        } else {
+            detect_remote_legacy_app_dir(ssh_target, &install_root).await?
+        };
+        let activation_script = build_remote_app_copy_activation_script(
+            &install_root,
+            main_exe_name,
+            &release.version,
+            &runtime_environment,
+            &release.persistent_assets,
+            legacy_app_dir.as_deref(),
+            no_start,
+        )?;
+        let ssh_command = format!("sh -lc {}", shell_single_quote(&activation_script));
+        logline::info(&format!("Activating pre-staged install on '{file_target}'..."));
+        return run_tailscale_streaming(&["ssh", ssh_target, ssh_command.as_str()], "remote").await;
+    }
+
     std::fs::create_dir_all(download_dir)?;
     let local_package = download_dir.join(Path::new(full_filename).file_name().unwrap_or_default());
     let acquisition =
@@ -2478,16 +2586,6 @@ async fn deploy_remote_app_copy_for_tailscale(
             ));
         }
     }
-
-    let remote_home = detect_remote_home_directory(ssh_target).await?;
-    let install_root = remote_install_root(&remote_home, app_id, &release.install_directory)?;
-    let active_app_dir = install_root.join("app");
-    let runtime_environment = build_remote_runtime_environment(release, launch_env);
-    let main_exe_name = if release.main_exe.trim().is_empty() {
-        app_id
-    } else {
-        release.main_exe.trim()
-    };
 
     let staging_dir =
         tempfile::tempdir().map_err(|e| SurgeError::Platform(format!("Failed to create staging directory: {e}")))?;
@@ -2531,6 +2629,18 @@ mkdir -p \"$install_root\"; rm -rf \"$stage_dir\"; mkdir -p \"$stage_dir\"; tar 
     ));
     stream_directory_to_tailscale_node_with_command(ssh_target, &stage_root, &transfer_command).await?;
 
+    if stage {
+        // Write a version marker so the next install can detect what was staged
+        let marker_cmd = format!(
+            "echo {} > {}/.surge-transfer-stage/.surge-staged-version",
+            shell_single_quote(&release.version),
+            shell_single_quote(&install_root.to_string_lossy())
+        );
+        let ssh_command = format!("sh -lc {}", shell_single_quote(&marker_cmd));
+        run_tailscale_streaming(&["ssh", ssh_target, ssh_command.as_str()], "remote").await?;
+        return Ok(());
+    }
+
     let activation_script = build_remote_app_copy_activation_script(
         &install_root,
         main_exe_name,
@@ -2555,6 +2665,23 @@ fn select_remote_installer_mode(storage_config: &surge_core::context::StorageCon
         | surge_core::context::StorageProvider::AzureBlob
         | surge_core::context::StorageProvider::Gcs
         | surge_core::context::StorageProvider::GitHubReleases => RemoteInstallerMode::Online,
+    }
+}
+
+fn select_remote_tailscale_transfer_strategy(
+    host_can_build_installer: bool,
+    installer_mode: RemoteInstallerMode,
+    stage: bool,
+    has_matching_pre_staged_version: bool,
+) -> RemoteTailscaleTransferStrategy {
+    if !host_can_build_installer
+        || matches!(installer_mode, RemoteInstallerMode::Offline) && (stage || has_matching_pre_staged_version)
+    {
+        RemoteTailscaleTransferStrategy::AppCopy
+    } else {
+        RemoteTailscaleTransferStrategy::Installer {
+            prefer_published: !stage,
+        }
     }
 }
 
@@ -2703,6 +2830,27 @@ fn parse_remote_install_state(output: &str) -> Option<RemoteInstallState> {
     }
 
     version.map(|version| RemoteInstallState { version, channel })
+}
+
+async fn check_remote_staged_version(ssh_node: &str, install_root: &Path) -> Option<String> {
+    let probe = format!(
+        "cat {}/.surge-transfer-stage/.surge-staged-version 2>/dev/null",
+        shell_single_quote(&install_root.to_string_lossy())
+    );
+    let command = format!("sh -c {}", shell_single_quote(&probe));
+    match run_tailscale_capture(&["ssh", ssh_node, command.as_str()]).await {
+        Ok(output) => {
+            let version = output.trim().to_string();
+            if version.is_empty() { None } else { Some(version) }
+        }
+        Err(_) => None,
+    }
+}
+
+async fn remote_staged_version_matches_release(ssh_node: &str, app_id: &str, release: &ReleaseEntry) -> Result<bool> {
+    let remote_home = detect_remote_home_directory(ssh_node).await?;
+    let install_root = remote_install_root(&remote_home, app_id, &release.install_directory)?;
+    Ok(check_remote_staged_version(ssh_node, &install_root).await.as_deref() == Some(release.version.as_str()))
 }
 
 async fn detect_remote_launch_environment(ssh_node: &str) -> RemoteLaunchEnvironment {
@@ -3295,6 +3443,36 @@ mod tests {
     }
 
     #[test]
+    fn select_remote_tailscale_transfer_strategy_uses_app_copy_when_stage_reduces_transfer() {
+        assert_eq!(
+            select_remote_tailscale_transfer_strategy(true, RemoteInstallerMode::Offline, true, false),
+            RemoteTailscaleTransferStrategy::AppCopy
+        );
+        assert_eq!(
+            select_remote_tailscale_transfer_strategy(true, RemoteInstallerMode::Offline, false, true),
+            RemoteTailscaleTransferStrategy::AppCopy
+        );
+        assert_eq!(
+            select_remote_tailscale_transfer_strategy(false, RemoteInstallerMode::Online, false, false),
+            RemoteTailscaleTransferStrategy::AppCopy
+        );
+    }
+
+    #[test]
+    fn select_remote_tailscale_transfer_strategy_disables_published_installers_for_stage_mode() {
+        assert_eq!(
+            select_remote_tailscale_transfer_strategy(true, RemoteInstallerMode::Online, true, false),
+            RemoteTailscaleTransferStrategy::Installer {
+                prefer_published: false
+            }
+        );
+        assert_eq!(
+            select_remote_tailscale_transfer_strategy(true, RemoteInstallerMode::Online, false, false),
+            RemoteTailscaleTransferStrategy::Installer { prefer_published: true }
+        );
+    }
+
+    #[test]
     fn plan_remote_published_installer_uses_default_channel_key() {
         let manifest = remote_manifest("demo", "linux-arm64", &["test", "production"], &["online"]);
         let mut entry = release("1.2.3", "test", "linux-arm64", "demo.tar.zst");
@@ -3570,9 +3748,12 @@ mod tests {
             Some("stable"),
             Some(&rid),
             Some("1.2.3"),
-            false,
-            true,
-            false,
+            InstallBehavior {
+                plan_only: false,
+                no_start: true,
+                force: false,
+                stage: StageBehavior::Install,
+            },
             &download_dir,
             StorageOverrides::default(),
         )

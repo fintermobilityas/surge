@@ -33,6 +33,7 @@ These PRs are already merged:
 - `#61` `refactor(core): split pack builder full delta and index update flows`
 - `#62` `refactor(cli): split pack command installer resolution and upload flow`
 - `#63` `refactor(core): split release restore planning and artifact recovery`
+- `#64` `refactor(core): split shortcut installation by platform`
 
 ## Active Phase
 
@@ -70,14 +71,7 @@ Exit criteria:
 
 These are the remaining planned PRs from the original Rust-first campaign.
 
-### 1. `refactor/shortcuts-phase-1`
-
-- split [`crates/surge-core/src/platform/shortcuts.rs`](../../crates/surge-core/src/platform/shortcuts.rs)
-  into a module tree
-- keep the root orchestration-only
-- move platform behavior into `linux`, `windows`, `macos`, and shared helper modules
-
-### 2. `refactor/manifest-phase-1`
+### 1. `refactor/manifest-phase-1`
 
 - split [`crates/surge-core/src/config/manifest/mod.rs`](../../crates/surge-core/src/config/manifest/mod.rs)
   into focused modules for:
@@ -86,7 +80,7 @@ These are the remaining planned PRs from the original Rust-first campaign.
   - validation
   - effective-config or installer metadata helpers
 
-### 3. `refactor/maintainability-phase-2`
+### 2. `refactor/maintainability-phase-2`
 
 - switch maintainability enforcement from advisory-only to blocking for the
   remaining Rust source tree

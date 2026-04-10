@@ -36,35 +36,37 @@ These PRs are already merged:
 - `#64` `refactor(core): split shortcut installation by platform`
 - `#65` `refactor(core): split manifest module responsibilities`
 - `#66` `refactor(core): split install module responsibilities`
+- `#67` `refactor(core): split azure storage backend helpers`
 
 ## Active Phase
 
-### `refactor/storage-azure-phase-1`
+### `refactor/storage-gcs-phase-1`
 
 Current goal:
 
-- split [`crates/surge-core/src/storage/azure/mod.rs`](../../crates/surge-core/src/storage/azure/mod.rs)
+- split [`crates/surge-core/src/storage/gcs/mod.rs`](../../crates/surge-core/src/storage/gcs/mod.rs)
   into:
-  - `storage/azure/auth.rs`
-  - `storage/azure/requests.rs`
-  - `storage/azure/listing.rs`
+  - `storage/gcs/auth.rs`
+  - `storage/gcs/requests.rs`
+  - `storage/gcs/xml_listing.rs`
+  - `storage/gcs/json_listing.rs`
 
 Current checkpoint:
 
 - the leaf modules have been created
 - the root module has been reduced to the backend type and module wiring
 - targeted compile of `surge-core` passes
-- focused `storage::azure` tests pass
+- focused `storage::gcs` tests pass
 - focused `surge-core` clippy passes
-- the azure baseline entry has been removed
+- the gcs baseline entry has been removed
 - the full pre-push suite passes on the branch
 
 Exit criteria:
 
-- `cargo test -p surge-core storage::azure` passes
+- `cargo test -p surge-core storage::gcs` passes
 - `cargo clippy -p surge-core --all-targets --all-features -- -D warnings -W clippy::pedantic` passes
 - `./scripts/check-maintainability.sh` reports the file below the target so the
-  azure baseline entry can be removed
+  gcs baseline entry can be removed
 - the full pre-push suite passes
 - the PR is merged with squash, local cleanup is done, and merged-`main` CI is green
 
@@ -72,13 +74,14 @@ Exit criteria:
 
 These are the remaining planned PRs from the original Rust-first campaign.
 
-### 1. `refactor/storage-azure-phase-1`
+### 1. `refactor/storage-gcs-phase-1`
 
-- split [`crates/surge-core/src/storage/azure/mod.rs`](../../crates/surge-core/src/storage/azure/mod.rs)
+- split [`crates/surge-core/src/storage/gcs/mod.rs`](../../crates/surge-core/src/storage/gcs/mod.rs)
   into focused modules for:
-  - shared-key signing and credential checks
+  - auth-mode selection and signing helpers
   - request construction and backend operations
-  - list-response XML parsing
+  - XML list parsing
+  - JSON list parsing
 
 ### 2. `refactor/maintainability-phase-2`
 
@@ -102,7 +105,6 @@ be decomposed to fully retire the baseline.
 ### Core surfaces
 
 - [`crates/surge-core/src/releases/delta.rs`](../../crates/surge-core/src/releases/delta.rs)
-- [`crates/surge-core/src/storage/gcs.rs`](../../crates/surge-core/src/storage/gcs.rs)
 
 ### Bench debt
 

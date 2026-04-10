@@ -990,30 +990,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_remote_published_installer_uses_default_channel_key() {
-        let manifest = remote_manifest("demo", "linux-arm64", &["test", "production"], &["online"]);
-        let mut entry = release("1.2.3", "test", "linux-arm64", "demo.tar.zst");
-        entry.installers = vec!["online".to_string()];
-
-        let plan = plan_remote_published_installer(
-            &manifest,
-            "demo",
-            "linux-arm64",
-            "test",
-            &entry,
-            RemoteInstallerMode::Online,
-        )
-        .expect("plan should resolve");
-
-        assert_eq!(
-            plan.candidate_keys,
-            vec!["installers/Setup-linux-arm64-demo-test-online.bin".to_string()]
-        );
-        assert!(plan.blockers.is_empty(), "unexpected blockers: {:?}", plan.blockers);
-    }
-
-    #[test]
-    fn plan_remote_published_installer_reports_channel_mismatch() {
+    fn plan_remote_published_installer_uses_requested_channel_key() {
         let manifest = remote_manifest("demo", "linux-arm64", &["test", "production"], &["online"]);
         let mut entry = release("1.2.3", "production", "linux-arm64", "demo.tar.zst");
         entry.installers = vec!["online".to_string()];
@@ -1030,15 +1007,32 @@ mod tests {
 
         assert_eq!(
             plan.candidate_keys,
-            vec!["installers/Setup-linux-arm64-demo-test-online.bin".to_string()]
+            vec!["installers/Setup-linux-arm64-demo-production-online.bin".to_string()]
         );
-        assert!(
-            plan.blockers
-                .iter()
-                .any(|blocker| blocker.contains("default channel 'test'")),
-            "missing channel mismatch blocker: {:?}",
-            plan.blockers
+        assert!(plan.blockers.is_empty(), "unexpected blockers: {:?}", plan.blockers);
+    }
+
+    #[test]
+    fn plan_remote_published_installer_drops_default_channel_mismatch_blocker() {
+        let manifest = remote_manifest("demo", "linux-arm64", &["test", "production"], &["online"]);
+        let mut entry = release("1.2.3", "production", "linux-arm64", "demo.tar.zst");
+        entry.installers = vec!["online".to_string()];
+
+        let plan = plan_remote_published_installer(
+            &manifest,
+            "demo",
+            "linux-arm64",
+            "production",
+            &entry,
+            RemoteInstallerMode::Online,
+        )
+        .expect("plan should resolve");
+
+        assert_eq!(
+            plan.candidate_keys,
+            vec!["installers/Setup-linux-arm64-demo-production-online.bin".to_string()]
         );
+        assert!(plan.blockers.is_empty(), "unexpected blockers: {:?}", plan.blockers);
     }
 
     #[tokio::test]

@@ -14,7 +14,7 @@ use super::launchers::{
     ensure_host_compatible_rid, find_gui_installer_launcher_for_rid, find_installer_launcher_for_rid,
     find_surge_binary_for_rid, surge_binary_name_for_rid,
 };
-use super::resolution::{default_channel_for_app, installer_storage_prefix};
+use super::resolution::installer_storage_prefix;
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_installers(
@@ -24,6 +24,7 @@ pub(super) fn build_installers(
     app_id: &str,
     rid: &str,
     version: &str,
+    channel: &str,
     manifest_root: &Path,
     artifacts_dir: &Path,
     output_dir: &Path,
@@ -36,6 +37,7 @@ pub(super) fn build_installers(
         app_id,
         rid,
         version,
+        channel,
         manifest_root,
         artifacts_dir,
         output_dir,
@@ -52,6 +54,7 @@ pub(super) fn build_installers_with_launcher(
     app_id: &str,
     rid: &str,
     version: &str,
+    channel: &str,
     manifest_root: &Path,
     artifacts_dir: &Path,
     output_dir: &Path,
@@ -63,8 +66,6 @@ pub(super) fn build_installers_with_launcher(
         return Ok(Vec::new());
     }
     ensure_host_compatible_rid(rid)?;
-
-    let default_channel = default_channel_for_app(manifest, app);
 
     let installers_dir = output_dir
         .parent()
@@ -110,7 +111,7 @@ pub(super) fn build_installers_with_launcher(
     for installer_type in installer_types {
         let installer_suffix = installer_type.as_str();
         let installer_ext = if rid.starts_with("win-") { "exe" } else { "bin" };
-        let installer_filename = format!("Setup-{rid}-{app_id}-{default_channel}-{installer_suffix}.{installer_ext}");
+        let installer_filename = format!("Setup-{rid}-{app_id}-{channel}-{installer_suffix}.{installer_ext}");
         let installer_path = installers_dir.join(&installer_filename);
 
         let staging_dir =
@@ -131,7 +132,7 @@ pub(super) fn build_installers_with_launcher(
             app_id: app_id.to_string(),
             rid: rid.to_string(),
             version: version.to_string(),
-            channel: default_channel.clone(),
+            channel: channel.to_string(),
             generated_utc: chrono::Utc::now().to_rfc3339(),
             headless_default_if_no_display: true,
             release_index_key: RELEASES_FILE_COMPRESSED.to_string(),

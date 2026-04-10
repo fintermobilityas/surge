@@ -218,6 +218,10 @@ pub(crate) enum Commands {
         #[arg(long)]
         version: Option<String>,
 
+        /// Channel to resolve releases from when using --installers
+        #[arg(long, requires = "installers")]
+        channel: Option<String>,
+
         /// Build installers only (snapx-compatible restore mode)
         #[arg(long, short = 'i')]
         installers: bool,
@@ -450,6 +454,15 @@ mod tests {
     }
 
     #[test]
+    fn restore_channel_requires_installers_flag() {
+        let Err(err) = Cli::try_parse_from(["surge", "restore", "--channel", "production"]) else {
+            panic!("channel should require installers mode");
+        };
+
+        assert!(err.to_string().contains("--installers"));
+    }
+
+    #[test]
     fn restore_upload_installers_conflicts_with_package_file() {
         let Err(err) = Cli::try_parse_from([
             "surge",
@@ -463,6 +476,22 @@ mod tests {
         };
 
         assert!(err.to_string().contains("--package-file"));
+    }
+
+    #[test]
+    fn restore_channel_parses_in_installers_mode() {
+        let cli = Cli::try_parse_from(["surge", "restore", "--installers", "--channel", "production"])
+            .expect("restore installers mode with channel should parse");
+
+        let Commands::Restore {
+            channel, installers, ..
+        } = cli.command
+        else {
+            panic!("expected restore command");
+        };
+
+        assert!(installers);
+        assert_eq!(channel.as_deref(), Some("production"));
     }
 
     #[test]

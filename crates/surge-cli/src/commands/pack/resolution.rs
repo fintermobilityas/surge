@@ -12,7 +12,7 @@ use surge_core::storage::{self, StorageBackend};
 pub(super) struct ResolvedInstallerPackage {
     pub(super) app_id: String,
     pub(super) rid: String,
-    pub(super) default_channel: String,
+    pub(super) selected_channel: String,
     pub(super) selected_version: String,
     pub(super) full_key: String,
     pub(super) full_sha256: String,
@@ -25,6 +25,7 @@ pub(super) async fn resolve_installer_package(
     manifest_path: &Path,
     app_id: Option<&str>,
     version: Option<&str>,
+    channel: Option<&str>,
     rid: Option<&str>,
     artifacts_dir: Option<&Path>,
 ) -> Result<(Box<dyn StorageBackend>, ReleaseIndex, ResolvedInstallerPackage)> {
@@ -33,7 +34,10 @@ pub(super) async fn resolve_installer_package(
     let (app, _) = manifest
         .find_app_with_target(&app_id, &rid)
         .ok_or_else(|| SurgeError::Config(format!("No target {rid} found for app {app_id}")))?;
-    let default_channel = default_channel_for_app(manifest, app);
+    let selected_channel = channel
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map_or_else(|| default_channel_for_app(manifest, app), ToString::to_string);
     let storage_config = super::super::build_app_scoped_storage_config(manifest, manifest_path, &app_id)?;
     let backend = storage::create_storage_backend(&storage_config)?;
     let index = fetch_release_index(&*backend).await?;
@@ -43,13 +47,13 @@ pub(super) async fn resolve_installer_package(
             index.app_id, app_id
         )));
     }
-    let selected_release =
-        select_release_for_installers(&index.releases, &default_channel, version, &rid).ok_or_else(|| {
+    let selected_release = select_release_for_installers(&index.releases, &selected_channel, version, &rid)
+        .ok_or_else(|| {
             SurgeError::NotFound(format!(
                 "No release found for app '{}' rid '{}' on channel '{}'{}",
                 app_id,
                 rid,
-                default_channel,
+                selected_channel,
                 version.map_or_else(String::new, |v| format!(" and version '{v}'"))
             ))
         })?;
@@ -76,7 +80,7 @@ pub(super) async fn resolve_installer_package(
         ResolvedInstallerPackage {
             app_id,
             rid,
-            default_channel,
+            selected_channel,
             selected_version: selected_release.version.clone(),
             full_key: full_key.to_string(),
             full_sha256: selected_release.full_sha256.clone(),

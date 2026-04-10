@@ -51,15 +51,12 @@ jobs:
       - run: cargo fmt --all -- --check
 
   maintainability:
-    name: maintainability (advisory)
+    name: maintainability
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - name: Run maintainability guardrail (non-blocking)
-        run: |
-          ./scripts/check-maintainability.sh || {
-            echo "::warning::Maintainability guardrail detected a new oversized Rust source file or growth in an existing hotspot."
-          }
+      - name: Run maintainability guardrail
+        run: ./scripts/check-maintainability.sh
 
   clippy:
     name: clippy

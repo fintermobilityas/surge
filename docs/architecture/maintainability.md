@@ -1,8 +1,9 @@
 # Maintainability Guardrails
 
 This document describes the module boundaries and file-size guardrails for the
-ongoing Surge refactor campaign. The goal is to stop large multi-purpose source
-files from growing further while the existing hotspots are split incrementally.
+Surge Rust source tree. The goal is to keep large multi-purpose source files
+from growing back into hotspots after the first refactor wave burned down the
+initial backlog.
 
 ## Module Boundaries
 
@@ -53,17 +54,21 @@ files from growing further while the existing hotspots are split incrementally.
   source file, move them into a colocated `tests/` tree next to the module.
 - `#[allow(clippy::too_many_lines)]` is temporary debt and should not be added
   to new code as a substitute for decomposition.
+- Existing `clippy::too_many_lines` allowances are separate lint debt. They do
+  not override the file-size guardrail or justify growing a source file past the
+  `600`-line target.
 
-## Advisory Guardrail
+## Blocking Guardrail
 
-- `./scripts/check-maintainability.sh` enforces the `600`-line target in
-  advisory mode during the refactor campaign.
+- `./scripts/check-maintainability.sh` is a blocking local and CI check.
 - The script uses [`maintainability-baseline.txt`](./maintainability-baseline.txt)
-  to record the current oversized-file debt. CI warns when:
-  - a new Rust source file crosses the threshold
-  - an already oversized file grows beyond its recorded baseline
-- Once the current hotspots are split, the guardrail can move from advisory to
-  blocking.
+  only for explicitly accepted temporary exceptions.
+- The baseline ledger is currently empty. Any Rust source file in `crates/*/src`
+  that crosses the threshold now fails immediately unless a reviewed baseline
+  entry is added in the same change.
+- If a temporary baseline entry is ever needed again, it must record the
+  current measured production-line count and be removed in the PR that brings
+  the file back under the target.
 
 ## Review Heuristics
 

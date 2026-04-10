@@ -1,24 +1,21 @@
 # Cleanup Rollout Plan
 
-This document is the working plan for finishing the Surge maintainability
-cleanup after the first refactor wave. It tracks what has already landed, what
-is in flight, and what still needs to be split before the file-size baseline
-can be retired.
+This document records the first Surge maintainability cleanup wave. The campaign
+is complete: the oversized Rust source backlog is gone, the baseline ledger is
+empty, and the maintainability guardrail is now blocking in CI.
 
-## Objectives
+## Final Status
 
-- Keep `main` green throughout the cleanup campaign.
-- Land one scoped PR at a time from a fresh worktree.
-- Use GitHub `Squash and merge` for every cleanup PR.
-- Delete the local branch and remove the local worktree after each merge.
-- Wait for the merged-`main` CI run to finish green before starting the next PR.
-- Reduce oversized Rust source files below the `600` production-line target so
-  [`maintainability-baseline.txt`](./maintainability-baseline.txt) can be
-  removed.
+- `main` stayed green throughout the campaign.
+- Each cleanup PR landed as one scoped branch and merged with GitHub `Squash and merge`.
+- The Rust source backlog is below the `600` production-line target.
+- [`maintainability-baseline.txt`](./maintainability-baseline.txt) is empty and
+  available only for future reviewed exceptions.
+- The maintainability check is now blocking rather than advisory.
 
 ## Completed Phases
 
-These PRs are already merged:
+These PRs landed during the campaign:
 
 - `#51` `ci: add maintainability guardrails`
 - `#52` `refactor(cli): split install selection and manifest resolution helpers`
@@ -44,57 +41,20 @@ These PRs are already merged:
 - `#72` `refactor(installer-ui): split app rendering helpers`
 - `#74` `refactor(core): split delta module helpers`
 - `#75` `refactor(cli): split remote install helpers`
+- `#76` `refactor(cli): split install root orchestration`
 
-## Active Phase
+## Ongoing Rules
 
-### `refactor/cli-install-root-phase-2`
+Future maintainability work should continue using the same rollout rules:
 
-Current goal:
-
-- split [`crates/surge-cli/src/commands/install/mod.rs`](../../crates/surge-cli/src/commands/install/mod.rs)
-  into:
-  - `install/mod.rs`
-  - `install/local.rs`
-  - `install/runtime.rs`
-  - `install/progress.rs`
-
-Current checkpoint:
-
-- the local workflow, runtime helpers, and progress helpers have been extracted into leaf modules
-- the root module now owns type definitions, install selection, and high-level orchestration only
-- targeted compile of `surge-cli` passes
-- focused `surge-cli` install tests pass
-- focused `surge-cli` clippy passes
-- the final maintainability baseline entry has been removed
-- the full pre-push suite is the remaining branch gate
-
-Exit criteria:
-
-- `cargo test -p surge-cli commands::install::` passes
-- `cargo clippy -p surge-cli --all-targets --all-features -- -D warnings -W clippy::pedantic` passes
-- `./scripts/check-maintainability.sh` reports the file below the target so the
-  install baseline entry can be removed
-- the full pre-push suite passes
-- the PR is merged with squash, local cleanup is done, and merged-`main` CI is green
-
-## Remaining First-Wave PRs
-
-These are the remaining planned PRs after the current install-root split lands.
-
-### 1. `refactor/maintainability-phase-2`
-
-- switch maintainability enforcement from advisory-only to blocking for the
-  remaining Rust source tree
-- remove stale baseline entries that have been burned down
-- keep any still-deferred files explicitly listed until they are actually split
-
-## Remaining Second-Wave File Splits
-
-No second-wave file splits remain once the current branch lands.
+- keep `main` green throughout the change
+- land one scoped PR at a time from a fresh worktree
+- use GitHub `Squash and merge`
+- wait for the merged-`main` CI run to finish green before starting the next PR
 
 ## Execution Rules
 
-Every cleanup PR follows the same loop:
+When a future hotspot needs a focused cleanup PR, follow the same loop:
 
 1. Pull the latest `main`.
 2. Create a fresh branch and worktree for one scoped PR only.
@@ -107,7 +67,7 @@ Every cleanup PR follows the same loop:
 9. Pull the squashed result back onto local `main`.
 10. Delete the merged local branch and remove the temporary worktree.
 11. Wait for the merged-`main` CI run to finish green.
-12. Start the next PR from a new clean worktree.
+12. Start the next PR from a new clean worktree if more cleanup remains.
 
 ## Validation Gates
 
@@ -135,12 +95,11 @@ During active development, run focused checks first:
 
 ## Completion Criteria
 
-The cleanup campaign is complete when all of the following are true:
+The first-wave campaign closed because all of the following are now true:
 
 - no Rust source file in `crates/*/src` exceeds `600` production lines unless
   it is explicitly accepted debt
-- [`maintainability-baseline.txt`](./maintainability-baseline.txt) is empty or removed
+- [`maintainability-baseline.txt`](./maintainability-baseline.txt) is empty
 - the maintainability check is blocking rather than advisory
-- the module roots for install, restore, pack, update, shortcuts, manifest, delta, and
-  FFI surfaces are orchestration-first rather than monolithic
-- each merged PR has been cleaned up locally with no stale worktrees left behind
+- the module roots for install, restore, pack, update, shortcuts, manifest,
+  delta, and FFI surfaces are orchestration-first rather than monolithic

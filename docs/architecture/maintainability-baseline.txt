@@ -5,7 +5,6 @@
 813 crates/surge-cli/src/commands/install/mod.rs
 1860 crates/surge-cli/src/commands/install/remote.rs
 835 crates/surge-cli/src/main.rs
-861 crates/surge-core/src/config/manifest.rs
 727 crates/surge-core/src/install.rs
 782 crates/surge-core/src/releases/delta.rs
 604 crates/surge-core/src/storage/azure.rs

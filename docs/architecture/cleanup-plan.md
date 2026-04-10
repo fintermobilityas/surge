@@ -37,36 +37,37 @@ These PRs are already merged:
 - `#65` `refactor(core): split manifest module responsibilities`
 - `#66` `refactor(core): split install module responsibilities`
 - `#67` `refactor(core): split azure storage backend helpers`
+- `#68` `refactor(core): split gcs storage backend helpers`
 
 ## Active Phase
 
-### `refactor/storage-gcs-phase-1`
+### `refactor/bench-payload-phase-1`
 
 Current goal:
 
-- split [`crates/surge-core/src/storage/gcs/mod.rs`](../../crates/surge-core/src/storage/gcs/mod.rs)
+- split [`crates/surge-bench/src/payload/mod.rs`](../../crates/surge-bench/src/payload/mod.rs)
   into:
-  - `storage/gcs/auth.rs`
-  - `storage/gcs/requests.rs`
-  - `storage/gcs/xml_listing.rs`
-  - `storage/gcs/json_listing.rs`
+  - `payload/rng.rs`
+  - `payload/specs.rs`
+  - `payload/synthetic.rs`
+  - `payload/mutations.rs`
 
 Current checkpoint:
 
 - the leaf modules have been created
-- the root module has been reduced to the backend type and module wiring
-- targeted compile of `surge-core` passes
-- focused `storage::gcs` tests pass
-- focused `surge-core` clippy passes
-- the gcs baseline entry has been removed
+- the root module has been reduced to public types, template orchestration, and the top-level generator
+- targeted compile of `surge-bench` passes
+- focused `surge-bench` tests pass
+- focused `surge-bench` clippy passes
+- the payload baseline entry has been removed
 - the full pre-push suite passes on the branch
 
 Exit criteria:
 
-- `cargo test -p surge-core storage::gcs` passes
-- `cargo clippy -p surge-core --all-targets --all-features -- -D warnings -W clippy::pedantic` passes
+- `cargo test -p surge-bench` passes
+- `cargo clippy -p surge-bench --all-targets --all-features -- -D warnings -W clippy::pedantic` passes
 - `./scripts/check-maintainability.sh` reports the file below the target so the
-  gcs baseline entry can be removed
+  payload baseline entry can be removed
 - the full pre-push suite passes
 - the PR is merged with squash, local cleanup is done, and merged-`main` CI is green
 
@@ -74,14 +75,14 @@ Exit criteria:
 
 These are the remaining planned PRs from the original Rust-first campaign.
 
-### 1. `refactor/storage-gcs-phase-1`
+### 1. `refactor/bench-payload-phase-1`
 
-- split [`crates/surge-core/src/storage/gcs/mod.rs`](../../crates/surge-core/src/storage/gcs/mod.rs)
+- split [`crates/surge-bench/src/payload/mod.rs`](../../crates/surge-bench/src/payload/mod.rs)
   into focused modules for:
-  - auth-mode selection and signing helpers
-  - request construction and backend operations
-  - XML list parsing
-  - JSON list parsing
+  - rng helpers
+  - file spec and size-scaling helpers
+  - synthetic payload generation
+  - mutation helpers for derived releases
 
 ### 2. `refactor/maintainability-phase-2`
 
@@ -108,7 +109,6 @@ be decomposed to fully retire the baseline.
 
 ### Bench debt
 
-- [`crates/surge-bench/src/payload.rs`](../../crates/surge-bench/src/payload.rs)
 - [`crates/surge-bench/src/runner.rs`](../../crates/surge-bench/src/runner.rs)
 
 ## Execution Rules

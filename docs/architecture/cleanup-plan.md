@@ -56,7 +56,7 @@ Current checkpoint:
 - focused `config::manifest` tests pass
 - focused `surge-core` clippy passes
 - the manifest baseline entry has been removed
-- the full pre-push suite still needs to run before push
+- the full pre-push suite passes on the branch
 
 Exit criteria:
 

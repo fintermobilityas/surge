@@ -9,7 +9,7 @@ use crate::releases::manifest::COMPRESSION_ZSTD;
 use super::types::{InstallerType, PackCompressionFormat, PackDeltaStrategy, SurgeManifest};
 
 impl SurgeManifest {
-    pub(super) fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         if self.schema != crate::config::constants::SCHEMA_VERSION && self.schema != 2 {
             return Err(SurgeError::Config(format!(
                 "Unsupported schema version: {} (expected {} or 2)",

@@ -43,45 +43,43 @@ These PRs are already merged:
 - `#71` `refactor(cli): split main entrypoint helpers`
 - `#72` `refactor(installer-ui): split app rendering helpers`
 - `#74` `refactor(core): split delta module helpers`
+- `#75` `refactor(cli): split remote install helpers`
 
 ## Active Phase
 
-### `refactor/cli-install-remote-phase-2`
+### `refactor/cli-install-root-phase-2`
 
 Current goal:
 
-- split [`crates/surge-cli/src/commands/install/remote.rs`](../../crates/surge-cli/src/commands/install/remote.rs)
+- split [`crates/surge-cli/src/commands/install/mod.rs`](../../crates/surge-cli/src/commands/install/mod.rs)
   into:
-  - `remote/mod.rs`
-  - `remote/types.rs`
-  - `remote/execution.rs`
-  - `remote/published_installer.rs`
-  - `remote/activation.rs`
-  - `remote/staging.rs`
-  - `remote/state.rs`
+  - `install/mod.rs`
+  - `install/local.rs`
+  - `install/runtime.rs`
+  - `install/progress.rs`
 
 Current checkpoint:
 
-- the leaf modules have been created and the old flat file has been removed
-- the root module has been reduced to runtime orchestration reexports plus `#[cfg(test)]` test fixtures
+- the local workflow, runtime helpers, and progress helpers have been extracted into leaf modules
+- the root module now owns type definitions, install selection, and high-level orchestration only
 - targeted compile of `surge-cli` passes
 - focused `surge-cli` install tests pass
 - focused `surge-cli` clippy passes
-- the remote baseline entry has been removed
-- the full pre-push suite passes on the branch
+- the final maintainability baseline entry has been removed
+- the full pre-push suite is the remaining branch gate
 
 Exit criteria:
 
 - `cargo test -p surge-cli commands::install::` passes
 - `cargo clippy -p surge-cli --all-targets --all-features -- -D warnings -W clippy::pedantic` passes
 - `./scripts/check-maintainability.sh` reports the file below the target so the
-  remote baseline entry can be removed
+  install baseline entry can be removed
 - the full pre-push suite passes
 - the PR is merged with squash, local cleanup is done, and merged-`main` CI is green
 
 ## Remaining First-Wave PRs
 
-These are the remaining planned PRs after the current remote split lands.
+These are the remaining planned PRs after the current install-root split lands.
 
 ### 1. `refactor/maintainability-phase-2`
 
@@ -92,12 +90,7 @@ These are the remaining planned PRs after the current remote split lands.
 
 ## Remaining Second-Wave File Splits
 
-Once the first-wave PRs above land, the following oversized files still need to
-be decomposed to fully retire the baseline.
-
-### CLI and Installer surfaces
-
-- [`crates/surge-cli/src/commands/install/mod.rs`](../../crates/surge-cli/src/commands/install/mod.rs)
+No second-wave file splits remain once the current branch lands.
 
 ## Execution Rules
 

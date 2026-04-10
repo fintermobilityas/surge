@@ -1,39 +1,39 @@
 #![allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 
+mod local;
 mod profile;
+mod progress;
 mod releases;
 mod remote;
 mod resolution;
+mod runtime;
 mod selection;
 
 use std::collections::BTreeMap;
-use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Instant;
 
 use crate::logline;
-use indicatif::{ProgressBar, ProgressStyle};
 use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
+pub(crate) use self::progress::{make_progress_bar, make_spinner, shell_single_quote};
 pub(crate) use self::resolution::selected_install_manifest_path;
+pub(crate) use self::runtime::{
+    auto_start_after_install, host_can_build_installer_locally, install_package_locally, release_install_profile,
+    release_runtime_manifest_metadata, stop_running_supervisor,
+};
 
+use self::local::install_selected_release_locally;
 use self::profile::{
     build_rid_candidates, derive_base_rid, detect_local_profile, warn_if_local_rid_looks_incompatible,
 };
 use self::releases::{ArchiveAcquisition, download_release_archive, fetch_release_index, select_release};
 use self::remote::{
-    RemoteHostInstallerAvailability, RemoteInstallerMode, RemoteTailscaleCachedState, RemoteTailscaleOperation,
-    RemoteTailscaleTransferInputs, RemoteTailscaleTransferStrategy, build_installer_for_tailscale,
-    check_remote_install_state, deploy_remote_app_copy_for_tailscale, detect_remote_launch_environment,
-    ensure_supported_tailscale_rid, missing_remote_installer_error, plan_remote_published_installer,
-    plan_remote_published_installer_without_manifest, remote_install_matches, remote_staged_installer_matches_release,
-    remote_staged_payload_matches_release, resolve_tailscale_targets, run_remote_staged_installer_setup,
-    run_tailscale_streaming, select_remote_installer_mode, select_remote_tailscale_transfer_strategy,
-    should_skip_remote_install, stream_file_to_tailscale_node_with_command,
-    try_prepare_published_installer_for_tailscale, verify_remote_stage_readiness, warn_if_remote_stage_cleanup_fails,
+    ensure_supported_tailscale_rid, install_release_via_tailscale, resolve_tailscale_targets,
+    verify_remote_stage_readiness,
 };
 use self::resolution::{
     build_storage_config_with_overrides, build_storage_config_without_manifest, load_install_manifest_if_available,
@@ -50,7 +50,7 @@ use surge_core::config::installer::{
 };
 use surge_core::config::manifest::SurgeManifest;
 use surge_core::error::{Result, SurgeError};
-use surge_core::install::{self as core_install, InstallProfile};
+use surge_core::install::{self as core_install};
 use surge_core::releases::artifact_cache::{CacheFetchOutcome, cache_path_for_key, fetch_or_reuse_file};
 use surge_core::releases::manifest::{ReleaseEntry, ReleaseIndex};
 use surge_core::releases::version::compare_versions;
@@ -377,437 +377,45 @@ pub async fn execute(
 
     match &install_target {
         InstallTarget::Local => {
-            std::fs::create_dir_all(download_dir)?;
-            let local_package = download_dir.join(Path::new(full_filename).file_name().unwrap_or_default());
-            let acquisition = download_release_archive(
+            install_selected_release_locally(
                 &*backend,
                 &index,
+                download_dir,
+                &app_id,
                 release,
+                &channel,
                 &rid_candidates,
                 full_filename,
-                &local_package,
+                &storage_config,
+                behavior.no_start,
             )
             .await?;
-            match acquisition {
-                ArchiveAcquisition::ReusedLocal => {
-                    logline::success(&format!(
-                        "Using cached package '{}' at '{}'.",
-                        Path::new(full_filename).display(),
-                        local_package.display()
-                    ));
-                }
-                ArchiveAcquisition::Downloaded => {
-                    logline::success(&format!(
-                        "Downloaded '{}' to '{}'.",
-                        Path::new(full_filename).display(),
-                        local_package.display()
-                    ));
-                }
-                ArchiveAcquisition::Reconstructed => {
-                    logline::warn(&format!(
-                        "Direct full package '{}' missing in backend; reconstructed from retained release artifacts.",
-                        Path::new(full_filename).display()
-                    ));
-                }
-            }
-            stop_running_supervisor(&app_id, release).await?;
-            let install_root = install_package_locally(&app_id, release, &local_package)?;
-            let active_app_dir = install_root.join("app");
-            let install_profile = release_install_profile(&app_id, release);
-            let runtime_manifest = release_runtime_manifest_metadata(release, &channel, &storage_config);
-            core_install::write_runtime_manifest(&active_app_dir, &install_profile, &runtime_manifest)?;
-            logline::success(&format!(
-                "Installed '{}' to '{}' (active app: '{}').",
-                app_id,
-                install_root.display(),
-                active_app_dir.display()
-            ));
-
-            if !behavior.no_start && !behavior.plan_only {
-                let display_name = release.display_name(&app_id);
-                match auto_start_after_install(release, &app_id, &install_root, &active_app_dir) {
-                    Ok(pid) => {
-                        logline::success(&format!("Started '{display_name}' (pid {pid})."));
-                    }
-                    Err(e) => {
-                        logline::warn(&format!("Auto-start failed: {e}"));
-                    }
-                }
-            }
         }
         InstallTarget::Tailscale {
             ssh_target,
             file_target,
         } => {
-            let installer_mode = select_remote_installer_mode(&storage_config);
-            let install_dir = if release.install_directory.trim().is_empty() {
-                &app_id
-            } else {
-                release.install_directory.trim()
-            };
-            let remote_state = check_remote_install_state(ssh_target, install_dir).await;
-            let install_matches = remote_install_matches(remote_state.as_ref(), &release.version, &channel);
-            if should_skip_remote_install(install_matches, behavior.force) {
-                logline::success(&format!(
-                    "'{app_id}' v{} ({channel}) is already installed on '{file_target}', skipping.",
-                    release.version
-                ));
-            } else {
-                if install_matches {
-                    logline::info(&format!(
-                        "'{app_id}' v{} ({channel}) is already installed on '{file_target}'; reinstalling due to --force.",
-                        release.version
-                    ));
-                } else if let Some(remote_state) = &remote_state
-                    && remote_state.version.trim() == release.version
-                {
-                    logline::info(&format!(
-                        "'{app_id}' v{} is installed on '{file_target}' with channel '{}'; reinstalling to switch to '{channel}'.",
-                        release.version,
-                        remote_state.channel.as_deref().unwrap_or("unknown")
-                    ));
-                }
-                let launch_env = detect_remote_launch_environment(ssh_target).await;
-                if let Some(display) = launch_env.display.as_deref() {
-                    logline::info(&format!("Detected remote X11 session for install: DISPLAY={display}"));
-                } else if let Some(wayland_display) = launch_env.wayland_display.as_deref() {
-                    logline::info(&format!(
-                        "Detected remote Wayland session for install: WAYLAND_DISPLAY={wayland_display}"
-                    ));
-                } else if launch_env.has_graphical_session() {
-                    logline::info("Detected remote graphical session for install.");
-                } else {
-                    logline::info(
-                        "No remote graphical session environment detected; install will default to headless startup.",
-                    );
-                }
-                let host_can_build_installer = host_can_build_installer_locally(&selected_rid);
-                let has_matching_pre_staged_app_copy_payload = if host_can_build_installer
-                    && installer_mode == RemoteInstallerMode::Offline
-                    && !behavior.mode.is_stage()
-                {
-                    remote_staged_payload_matches_release(ssh_target, &app_id, release, &channel, &storage_config)
-                        .await?
-                } else {
-                    false
-                };
-                let has_matching_pre_staged_installer_cache =
-                    if installer_mode == RemoteInstallerMode::Online && !behavior.mode.is_stage() {
-                        remote_staged_installer_matches_release(ssh_target, &app_id, release, &channel, &storage_config)
-                            .await?
-                    } else {
-                        false
-                    };
-                let transfer_strategy = select_remote_tailscale_transfer_strategy(RemoteTailscaleTransferInputs {
-                    host_installer_availability: if host_can_build_installer {
-                        RemoteHostInstallerAvailability::Available
-                    } else {
-                        RemoteHostInstallerAvailability::Unavailable
-                    },
-                    installer_mode,
-                    operation: if behavior.mode.is_stage() {
-                        RemoteTailscaleOperation::Stage
-                    } else {
-                        RemoteTailscaleOperation::Install
-                    },
-                    cached_state: if has_matching_pre_staged_installer_cache {
-                        RemoteTailscaleCachedState::InstallerCache
-                    } else if has_matching_pre_staged_app_copy_payload {
-                        RemoteTailscaleCachedState::AppCopyPayload
-                    } else {
-                        RemoteTailscaleCachedState::None
-                    },
-                });
-                if matches!(transfer_strategy, RemoteTailscaleTransferStrategy::AppCopy) {
-                    deploy_remote_app_copy_for_tailscale(
-                        &*backend,
-                        &index,
-                        download_dir,
-                        ssh_target,
-                        file_target,
-                        &app_id,
-                        &selected_rid,
-                        release,
-                        &channel,
-                        &storage_config,
-                        &launch_env,
-                        &rid_candidates,
-                        full_filename,
-                        behavior.no_start,
-                        behavior.mode.is_stage(),
-                    )
-                    .await?;
-                    if !behavior.mode.is_stage() {
-                        warn_if_remote_stage_cleanup_fails(ssh_target, &app_id, release).await;
-                    }
-                    if behavior.mode.is_stage() {
-                        logline::success(&format!(
-                            "Staged '{app_id}' v{} on tailscale node '{file_target}'.",
-                            release.version
-                        ));
-                    } else {
-                        logline::success(&format!("Installed '{app_id}' on tailscale node '{file_target}'."));
-                    }
-                    return Ok(());
-                }
-                if matches!(transfer_strategy, RemoteTailscaleTransferStrategy::StagedInstallerCache) {
-                    run_remote_staged_installer_setup(ssh_target, file_target, &app_id, release, behavior.no_start)
-                        .await?;
-                    logline::success(&format!("Installed '{app_id}' on tailscale node '{file_target}'."));
-                    return Ok(());
-                }
-                let published_installer_plan = if let Some(manifest) = manifest.as_ref() {
-                    plan_remote_published_installer(
-                        manifest,
-                        &app_id,
-                        &selected_rid,
-                        &channel,
-                        release,
-                        installer_mode,
-                    )?
-                } else {
-                    plan_remote_published_installer_without_manifest(
-                        &app_id,
-                        &selected_rid,
-                        &channel,
-                        release,
-                        installer_mode,
-                    )
-                };
-                let published_installer_path = if matches!(
-                    transfer_strategy,
-                    RemoteTailscaleTransferStrategy::Installer { prefer_published: true }
-                ) {
-                    try_prepare_published_installer_for_tailscale(
-                        &*backend,
-                        download_dir,
-                        &published_installer_plan,
-                        &app_id,
-                        release,
-                        &channel,
-                        &storage_config,
-                        &launch_env,
-                        installer_mode,
-                    )
-                    .await?
-                } else {
-                    None
-                };
-                let installer_path = if let Some(installer_path) = published_installer_path {
-                    installer_path
-                } else if installer_mode == RemoteInstallerMode::Offline {
-                    if !host_can_build_installer {
-                        return Err(missing_remote_installer_error(
-                            &selected_rid,
-                            &published_installer_plan,
-                            installer_mode,
-                        ));
-                    }
-                    std::fs::create_dir_all(download_dir)?;
-                    let local_package = download_dir.join(Path::new(full_filename).file_name().unwrap_or_default());
-                    let acquisition = download_release_archive(
-                        &*backend,
-                        &index,
-                        release,
-                        &rid_candidates,
-                        full_filename,
-                        &local_package,
-                    )
-                    .await?;
-                    match acquisition {
-                        ArchiveAcquisition::ReusedLocal => {
-                            logline::success(&format!(
-                                "Using cached package '{}' at '{}'.",
-                                Path::new(full_filename).display(),
-                                local_package.display()
-                            ));
-                        }
-                        ArchiveAcquisition::Downloaded => {
-                            logline::success(&format!(
-                                "Downloaded '{}' to '{}'.",
-                                Path::new(full_filename).display(),
-                                local_package.display()
-                            ));
-                        }
-                        ArchiveAcquisition::Reconstructed => {
-                            logline::warn(&format!(
-                                "Direct full package '{}' missing in backend; reconstructed from retained release artifacts.",
-                                Path::new(full_filename).display()
-                            ));
-                        }
-                    }
-                    logline::info("Building offline installer for remote deployment...");
-                    build_installer_for_tailscale(
-                        manifest.as_ref(),
-                        &app_id,
-                        &selected_rid,
-                        release,
-                        &channel,
-                        &storage_config,
-                        Some(&local_package),
-                        &launch_env,
-                        installer_mode,
-                    )?
-                } else {
-                    if !host_can_build_installer {
-                        return Err(missing_remote_installer_error(
-                            &selected_rid,
-                            &published_installer_plan,
-                            installer_mode,
-                        ));
-                    }
-                    logline::info("Building online installer for remote deployment...");
-                    build_installer_for_tailscale(
-                        manifest.as_ref(),
-                        &app_id,
-                        &selected_rid,
-                        release,
-                        &channel,
-                        &storage_config,
-                        None,
-                        &launch_env,
-                        installer_mode,
-                    )?
-                };
-                let installer_size = std::fs::metadata(&installer_path).map(|m| m.len()).unwrap_or(0);
-                logline::info(&format!(
-                    "Transferring installer to '{file_target}' ({})...",
-                    crate::formatters::format_bytes(installer_size),
-                ));
-                stream_file_to_tailscale_node_with_command(
-                    ssh_target,
-                    &installer_path,
-                    "cat > /tmp/.surge-installer && chmod +x /tmp/.surge-installer",
-                )
-                .await?;
-
-                let no_start_flag = if behavior.no_start { " --no-start" } else { "" };
-                let stage_flag = if behavior.mode.is_stage() { " --stage" } else { "" };
-                let run_cmd =
-                    format!("/tmp/.surge-installer{no_start_flag}{stage_flag} && rm -f /tmp/.surge-installer");
-                let ssh_command = format!("sh -lc {}", shell_single_quote(&run_cmd));
-                if behavior.mode.is_stage() {
-                    logline::info(&format!("Running installer in stage mode on '{file_target}'..."));
-                } else {
-                    logline::info(&format!("Running installer on '{file_target}'..."));
-                }
-                run_tailscale_streaming(&["ssh", ssh_target, ssh_command.as_str()], "remote").await?;
-                if !behavior.mode.is_stage() {
-                    warn_if_remote_stage_cleanup_fails(ssh_target, &app_id, release).await;
-                }
-                if behavior.mode.is_stage() {
-                    logline::success(&format!(
-                        "Staged '{app_id}' v{} on tailscale node '{file_target}'.",
-                        release.version
-                    ));
-                } else {
-                    logline::success(&format!("Installed '{app_id}' on tailscale node '{file_target}'."));
-                }
-            }
+            install_release_via_tailscale(
+                manifest.as_ref(),
+                &*backend,
+                &index,
+                download_dir,
+                ssh_target,
+                file_target,
+                &app_id,
+                &selected_rid,
+                &rid_candidates,
+                release,
+                &channel,
+                &storage_config,
+                full_filename,
+                behavior,
+            )
+            .await?;
         }
     }
 
     Ok(())
-}
-
-fn release_install_profile<'a>(app_id: &'a str, release: &'a ReleaseEntry) -> InstallProfile<'a> {
-    InstallProfile::new(
-        app_id,
-        release.display_name(app_id),
-        &release.main_exe,
-        &release.install_directory,
-        &release.supervisor_id,
-        &release.icon,
-        &release.shortcuts,
-        &release.persistent_assets,
-        &release.environment,
-    )
-}
-
-async fn stop_running_supervisor(app_id: &str, release: &ReleaseEntry) -> Result<()> {
-    let supervisor_id = release.supervisor_id.trim();
-    if supervisor_id.is_empty() {
-        return Ok(());
-    }
-
-    let install_root = surge_core::platform::paths::default_install_root(app_id, &release.install_directory)?;
-    super::stop_supervisor(&install_root, supervisor_id).await
-}
-
-fn install_package_locally(app_id: &str, release: &ReleaseEntry, package_path: &Path) -> Result<std::path::PathBuf> {
-    let profile = release_install_profile(app_id, release);
-    core_install::install_package_locally(&profile, package_path)
-}
-
-fn auto_start_after_install(
-    release: &ReleaseEntry,
-    app_id: &str,
-    install_root: &std::path::Path,
-    active_app_dir: &std::path::Path,
-) -> Result<u32> {
-    let profile = release_install_profile(app_id, release);
-    core_install::auto_start_after_install_sequence(&profile, install_root, active_app_dir, &release.version)
-}
-
-fn release_runtime_manifest_metadata<'a>(
-    release: &'a ReleaseEntry,
-    channel: &'a str,
-    storage_config: &'a surge_core::context::StorageConfig,
-) -> core_install::RuntimeManifestMetadata<'a> {
-    core_install::RuntimeManifestMetadata::new(
-        &release.version,
-        channel,
-        core_install::storage_provider_manifest_name(storage_config.provider),
-        &storage_config.bucket,
-        &storage_config.region,
-        &storage_config.endpoint,
-    )
-}
-
-fn host_can_build_installer_locally(rid: &str) -> bool {
-    super::pack::ensure_host_compatible_rid(rid).is_ok()
-}
-
-fn make_progress_bar(message: &str, total: u64) -> Option<ProgressBar> {
-    if !std::io::stdout().is_terminal() {
-        return None;
-    }
-
-    let bar = ProgressBar::new(total);
-    let style = ProgressStyle::with_template("{msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
-        .unwrap_or_else(|_| ProgressStyle::default_bar())
-        .progress_chars("=> ");
-    bar.set_style(style);
-    bar.set_message(message.to_string());
-    Some(bar)
-}
-
-fn make_spinner(message: &str) -> Option<ProgressBar> {
-    if !std::io::stdout().is_terminal() {
-        return None;
-    }
-
-    let spinner = ProgressBar::new_spinner();
-    let style = ProgressStyle::with_template("{spinner} {msg}")
-        .unwrap_or_else(|_| ProgressStyle::default_spinner())
-        .tick_chars("|/-\\ ");
-    spinner.set_style(style);
-    spinner.set_message(message.to_string());
-    spinner.enable_steady_tick(std::time::Duration::from_millis(80));
-    Some(spinner)
-}
-
-fn shell_single_quote(raw: &str) -> String {
-    let mut escaped = String::from("'");
-    for ch in raw.chars() {
-        if ch == '\'' {
-            escaped.push_str("'\"'\"'");
-        } else {
-            escaped.push(ch);
-        }
-    }
-    escaped.push('\'');
-    escaped
 }
 
 #[cfg(test)]
@@ -822,12 +430,17 @@ mod tests {
     };
     use super::releases::{ArchiveAcquisition, download_release_archive, select_release};
     use super::remote::{
-        RemoteInstallState, RemoteLaunchEnvironment, RemotePublishedInstallerPlan,
-        build_remote_app_copy_activation_script, build_remote_installer_manifest, build_remote_paths_exist_probe,
-        build_remote_stage_cleanup_command, build_remote_staged_installer_setup_command,
-        build_remote_stop_supervisor_command, parse_remote_install_state, parse_remote_launch_environment,
-        parse_remote_staged_payload_identity, published_installer_public_url, remote_launch_environment_probe,
-        remote_staged_payload_identity, select_latest_remote_legacy_app_dir,
+        RemoteHostInstallerAvailability, RemoteInstallState, RemoteInstallerMode, RemoteLaunchEnvironment,
+        RemotePublishedInstallerPlan, RemoteTailscaleCachedState, RemoteTailscaleOperation,
+        RemoteTailscaleTransferInputs, RemoteTailscaleTransferStrategy, build_remote_app_copy_activation_script,
+        build_remote_installer_manifest, build_remote_paths_exist_probe, build_remote_stage_cleanup_command,
+        build_remote_staged_installer_setup_command, build_remote_stop_supervisor_command,
+        missing_remote_installer_error, parse_remote_install_state, parse_remote_launch_environment,
+        parse_remote_staged_payload_identity, plan_remote_published_installer,
+        plan_remote_published_installer_without_manifest, published_installer_public_url, remote_install_matches,
+        remote_launch_environment_probe, remote_staged_payload_identity, select_latest_remote_legacy_app_dir,
+        select_remote_installer_mode, select_remote_tailscale_transfer_strategy, should_skip_remote_install,
+        try_prepare_published_installer_for_tailscale,
     };
     use super::resolution::{
         build_storage_config_without_manifest, resolve_install_app_id_without_manifest,

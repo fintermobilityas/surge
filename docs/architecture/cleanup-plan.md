@@ -40,34 +40,38 @@ These PRs are already merged:
 - `#68` `refactor(core): split gcs storage backend helpers`
 - `#69` `refactor(bench): split payload generation helpers`
 - `#70` `refactor(bench): split runner helpers`
+- `#71` `refactor(cli): split main entrypoint helpers`
 
 ## Active Phase
 
-### `refactor/cli-main-phase-1`
+### `refactor/installer-ui-app-phase-1`
 
 Current goal:
 
-- split [`crates/surge-cli/src/main.rs`](../../crates/surge-cli/src/main.rs)
+- split [`crates/surge-installer-ui/src/app.rs`](../../crates/surge-installer-ui/src/app.rs)
   into:
-  - `cli.rs`
-  - `bootstrap.rs`
+  - `app/mod.rs`
+  - `app/theme.rs`
+  - `app/widgets.rs`
+  - `app/icons.rs`
+  - `app/screens.rs`
 
 Current checkpoint:
 
 - the leaf modules have been created
-- the root module has been reduced to runtime entrypoint and command dispatch
-- targeted compile of `surge-cli` passes
-- focused `surge-cli` tests pass
-- focused `surge-cli` clippy passes
-- the main baseline entry has been removed
+- the root module has been reduced to installer state, progress polling, and screen dispatch
+- targeted compile of `surge-installer-ui` passes
+- focused `surge-installer-ui` tests pass
+- focused `surge-installer-ui` clippy passes
+- the installer UI baseline entry has been removed
 - the full pre-push suite passes on the branch
 
 Exit criteria:
 
-- `cargo test -p surge-cli` passes
-- `cargo clippy -p surge-cli --all-targets --all-features -- -D warnings -W clippy::pedantic` passes
+- `cargo test -p surge-installer-ui` passes
+- `cargo clippy -p surge-installer-ui --all-targets --all-features -- -D warnings -W clippy::pedantic` passes
 - `./scripts/check-maintainability.sh` reports the file below the target so the
-  main baseline entry can be removed
+  installer UI baseline entry can be removed
 - the full pre-push suite passes
 - the PR is merged with squash, local cleanup is done, and merged-`main` CI is green
 
@@ -75,15 +79,7 @@ Exit criteria:
 
 These are the remaining planned PRs from the original Rust-first campaign.
 
-### 1. `refactor/cli-main-phase-1`
-
-- split [`crates/surge-cli/src/main.rs`](../../crates/surge-cli/src/main.rs)
-  into focused modules for:
-  - clap command and argument definitions
-  - tracing/bootstrap and env-loading helpers
-  - keep `main` and runtime dispatch at the current path
-
-### 2. `refactor/maintainability-phase-2`
+### 1. `refactor/maintainability-phase-2`
 
 - switch maintainability enforcement from advisory-only to blocking for the
   remaining Rust source tree
@@ -99,7 +95,6 @@ be decomposed to fully retire the baseline.
 
 - [`crates/surge-cli/src/commands/install/mod.rs`](../../crates/surge-cli/src/commands/install/mod.rs)
 - [`crates/surge-cli/src/commands/install/remote.rs`](../../crates/surge-cli/src/commands/install/remote.rs)
-- [`crates/surge-installer-ui/src/app.rs`](../../crates/surge-installer-ui/src/app.rs)
 
 ### Core surfaces
 

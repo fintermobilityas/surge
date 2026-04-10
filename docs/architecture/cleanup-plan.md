@@ -41,37 +41,39 @@ These PRs are already merged:
 - `#69` `refactor(bench): split payload generation helpers`
 - `#70` `refactor(bench): split runner helpers`
 - `#71` `refactor(cli): split main entrypoint helpers`
+- `#72` `refactor(installer-ui): split app rendering helpers`
 
 ## Active Phase
 
-### `refactor/installer-ui-app-phase-1`
+### `refactor/core-delta-phase-1`
 
 Current goal:
 
-- split [`crates/surge-installer-ui/src/app.rs`](../../crates/surge-installer-ui/src/app.rs)
+- split [`crates/surge-core/src/releases/delta.rs`](../../crates/surge-core/src/releases/delta.rs)
   into:
-  - `app/mod.rs`
-  - `app/theme.rs`
-  - `app/widgets.rs`
-  - `app/icons.rs`
-  - `app/screens.rs`
+  - `delta/mod.rs`
+  - `delta/format.rs`
+  - `delta/archive.rs`
+  - `delta/sparse_ops.rs`
+  - `delta/tree.rs`
+  - `delta/fs_apply.rs`
 
 Current checkpoint:
 
 - the leaf modules have been created
-- the root module has been reduced to installer state, progress polling, and screen dispatch
-- targeted compile of `surge-installer-ui` passes
-- focused `surge-installer-ui` tests pass
-- focused `surge-installer-ui` clippy passes
-- the installer UI baseline entry has been removed
+- the root module has been reduced to public delta entrypoints and apply/decode dispatch
+- targeted compile of `surge-core` passes
+- focused `surge-core` delta tests pass
+- focused `surge-core` clippy passes
+- the delta baseline entry has been removed
 - the full pre-push suite passes on the branch
 
 Exit criteria:
 
-- `cargo test -p surge-installer-ui` passes
-- `cargo clippy -p surge-installer-ui --all-targets --all-features -- -D warnings -W clippy::pedantic` passes
+- `cargo test -p surge-core releases::delta` passes
+- `cargo clippy -p surge-core --all-targets --all-features -- -D warnings -W clippy::pedantic` passes
 - `./scripts/check-maintainability.sh` reports the file below the target so the
-  installer UI baseline entry can be removed
+  delta baseline entry can be removed
 - the full pre-push suite passes
 - the PR is merged with squash, local cleanup is done, and merged-`main` CI is green
 
@@ -95,10 +97,6 @@ be decomposed to fully retire the baseline.
 
 - [`crates/surge-cli/src/commands/install/mod.rs`](../../crates/surge-cli/src/commands/install/mod.rs)
 - [`crates/surge-cli/src/commands/install/remote.rs`](../../crates/surge-cli/src/commands/install/remote.rs)
-
-### Core surfaces
-
-- [`crates/surge-core/src/releases/delta.rs`](../../crates/surge-core/src/releases/delta.rs)
 
 ## Execution Rules
 

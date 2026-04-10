@@ -1,4 +1,3 @@
 # Maximum allowed production-line counts for current oversized Rust source files.
 # Format: <max_lines> <path>
 813 crates/surge-cli/src/commands/install/mod.rs
-1860 crates/surge-cli/src/commands/install/remote.rs

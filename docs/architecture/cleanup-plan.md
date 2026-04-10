@@ -42,44 +42,46 @@ These PRs are already merged:
 - `#70` `refactor(bench): split runner helpers`
 - `#71` `refactor(cli): split main entrypoint helpers`
 - `#72` `refactor(installer-ui): split app rendering helpers`
+- `#74` `refactor(core): split delta module helpers`
 
 ## Active Phase
 
-### `refactor/core-delta-phase-1`
+### `refactor/cli-install-remote-phase-2`
 
 Current goal:
 
-- split [`crates/surge-core/src/releases/delta.rs`](../../crates/surge-core/src/releases/delta.rs)
+- split [`crates/surge-cli/src/commands/install/remote.rs`](../../crates/surge-cli/src/commands/install/remote.rs)
   into:
-  - `delta/mod.rs`
-  - `delta/format.rs`
-  - `delta/archive.rs`
-  - `delta/sparse_ops.rs`
-  - `delta/tree.rs`
-  - `delta/fs_apply.rs`
+  - `remote/mod.rs`
+  - `remote/types.rs`
+  - `remote/execution.rs`
+  - `remote/published_installer.rs`
+  - `remote/activation.rs`
+  - `remote/staging.rs`
+  - `remote/state.rs`
 
 Current checkpoint:
 
-- the leaf modules have been created
-- the root module has been reduced to public delta entrypoints and apply/decode dispatch
-- targeted compile of `surge-core` passes
-- focused `surge-core` delta tests pass
-- focused `surge-core` clippy passes
-- the delta baseline entry has been removed
+- the leaf modules have been created and the old flat file has been removed
+- the root module has been reduced to runtime orchestration reexports plus `#[cfg(test)]` test fixtures
+- targeted compile of `surge-cli` passes
+- focused `surge-cli` install tests pass
+- focused `surge-cli` clippy passes
+- the remote baseline entry has been removed
 - the full pre-push suite passes on the branch
 
 Exit criteria:
 
-- `cargo test -p surge-core releases::delta` passes
-- `cargo clippy -p surge-core --all-targets --all-features -- -D warnings -W clippy::pedantic` passes
+- `cargo test -p surge-cli commands::install::` passes
+- `cargo clippy -p surge-cli --all-targets --all-features -- -D warnings -W clippy::pedantic` passes
 - `./scripts/check-maintainability.sh` reports the file below the target so the
-  delta baseline entry can be removed
+  remote baseline entry can be removed
 - the full pre-push suite passes
 - the PR is merged with squash, local cleanup is done, and merged-`main` CI is green
 
 ## Remaining First-Wave PRs
 
-These are the remaining planned PRs from the original Rust-first campaign.
+These are the remaining planned PRs after the current remote split lands.
 
 ### 1. `refactor/maintainability-phase-2`
 
@@ -96,7 +98,6 @@ be decomposed to fully retire the baseline.
 ### CLI and Installer surfaces
 
 - [`crates/surge-cli/src/commands/install/mod.rs`](../../crates/surge-cli/src/commands/install/mod.rs)
-- [`crates/surge-cli/src/commands/install/remote.rs`](../../crates/surge-cli/src/commands/install/remote.rs)
 
 ## Execution Rules
 
@@ -147,6 +148,6 @@ The cleanup campaign is complete when all of the following are true:
   it is explicitly accepted debt
 - [`maintainability-baseline.txt`](./maintainability-baseline.txt) is empty or removed
 - the maintainability check is blocking rather than advisory
-- the module roots for install, restore, pack, update, shortcuts, manifest, and
+- the module roots for install, restore, pack, update, shortcuts, manifest, delta, and
   FFI surfaces are orchestration-first rather than monolithic
 - each merged PR has been cleaned up locally with no stale worktrees left behind

@@ -6,6 +6,5 @@
 1860 crates/surge-cli/src/commands/install/remote.rs
 835 crates/surge-cli/src/main.rs
 782 crates/surge-core/src/releases/delta.rs
-604 crates/surge-core/src/storage/azure.rs
 840 crates/surge-core/src/storage/gcs.rs
 760 crates/surge-installer-ui/src/app.rs

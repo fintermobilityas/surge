@@ -39,37 +39,35 @@ These PRs are already merged:
 - `#67` `refactor(core): split azure storage backend helpers`
 - `#68` `refactor(core): split gcs storage backend helpers`
 - `#69` `refactor(bench): split payload generation helpers`
+- `#70` `refactor(bench): split runner helpers`
 
 ## Active Phase
 
-### `refactor/bench-runner-phase-1`
+### `refactor/cli-main-phase-1`
 
 Current goal:
 
-- split [`crates/surge-bench/src/runner/mod.rs`](../../crates/surge-bench/src/runner/mod.rs)
+- split [`crates/surge-cli/src/main.rs`](../../crates/surge-cli/src/main.rs)
   into:
-  - `runner/microbench.rs`
-  - `runner/installer.rs`
-  - `runner/update.rs`
-  - `runner/fs_compare.rs`
-  - `runner/manifest.rs`
+  - `cli.rs`
+  - `bootstrap.rs`
 
 Current checkpoint:
 
 - the leaf modules have been created
-- the root module has been reduced to shared constants, timing, and public reexports
-- targeted compile of `surge-bench` passes
-- focused `surge-bench` tests pass
-- focused `surge-bench` clippy passes
-- the runner baseline entry has been removed
+- the root module has been reduced to runtime entrypoint and command dispatch
+- targeted compile of `surge-cli` passes
+- focused `surge-cli` tests pass
+- focused `surge-cli` clippy passes
+- the main baseline entry has been removed
 - the full pre-push suite passes on the branch
 
 Exit criteria:
 
-- `cargo test -p surge-bench` passes
-- `cargo clippy -p surge-bench --all-targets --all-features -- -D warnings -W clippy::pedantic` passes
+- `cargo test -p surge-cli` passes
+- `cargo clippy -p surge-cli --all-targets --all-features -- -D warnings -W clippy::pedantic` passes
 - `./scripts/check-maintainability.sh` reports the file below the target so the
-  runner baseline entry can be removed
+  main baseline entry can be removed
 - the full pre-push suite passes
 - the PR is merged with squash, local cleanup is done, and merged-`main` CI is green
 
@@ -77,15 +75,13 @@ Exit criteria:
 
 These are the remaining planned PRs from the original Rust-first campaign.
 
-### 1. `refactor/bench-runner-phase-1`
+### 1. `refactor/cli-main-phase-1`
 
-- split [`crates/surge-bench/src/runner/mod.rs`](../../crates/surge-bench/src/runner/mod.rs)
+- split [`crates/surge-cli/src/main.rs`](../../crates/surge-cli/src/main.rs)
   into focused modules for:
-  - microbench archive, hash, diff, and synthetic installer helpers
-  - real installer scenario execution helpers
-  - real publish/update scenario helpers
-  - filesystem comparison and size helpers
-  - manifest-writing helpers
+  - clap command and argument definitions
+  - tracing/bootstrap and env-loading helpers
+  - keep `main` and runtime dispatch at the current path
 
 ### 2. `refactor/maintainability-phase-2`
 
@@ -103,7 +99,6 @@ be decomposed to fully retire the baseline.
 
 - [`crates/surge-cli/src/commands/install/mod.rs`](../../crates/surge-cli/src/commands/install/mod.rs)
 - [`crates/surge-cli/src/commands/install/remote.rs`](../../crates/surge-cli/src/commands/install/remote.rs)
-- [`crates/surge-cli/src/main.rs`](../../crates/surge-cli/src/main.rs)
 - [`crates/surge-installer-ui/src/app.rs`](../../crates/surge-installer-ui/src/app.rs)
 
 ### Core surfaces

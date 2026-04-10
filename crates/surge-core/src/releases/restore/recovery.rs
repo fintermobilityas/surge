@@ -217,7 +217,7 @@ fn verify_expected_sha256(expected: &str, data: &[u8], context: &str) -> Result<
 
     let actual = sha256_hex(data);
     if actual != expected {
-        return Err(SurgeError::Storage(format!(
+        return Err(SurgeError::Integrity(format!(
             "SHA-256 mismatch for {context}: expected {expected}, got {actual}"
         )));
     }

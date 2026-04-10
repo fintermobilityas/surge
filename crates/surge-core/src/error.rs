@@ -67,6 +67,9 @@ pub enum SurgeError {
     #[error("Update error: {0}")]
     Update(String),
 
+    #[error("Integrity error: {0}")]
+    Integrity(String),
+
     #[error("Pack error: {0}")]
     Pack(String),
 

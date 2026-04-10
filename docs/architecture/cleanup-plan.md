@@ -32,33 +32,38 @@ These PRs are already merged:
 - `#60` `refactor(core): isolate update supervisor and lifecycle restart helpers`
 - `#61` `refactor(core): split pack builder full delta and index update flows`
 - `#62` `refactor(cli): split pack command installer resolution and upload flow`
+- `#63` `refactor(core): split release restore planning and artifact recovery`
+- `#64` `refactor(core): split shortcut installation by platform`
 
 ## Active Phase
 
-### `refactor/restore-phase-1`
+### `refactor/manifest-phase-1`
 
 Current goal:
 
-- split [`crates/surge-core/src/releases/restore.rs`](../../crates/surge-core/src/releases/restore.rs)
+- split [`crates/surge-core/src/config/manifest/mod.rs`](../../crates/surge-core/src/config/manifest/mod.rs)
   into:
-  - `restore/planning.rs`
-  - `restore/candidate.rs`
-  - `restore/recovery.rs`
-  - `restore/retention.rs`
+  - `manifest/types.rs`
+  - `manifest/normalize.rs`
+  - `manifest/lookup.rs`
+  - `manifest/validate.rs`
 
 Current checkpoint:
 
 - the leaf modules have been created
-- the root module has been reduced to orchestration types and re-exports
+- the root module has been reduced to parse/load orchestration plus tests
 - targeted compile of `surge-core` passes
-- restore tests still need import cleanup after the split
+- focused `config::manifest` tests pass
+- focused `surge-core` clippy passes
+- the manifest baseline entry has been removed
+- the full pre-push suite passes on the branch
 
 Exit criteria:
 
-- `cargo test -p surge-core releases::restore` passes
+- `cargo test -p surge-core config::manifest` passes
 - `cargo clippy -p surge-core --all-targets --all-features -- -D warnings -W clippy::pedantic` passes
 - `./scripts/check-maintainability.sh` reports the file below the target so the
-  restore baseline entry can be removed
+  manifest baseline entry can be removed
 - the full pre-push suite passes
 - the PR is merged with squash, local cleanup is done, and merged-`main` CI is green
 
@@ -66,30 +71,16 @@ Exit criteria:
 
 These are the remaining planned PRs from the original Rust-first campaign.
 
-### 1. `refactor/restore-phase-1`
+### 1. `refactor/manifest-phase-1`
 
-- split release restore planning, candidate selection, recovery, and retention
-- remove `crates/surge-core/src/releases/restore.rs` from the baseline once it
-  stays at or below `600` production lines
-
-### 2. `refactor/shortcuts-phase-1`
-
-- split [`crates/surge-core/src/platform/shortcuts.rs`](../../crates/surge-core/src/platform/shortcuts.rs)
-  into a module tree
-- keep the root orchestration-only
-- move platform behavior into `linux`, `windows`, `macos`, and shared helper modules
-
-### 3. `refactor/manifest-phase-1`
-
-- split [`crates/surge-core/src/config/manifest.rs`](../../crates/surge-core/src/config/manifest.rs)
+- split [`crates/surge-core/src/config/manifest/mod.rs`](../../crates/surge-core/src/config/manifest/mod.rs)
   into focused modules for:
   - types
-  - parsing
   - normalization
   - validation
   - effective-config or installer metadata helpers
 
-### 4. `refactor/maintainability-phase-2`
+### 2. `refactor/maintainability-phase-2`
 
 - switch maintainability enforcement from advisory-only to blocking for the
   remaining Rust source tree

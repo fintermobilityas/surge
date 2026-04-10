@@ -1,0 +1,158 @@
+mod lookup;
+mod normalize;
+mod types;
+mod validate;
+
+use std::path::Path;
+
+use serde_yaml::Value;
+
+use crate::error::{Result, SurgeError};
+
+pub use self::types::{
+    AppConfig, ChannelManifestConfig, InstallerType, LockManifestConfig, PackCompressionFormat,
+    PackCompressionManifestConfig, PackDeltaManifestConfig, PackDeltaStrategy, PackManifestConfig, PackPolicy,
+    PackRetentionManifestConfig, ShortcutLocation, StorageManifestConfig, SurgeManifest, TargetConfig,
+};
+
+impl SurgeManifest {
+    pub fn parse(data: &[u8]) -> Result<Self> {
+        let raw: Value = serde_yaml::from_slice(data)?;
+        validate::reject_embedded_storage_credentials(&raw)?;
+        let mut manifest: Self = serde_yaml::from_value(raw)?;
+        manifest.normalize();
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    pub fn from_file(path: &Path) -> Result<Self> {
+        let data = std::fs::read(path)
+            .map_err(|e| SurgeError::Config(format!("Failed to read manifest '{}': {e}", path.display())))?;
+        Self::parse(&data)
+    }
+
+    pub fn to_yaml(&self) -> Result<Vec<u8>> {
+        let manifest_yaml = serde_yaml::to_string(self)?;
+        Ok(manifest_yaml.into_bytes())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PackDeltaStrategy, SurgeManifest};
+    use crate::config::constants::{
+        PACK_DEFAULT_CHECKPOINT_EVERY, PACK_DEFAULT_KEEP_LATEST_FULLS, PACK_DEFAULT_MAX_CHAIN_LENGTH,
+        PACK_DEFAULT_ZSTD_LEVEL,
+    };
+
+    #[test]
+    fn parse_derives_single_target_id_when_missing() {
+        let yaml = br"schema: 1
+storage:
+  provider: filesystem
+  bucket: /tmp/store
+apps:
+  - main: demoapp
+    target:
+      rid: linux-x64
+      distro: ubuntu24.04
+      variant: cuda
+";
+
+        let manifest = SurgeManifest::parse(yaml).expect("manifest should parse");
+        assert_eq!(manifest.apps.len(), 1);
+        assert_eq!(manifest.apps[0].id, "demoapp-ubuntu24.04-linux-x64-cuda");
+    }
+
+    #[test]
+    fn parse_preserves_explicit_single_target_id() {
+        let yaml = br"schema: 1
+storage:
+  provider: filesystem
+  bucket: /tmp/store
+apps:
+  - id: explicit-id
+    main: demoapp
+    target:
+      rid: linux-x64
+      distro: ubuntu24.04
+";
+
+        let manifest = SurgeManifest::parse(yaml).expect("manifest should parse");
+        assert_eq!(manifest.apps.len(), 1);
+        assert_eq!(manifest.apps[0].id, "explicit-id");
+    }
+
+    #[test]
+    fn effective_pack_policy_uses_defaults_when_pack_is_omitted() {
+        let yaml = br"schema: 1
+storage:
+  provider: filesystem
+  bucket: /tmp/store
+apps:
+  - id: demoapp
+    target:
+      rid: linux-x64
+";
+
+        let manifest = SurgeManifest::parse(yaml).expect("manifest should parse");
+        let policy = manifest.effective_pack_policy();
+
+        assert_eq!(policy.delta_strategy, PackDeltaStrategy::SparseFileOps);
+        assert_eq!(policy.compression_level, PACK_DEFAULT_ZSTD_LEVEL);
+        assert_eq!(policy.max_chain_length, PACK_DEFAULT_MAX_CHAIN_LENGTH);
+        assert_eq!(policy.keep_latest_fulls, PACK_DEFAULT_KEEP_LATEST_FULLS);
+        assert_eq!(policy.checkpoint_every, PACK_DEFAULT_CHECKPOINT_EVERY);
+    }
+
+    #[test]
+    fn parse_accepts_pack_policy_override() {
+        let yaml = br"schema: 1
+storage:
+  provider: filesystem
+  bucket: /tmp/store
+pack:
+  delta:
+    strategy: archive-bsdiff
+    max_chain_length: 4
+  compression:
+    format: zstd
+    level: 5
+  retention:
+    keep_latest_fulls: 3
+    checkpoint_every: 9
+apps:
+  - id: demoapp
+    target:
+      rid: linux-x64
+";
+
+        let manifest = SurgeManifest::parse(yaml).expect("manifest should parse");
+        let policy = manifest.effective_pack_policy();
+
+        assert_eq!(policy.delta_strategy, PackDeltaStrategy::ArchiveBsdiff);
+        assert_eq!(policy.compression_level, 5);
+        assert_eq!(policy.max_chain_length, 4);
+        assert_eq!(policy.keep_latest_fulls, 3);
+        assert_eq!(policy.checkpoint_every, 9);
+    }
+
+    #[test]
+    fn parse_rejects_invalid_pack_compression_level() {
+        let yaml = br"schema: 1
+storage:
+  provider: filesystem
+  bucket: /tmp/store
+pack:
+  compression:
+    level: 23
+apps:
+  - id: demoapp
+    target:
+      rid: linux-x64
+";
+
+        let err = SurgeManifest::parse(yaml).expect_err("manifest should be rejected");
+        assert!(err.to_string().contains("pack.compression.level"));
+    }
+}

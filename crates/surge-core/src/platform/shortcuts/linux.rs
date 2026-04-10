@@ -1,5 +1,8 @@
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
 
 use crate::config::manifest::ShortcutLocation;
 

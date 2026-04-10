@@ -457,6 +457,7 @@ impl UpdateManager {
 mod tests {
     #![allow(clippy::cast_possible_wrap)]
 
+    use std::path::{Path, PathBuf};
     use std::sync::Mutex;
     use std::time::Duration;
 
@@ -524,6 +525,19 @@ mod tests {
         let rid = current_rid();
         let raw = rid.split('-').next().unwrap_or_default();
         release_index::normalize_os_label(raw)
+    }
+
+    fn app_scoped_store_root(store_root: &Path, app_id: &str) -> PathBuf {
+        let app_store = store_root.join(app_id);
+        std::fs::create_dir_all(&app_store).unwrap();
+        app_store
+    }
+
+    fn write_app_scoped_release_index(store_root: &Path, app_id: &str, index: &ReleaseIndex) -> PathBuf {
+        let app_store = app_scoped_store_root(store_root, app_id);
+        let compressed = compress_release_index(index, DEFAULT_ZSTD_LEVEL).unwrap();
+        std::fs::write(app_store.join(RELEASES_FILE_COMPRESSED), compressed).unwrap();
+        app_store
     }
 
     fn pseudo_random_bytes(len: usize) -> Vec<u8> {
@@ -703,6 +717,7 @@ mod tests {
     async fn test_check_for_updates_rejects_mismatched_app_id() {
         let tmp = tempfile::tempdir().unwrap();
         let store_root = tmp.path().join("store");
+        let app_id = "test-app";
         std::fs::create_dir_all(&store_root).unwrap();
 
         let index = ReleaseIndex {
@@ -711,8 +726,7 @@ mod tests {
             ..ReleaseIndex::default()
         };
 
-        let compressed = compress_release_index(&index, DEFAULT_ZSTD_LEVEL).unwrap();
-        std::fs::write(store_root.join(RELEASES_FILE_COMPRESSED), compressed).unwrap();
+        write_app_scoped_release_index(&store_root, app_id, &index);
 
         let ctx = Arc::new(Context::new());
         ctx.set_storage(
@@ -723,19 +737,17 @@ mod tests {
             "",
             "",
         );
-        let mut manager = UpdateManager::new(ctx, "test-app", "1.0.0", "stable", tmp.path().to_str().unwrap()).unwrap();
+        let mut manager = UpdateManager::new(ctx, app_id, "1.0.0", "stable", tmp.path().to_str().unwrap()).unwrap();
 
         let err = manager.check_for_updates().await.unwrap_err();
         assert!(err.to_string().contains("does not match requested app"));
     }
 
     #[tokio::test]
-    async fn test_check_for_updates_falls_back_to_app_scoped_prefix() {
+    async fn test_check_for_updates_loads_required_app_scoped_prefix() {
         let tmp = tempfile::tempdir().unwrap();
         let store_root = tmp.path().join("store");
         let app_id = "test-app";
-        let app_scoped_store = store_root.join(app_id);
-        std::fs::create_dir_all(&app_scoped_store).unwrap();
 
         let index = ReleaseIndex {
             app_id: app_id.to_string(),
@@ -747,8 +759,7 @@ mod tests {
             )],
             ..ReleaseIndex::default()
         };
-        let compressed = compress_release_index(&index, DEFAULT_ZSTD_LEVEL).unwrap();
-        std::fs::write(app_scoped_store.join(RELEASES_FILE_COMPRESSED), compressed).unwrap();
+        write_app_scoped_release_index(&store_root, app_id, &index);
 
         let ctx = Arc::new(Context::new());
         ctx.set_storage(
@@ -772,9 +783,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_check_for_updates_prefers_app_scoped_prefix_when_root_index_is_mismatched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("store");
+        let app_id = "test-app";
+        std::fs::create_dir_all(&store_root).unwrap();
+
+        let root_index = ReleaseIndex {
+            app_id: "other-app".to_string(),
+            releases: vec![make_entry(
+                "9.9.9",
+                "stable",
+                &current_os_label_for_tests(),
+                &current_rid(),
+            )],
+            ..ReleaseIndex::default()
+        };
+        let root_compressed = compress_release_index(&root_index, DEFAULT_ZSTD_LEVEL).unwrap();
+        std::fs::write(store_root.join(RELEASES_FILE_COMPRESSED), root_compressed).unwrap();
+
+        let scoped_index = ReleaseIndex {
+            app_id: app_id.to_string(),
+            releases: vec![make_entry(
+                "1.1.0",
+                "stable",
+                &current_os_label_for_tests(),
+                &current_rid(),
+            )],
+            ..ReleaseIndex::default()
+        };
+        write_app_scoped_release_index(&store_root, app_id, &scoped_index);
+
+        let ctx = Arc::new(Context::new());
+        ctx.set_storage(
+            StorageProvider::Filesystem,
+            store_root.to_str().unwrap(),
+            "",
+            "",
+            "",
+            "",
+        );
+        let mut manager =
+            UpdateManager::new(ctx.clone(), app_id, "1.0.0", "stable", tmp.path().to_str().unwrap()).unwrap();
+
+        let info = manager
+            .check_for_updates()
+            .await
+            .expect("update check should succeed")
+            .expect("update should be available");
+        assert_eq!(info.latest_version, "1.1.0");
+        assert_eq!(ctx.storage_config().prefix, app_id);
+    }
+
+    #[tokio::test]
+    async fn test_check_for_updates_requires_app_scoped_prefix_when_it_is_derivable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("store");
+        let app_id = "test-app";
+        std::fs::create_dir_all(&store_root).unwrap();
+
+        let root_index = ReleaseIndex {
+            app_id: app_id.to_string(),
+            releases: vec![make_entry(
+                "1.1.0",
+                "stable",
+                &current_os_label_for_tests(),
+                &current_rid(),
+            )],
+            ..ReleaseIndex::default()
+        };
+        let root_compressed = compress_release_index(&root_index, DEFAULT_ZSTD_LEVEL).unwrap();
+        std::fs::write(store_root.join(RELEASES_FILE_COMPRESSED), root_compressed).unwrap();
+
+        let ctx = Arc::new(Context::new());
+        ctx.set_storage(
+            StorageProvider::Filesystem,
+            store_root.to_str().unwrap(),
+            "",
+            "",
+            "",
+            "",
+        );
+        let mut manager = UpdateManager::new(ctx, app_id, "1.0.0", "stable", tmp.path().to_str().unwrap()).unwrap();
+
+        let err = manager.check_for_updates().await.unwrap_err();
+        assert!(err.to_string().contains("not found on required app-scoped prefix"));
+    }
+
+    #[tokio::test]
     async fn test_check_for_updates_genesis_without_delta_uses_full_strategy() {
         let tmp = tempfile::tempdir().unwrap();
         let store_root = tmp.path().join("store");
+        let app_id = "test-app";
         std::fs::create_dir_all(&store_root).unwrap();
 
         let mut release = make_entry("1.1.0", "stable", &current_os_label_for_tests(), &current_rid());
@@ -782,13 +882,12 @@ mod tests {
         release.set_primary_delta(None);
 
         let index = ReleaseIndex {
-            app_id: "test-app".to_string(),
+            app_id: app_id.to_string(),
             releases: vec![release],
             ..ReleaseIndex::default()
         };
 
-        let compressed = compress_release_index(&index, DEFAULT_ZSTD_LEVEL).unwrap();
-        std::fs::write(store_root.join(RELEASES_FILE_COMPRESSED), compressed).unwrap();
+        write_app_scoped_release_index(&store_root, app_id, &index);
 
         let ctx = Arc::new(Context::new());
         ctx.set_storage(
@@ -800,7 +899,7 @@ mod tests {
             "",
         );
 
-        let mut manager = UpdateManager::new(ctx, "test-app", "1.0.0", "stable", tmp.path().to_str().unwrap()).unwrap();
+        let mut manager = UpdateManager::new(ctx, app_id, "1.0.0", "stable", tmp.path().to_str().unwrap()).unwrap();
 
         let info = manager.check_for_updates().await.unwrap().unwrap();
         assert!(!info.delta_available);
@@ -813,6 +912,7 @@ mod tests {
     async fn test_check_for_updates_treats_stable_as_newer_than_matching_prerelease() {
         let tmp = tempfile::tempdir().unwrap();
         let store_root = tmp.path().join("store");
+        let app_id = "test-app";
         std::fs::create_dir_all(&store_root).unwrap();
 
         let rid = current_rid();
@@ -828,13 +928,12 @@ mod tests {
         stable.set_primary_delta(None);
 
         let index = ReleaseIndex {
-            app_id: "test-app".to_string(),
+            app_id: app_id.to_string(),
             releases: vec![prerelease, stable],
             ..ReleaseIndex::default()
         };
 
-        let compressed = compress_release_index(&index, DEFAULT_ZSTD_LEVEL).unwrap();
-        std::fs::write(store_root.join(RELEASES_FILE_COMPRESSED), compressed).unwrap();
+        write_app_scoped_release_index(&store_root, app_id, &index);
 
         let ctx = Arc::new(Context::new());
         ctx.set_storage(
@@ -848,7 +947,7 @@ mod tests {
 
         let mut manager = UpdateManager::new(
             ctx,
-            "test-app",
+            app_id,
             "2859.0.0-prerelease.56",
             "test",
             tmp.path().to_str().unwrap(),
@@ -866,6 +965,7 @@ mod tests {
     async fn test_check_for_updates_uses_descriptor_delta_chain() {
         let tmp = tempfile::tempdir().unwrap();
         let store_root = tmp.path().join("store");
+        let app_id = "test-app";
         std::fs::create_dir_all(&store_root).unwrap();
 
         let rid = current_rid();
@@ -880,12 +980,11 @@ mod tests {
         )));
 
         let index = ReleaseIndex {
-            app_id: "test-app".to_string(),
+            app_id: app_id.to_string(),
             releases: vec![release],
             ..ReleaseIndex::default()
         };
-        let compressed = compress_release_index(&index, DEFAULT_ZSTD_LEVEL).unwrap();
-        std::fs::write(store_root.join(RELEASES_FILE_COMPRESSED), compressed).unwrap();
+        write_app_scoped_release_index(&store_root, app_id, &index);
 
         let ctx = Arc::new(Context::new());
         ctx.set_storage(
@@ -897,7 +996,7 @@ mod tests {
             "",
         );
 
-        let mut manager = UpdateManager::new(ctx, "test-app", "1.0.0", "stable", tmp.path().to_str().unwrap()).unwrap();
+        let mut manager = UpdateManager::new(ctx, app_id, "1.0.0", "stable", tmp.path().to_str().unwrap()).unwrap();
         let info = manager.check_for_updates().await.unwrap().unwrap();
         assert!(info.delta_available);
         assert_eq!(info.apply_strategy, ApplyStrategy::Delta);
@@ -908,6 +1007,7 @@ mod tests {
     async fn test_check_for_updates_falls_back_to_full_for_unsupported_descriptor() {
         let tmp = tempfile::tempdir().unwrap();
         let store_root = tmp.path().join("store");
+        let app_id = "test-app";
         std::fs::create_dir_all(&store_root).unwrap();
 
         let rid = current_rid();
@@ -926,12 +1026,11 @@ mod tests {
         release.preferred_delta_id = "primary".to_string();
 
         let index = ReleaseIndex {
-            app_id: "test-app".to_string(),
+            app_id: app_id.to_string(),
             releases: vec![release],
             ..ReleaseIndex::default()
         };
-        let compressed = compress_release_index(&index, DEFAULT_ZSTD_LEVEL).unwrap();
-        std::fs::write(store_root.join(RELEASES_FILE_COMPRESSED), compressed).unwrap();
+        write_app_scoped_release_index(&store_root, app_id, &index);
 
         let ctx = Arc::new(Context::new());
         ctx.set_storage(
@@ -943,7 +1042,7 @@ mod tests {
             "",
         );
 
-        let mut manager = UpdateManager::new(ctx, "test-app", "1.0.0", "stable", tmp.path().to_str().unwrap()).unwrap();
+        let mut manager = UpdateManager::new(ctx, app_id, "1.0.0", "stable", tmp.path().to_str().unwrap()).unwrap();
         let info = manager.check_for_updates().await.unwrap().unwrap();
         assert!(!info.delta_available);
         assert_eq!(info.apply_strategy, ApplyStrategy::Full);
@@ -953,20 +1052,20 @@ mod tests {
     async fn test_check_for_updates_after_channel_switch() {
         let tmp = tempfile::tempdir().unwrap();
         let store_root = tmp.path().join("store");
+        let app_id = "test-app";
         std::fs::create_dir_all(&store_root).unwrap();
         let rid = current_rid();
         let os = current_os_label_for_tests();
 
         let index = ReleaseIndex {
-            app_id: "test-app".to_string(),
+            app_id: app_id.to_string(),
             releases: vec![
                 make_entry("1.1.0", "stable", &os, &rid),
                 make_entry("1.2.0", "test", &os, &rid),
             ],
             ..ReleaseIndex::default()
         };
-        let compressed = compress_release_index(&index, DEFAULT_ZSTD_LEVEL).unwrap();
-        std::fs::write(store_root.join(RELEASES_FILE_COMPRESSED), compressed).unwrap();
+        write_app_scoped_release_index(&store_root, app_id, &index);
 
         let ctx = Arc::new(Context::new());
         ctx.set_storage(
@@ -978,7 +1077,7 @@ mod tests {
             "",
         );
 
-        let mut manager = UpdateManager::new(ctx, "test-app", "1.0.0", "stable", tmp.path().to_str().unwrap()).unwrap();
+        let mut manager = UpdateManager::new(ctx, app_id, "1.0.0", "stable", tmp.path().to_str().unwrap()).unwrap();
         let stable_update = manager.check_for_updates().await.unwrap().unwrap();
         assert_eq!(stable_update.latest_version, "1.1.0");
 
@@ -992,12 +1091,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store_root = tmp.path().join("store");
         let install_root = tmp.path().join("install");
+        let app_id = "test-app";
         std::fs::create_dir_all(&store_root).unwrap();
         std::fs::create_dir_all(&install_root).unwrap();
+        let app_store = app_scoped_store_root(&store_root, app_id);
 
         let rid = current_rid();
-        let full_filename = format!("test-app-1.1.0-{rid}-full.tar.zst");
-        let full_path = store_root.join(&full_filename);
+        let full_filename = format!("{app_id}-1.1.0-{rid}-full.tar.zst");
+        let full_path = app_store.join(&full_filename);
 
         let mut packer = ArchivePacker::new(3).unwrap();
         packer.add_buffer("payload.txt", b"installed payload", 0o644).unwrap();
@@ -1007,7 +1108,7 @@ mod tests {
         let full_sha256 = sha256_hex_file(&full_path).unwrap();
 
         let index = ReleaseIndex {
-            app_id: "test-app".to_string(),
+            app_id: app_id.to_string(),
             releases: vec![ReleaseEntry {
                 version: "1.1.0".to_string(),
                 channels: vec!["stable".to_string()],
@@ -1022,8 +1123,8 @@ mod tests {
                 created_utc: chrono::Utc::now().to_rfc3339(),
                 release_notes: String::new(),
                 name: String::new(),
-                main_exe: "test-app".to_string(),
-                install_directory: "test-app".to_string(),
+                main_exe: app_id.to_string(),
+                install_directory: app_id.to_string(),
                 supervisor_id: String::new(),
                 icon: String::new(),
                 shortcuts: Vec::new(),
@@ -1034,8 +1135,7 @@ mod tests {
             ..ReleaseIndex::default()
         };
 
-        let compressed = compress_release_index(&index, DEFAULT_ZSTD_LEVEL).unwrap();
-        std::fs::write(store_root.join(RELEASES_FILE_COMPRESSED), compressed).unwrap();
+        write_app_scoped_release_index(&store_root, app_id, &index);
 
         let ctx = Arc::new(Context::new());
         ctx.set_storage(
@@ -1047,8 +1147,7 @@ mod tests {
             "",
         );
 
-        let mut manager =
-            UpdateManager::new(ctx, "test-app", "1.0.0", "stable", install_root.to_str().unwrap()).unwrap();
+        let mut manager = UpdateManager::new(ctx, app_id, "1.0.0", "stable", install_root.to_str().unwrap()).unwrap();
 
         let info = manager.check_for_updates().await.unwrap().unwrap();
         assert_eq!(info.apply_strategy, ApplyStrategy::Full);
@@ -1070,7 +1169,7 @@ mod tests {
         assert!(runtime_manifest_raw.contains("version: 1.1.0"));
         assert!(runtime_manifest_raw.contains("channel: stable"));
 
-        std::fs::remove_file(store_root.join(&full_filename)).unwrap();
+        std::fs::remove_file(app_store.join(&full_filename)).unwrap();
         manager
             .download_and_apply(&info, None::<fn(ProgressInfo)>)
             .await
@@ -1086,8 +1185,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store_root = tmp.path().join("store");
         let install_root = tmp.path().join("install");
+        let app_id = "test-app";
         std::fs::create_dir_all(&store_root).unwrap();
         std::fs::create_dir_all(&install_root).unwrap();
+        let app_store = app_scoped_store_root(&store_root, app_id);
 
         let current_app_dir = install_root.join("app");
         std::fs::create_dir_all(current_app_dir.join("state")).unwrap();
@@ -1098,8 +1199,8 @@ mod tests {
         std::fs::write(current_app_dir.join("temp").join("old.log"), "remove dir").unwrap();
 
         let rid = current_rid();
-        let full_filename = format!("test-app-1.1.0-{rid}-full.tar.zst");
-        let full_path = store_root.join(&full_filename);
+        let full_filename = format!("{app_id}-1.1.0-{rid}-full.tar.zst");
+        let full_path = app_store.join(&full_filename);
 
         let mut packer = ArchivePacker::new(3).unwrap();
         packer.add_buffer("payload.txt", b"new payload", 0o644).unwrap();
@@ -1111,7 +1212,7 @@ mod tests {
         let full_sha256 = sha256_hex_file(&full_path).unwrap();
 
         let index = ReleaseIndex {
-            app_id: "test-app".to_string(),
+            app_id: app_id.to_string(),
             releases: vec![ReleaseEntry {
                 version: "1.1.0".to_string(),
                 channels: vec!["stable".to_string()],
@@ -1126,8 +1227,8 @@ mod tests {
                 created_utc: chrono::Utc::now().to_rfc3339(),
                 release_notes: String::new(),
                 name: String::new(),
-                main_exe: "test-app".to_string(),
-                install_directory: "test-app".to_string(),
+                main_exe: app_id.to_string(),
+                install_directory: app_id.to_string(),
                 supervisor_id: String::new(),
                 icon: String::new(),
                 shortcuts: Vec::new(),
@@ -1138,8 +1239,7 @@ mod tests {
             ..ReleaseIndex::default()
         };
 
-        let compressed = compress_release_index(&index, DEFAULT_ZSTD_LEVEL).unwrap();
-        std::fs::write(store_root.join(RELEASES_FILE_COMPRESSED), compressed).unwrap();
+        write_app_scoped_release_index(&store_root, app_id, &index);
 
         let ctx = Arc::new(Context::new());
         ctx.set_storage(
@@ -1151,8 +1251,7 @@ mod tests {
             "",
         );
 
-        let mut manager =
-            UpdateManager::new(ctx, "test-app", "1.0.0", "stable", install_root.to_str().unwrap()).unwrap();
+        let mut manager = UpdateManager::new(ctx, app_id, "1.0.0", "stable", install_root.to_str().unwrap()).unwrap();
         let info = manager.check_for_updates().await.unwrap().unwrap();
         assert_eq!(info.apply_strategy, ApplyStrategy::Full);
 
@@ -1184,12 +1283,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store_root = tmp.path().join("store");
         let install_root = tmp.path().join("install");
+        let app_id = "test-app";
         std::fs::create_dir_all(&store_root).unwrap();
         std::fs::create_dir_all(&install_root).unwrap();
+        let app_store = app_scoped_store_root(&store_root, app_id);
 
         let rid = current_rid();
-        let full_filename = format!("test-app-1.1.0-{rid}-full.tar.zst");
-        let full_path = store_root.join(&full_filename);
+        let full_filename = format!("{app_id}-1.1.0-{rid}-full.tar.zst");
+        let full_path = app_store.join(&full_filename);
 
         let mut packer = ArchivePacker::new(3).unwrap();
         for index in 0..3 {
@@ -1204,7 +1305,7 @@ mod tests {
         let full_sha256 = sha256_hex_file(&full_path).unwrap();
 
         let index = ReleaseIndex {
-            app_id: "test-app".to_string(),
+            app_id: app_id.to_string(),
             releases: vec![ReleaseEntry {
                 version: "1.1.0".to_string(),
                 channels: vec!["stable".to_string()],
@@ -1219,8 +1320,8 @@ mod tests {
                 created_utc: chrono::Utc::now().to_rfc3339(),
                 release_notes: String::new(),
                 name: String::new(),
-                main_exe: "test-app".to_string(),
-                install_directory: "test-app".to_string(),
+                main_exe: app_id.to_string(),
+                install_directory: app_id.to_string(),
                 supervisor_id: String::new(),
                 icon: String::new(),
                 shortcuts: Vec::new(),
@@ -1231,8 +1332,7 @@ mod tests {
             ..ReleaseIndex::default()
         };
 
-        let compressed = compress_release_index(&index, DEFAULT_ZSTD_LEVEL).unwrap();
-        std::fs::write(store_root.join(RELEASES_FILE_COMPRESSED), compressed).unwrap();
+        write_app_scoped_release_index(&store_root, app_id, &index);
 
         let ctx = Arc::new(Context::new());
         ctx.set_storage(
@@ -1244,8 +1344,7 @@ mod tests {
             "",
         );
 
-        let mut manager =
-            UpdateManager::new(ctx, "test-app", "1.0.0", "stable", install_root.to_str().unwrap()).unwrap();
+        let mut manager = UpdateManager::new(ctx, app_id, "1.0.0", "stable", install_root.to_str().unwrap()).unwrap();
         let info = manager.check_for_updates().await.unwrap().unwrap();
 
         let observed = Arc::new(Mutex::new(Vec::<ProgressInfo>::new()));
@@ -1301,8 +1400,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store_root = tmp.path().join("store");
         let install_root = tmp.path().join("install");
+        let app_id = "test-app";
         std::fs::create_dir_all(&store_root).unwrap();
         std::fs::create_dir_all(&install_root).unwrap();
+        let app_store = app_scoped_store_root(&store_root, app_id);
 
         let rid = current_rid();
         let os = current_os_label_for_tests();
@@ -1330,21 +1431,21 @@ mod tests {
         let patch_v4 = bsdiff_buffers(&full_v3, &full_v4).unwrap();
         let delta_v4 = zstd::encode_all(patch_v4.as_slice(), 3).unwrap();
 
-        let full_v1_name = format!("test-app-1.0.0-{rid}-full.tar.zst");
-        let full_v2_name = format!("test-app-1.1.0-{rid}-full.tar.zst");
-        let full_v3_name = format!("test-app-1.2.0-{rid}-full.tar.zst");
-        let full_v4_name = format!("test-app-1.3.0-{rid}-full.tar.zst");
-        let delta_v2_name = format!("test-app-1.1.0-{rid}-delta.tar.zst");
-        let delta_v3_name = format!("test-app-1.2.0-{rid}-delta.tar.zst");
-        let delta_v4_name = format!("test-app-1.3.0-{rid}-delta.tar.zst");
+        let full_v1_name = format!("{app_id}-1.0.0-{rid}-full.tar.zst");
+        let full_v2_name = format!("{app_id}-1.1.0-{rid}-full.tar.zst");
+        let full_v3_name = format!("{app_id}-1.2.0-{rid}-full.tar.zst");
+        let full_v4_name = format!("{app_id}-1.3.0-{rid}-full.tar.zst");
+        let delta_v2_name = format!("{app_id}-1.1.0-{rid}-delta.tar.zst");
+        let delta_v3_name = format!("{app_id}-1.2.0-{rid}-delta.tar.zst");
+        let delta_v4_name = format!("{app_id}-1.3.0-{rid}-delta.tar.zst");
 
-        std::fs::write(store_root.join(&full_v1_name), &full_v1).unwrap();
-        std::fs::write(store_root.join(&delta_v2_name), &delta_v2).unwrap();
-        std::fs::write(store_root.join(&delta_v3_name), &delta_v3).unwrap();
-        std::fs::write(store_root.join(&delta_v4_name), &delta_v4).unwrap();
+        std::fs::write(app_store.join(&full_v1_name), &full_v1).unwrap();
+        std::fs::write(app_store.join(&delta_v2_name), &delta_v2).unwrap();
+        std::fs::write(app_store.join(&delta_v3_name), &delta_v3).unwrap();
+        std::fs::write(app_store.join(&delta_v4_name), &delta_v4).unwrap();
 
         let index = ReleaseIndex {
-            app_id: "test-app".to_string(),
+            app_id: app_id.to_string(),
             releases: vec![
                 ReleaseEntry {
                     version: "1.0.0".to_string(),
@@ -1360,8 +1461,8 @@ mod tests {
                     created_utc: chrono::Utc::now().to_rfc3339(),
                     release_notes: String::new(),
                     name: String::new(),
-                    main_exe: "test-app".to_string(),
-                    install_directory: "test-app".to_string(),
+                    main_exe: app_id.to_string(),
+                    install_directory: app_id.to_string(),
                     supervisor_id: String::new(),
                     icon: String::new(),
                     shortcuts: Vec::new(),
@@ -1389,8 +1490,8 @@ mod tests {
                     created_utc: chrono::Utc::now().to_rfc3339(),
                     release_notes: String::new(),
                     name: String::new(),
-                    main_exe: "test-app".to_string(),
-                    install_directory: "test-app".to_string(),
+                    main_exe: app_id.to_string(),
+                    install_directory: app_id.to_string(),
                     supervisor_id: String::new(),
                     icon: String::new(),
                     shortcuts: Vec::new(),
@@ -1418,8 +1519,8 @@ mod tests {
                     created_utc: chrono::Utc::now().to_rfc3339(),
                     release_notes: String::new(),
                     name: String::new(),
-                    main_exe: "test-app".to_string(),
-                    install_directory: "test-app".to_string(),
+                    main_exe: app_id.to_string(),
+                    install_directory: app_id.to_string(),
                     supervisor_id: String::new(),
                     icon: String::new(),
                     shortcuts: Vec::new(),
@@ -1447,8 +1548,8 @@ mod tests {
                     created_utc: chrono::Utc::now().to_rfc3339(),
                     release_notes: String::new(),
                     name: String::new(),
-                    main_exe: "test-app".to_string(),
-                    install_directory: "test-app".to_string(),
+                    main_exe: app_id.to_string(),
+                    install_directory: app_id.to_string(),
                     supervisor_id: String::new(),
                     icon: String::new(),
                     shortcuts: Vec::new(),
@@ -1460,8 +1561,7 @@ mod tests {
             ..ReleaseIndex::default()
         };
 
-        let compressed = compress_release_index(&index, DEFAULT_ZSTD_LEVEL).unwrap();
-        std::fs::write(store_root.join(RELEASES_FILE_COMPRESSED), compressed).unwrap();
+        write_app_scoped_release_index(&store_root, app_id, &index);
 
         let ctx = Arc::new(Context::new());
         ctx.set_storage(
@@ -1473,8 +1573,7 @@ mod tests {
             "",
         );
 
-        let mut manager =
-            UpdateManager::new(ctx, "test-app", "1.0.0", "stable", install_root.to_str().unwrap()).unwrap();
+        let mut manager = UpdateManager::new(ctx, app_id, "1.0.0", "stable", install_root.to_str().unwrap()).unwrap();
         let info = manager.check_for_updates().await.unwrap().unwrap();
         assert_eq!(info.apply_strategy, ApplyStrategy::Delta);
 
@@ -1515,8 +1614,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store_root = tmp.path().join("store");
         let install_root = tmp.path().join("install");
+        let app_id = "test-app";
         std::fs::create_dir_all(&store_root).unwrap();
         std::fs::create_dir_all(&install_root).unwrap();
+        let app_store = app_scoped_store_root(&store_root, app_id);
 
         let rid = current_rid();
         let os = current_os_label_for_tests();
@@ -1538,18 +1639,18 @@ mod tests {
         let patch_v3 = bsdiff_buffers(&full_v2, &full_v3).unwrap();
         let delta_v3 = zstd::encode_all(patch_v3.as_slice(), 3).unwrap();
 
-        let full_v1_name = format!("test-app-1.0.0-{rid}-full.tar.zst");
-        let full_v2_name = format!("test-app-1.1.0-{rid}-full.tar.zst");
-        let full_v3_name = format!("test-app-1.2.0-{rid}-full.tar.zst");
-        let delta_v2_name = format!("test-app-1.1.0-{rid}-delta.tar.zst");
-        let delta_v3_name = format!("test-app-1.2.0-{rid}-delta.tar.zst");
+        let full_v1_name = format!("{app_id}-1.0.0-{rid}-full.tar.zst");
+        let full_v2_name = format!("{app_id}-1.1.0-{rid}-full.tar.zst");
+        let full_v3_name = format!("{app_id}-1.2.0-{rid}-full.tar.zst");
+        let delta_v2_name = format!("{app_id}-1.1.0-{rid}-delta.tar.zst");
+        let delta_v3_name = format!("{app_id}-1.2.0-{rid}-delta.tar.zst");
 
-        std::fs::write(store_root.join(&full_v1_name), &full_v1).unwrap();
-        std::fs::write(store_root.join(&delta_v2_name), &delta_v2).unwrap();
-        std::fs::write(store_root.join(&delta_v3_name), &delta_v3).unwrap();
+        std::fs::write(app_store.join(&full_v1_name), &full_v1).unwrap();
+        std::fs::write(app_store.join(&delta_v2_name), &delta_v2).unwrap();
+        std::fs::write(app_store.join(&delta_v3_name), &delta_v3).unwrap();
 
         let index = ReleaseIndex {
-            app_id: "test-app".to_string(),
+            app_id: app_id.to_string(),
             releases: vec![
                 ReleaseEntry {
                     version: "1.0.0".to_string(),
@@ -1565,8 +1666,8 @@ mod tests {
                     created_utc: chrono::Utc::now().to_rfc3339(),
                     release_notes: String::new(),
                     name: String::new(),
-                    main_exe: "test-app".to_string(),
-                    install_directory: "test-app".to_string(),
+                    main_exe: app_id.to_string(),
+                    install_directory: app_id.to_string(),
                     supervisor_id: String::new(),
                     icon: String::new(),
                     shortcuts: Vec::new(),
@@ -1594,8 +1695,8 @@ mod tests {
                     created_utc: chrono::Utc::now().to_rfc3339(),
                     release_notes: String::new(),
                     name: String::new(),
-                    main_exe: "test-app".to_string(),
-                    install_directory: "test-app".to_string(),
+                    main_exe: app_id.to_string(),
+                    install_directory: app_id.to_string(),
                     supervisor_id: String::new(),
                     icon: String::new(),
                     shortcuts: Vec::new(),
@@ -1623,8 +1724,8 @@ mod tests {
                     created_utc: chrono::Utc::now().to_rfc3339(),
                     release_notes: String::new(),
                     name: String::new(),
-                    main_exe: "test-app".to_string(),
-                    install_directory: "test-app".to_string(),
+                    main_exe: app_id.to_string(),
+                    install_directory: app_id.to_string(),
                     supervisor_id: String::new(),
                     icon: String::new(),
                     shortcuts: Vec::new(),
@@ -1636,8 +1737,7 @@ mod tests {
             ..ReleaseIndex::default()
         };
 
-        let compressed = compress_release_index(&index, DEFAULT_ZSTD_LEVEL).unwrap();
-        std::fs::write(store_root.join(RELEASES_FILE_COMPRESSED), compressed).unwrap();
+        write_app_scoped_release_index(&store_root, app_id, &index);
 
         let ctx = Arc::new(Context::new());
         ctx.set_storage(
@@ -1649,8 +1749,7 @@ mod tests {
             "",
         );
 
-        let mut manager =
-            UpdateManager::new(ctx, "test-app", "1.1.0", "stable", install_root.to_str().unwrap()).unwrap();
+        let mut manager = UpdateManager::new(ctx, app_id, "1.1.0", "stable", install_root.to_str().unwrap()).unwrap();
         let info = manager.check_for_updates().await.unwrap().unwrap();
         assert_eq!(info.apply_strategy, ApplyStrategy::Delta);
         manager
@@ -1667,8 +1766,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store_root = tmp.path().join("store");
         let install_root = tmp.path().join("install");
+        let app_id = "test-app";
         std::fs::create_dir_all(&store_root).unwrap();
         std::fs::create_dir_all(&install_root).unwrap();
+        let app_store = app_scoped_store_root(&store_root, app_id);
 
         let rid = current_rid();
         let os = current_os_label_for_tests();
@@ -1691,14 +1792,14 @@ mod tests {
         let patch_v3 = build_sparse_file_patch(&full_v2, &full_v3, 3, 0, &ChunkedDiffOptions::default()).unwrap();
         let delta_v3 = zstd::encode_all(patch_v3.as_slice(), 3).unwrap();
 
-        let full_v2_name = format!("test-app-1.1.0-{rid}-full.tar.zst");
-        let full_v3_name = format!("test-app-1.2.0-{rid}-full.tar.zst");
-        let delta_v3_name = format!("test-app-1.2.0-{rid}-delta.tar.zst");
+        let full_v2_name = format!("{app_id}-1.1.0-{rid}-full.tar.zst");
+        let full_v3_name = format!("{app_id}-1.2.0-{rid}-full.tar.zst");
+        let delta_v3_name = format!("{app_id}-1.2.0-{rid}-delta.tar.zst");
 
-        std::fs::write(store_root.join(&delta_v3_name), &delta_v3).unwrap();
+        std::fs::write(app_store.join(&delta_v3_name), &delta_v3).unwrap();
 
         let index = ReleaseIndex {
-            app_id: "test-app".to_string(),
+            app_id: app_id.to_string(),
             releases: vec![
                 ReleaseEntry {
                     version: "1.1.0".to_string(),
@@ -1714,8 +1815,8 @@ mod tests {
                     created_utc: chrono::Utc::now().to_rfc3339(),
                     release_notes: String::new(),
                     name: String::new(),
-                    main_exe: "test-app".to_string(),
-                    install_directory: "test-app".to_string(),
+                    main_exe: app_id.to_string(),
+                    install_directory: app_id.to_string(),
                     supervisor_id: String::new(),
                     icon: String::new(),
                     shortcuts: Vec::new(),
@@ -1743,8 +1844,8 @@ mod tests {
                     created_utc: chrono::Utc::now().to_rfc3339(),
                     release_notes: String::new(),
                     name: String::new(),
-                    main_exe: "test-app".to_string(),
-                    install_directory: "test-app".to_string(),
+                    main_exe: app_id.to_string(),
+                    install_directory: app_id.to_string(),
                     supervisor_id: String::new(),
                     icon: String::new(),
                     shortcuts: Vec::new(),
@@ -1756,20 +1857,19 @@ mod tests {
             ..ReleaseIndex::default()
         };
 
-        let compressed = compress_release_index(&index, DEFAULT_ZSTD_LEVEL).unwrap();
-        std::fs::write(store_root.join(RELEASES_FILE_COMPRESSED), compressed).unwrap();
+        write_app_scoped_release_index(&store_root, app_id, &index);
 
         let active_app_dir = install_root.join("app");
         std::fs::create_dir_all(active_app_dir.join(".surge")).unwrap();
         std::fs::write(active_app_dir.join("payload.txt"), "v2 payload").unwrap();
         std::fs::write(
             active_app_dir.join(crate::install::RUNTIME_MANIFEST_RELATIVE_PATH),
-            "id: test-app\nversion: 1.1.0\n",
+            format!("id: {app_id}\nversion: 1.1.0\n"),
         )
         .unwrap();
         std::fs::write(
             active_app_dir.join(crate::install::LEGACY_RUNTIME_MANIFEST_RELATIVE_PATH),
-            "id: test-app\nversion: 1.1.0\n",
+            format!("id: {app_id}\nversion: 1.1.0\n"),
         )
         .unwrap();
 
@@ -1811,8 +1911,7 @@ mod tests {
         let rebuilt = apply_delta_patch(&synthesized, &decoded, &delta).unwrap();
         assert_eq!(rebuilt, full_v3);
 
-        let mut manager =
-            UpdateManager::new(ctx, "test-app", "1.1.0", "stable", install_root.to_str().unwrap()).unwrap();
+        let mut manager = UpdateManager::new(ctx, app_id, "1.1.0", "stable", install_root.to_str().unwrap()).unwrap();
         let info = manager.check_for_updates().await.unwrap().unwrap();
         assert_eq!(info.apply_strategy, ApplyStrategy::Delta);
         assert_eq!(info.apply_releases.len(), 1);
@@ -1831,20 +1930,189 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_download_and_apply_delta_prefers_app_scoped_release_index_lineage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("store");
+        let install_root = tmp.path().join("install");
+        let app_id = "test-app";
+        let app_scoped_store = store_root.join(app_id);
+        std::fs::create_dir_all(&store_root).unwrap();
+        std::fs::create_dir_all(&app_scoped_store).unwrap();
+        std::fs::create_dir_all(&install_root).unwrap();
+
+        let rid = current_rid();
+        let os = current_os_label_for_tests();
+
+        let source_v2_good = tmp.path().join("source-v2-good");
+        let source_v2_bad = tmp.path().join("source-v2-bad");
+        let source_v3 = tmp.path().join("source-v3");
+        std::fs::create_dir_all(&source_v2_good).unwrap();
+        std::fs::create_dir_all(&source_v2_bad).unwrap();
+        std::fs::create_dir_all(&source_v3).unwrap();
+        std::fs::write(source_v2_good.join("payload.txt"), "v2 payload").unwrap();
+        std::fs::write(source_v2_bad.join("payload.txt"), "v2 payload").unwrap();
+        std::fs::write(source_v3.join("payload.txt"), "v3 payload").unwrap();
+        std::fs::write(
+            source_v2_good.join("camera-tuner.deps.json"),
+            "{\"deps\":\"good-v2\"}\n",
+        )
+        .unwrap();
+        std::fs::write(source_v2_bad.join("camera-tuner.deps.json"), "{\"deps\":\"bad-v2\"}\n").unwrap();
+        std::fs::write(source_v3.join("camera-tuner.deps.json"), "{\"deps\":\"v3\"}\n").unwrap();
+
+        let mut good_v2_packer = ArchivePacker::new(3).unwrap();
+        good_v2_packer.add_directory(&source_v2_good, "").unwrap();
+        let full_v2_good = good_v2_packer.finalize().unwrap();
+
+        let mut bad_v2_packer = ArchivePacker::new(3).unwrap();
+        bad_v2_packer.add_directory(&source_v2_bad, "").unwrap();
+        let full_v2_bad = bad_v2_packer.finalize().unwrap();
+
+        let mut v3_packer = ArchivePacker::new(3).unwrap();
+        v3_packer.add_directory(&source_v3, "").unwrap();
+        let full_v3 = v3_packer.finalize().unwrap();
+
+        let patch_v3 = build_sparse_file_patch(&full_v2_good, &full_v3, 3, 0, &ChunkedDiffOptions::default()).unwrap();
+        let delta_v3 = zstd::encode_all(patch_v3.as_slice(), 3).unwrap();
+
+        let full_v2_name = format!("{app_id}-1.1.0-{rid}-full.tar.zst");
+        let full_v3_name = format!("{app_id}-1.2.0-{rid}-full.tar.zst");
+        let delta_v3_name = format!("{app_id}-1.2.0-{rid}-delta.tar.zst");
+
+        std::fs::write(store_root.join(&full_v2_name), &full_v2_bad).unwrap();
+        std::fs::write(store_root.join(&full_v3_name), &full_v3).unwrap();
+        std::fs::write(store_root.join(&delta_v3_name), &delta_v3).unwrap();
+
+        std::fs::write(app_scoped_store.join(&full_v2_name), &full_v2_good).unwrap();
+        std::fs::write(app_scoped_store.join(&full_v3_name), &full_v3).unwrap();
+        std::fs::write(app_scoped_store.join(&delta_v3_name), &delta_v3).unwrap();
+
+        let make_index = |full_v2: &[u8]| ReleaseIndex {
+            app_id: app_id.to_string(),
+            releases: vec![
+                ReleaseEntry {
+                    version: "1.1.0".to_string(),
+                    channels: vec!["stable".to_string()],
+                    os: os.clone(),
+                    rid: rid.clone(),
+                    is_genesis: true,
+                    full_filename: full_v2_name.clone(),
+                    full_size: full_v2.len() as i64,
+                    full_sha256: sha256_hex(full_v2),
+                    deltas: Vec::new(),
+                    preferred_delta_id: String::new(),
+                    created_utc: chrono::Utc::now().to_rfc3339(),
+                    release_notes: String::new(),
+                    name: String::new(),
+                    main_exe: app_id.to_string(),
+                    install_directory: app_id.to_string(),
+                    supervisor_id: String::new(),
+                    icon: String::new(),
+                    shortcuts: Vec::new(),
+                    persistent_assets: Vec::new(),
+                    installers: Vec::new(),
+                    environment: std::collections::BTreeMap::new(),
+                },
+                ReleaseEntry {
+                    version: "1.2.0".to_string(),
+                    channels: vec!["stable".to_string()],
+                    os: os.clone(),
+                    rid: rid.clone(),
+                    is_genesis: false,
+                    full_filename: full_v3_name.clone(),
+                    full_size: full_v3.len() as i64,
+                    full_sha256: sha256_hex(&full_v3),
+                    deltas: vec![DeltaArtifact::sparse_file_ops_zstd(
+                        "primary",
+                        "1.1.0",
+                        &delta_v3_name,
+                        delta_v3.len() as i64,
+                        &sha256_hex(&delta_v3),
+                    )],
+                    preferred_delta_id: "primary".to_string(),
+                    created_utc: chrono::Utc::now().to_rfc3339(),
+                    release_notes: String::new(),
+                    name: String::new(),
+                    main_exe: app_id.to_string(),
+                    install_directory: app_id.to_string(),
+                    supervisor_id: String::new(),
+                    icon: String::new(),
+                    shortcuts: Vec::new(),
+                    persistent_assets: Vec::new(),
+                    installers: Vec::new(),
+                    environment: std::collections::BTreeMap::new(),
+                },
+            ],
+            ..ReleaseIndex::default()
+        };
+
+        let root_compressed = compress_release_index(&make_index(&full_v2_bad), DEFAULT_ZSTD_LEVEL).unwrap();
+        std::fs::write(store_root.join(RELEASES_FILE_COMPRESSED), root_compressed).unwrap();
+        let scoped_compressed = compress_release_index(&make_index(&full_v2_good), DEFAULT_ZSTD_LEVEL).unwrap();
+        std::fs::write(app_scoped_store.join(RELEASES_FILE_COMPRESSED), scoped_compressed).unwrap();
+
+        let active_app_dir = install_root.join("app");
+        std::fs::create_dir_all(active_app_dir.join(".surge")).unwrap();
+        std::fs::write(active_app_dir.join("payload.txt"), "v2 payload").unwrap();
+        std::fs::write(
+            active_app_dir.join("camera-tuner.deps.json"),
+            "{\"deps\":\"good-v2\"}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            active_app_dir.join(crate::install::RUNTIME_MANIFEST_RELATIVE_PATH),
+            format!("id: {app_id}\nversion: 1.1.0\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            active_app_dir.join(crate::install::LEGACY_RUNTIME_MANIFEST_RELATIVE_PATH),
+            format!("id: {app_id}\nversion: 1.1.0\n"),
+        )
+        .unwrap();
+
+        let ctx = Arc::new(Context::new());
+        ctx.set_storage(
+            StorageProvider::Filesystem,
+            store_root.to_str().unwrap(),
+            "",
+            "",
+            "",
+            "",
+        );
+
+        let mut manager =
+            UpdateManager::new(ctx.clone(), app_id, "1.1.0", "stable", install_root.to_str().unwrap()).unwrap();
+        let info = manager.check_for_updates().await.unwrap().unwrap();
+        assert_eq!(ctx.storage_config().prefix, app_id);
+        assert_eq!(info.apply_strategy, ApplyStrategy::Delta);
+        manager
+            .download_and_apply(&info, None::<fn(ProgressInfo)>)
+            .await
+            .unwrap();
+
+        let installed_payload = std::fs::read_to_string(install_root.join("app").join("payload.txt")).unwrap();
+        assert_eq!(installed_payload, "v3 payload");
+        let installed_deps = std::fs::read_to_string(install_root.join("app").join("camera-tuner.deps.json")).unwrap();
+        assert_eq!(installed_deps, "{\"deps\":\"v3\"}\n");
+    }
+
+    #[tokio::test]
     async fn test_download_and_apply_moves_previous_active_into_version_snapshot() {
         let tmp = tempfile::tempdir().unwrap();
         let store_root = tmp.path().join("store");
         let install_root = tmp.path().join("install");
+        let app_id = "test-app";
         std::fs::create_dir_all(&store_root).unwrap();
         std::fs::create_dir_all(&install_root).unwrap();
+        let app_store = app_scoped_store_root(&store_root, app_id);
 
         let current_app_dir = install_root.join("app");
         std::fs::create_dir_all(&current_app_dir).unwrap();
         std::fs::write(current_app_dir.join("payload.txt"), "old payload").unwrap();
 
         let rid = current_rid();
-        let full_filename = format!("test-app-1.1.0-{rid}-full.tar.zst");
-        let full_path = store_root.join(&full_filename);
+        let full_filename = format!("{app_id}-1.1.0-{rid}-full.tar.zst");
+        let full_path = app_store.join(&full_filename);
 
         let mut packer = ArchivePacker::new(3).unwrap();
         packer.add_buffer("payload.txt", b"new payload", 0o644).unwrap();
@@ -1854,7 +2122,7 @@ mod tests {
         let full_sha256 = sha256_hex_file(&full_path).unwrap();
 
         let index = ReleaseIndex {
-            app_id: "test-app".to_string(),
+            app_id: app_id.to_string(),
             releases: vec![ReleaseEntry {
                 version: "1.1.0".to_string(),
                 channels: vec!["stable".to_string()],
@@ -1869,8 +2137,8 @@ mod tests {
                 created_utc: chrono::Utc::now().to_rfc3339(),
                 release_notes: String::new(),
                 name: String::new(),
-                main_exe: "test-app".to_string(),
-                install_directory: "test-app".to_string(),
+                main_exe: app_id.to_string(),
+                install_directory: app_id.to_string(),
                 supervisor_id: String::new(),
                 icon: String::new(),
                 shortcuts: Vec::new(),
@@ -1881,8 +2149,7 @@ mod tests {
             ..ReleaseIndex::default()
         };
 
-        let compressed = compress_release_index(&index, DEFAULT_ZSTD_LEVEL).unwrap();
-        std::fs::write(store_root.join(RELEASES_FILE_COMPRESSED), compressed).unwrap();
+        write_app_scoped_release_index(&store_root, app_id, &index);
 
         let ctx = Arc::new(Context::new());
         ctx.set_storage(
@@ -1894,8 +2161,7 @@ mod tests {
             "",
         );
 
-        let mut manager =
-            UpdateManager::new(ctx, "test-app", "1.0.0", "stable", install_root.to_str().unwrap()).unwrap();
+        let mut manager = UpdateManager::new(ctx, app_id, "1.0.0", "stable", install_root.to_str().unwrap()).unwrap();
         let info = manager.check_for_updates().await.unwrap().unwrap();
         manager
             .download_and_apply(&info, None::<fn(ProgressInfo)>)
@@ -1917,8 +2183,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store_root = tmp.path().join("store");
         let install_root = tmp.path().join("install");
+        let app_id = "test-app";
         std::fs::create_dir_all(&store_root).unwrap();
         std::fs::create_dir_all(&install_root).unwrap();
+        let app_store = app_scoped_store_root(&store_root, app_id);
 
         let current_app_dir = install_root.join("app");
         std::fs::create_dir_all(&current_app_dir).unwrap();
@@ -1928,8 +2196,8 @@ mod tests {
         std::fs::create_dir_all(install_root.join("app-backup")).unwrap();
 
         let rid = current_rid();
-        let full_filename = format!("test-app-1.1.0-{rid}-full.tar.zst");
-        let full_path = store_root.join(&full_filename);
+        let full_filename = format!("{app_id}-1.1.0-{rid}-full.tar.zst");
+        let full_path = app_store.join(&full_filename);
 
         let mut packer = ArchivePacker::new(3).unwrap();
         packer.add_buffer("payload.txt", b"new payload", 0o644).unwrap();
@@ -1939,7 +2207,7 @@ mod tests {
         let full_sha256 = sha256_hex_file(&full_path).unwrap();
 
         let index = ReleaseIndex {
-            app_id: "test-app".to_string(),
+            app_id: app_id.to_string(),
             releases: vec![ReleaseEntry {
                 version: "1.1.0".to_string(),
                 channels: vec!["stable".to_string()],
@@ -1954,8 +2222,8 @@ mod tests {
                 created_utc: chrono::Utc::now().to_rfc3339(),
                 release_notes: String::new(),
                 name: String::new(),
-                main_exe: "test-app".to_string(),
-                install_directory: "test-app".to_string(),
+                main_exe: app_id.to_string(),
+                install_directory: app_id.to_string(),
                 supervisor_id: String::new(),
                 icon: String::new(),
                 shortcuts: Vec::new(),
@@ -1966,8 +2234,7 @@ mod tests {
             ..ReleaseIndex::default()
         };
 
-        let compressed = compress_release_index(&index, DEFAULT_ZSTD_LEVEL).unwrap();
-        std::fs::write(store_root.join(RELEASES_FILE_COMPRESSED), compressed).unwrap();
+        write_app_scoped_release_index(&store_root, app_id, &index);
 
         let ctx = Arc::new(Context::new());
         ctx.set_storage(
@@ -1979,8 +2246,7 @@ mod tests {
             "",
         );
 
-        let mut manager =
-            UpdateManager::new(ctx, "test-app", "1.0.0", "stable", install_root.to_str().unwrap()).unwrap();
+        let mut manager = UpdateManager::new(ctx, app_id, "1.0.0", "stable", install_root.to_str().unwrap()).unwrap();
         manager.set_release_retention_limit(1);
 
         let info = manager.check_for_updates().await.unwrap().unwrap();
@@ -2001,8 +2267,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store_root = tmp.path().join("store");
         let install_root = tmp.path().join("install");
+        let app_id = "test-app";
         std::fs::create_dir_all(&store_root).unwrap();
         std::fs::create_dir_all(&install_root).unwrap();
+        let app_store = app_scoped_store_root(&store_root, app_id);
 
         let current_app_dir = install_root.join("app");
         std::fs::create_dir_all(&current_app_dir).unwrap();
@@ -2010,8 +2278,8 @@ mod tests {
         std::fs::create_dir_all(install_root.join("app-0.9.0")).unwrap();
 
         let rid = current_rid();
-        let full_filename = format!("test-app-1.1.0-{rid}-full.tar.zst");
-        let full_path = store_root.join(&full_filename);
+        let full_filename = format!("{app_id}-1.1.0-{rid}-full.tar.zst");
+        let full_path = app_store.join(&full_filename);
 
         let mut packer = ArchivePacker::new(3).unwrap();
         packer.add_buffer("payload.txt", b"new payload", 0o644).unwrap();
@@ -2021,7 +2289,7 @@ mod tests {
         let full_sha256 = sha256_hex_file(&full_path).unwrap();
 
         let index = ReleaseIndex {
-            app_id: "test-app".to_string(),
+            app_id: app_id.to_string(),
             releases: vec![ReleaseEntry {
                 version: "1.1.0".to_string(),
                 channels: vec!["stable".to_string()],
@@ -2036,8 +2304,8 @@ mod tests {
                 created_utc: chrono::Utc::now().to_rfc3339(),
                 release_notes: String::new(),
                 name: String::new(),
-                main_exe: "test-app".to_string(),
-                install_directory: "test-app".to_string(),
+                main_exe: app_id.to_string(),
+                install_directory: app_id.to_string(),
                 supervisor_id: String::new(),
                 icon: String::new(),
                 shortcuts: Vec::new(),
@@ -2048,8 +2316,7 @@ mod tests {
             ..ReleaseIndex::default()
         };
 
-        let compressed = compress_release_index(&index, DEFAULT_ZSTD_LEVEL).unwrap();
-        std::fs::write(store_root.join(RELEASES_FILE_COMPRESSED), compressed).unwrap();
+        write_app_scoped_release_index(&store_root, app_id, &index);
 
         let ctx = Arc::new(Context::new());
         ctx.set_storage(
@@ -2061,8 +2328,7 @@ mod tests {
             "",
         );
 
-        let mut manager =
-            UpdateManager::new(ctx, "test-app", "1.0.0", "stable", install_root.to_str().unwrap()).unwrap();
+        let mut manager = UpdateManager::new(ctx, app_id, "1.0.0", "stable", install_root.to_str().unwrap()).unwrap();
         manager.set_release_retention_limit(0);
 
         let info = manager.check_for_updates().await.unwrap().unwrap();
@@ -2093,12 +2359,14 @@ mod tests {
 
         let store_root = tmp.path().join("store");
         let install_root = tmp.path().join("install");
+        let app_id = "test-app";
         std::fs::create_dir_all(&store_root).unwrap();
         std::fs::create_dir_all(&install_root).unwrap();
+        let app_store = app_scoped_store_root(&store_root, app_id);
 
         let rid = current_rid();
-        let full_filename = format!("test-app-1.1.0-{rid}-full.tar.zst");
-        let full_path = store_root.join(&full_filename);
+        let full_filename = format!("{app_id}-1.1.0-{rid}-full.tar.zst");
+        let full_path = app_store.join(&full_filename);
 
         let mut packer = ArchivePacker::new(3).unwrap();
         packer.add_buffer("demoapp", b"#!/bin/sh\necho demo\n", 0o755).unwrap();
@@ -2110,7 +2378,7 @@ mod tests {
         let full_sha256 = sha256_hex_file(&full_path).unwrap();
 
         let index = ReleaseIndex {
-            app_id: "test-app".to_string(),
+            app_id: app_id.to_string(),
             releases: vec![ReleaseEntry {
                 version: "1.1.0".to_string(),
                 channels: vec!["stable".to_string()],
@@ -2126,7 +2394,7 @@ mod tests {
                 release_notes: String::new(),
                 name: String::new(),
                 main_exe: "demoapp".to_string(),
-                install_directory: "test-app".to_string(),
+                install_directory: app_id.to_string(),
                 supervisor_id: String::new(),
                 icon: "icon.png".to_string(),
                 shortcuts: vec![ShortcutLocation::Desktop, ShortcutLocation::Startup],
@@ -2137,8 +2405,7 @@ mod tests {
             ..ReleaseIndex::default()
         };
 
-        let compressed = compress_release_index(&index, DEFAULT_ZSTD_LEVEL).unwrap();
-        std::fs::write(store_root.join(RELEASES_FILE_COMPRESSED), compressed).unwrap();
+        write_app_scoped_release_index(&store_root, app_id, &index);
 
         let ctx = Arc::new(Context::new());
         ctx.set_storage(
@@ -2150,8 +2417,7 @@ mod tests {
             "",
         );
 
-        let mut manager =
-            UpdateManager::new(ctx, "test-app", "1.0.0", "stable", install_root.to_str().unwrap()).unwrap();
+        let mut manager = UpdateManager::new(ctx, app_id, "1.0.0", "stable", install_root.to_str().unwrap()).unwrap();
         let info = manager.check_for_updates().await.unwrap().unwrap();
         assert_eq!(info.apply_strategy, ApplyStrategy::Full);
         manager

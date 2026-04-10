@@ -734,6 +734,67 @@ apps:
     }
 
     #[tokio::test]
+    async fn test_update_release_index_rejects_existing_index_for_other_app() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("store");
+        let artifacts_root = tmp.path().join("artifacts");
+        std::fs::create_dir_all(&store_root).unwrap();
+        std::fs::create_dir_all(&artifacts_root).unwrap();
+        std::fs::write(artifacts_root.join("payload.txt"), b"payload").unwrap();
+
+        let app_id = "demo";
+        let rid = current_rid();
+        let manifest_path = tmp.path().join("surge.yml");
+        let manifest_yaml = format!(
+            r"schema: 1
+storage:
+  provider: filesystem
+  bucket: {bucket}
+apps:
+  - id: {app_id}
+    target:
+      rid: {rid}
+",
+            bucket = store_root.display()
+        );
+        std::fs::write(&manifest_path, manifest_yaml).unwrap();
+
+        let index = ReleaseIndex {
+            app_id: "other-app".to_string(),
+            ..ReleaseIndex::default()
+        };
+        let compressed = compress_release_index(&index, DEFAULT_ZSTD_LEVEL).unwrap();
+        std::fs::write(store_root.join(RELEASES_FILE_COMPRESSED), compressed).unwrap();
+
+        let ctx = Arc::new(Context::new());
+        ctx.set_storage(
+            StorageProvider::Filesystem,
+            store_root.to_str().unwrap(),
+            "",
+            "",
+            "",
+            "",
+        );
+
+        let mut builder = PackBuilder::new(
+            ctx,
+            manifest_path.to_str().unwrap(),
+            app_id,
+            &rid,
+            "1.0.0",
+            artifacts_root.to_str().unwrap(),
+        )
+        .unwrap();
+
+        builder.build(None).await.unwrap();
+        let err = builder.update_release_index("stable").await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Release index app_id 'other-app' does not match pack app 'demo'")
+        );
+    }
+
+    #[tokio::test]
     async fn test_build_and_push_breakdown_reports_full_and_delta_timings() {
         let tmp = tempfile::tempdir().expect("tempdir should be created");
         let store_root = tmp.path().join("store");

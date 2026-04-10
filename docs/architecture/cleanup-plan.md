@@ -34,36 +34,37 @@ These PRs are already merged:
 - `#62` `refactor(cli): split pack command installer resolution and upload flow`
 - `#63` `refactor(core): split release restore planning and artifact recovery`
 - `#64` `refactor(core): split shortcut installation by platform`
+- `#65` `refactor(core): split manifest module responsibilities`
 
 ## Active Phase
 
-### `refactor/manifest-phase-1`
+### `refactor/install-phase-1`
 
 Current goal:
 
-- split [`crates/surge-core/src/config/manifest/mod.rs`](../../crates/surge-core/src/config/manifest/mod.rs)
+- split [`crates/surge-core/src/install/mod.rs`](../../crates/surge-core/src/install/mod.rs)
   into:
-  - `manifest/types.rs`
-  - `manifest/normalize.rs`
-  - `manifest/lookup.rs`
-  - `manifest/validate.rs`
+  - `install/runtime_manifest.rs`
+  - `install/activation.rs`
+  - `install/persistent_assets.rs`
+  - `install/launch.rs`
 
 Current checkpoint:
 
 - the leaf modules have been created
-- the root module has been reduced to parse/load orchestration plus tests
+- the root module has been reduced to install-facing types, entrypoints, and tests
 - targeted compile of `surge-core` passes
-- focused `config::manifest` tests pass
+- focused `install` tests pass
 - focused `surge-core` clippy passes
-- the manifest baseline entry has been removed
+- the install baseline entry has been removed
 - the full pre-push suite passes on the branch
 
 Exit criteria:
 
-- `cargo test -p surge-core config::manifest` passes
+- `cargo test -p surge-core install` passes
 - `cargo clippy -p surge-core --all-targets --all-features -- -D warnings -W clippy::pedantic` passes
 - `./scripts/check-maintainability.sh` reports the file below the target so the
-  manifest baseline entry can be removed
+  install baseline entry can be removed
 - the full pre-push suite passes
 - the PR is merged with squash, local cleanup is done, and merged-`main` CI is green
 
@@ -71,14 +72,14 @@ Exit criteria:
 
 These are the remaining planned PRs from the original Rust-first campaign.
 
-### 1. `refactor/manifest-phase-1`
+### 1. `refactor/install-phase-1`
 
-- split [`crates/surge-core/src/config/manifest/mod.rs`](../../crates/surge-core/src/config/manifest/mod.rs)
+- split [`crates/surge-core/src/install/mod.rs`](../../crates/surge-core/src/install/mod.rs)
   into focused modules for:
-  - types
-  - normalization
-  - validation
-  - effective-config or installer metadata helpers
+  - runtime manifest handling
+  - activation and snapshot pruning
+  - persistent asset copying and validation
+  - launch and post-install lifecycle helpers
 
 ### 2. `refactor/maintainability-phase-2`
 
@@ -101,7 +102,6 @@ be decomposed to fully retire the baseline.
 
 ### Core surfaces
 
-- [`crates/surge-core/src/install.rs`](../../crates/surge-core/src/install.rs)
 - [`crates/surge-core/src/releases/delta.rs`](../../crates/surge-core/src/releases/delta.rs)
 - [`crates/surge-core/src/storage/azure.rs`](../../crates/surge-core/src/storage/azure.rs)
 - [`crates/surge-core/src/storage/gcs.rs`](../../crates/surge-core/src/storage/gcs.rs)

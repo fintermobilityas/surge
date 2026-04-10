@@ -2,4 +2,3 @@
 # Format: <max_lines> <path>
 813 crates/surge-cli/src/commands/install/mod.rs
 1860 crates/surge-cli/src/commands/install/remote.rs
-782 crates/surge-core/src/releases/delta.rs

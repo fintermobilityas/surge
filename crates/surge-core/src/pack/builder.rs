@@ -237,6 +237,10 @@ impl PackBuilder {
                 debug!("No previous version for delta, skipping");
                 None
             }
+            Err(e) if matches!(e, SurgeError::Integrity(_)) => {
+                self.artifacts.clear();
+                return Err(e);
+            }
             Err(e) => {
                 warn!("Delta package build failed (non-fatal): {e}");
                 None
@@ -350,11 +354,14 @@ mod tests {
     use crate::crypto::sha256::sha256_hex;
     use crate::diff::wrapper::bsdiff_buffers;
     use crate::platform::detect::current_rid;
+    use crate::releases::artifact_cache::cache_path_for_key;
     use crate::releases::manifest::{
         DeltaArtifact, PATCH_FORMAT_SPARSE_FILE_OPS_V1, ReleaseEntry, ReleaseIndex, compress_release_index,
         decompress_release_index,
     };
-    use crate::releases::restore::restore_full_archive_for_version;
+    use crate::releases::restore::{
+        RestoreOptions, restore_full_archive_for_version, restore_full_archive_for_version_with_options,
+    };
 
     #[test]
     fn test_detect_os_from_rid() {
@@ -791,6 +798,262 @@ apps:
         assert!(
             err.to_string()
                 .contains("Release index app_id 'other-app' does not match pack app 'demo'")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_delta_rejects_inconsistent_base_sha256() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("store");
+        let artifacts_root = tmp.path().join("artifacts");
+        std::fs::create_dir_all(&store_root).unwrap();
+        std::fs::create_dir_all(&artifacts_root).unwrap();
+        std::fs::write(artifacts_root.join("payload.txt"), b"v2 payload").unwrap();
+
+        let app_id = "demo";
+        let rid = current_rid();
+        let manifest_path = tmp.path().join("surge.yml");
+        let manifest_yaml = format!(
+            r"schema: 1
+storage:
+  provider: filesystem
+  bucket: {bucket}
+apps:
+  - id: {app_id}
+    target:
+      rid: {rid}
+",
+            bucket = store_root.display()
+        );
+        std::fs::write(&manifest_path, manifest_yaml).unwrap();
+
+        let mut packer_v1 = ArchivePacker::new(3).unwrap();
+        packer_v1.add_buffer("payload.txt", b"v1 payload", 0o644).unwrap();
+        let full_v1 = packer_v1.finalize().unwrap();
+
+        let full_v1_name = format!("{app_id}-1.0.0-{rid}-full.tar.zst");
+        std::fs::write(store_root.join(&full_v1_name), &full_v1).unwrap();
+
+        let index = ReleaseIndex {
+            app_id: app_id.to_string(),
+            releases: vec![ReleaseEntry {
+                version: "1.0.0".to_string(),
+                channels: vec!["stable".to_string()],
+                os: "linux".to_string(),
+                rid: rid.clone(),
+                is_genesis: true,
+                full_filename: full_v1_name,
+                full_size: full_v1.len() as i64,
+                full_sha256: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+                deltas: Vec::new(),
+                preferred_delta_id: String::new(),
+                created_utc: chrono::Utc::now().to_rfc3339(),
+                release_notes: String::new(),
+                name: String::new(),
+                main_exe: app_id.to_string(),
+                install_directory: app_id.to_string(),
+                supervisor_id: String::new(),
+                icon: String::new(),
+                shortcuts: Vec::new(),
+                persistent_assets: Vec::new(),
+                installers: Vec::new(),
+                environment: BTreeMap::new(),
+            }],
+            ..ReleaseIndex::default()
+        };
+
+        let compressed = compress_release_index(&index, DEFAULT_ZSTD_LEVEL).unwrap();
+        std::fs::write(store_root.join(RELEASES_FILE_COMPRESSED), compressed).unwrap();
+
+        let ctx = Arc::new(Context::new());
+        ctx.set_storage(
+            StorageProvider::Filesystem,
+            store_root.to_str().unwrap(),
+            "",
+            "",
+            "",
+            "",
+        );
+
+        let mut builder = PackBuilder::new(
+            ctx,
+            manifest_path.to_str().unwrap(),
+            app_id,
+            &rid,
+            "1.1.0",
+            artifacts_root.to_str().unwrap(),
+        )
+        .unwrap();
+
+        let err = builder.build(None).await.unwrap_err();
+        assert!(
+            err.to_string().contains("SHA-256 mismatch"),
+            "expected SHA-256 mismatch error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_delta_fails_on_corrupt_direct_base_even_if_cached_chain_can_reconstruct_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("store");
+        let artifacts_root = tmp.path().join("artifacts");
+        let cache_root = tmp.path().join("cache");
+        std::fs::create_dir_all(&store_root).unwrap();
+        std::fs::create_dir_all(&artifacts_root).unwrap();
+        std::fs::create_dir_all(&cache_root).unwrap();
+        std::fs::write(artifacts_root.join("payload.txt"), b"v3 payload").unwrap();
+
+        let app_id = "demo";
+        let rid = current_rid();
+        let manifest_path = tmp.path().join("surge.yml");
+        let manifest_yaml = format!(
+            r"schema: 1
+storage:
+  provider: filesystem
+  bucket: {bucket}
+apps:
+  - id: {app_id}
+    target:
+      rid: {rid}
+",
+            bucket = store_root.display()
+        );
+        std::fs::write(&manifest_path, manifest_yaml).unwrap();
+
+        let mut packer_v1 = ArchivePacker::new(3).unwrap();
+        packer_v1.add_buffer("payload.txt", b"v1 payload", 0o644).unwrap();
+        let full_v1 = packer_v1.finalize().unwrap();
+
+        let mut packer_v2 = ArchivePacker::new(3).unwrap();
+        packer_v2.add_buffer("payload.txt", b"v2 payload", 0o644).unwrap();
+        let full_v2 = packer_v2.finalize().unwrap();
+
+        let patch_v2 = bsdiff_buffers(&full_v1, &full_v2).unwrap();
+        let delta_v2 = zstd::encode_all(patch_v2.as_slice(), 3).unwrap();
+
+        let full_v1_name = format!("{app_id}-1.0.0-{rid}-full.tar.zst");
+        let full_v2_name = format!("{app_id}-1.1.0-{rid}-full.tar.zst");
+        let delta_v2_name = format!("{app_id}-1.1.0-{rid}-delta.tar.zst");
+
+        let mut corrupted_full_v2 = full_v2.clone();
+        corrupted_full_v2[0] ^= 0xff;
+
+        std::fs::write(store_root.join(&full_v1_name), &full_v1).unwrap();
+        std::fs::write(store_root.join(&full_v2_name), &corrupted_full_v2).unwrap();
+        std::fs::write(store_root.join(&delta_v2_name), &delta_v2).unwrap();
+
+        let index = ReleaseIndex {
+            app_id: app_id.to_string(),
+            releases: vec![
+                ReleaseEntry {
+                    version: "1.0.0".to_string(),
+                    channels: vec!["stable".to_string()],
+                    os: "linux".to_string(),
+                    rid: rid.clone(),
+                    is_genesis: true,
+                    full_filename: full_v1_name.clone(),
+                    full_size: full_v1.len() as i64,
+                    full_sha256: sha256_hex(&full_v1),
+                    deltas: Vec::new(),
+                    preferred_delta_id: String::new(),
+                    created_utc: chrono::Utc::now().to_rfc3339(),
+                    release_notes: String::new(),
+                    name: String::new(),
+                    main_exe: app_id.to_string(),
+                    install_directory: app_id.to_string(),
+                    supervisor_id: String::new(),
+                    icon: String::new(),
+                    shortcuts: Vec::new(),
+                    persistent_assets: Vec::new(),
+                    installers: Vec::new(),
+                    environment: BTreeMap::new(),
+                },
+                ReleaseEntry {
+                    version: "1.1.0".to_string(),
+                    channels: vec!["stable".to_string()],
+                    os: "linux".to_string(),
+                    rid: rid.clone(),
+                    is_genesis: false,
+                    full_filename: full_v2_name.clone(),
+                    full_size: full_v2.len() as i64,
+                    full_sha256: sha256_hex(&full_v2),
+                    deltas: vec![DeltaArtifact::bsdiff_zstd(
+                        "primary",
+                        "1.0.0",
+                        &delta_v2_name,
+                        delta_v2.len() as i64,
+                        &sha256_hex(&delta_v2),
+                    )],
+                    preferred_delta_id: "primary".to_string(),
+                    created_utc: chrono::Utc::now().to_rfc3339(),
+                    release_notes: String::new(),
+                    name: String::new(),
+                    main_exe: app_id.to_string(),
+                    install_directory: app_id.to_string(),
+                    supervisor_id: String::new(),
+                    icon: String::new(),
+                    shortcuts: Vec::new(),
+                    persistent_assets: Vec::new(),
+                    installers: Vec::new(),
+                    environment: BTreeMap::new(),
+                },
+            ],
+            ..ReleaseIndex::default()
+        };
+
+        let cached_full_v1 = cache_path_for_key(&cache_root, &full_v1_name).unwrap();
+        std::fs::create_dir_all(cached_full_v1.parent().unwrap()).unwrap();
+        std::fs::write(&cached_full_v1, &full_v1).unwrap();
+        let cached_delta_v2 = cache_path_for_key(&cache_root, &delta_v2_name).unwrap();
+        std::fs::create_dir_all(cached_delta_v2.parent().unwrap()).unwrap();
+        std::fs::write(&cached_delta_v2, &delta_v2).unwrap();
+
+        let backend = crate::storage::filesystem::FilesystemBackend::new(store_root.to_str().unwrap(), "");
+        let restored = restore_full_archive_for_version_with_options(
+            &backend,
+            &index,
+            &rid,
+            "1.1.0",
+            RestoreOptions {
+                cache_dir: Some(&cache_root),
+                progress: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(restored, full_v2);
+
+        let compressed = compress_release_index(&index, DEFAULT_ZSTD_LEVEL).unwrap();
+        std::fs::write(store_root.join(RELEASES_FILE_COMPRESSED), compressed).unwrap();
+
+        let ctx = Arc::new(Context::new());
+        ctx.set_storage(
+            StorageProvider::Filesystem,
+            store_root.to_str().unwrap(),
+            "",
+            "",
+            "",
+            "",
+        );
+
+        let mut builder = PackBuilder::new(
+            ctx,
+            manifest_path.to_str().unwrap(),
+            app_id,
+            &rid,
+            "1.2.0",
+            artifacts_root.to_str().unwrap(),
+        )
+        .unwrap();
+
+        let err = builder.build(None).await.unwrap_err();
+        assert!(
+            err.to_string().contains("SHA-256 mismatch"),
+            "expected SHA-256 mismatch error, got: {err}"
+        );
+        assert!(
+            builder.artifacts().is_empty(),
+            "integrity failures should clear staged artifacts"
         );
     }
 

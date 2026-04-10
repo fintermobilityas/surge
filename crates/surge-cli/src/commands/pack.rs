@@ -169,6 +169,7 @@ pub async fn execute(
         &app_id,
         &rid,
         version,
+        &self::resolution::default_channel_for_app(&manifest, app),
         manifest_path.parent().unwrap_or_else(|| Path::new(".")),
         artifacts_dir.as_path(),
         output_dir,
@@ -207,6 +208,7 @@ pub async fn execute_installers_only(
     manifest_path: &Path,
     app_id: Option<&str>,
     version: Option<&str>,
+    channel: Option<&str>,
     rid: Option<&str>,
     artifacts_dir: Option<&Path>,
     output_dir: &Path,
@@ -230,14 +232,14 @@ pub async fn execute_installers_only(
         super::ensure_mutating_storage_access(&storage_config, "upload installers")?;
     }
     let (backend, index, resolved) =
-        resolve_installer_package(&manifest, manifest_path, app_id, version, rid, artifacts_dir).await?;
+        resolve_installer_package(&manifest, manifest_path, app_id, version, channel, rid, artifacts_dir).await?;
     print_stage_done(
         theme,
         1,
         total_stages,
         &format!(
             "Target: {}/{} (channel: {})",
-            resolved.app_id, resolved.rid, resolved.default_channel
+            resolved.app_id, resolved.rid, resolved.selected_channel
         ),
     );
 
@@ -376,6 +378,7 @@ pub async fn execute_installers_only(
         &resolved.app_id,
         &resolved.rid,
         &resolved.selected_version,
+        &resolved.selected_channel,
         manifest_path.parent().unwrap_or_else(|| Path::new(".")),
         &resolved.artifacts_dir,
         output_dir,
@@ -471,6 +474,11 @@ mod tests {
     }
 
     fn write_manifest(path: &Path, store_dir: &Path, app_id: &str, rid: &str) {
+        write_manifest_with_channels(path, store_dir, app_id, rid, &["stable"]);
+    }
+
+    fn write_manifest_with_channels(path: &Path, store_dir: &Path, app_id: &str, rid: &str, channels: &[&str]) {
+        let channels_yaml = channels.join(", ");
         let yaml = format!(
             r"schema: 1
 storage:
@@ -479,7 +487,7 @@ storage:
 apps:
   - id: {app_id}
     main_exe: demoapp
-    channels: [stable]
+    channels: [{channels_yaml}]
     target:
       rid: {rid}
       icon: icon.png
@@ -567,6 +575,7 @@ apps:
             &manifest_path,
             Some(app_id),
             Some(version),
+            None,
             Some(&rid),
             Some(&artifacts_dir),
             &packages_dir,
@@ -678,6 +687,7 @@ apps:
             &manifest_path,
             Some(app_id),
             None,
+            None,
             Some(&rid),
             None,
             &packages_dir,
@@ -736,6 +746,7 @@ apps:
             &manifest_path,
             Some(app_id),
             Some(version),
+            None,
             Some(&rid),
             None,
             &packages_dir,
@@ -820,6 +831,7 @@ apps:
             &manifest_path,
             Some(app_id),
             Some(version),
+            None,
             Some(&rid),
             None,
             &packages_dir,
@@ -883,6 +895,7 @@ apps:
             &manifest_path,
             Some(app_id),
             Some(version),
+            None,
             Some(&rid),
             Some(&artifacts_dir),
             &packages_dir,
@@ -903,6 +916,161 @@ apps:
         assert!(
             store_dir.join("installers").join(&offline_name).is_file(),
             "offline installer should be uploaded to the flat installers/ path"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_installers_only_uses_requested_channel_for_selection_and_installer_manifest() {
+        let tmp = tempfile::tempdir().expect("temp dir should be created");
+
+        let store_dir = tmp.path().join("store");
+        let artifacts_dir = tmp.path().join("artifacts");
+        let packages_dir = tmp.path().join("packages");
+        let manifest_path = tmp.path().join("surge.yml");
+        let app_id = "installer-app";
+        let rid = current_rid();
+        let production_version = "1.2.3";
+        let test_version = "9.9.9";
+        let stub = create_stub_installer_launcher(tmp.path(), &rid);
+        set_installer_launcher_override(&stub);
+
+        std::fs::create_dir_all(&store_dir).expect("store dir should be created");
+        std::fs::create_dir_all(&artifacts_dir).expect("artifacts dir should be created");
+        std::fs::create_dir_all(&packages_dir).expect("packages dir should be created");
+        std::fs::write(artifacts_dir.join("icon.png"), b"icon").expect("icon should be written");
+        write_manifest_with_channels(&manifest_path, &store_dir, app_id, &rid, &["test", "production"]);
+
+        let test_full = format!("{app_id}-{test_version}-{rid}-full.tar.zst");
+        let production_full = format!("{app_id}-{production_version}-{rid}-full.tar.zst");
+        write_release_index(
+            &store_dir,
+            app_id,
+            vec![
+                make_release(
+                    test_version,
+                    "test",
+                    &rid,
+                    &test_full,
+                    &sha256_hex(b"test package bytes"),
+                ),
+                make_release(
+                    production_version,
+                    "production",
+                    &rid,
+                    &production_full,
+                    &sha256_hex(b"production package bytes"),
+                ),
+            ],
+        );
+        std::fs::write(store_dir.join(&test_full), b"test package bytes").expect("test package should be written");
+        std::fs::write(store_dir.join(&production_full), b"production package bytes")
+            .expect("production package should be written");
+
+        execute_installers_only(
+            &manifest_path,
+            Some(app_id),
+            None,
+            Some("production"),
+            Some(&rid),
+            Some(&artifacts_dir),
+            &packages_dir,
+            None,
+            false,
+        )
+        .await
+        .expect("installer generation should succeed");
+
+        assert!(
+            packages_dir.join(&production_full).is_file(),
+            "requested channel should select the production release"
+        );
+        assert!(
+            !packages_dir.join(&test_full).is_file(),
+            "requested channel should not select the manifest default channel release"
+        );
+
+        let installers_dir = packages_dir
+            .parent()
+            .expect("parent should exist")
+            .join("installers")
+            .join(app_id)
+            .join(&rid);
+        let installer_ext = if rid.starts_with("win-") { "exe" } else { "bin" };
+        let offline = installers_dir.join(format!("Setup-{rid}-{app_id}-production-offline.{installer_ext}"));
+        assert!(
+            offline.exists(),
+            "offline installer should use the requested channel in its filename"
+        );
+
+        let payload = installer_payload(&offline);
+        let installer_manifest = String::from_utf8(
+            surge_core::archive::extractor::read_entry(&payload, "installer.yml")
+                .expect("installer.yml should be present"),
+        )
+        .expect("installer.yml should be UTF-8");
+        assert!(installer_manifest.contains("channel: production"));
+        assert!(installer_manifest.contains("version: 1.2.3"));
+    }
+
+    #[tokio::test]
+    async fn execute_installers_only_uploads_installers_to_requested_channel_key() {
+        let tmp = tempfile::tempdir().expect("temp dir should be created");
+
+        let store_dir = tmp.path().join("store");
+        let artifacts_dir = tmp.path().join("artifacts");
+        let packages_dir = tmp.path().join("packages");
+        let manifest_path = tmp.path().join("surge.yml");
+        let app_id = "installer-app";
+        let rid = current_rid();
+        let version = "2.3.0";
+        let stub = create_stub_installer_launcher(tmp.path(), &rid);
+        set_installer_launcher_override(&stub);
+
+        std::fs::create_dir_all(&store_dir).expect("store dir should be created");
+        std::fs::create_dir_all(&artifacts_dir).expect("artifacts dir should be created");
+        std::fs::create_dir_all(&packages_dir).expect("packages dir should be created");
+        std::fs::write(artifacts_dir.join("icon.png"), b"icon").expect("icon should be written");
+        write_manifest_with_channels(&manifest_path, &store_dir, app_id, &rid, &["test", "production"]);
+
+        let full_name = format!("{app_id}-{version}-{rid}-full.tar.zst");
+        write_release_index(
+            &store_dir,
+            app_id,
+            vec![make_release(
+                version,
+                "production",
+                &rid,
+                &full_name,
+                &sha256_hex(b"full package bytes"),
+            )],
+        );
+        std::fs::write(packages_dir.join(&full_name), b"full package bytes").expect("full package should be written");
+
+        execute_installers_only(
+            &manifest_path,
+            Some(app_id),
+            Some(version),
+            Some("production"),
+            Some(&rid),
+            Some(&artifacts_dir),
+            &packages_dir,
+            None,
+            true,
+        )
+        .await
+        .expect("installer generation and upload should succeed");
+
+        let installer_ext = if rid.starts_with("win-") { "exe" } else { "bin" };
+        let online_name = format!("Setup-{rid}-{app_id}-production-online.{installer_ext}");
+        let offline_name = format!("Setup-{rid}-{app_id}-production-offline.{installer_ext}");
+
+        assert!(
+            store_dir.join("installers").join(&online_name).is_file(),
+            "online installer should be uploaded under the requested channel key"
+        );
+        assert!(
+            store_dir.join("installers").join(&offline_name).is_file(),
+            "offline installer should be uploaded under the requested channel key"
         );
     }
 
@@ -1009,6 +1177,7 @@ apps:
             app_id,
             &rid,
             version,
+            "stable",
             tmp.path(),
             &artifacts_dir,
             &output_dir,
@@ -1082,6 +1251,7 @@ apps:
             app_id,
             &rid,
             version,
+            "stable",
             tmp.path(),
             &artifacts_dir,
             &output_dir,
@@ -1145,6 +1315,7 @@ apps:
             app_id,
             &rid,
             version,
+            "stable",
             &manifest_root,
             &artifacts_dir,
             &output_dir,

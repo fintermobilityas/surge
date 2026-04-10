@@ -573,15 +573,17 @@ use `--app-id` (and optionally `--rid`) to scope down.
 surge restore -i
 ```
 
-By default this resolves the latest release for the manifest app/target and default channel, restores missing full
-packages from storage into `.surge/packages`, and builds installers using artifacts from
+By default this resolves the latest release for the manifest app/target on the app's default channel, restores missing
+full packages from storage into `.surge/packages`, and builds installers using artifacts from
 `.surge/artifacts/<app-id>/<rid>/<version>`. The generated installers are written to
-`.surge/installers/<app-id>/<rid>`.
+`.surge/installers/<app-id>/<rid>`. Use `--channel <name>` to rebuild installers for a non-default channel after a
+promotion flow.
 
 Explicit override example:
 
 ```bash
 surge restore -i \
+  --channel production \
   --version 1.2.3 \
   --artifacts-dir ./publish \
   --packages-dir .surge/packages

@@ -13,20 +13,6 @@ fn remote_installer_extension_for_rid(rid: &str) -> &'static str {
     }
 }
 
-fn default_channel_for_remote_installer(manifest: &SurgeManifest, app_id: &str) -> Result<String> {
-    let app = manifest
-        .apps
-        .iter()
-        .find(|candidate| candidate.id == app_id)
-        .ok_or_else(|| SurgeError::Config(format!("App '{app_id}' was not found in manifest")))?;
-    Ok(app
-        .channels
-        .first()
-        .cloned()
-        .or_else(|| manifest.channels.first().map(|channel| channel.name.clone()))
-        .unwrap_or_else(|| "stable".to_string()))
-}
-
 pub(crate) fn plan_remote_published_installer(
     manifest: &SurgeManifest,
     app_id: &str,
@@ -38,7 +24,6 @@ pub(crate) fn plan_remote_published_installer(
     let (_app, target) = manifest
         .find_app_with_target(app_id, rid)
         .ok_or_else(|| SurgeError::Config(format!("App '{app_id}' with RID '{rid}' not found in manifest")))?;
-    let default_channel = default_channel_for_remote_installer(manifest, app_id)?;
     let declared_installers = if release.installers.is_empty() {
         &target.installers
     } else {
@@ -49,8 +34,7 @@ pub(crate) fn plan_remote_published_installer(
         RemoteInstallerMode::Offline => "offline",
     };
     let installer_ext = remote_installer_extension_for_rid(rid);
-    let candidate_key =
-        format!("installers/Setup-{rid}-{app_id}-{default_channel}-{desired_installer}.{installer_ext}");
+    let candidate_key = format!("installers/Setup-{rid}-{app_id}-{channel}-{desired_installer}.{installer_ext}");
 
     let mut blockers = Vec::new();
     if !declared_installers
@@ -64,11 +48,6 @@ pub(crate) fn plan_remote_published_installer(
         };
         blockers.push(format!(
             "release does not declare a '{desired_installer}' installer (declared installers: {declared})"
-        ));
-    }
-    if channel != default_channel {
-        blockers.push(format!(
-            "published installers are currently bound to app default channel '{default_channel}', but install requested '{channel}'"
         ));
     }
 

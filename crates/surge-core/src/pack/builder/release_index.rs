@@ -20,6 +20,15 @@ impl PackBuilder {
             },
             Err(e) => return Err(e),
         };
+        if !index.app_id.trim().is_empty() && index.app_id != self.app_id {
+            return Err(SurgeError::Pack(format!(
+                "Release index app_id '{}' does not match pack app '{}'",
+                index.app_id, self.app_id
+            )));
+        }
+        if index.app_id.trim().is_empty() {
+            index.app_id = self.app_id.clone();
+        }
 
         let full = self.artifacts.iter().find(|a| !a.is_delta);
         let delta = self.artifacts.iter().find(|a| a.is_delta);

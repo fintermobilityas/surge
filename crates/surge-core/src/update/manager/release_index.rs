@@ -16,47 +16,68 @@ use crate::storage_config::append_prefix;
 use super::{ApplyStrategy, UpdateInfo, UpdateManager};
 
 pub(super) async fn load_release_index(manager: &mut UpdateManager) -> Result<ReleaseIndex> {
-    match manager.storage.get_object(RELEASES_FILE_COMPRESSED).await {
-        Ok(data) => decompress_release_index(&data),
-        Err(SurgeError::NotFound(_)) => {
-            let base_prefix = manager.ctx.storage_config().prefix;
-            let scoped_prefix = append_prefix(&base_prefix, &manager.app_id);
-            if scoped_prefix == base_prefix {
+    let base_prefix = manager.ctx.storage_config().prefix;
+    let scoped_prefix = app_scoped_prefix(&base_prefix, &manager.app_id);
+
+    if let Some(scoped_prefix) = scoped_prefix {
+        debug!(
+            app_id = %manager.app_id,
+            base_prefix = %base_prefix,
+            scoped_prefix = %scoped_prefix,
+            "Requiring app-scoped release index derived from configured prefix"
+        );
+
+        let mut scoped_config = manager.ctx.storage_config();
+        scoped_config.prefix = scoped_prefix.clone();
+        let scoped_backend = create_storage_backend(&scoped_config)?;
+
+        match scoped_backend.get_object(RELEASES_FILE_COMPRESSED).await {
+            Ok(data) => {
+                info!(
+                    app_id = %manager.app_id,
+                    scoped_prefix = %scoped_prefix,
+                    "Using app-scoped storage prefix for update checks"
+                );
+                manager.ctx.set_storage_prefix(&scoped_prefix);
+                manager.storage = scoped_backend;
+                return decompress_release_index(&data);
+            }
+            Err(SurgeError::NotFound(_)) => {
                 return Err(SurgeError::NotFound(format!(
-                    "Release index '{RELEASES_FILE_COMPRESSED}' not found"
+                    "Release index '{RELEASES_FILE_COMPRESSED}' not found on required app-scoped prefix"
                 )));
             }
-
-            debug!(
-                app_id = %manager.app_id,
-                base_prefix = %base_prefix,
-                scoped_prefix = %scoped_prefix,
-                "Release index not found on configured prefix; trying app-scoped prefix"
-            );
-
-            let mut scoped_config = manager.ctx.storage_config();
-            scoped_config.prefix = scoped_prefix.clone();
-            let scoped_backend = create_storage_backend(&scoped_config)?;
-
-            match scoped_backend.get_object(RELEASES_FILE_COMPRESSED).await {
-                Ok(data) => {
-                    info!(
-                        app_id = %manager.app_id,
-                        scoped_prefix = %scoped_prefix,
-                        "Using app-scoped storage prefix for update checks"
-                    );
-                    manager.ctx.set_storage_prefix(&scoped_prefix);
-                    manager.storage = scoped_backend;
-                    decompress_release_index(&data)
-                }
-                Err(SurgeError::NotFound(_)) => Err(SurgeError::NotFound(format!(
-                    "Release index '{RELEASES_FILE_COMPRESSED}' not found on configured or app-scoped prefix"
-                ))),
-                Err(e) => Err(e),
-            }
+            Err(e) => return Err(e),
         }
+    }
+
+    match manager.storage.get_object(RELEASES_FILE_COMPRESSED).await {
+        Ok(data) => decompress_release_index(&data),
+        Err(SurgeError::NotFound(_)) => Err(SurgeError::NotFound(format!(
+            "Release index '{RELEASES_FILE_COMPRESSED}' not found"
+        ))),
         Err(e) => Err(e),
     }
+}
+
+fn app_scoped_prefix(base_prefix: &str, app_id: &str) -> Option<String> {
+    let app_id = app_id.trim().trim_matches('/');
+    if app_id.is_empty() {
+        return None;
+    }
+
+    let already_scoped = base_prefix
+        .trim()
+        .trim_matches('/')
+        .rsplit('/')
+        .next()
+        .is_some_and(|segment| segment == app_id);
+    if already_scoped {
+        return None;
+    }
+
+    let scoped_prefix = append_prefix(base_prefix, app_id);
+    (scoped_prefix != base_prefix).then_some(scoped_prefix)
 }
 
 pub(super) fn resolve_update_info(manager: &mut UpdateManager, index: ReleaseIndex) -> Result<Option<UpdateInfo>> {

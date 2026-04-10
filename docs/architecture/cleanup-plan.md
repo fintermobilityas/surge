@@ -38,28 +38,30 @@ These PRs are already merged:
 - `#66` `refactor(core): split install module responsibilities`
 - `#67` `refactor(core): split azure storage backend helpers`
 - `#68` `refactor(core): split gcs storage backend helpers`
+- `#69` `refactor(bench): split payload generation helpers`
 
 ## Active Phase
 
-### `refactor/bench-payload-phase-1`
+### `refactor/bench-runner-phase-1`
 
 Current goal:
 
-- split [`crates/surge-bench/src/payload/mod.rs`](../../crates/surge-bench/src/payload/mod.rs)
+- split [`crates/surge-bench/src/runner/mod.rs`](../../crates/surge-bench/src/runner/mod.rs)
   into:
-  - `payload/rng.rs`
-  - `payload/specs.rs`
-  - `payload/synthetic.rs`
-  - `payload/mutations.rs`
+  - `runner/microbench.rs`
+  - `runner/installer.rs`
+  - `runner/update.rs`
+  - `runner/fs_compare.rs`
+  - `runner/manifest.rs`
 
 Current checkpoint:
 
 - the leaf modules have been created
-- the root module has been reduced to public types, template orchestration, and the top-level generator
+- the root module has been reduced to shared constants, timing, and public reexports
 - targeted compile of `surge-bench` passes
 - focused `surge-bench` tests pass
 - focused `surge-bench` clippy passes
-- the payload baseline entry has been removed
+- the runner baseline entry has been removed
 - the full pre-push suite passes on the branch
 
 Exit criteria:
@@ -67,7 +69,7 @@ Exit criteria:
 - `cargo test -p surge-bench` passes
 - `cargo clippy -p surge-bench --all-targets --all-features -- -D warnings -W clippy::pedantic` passes
 - `./scripts/check-maintainability.sh` reports the file below the target so the
-  payload baseline entry can be removed
+  runner baseline entry can be removed
 - the full pre-push suite passes
 - the PR is merged with squash, local cleanup is done, and merged-`main` CI is green
 
@@ -75,14 +77,15 @@ Exit criteria:
 
 These are the remaining planned PRs from the original Rust-first campaign.
 
-### 1. `refactor/bench-payload-phase-1`
+### 1. `refactor/bench-runner-phase-1`
 
-- split [`crates/surge-bench/src/payload/mod.rs`](../../crates/surge-bench/src/payload/mod.rs)
+- split [`crates/surge-bench/src/runner/mod.rs`](../../crates/surge-bench/src/runner/mod.rs)
   into focused modules for:
-  - rng helpers
-  - file spec and size-scaling helpers
-  - synthetic payload generation
-  - mutation helpers for derived releases
+  - microbench archive, hash, diff, and synthetic installer helpers
+  - real installer scenario execution helpers
+  - real publish/update scenario helpers
+  - filesystem comparison and size helpers
+  - manifest-writing helpers
 
 ### 2. `refactor/maintainability-phase-2`
 
@@ -106,10 +109,6 @@ be decomposed to fully retire the baseline.
 ### Core surfaces
 
 - [`crates/surge-core/src/releases/delta.rs`](../../crates/surge-core/src/releases/delta.rs)
-
-### Bench debt
-
-- [`crates/surge-bench/src/runner.rs`](../../crates/surge-bench/src/runner.rs)
 
 ## Execution Rules
 

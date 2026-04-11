@@ -21,6 +21,7 @@ pub use self::format::{
     has_archive_bsdiff_magic_prefix, has_archive_chunked_magic_prefix, has_sparse_file_ops_magic_prefix,
     is_supported_delta, patch_format_from_magic_prefix,
 };
+pub(crate) use self::sparse_ops::apply_sparse_file_patch_to_directory;
 pub use self::sparse_ops::build_sparse_file_patch;
 
 pub fn decode_delta_patch(data: &[u8], delta: &DeltaArtifact) -> Result<Vec<u8>> {
@@ -74,4 +75,15 @@ pub fn apply_delta_patch(older: &[u8], patch: &[u8], delta: &DeltaArtifact) -> R
         "Unsupported delta algorithm/format '{}/{}'",
         delta.algorithm, delta.patch_format
     )))
+}
+
+#[must_use]
+pub fn is_sparse_file_ops_delta(delta: &DeltaArtifact) -> bool {
+    let patch_format = normalized_or_default(&delta.patch_format, PATCH_FORMAT_BSDIFF4);
+    if !patch_format.eq_ignore_ascii_case(PATCH_FORMAT_SPARSE_FILE_OPS_V1) {
+        return false;
+    }
+
+    let algorithm = delta.algorithm.trim();
+    algorithm.is_empty() || algorithm.eq_ignore_ascii_case(DIFF_ALGORITHM_FILE_OPS)
 }

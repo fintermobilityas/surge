@@ -12,9 +12,12 @@ use crate::crypto::sha256::sha256_hex;
 use crate::error::{Result, SurgeError};
 use crate::pack::builder::build_canonical_archive_from_directory;
 use crate::platform::detect::current_rid;
-use crate::platform::fs::write_file_atomic;
+use crate::platform::fs::{copy_directory_filtered, write_file_atomic};
 use crate::releases::artifact_cache::cache_path_for_key;
-use crate::releases::delta::{apply_delta_patch, decode_delta_patch, is_supported_delta};
+use crate::releases::delta::{
+    apply_delta_patch, apply_sparse_file_patch_to_directory, decode_delta_patch, is_sparse_file_ops_delta,
+    is_supported_delta,
+};
 use crate::releases::manifest::{ReleaseEntry, decompress_release_index};
 use crate::releases::restore::{
     RestoreOptions, find_release_for_version_rid, restore_full_archive_for_version_with_options,
@@ -93,6 +96,23 @@ async fn materialize_delta_payload<F>(
 where
     F: Fn(ProgressInfo) + Send + Sync,
 {
+    if info.apply_releases.iter().all(|release| {
+        release
+            .selected_delta()
+            .is_some_and(|delta| is_sparse_file_ops_delta(&delta))
+    }) && find_previous_app_dir(&manager.install_dir, &manager.current_version).is_some()
+    {
+        return materialize_sparse_delta_payload_direct(
+            manager,
+            info,
+            staging_dir,
+            artifact_cache_dir,
+            extract_dir,
+            progress,
+        )
+        .await;
+    }
+
     let apply_delta_started_at = Instant::now();
     let apply_delta_total_items = i64::try_from(info.apply_releases.len()).unwrap_or(i64::MAX);
     let apply_delta_total_bytes = info
@@ -188,9 +208,143 @@ where
         },
     );
 
+    let latest = info
+        .apply_releases
+        .last()
+        .ok_or_else(|| SurgeError::Update("No latest release".to_string()))?;
     let rebuilt_archive_path = staging_dir.join("rebuilt-full.tar.zst");
+    cache_rebuilt_full_archive(artifact_cache_dir, latest, &rebuilt_archive)?;
     tokio::fs::write(&rebuilt_archive_path, &rebuilt_archive).await?;
     extract_archive_with_progress(&rebuilt_archive_path, extract_dir, progress, 80, 90)?;
+
+    let source = extract_dir.join(&info.latest_version);
+    if source.exists() {
+        Ok(source)
+    } else {
+        Ok(extract_dir.to_path_buf())
+    }
+}
+
+async fn materialize_sparse_delta_payload_direct<F>(
+    manager: &UpdateManager,
+    info: &UpdateInfo,
+    staging_dir: &Path,
+    artifact_cache_dir: &Path,
+    extract_dir: &Path,
+    progress: Option<&Arc<F>>,
+) -> Result<PathBuf>
+where
+    F: Fn(ProgressInfo) + Send + Sync,
+{
+    let apply_delta_started_at = Instant::now();
+    let apply_delta_total_items = i64::try_from(info.apply_releases.len()).unwrap_or(i64::MAX);
+    let apply_delta_total_bytes = info
+        .apply_releases
+        .iter()
+        .filter_map(ReleaseEntry::selected_delta)
+        .fold(0i64, |acc, delta| acc.saturating_add(delta.size.max(0)));
+
+    emit_progress(
+        progress,
+        ProgressInfo {
+            phase: 5,
+            total_percent: 60,
+            bytes_total: apply_delta_total_bytes,
+            items_total: apply_delta_total_items,
+            ..ProgressInfo::default()
+        },
+    );
+
+    stage_installed_app_tree_for_sparse_apply(&manager.install_dir, &manager.current_version, extract_dir)?;
+
+    let mut apply_delta_items_done = 0i64;
+    let mut apply_delta_bytes_done = 0i64;
+    let mut final_archive_settings: Option<(i32, u32)> = None;
+    for release in &info.apply_releases {
+        manager.ctx.check_cancelled()?;
+
+        let Some(delta) = release.selected_delta() else {
+            return Err(SurgeError::Update(format!(
+                "Delta update path is missing delta filename for {}",
+                release.version
+            )));
+        };
+
+        if !is_sparse_file_ops_delta(&delta) {
+            return Err(SurgeError::Update(format!(
+                "Delta {} for {} is not eligible for direct sparse application",
+                delta.filename, release.version
+            )));
+        }
+
+        let delta_path = staging_dir.join(&delta.filename);
+        let delta_compressed = tokio::fs::read(&delta_path).await?;
+        let patch = decode_delta_patch(delta_compressed.as_slice(), &delta)
+            .map_err(|e| SurgeError::Archive(format!("Failed to decompress delta {}: {e}", delta.filename)))?;
+        final_archive_settings = Some(
+            apply_sparse_file_patch_to_directory(extract_dir, &patch)
+                .map_err(|e| SurgeError::Update(format!("Failed to apply delta {}: {e}", delta.filename)))?,
+        );
+
+        apply_delta_items_done = apply_delta_items_done.saturating_add(1);
+        apply_delta_bytes_done = apply_delta_bytes_done.saturating_add(delta.size.max(0));
+        let phase_percent = clamp_progress_percent(apply_delta_items_done, apply_delta_total_items.max(1));
+        emit_progress(
+            progress,
+            ProgressInfo {
+                phase: 5,
+                phase_percent,
+                total_percent: phase_total_percent(60, 20, phase_percent),
+                bytes_done: apply_delta_bytes_done,
+                bytes_total: apply_delta_total_bytes,
+                items_done: apply_delta_items_done,
+                items_total: apply_delta_total_items,
+                speed_bytes_per_sec: average_speed_bytes_per_sec(
+                    u64::try_from(apply_delta_bytes_done.max(0)).unwrap_or(u64::MAX),
+                    apply_delta_started_at,
+                ),
+            },
+        );
+    }
+
+    manager.ctx.check_cancelled()?;
+    let latest = info
+        .apply_releases
+        .last()
+        .ok_or_else(|| SurgeError::Update("No latest release".to_string()))?;
+    let (compression_level, zstd_workers) = final_archive_settings.unwrap_or_else(|| {
+        let budget = manager.ctx.resource_budget();
+        (budget.zstd_compression_level, budget.effective_zstd_workers())
+    });
+    let rebuilt_archive =
+        build_canonical_archive_from_directory(extract_dir, compression_level, zstd_workers, &BTreeSet::new())?;
+    if !latest.full_sha256.is_empty() {
+        let hash = sha256_hex(&rebuilt_archive);
+        if hash != latest.full_sha256 {
+            return Err(SurgeError::Update(format!(
+                "SHA-256 mismatch for rebuilt full archive {}: expected {}, got {hash}",
+                latest.version, latest.full_sha256
+            )));
+        }
+    }
+    cache_rebuilt_full_archive(artifact_cache_dir, latest, &rebuilt_archive)?;
+
+    emit_progress(
+        progress,
+        ProgressInfo {
+            phase: 5,
+            phase_percent: 100,
+            total_percent: 90,
+            bytes_done: apply_delta_total_bytes,
+            bytes_total: apply_delta_total_bytes,
+            items_done: apply_delta_total_items,
+            items_total: apply_delta_total_items,
+            speed_bytes_per_sec: average_speed_bytes_per_sec(
+                u64::try_from(apply_delta_total_bytes.max(0)).unwrap_or(u64::MAX),
+                apply_delta_started_at,
+            ),
+        },
+    );
 
     let source = extract_dir.join(&info.latest_version);
     if source.exists() {
@@ -242,6 +396,30 @@ async fn restore_base_full_archive(manager: &UpdateManager, artifact_cache_dir: 
             ))
         }),
     }
+}
+
+fn stage_installed_app_tree_for_sparse_apply(
+    install_dir: &Path,
+    current_version: &str,
+    extract_dir: &Path,
+) -> Result<()> {
+    let app_dir = find_previous_app_dir(install_dir, current_version).ok_or_else(|| {
+        SurgeError::NotFound(format!(
+            "No active installed app directory was found for current version {current_version}"
+        ))
+    })?;
+    let excluded_relative_paths = installed_app_archive_exclusions(&app_dir)?;
+    copy_directory_filtered(&app_dir, extract_dir, &excluded_relative_paths)
+}
+
+fn cache_rebuilt_full_archive(artifact_cache_dir: &Path, release: &ReleaseEntry, archive: &[u8]) -> Result<()> {
+    let full_filename = release.full_filename.trim();
+    if full_filename.is_empty() {
+        return Ok(());
+    }
+
+    let cache_path = cache_path_for_key(artifact_cache_dir, full_filename)?;
+    write_file_atomic(&cache_path, archive)
 }
 
 fn extract_archive_with_progress<F>(
@@ -318,12 +496,7 @@ pub(super) fn synthesize_current_full_archive_from_installed_app(
         ))
     })?;
 
-    let mut excluded_relative_paths = BTreeSet::new();
-    excluded_relative_paths.insert(crate::install::RUNTIME_MANIFEST_RELATIVE_PATH.to_string());
-    excluded_relative_paths.insert(crate::install::LEGACY_RUNTIME_MANIFEST_RELATIVE_PATH.to_string());
-    if runtime_state_dir_contains_only_manifests(&app_dir)? {
-        excluded_relative_paths.insert(".surge".to_string());
-    }
+    let excluded_relative_paths = installed_app_archive_exclusions(&app_dir)?;
 
     let budget = ctx.resource_budget();
     let archive = build_canonical_archive_from_directory(
@@ -409,4 +582,14 @@ fn runtime_state_dir_contains_only_manifests(app_dir: &Path) -> Result<bool> {
     }
 
     Ok(true)
+}
+
+fn installed_app_archive_exclusions(app_dir: &Path) -> Result<BTreeSet<String>> {
+    let mut excluded_relative_paths = BTreeSet::new();
+    excluded_relative_paths.insert(crate::install::RUNTIME_MANIFEST_RELATIVE_PATH.to_string());
+    excluded_relative_paths.insert(crate::install::LEGACY_RUNTIME_MANIFEST_RELATIVE_PATH.to_string());
+    if runtime_state_dir_contains_only_manifests(app_dir)? {
+        excluded_relative_paths.insert(".surge".to_string());
+    }
+    Ok(excluded_relative_paths)
 }

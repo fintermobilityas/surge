@@ -1710,7 +1710,7 @@ mod tests {
                     os,
                     rid: rid.clone(),
                     is_genesis: false,
-                    full_filename: full_v3_name,
+                    full_filename: full_v3_name.clone(),
                     full_size: full_v3.len() as i64,
                     full_sha256: sha256_hex(&full_v3),
                     deltas: vec![DeltaArtifact::bsdiff_zstd(
@@ -1830,7 +1830,7 @@ mod tests {
                     os,
                     rid: rid.clone(),
                     is_genesis: false,
-                    full_filename: full_v3_name,
+                    full_filename: full_v3_name.clone(),
                     full_size: full_v3.len() as i64,
                     full_sha256: sha256_hex(&full_v3),
                     deltas: vec![DeltaArtifact::sparse_file_ops_zstd(
@@ -1927,6 +1927,8 @@ mod tests {
 
         let cached_current_full = install_root.join(".surge-cache").join("artifacts").join(&full_v2_name);
         assert!(!cached_current_full.exists());
+        let cached_latest_full = install_root.join(".surge-cache").join("artifacts").join(&full_v3_name);
+        assert!(cached_latest_full.exists());
     }
 
     #[tokio::test]

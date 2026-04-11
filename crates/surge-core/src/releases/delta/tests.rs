@@ -198,3 +198,69 @@ fn test_sparse_file_patch_roundtrip_rebuilds_full_archive_bytes() {
     let rebuilt = apply_delta_patch(&full_v1, &decoded, &delta).unwrap();
     assert_eq!(rebuilt, full_v2);
 }
+
+#[test]
+fn test_sparse_file_patch_can_apply_directly_to_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let old_dir = dir.path().join("old");
+    let new_dir = dir.path().join("new");
+    std::fs::create_dir_all(old_dir.join("bin")).unwrap();
+    std::fs::create_dir_all(new_dir.join("bin")).unwrap();
+    std::fs::create_dir_all(new_dir.join("models")).unwrap();
+    std::fs::write(old_dir.join("bin").join("runtime.bin"), vec![b'A'; 256 * 1024]).unwrap();
+    std::fs::write(old_dir.join("config.json"), br#"{"version":1}"#).unwrap();
+    std::fs::write(new_dir.join("bin").join("runtime.bin"), {
+        let mut bytes = vec![b'A'; 256 * 1024];
+        bytes[2048] = b'B';
+        bytes
+    })
+    .unwrap();
+    std::fs::write(new_dir.join("config.json"), br#"{"version":2}"#).unwrap();
+    std::fs::write(new_dir.join("models").join("model-v2.bin"), vec![b'Z'; 128 * 1024]).unwrap();
+
+    let mut old_packer = ArchivePacker::new(7).unwrap();
+    old_packer.add_directory(&old_dir, "").unwrap();
+    let full_v1 = old_packer.finalize().unwrap();
+
+    let mut new_packer = ArchivePacker::new(7).unwrap();
+    new_packer.add_directory(&new_dir, "").unwrap();
+    let full_v2 = new_packer.finalize().unwrap();
+
+    let patch = build_sparse_file_patch(
+        &full_v1,
+        &full_v2,
+        7,
+        0,
+        &ChunkedDiffOptions {
+            chunk_size: 64 * 1024,
+            max_threads: 1,
+        },
+    )
+    .unwrap();
+    let delta_bytes = zstd::encode_all(patch.as_slice(), 3).unwrap();
+    let delta = DeltaArtifact::sparse_file_ops_zstd(
+        "primary",
+        "1.0.0",
+        "demo-1.1.0-delta.tar.zst",
+        i64::try_from(delta_bytes.len()).unwrap(),
+        &sha256_hex(&delta_bytes),
+    );
+    assert!(is_sparse_file_ops_delta(&delta));
+
+    let working_dir = tempfile::tempdir().unwrap();
+    crate::platform::fs::copy_directory(&old_dir, working_dir.path()).unwrap();
+
+    let decoded = decode_delta_patch(&delta_bytes, &delta).unwrap();
+    let archive_settings = apply_sparse_file_patch_to_directory(working_dir.path(), &decoded).unwrap();
+    assert_eq!(archive_settings, (7, 0));
+
+    let mut rebuilt_packer = ArchivePacker::new(7).unwrap();
+    rebuilt_packer.add_directory(working_dir.path(), "").unwrap();
+    let rebuilt = rebuilt_packer.finalize().unwrap();
+
+    assert_eq!(rebuilt, full_v2);
+    assert_eq!(
+        std::fs::read_to_string(working_dir.path().join("config.json")).unwrap(),
+        r#"{"version":2}"#
+    );
+}

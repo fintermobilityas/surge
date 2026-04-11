@@ -1,4 +1,5 @@
 use std::fs;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -189,6 +190,11 @@ pub(super) fn apply_sparse_file_patch(older: &[u8], patch: &[u8]) -> Result<Vec<
     };
     packer.add_directory(working_dir.path(), "")?;
     packer.finalize()
+}
+
+pub(crate) fn apply_sparse_file_patch_to_directory(root: &Path, patch: &[u8]) -> Result<(i32, u32)> {
+    let (manifest, payloads) = decode_sparse_file_ops_payload(patch)?;
+    apply_sparse_file_ops(root, &manifest.ops, payloads).map(|()| (manifest.compression_level, manifest.zstd_workers))
 }
 
 fn encode_sparse_file_ops_payload(manifest: &SparseFileDeltaManifest, payloads: &[u8]) -> Result<Vec<u8>> {

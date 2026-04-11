@@ -1932,6 +1932,159 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_download_and_apply_sparse_delta_uses_pristine_base_when_persistent_assets_diverge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("store");
+        let install_root = tmp.path().join("install");
+        let app_id = "test-app";
+        std::fs::create_dir_all(&store_root).unwrap();
+        std::fs::create_dir_all(&install_root).unwrap();
+        let app_store = app_scoped_store_root(&store_root, app_id);
+
+        let rid = current_rid();
+        let os = current_os_label_for_tests();
+
+        let source_v2 = tmp.path().join("source-v2");
+        let source_v3 = tmp.path().join("source-v3");
+        std::fs::create_dir_all(&source_v2).unwrap();
+        std::fs::create_dir_all(&source_v3).unwrap();
+        std::fs::write(source_v2.join("payload.txt"), "v2 payload").unwrap();
+        std::fs::write(source_v2.join("settings.json"), r#"{"theme":"light"}"#).unwrap();
+        std::fs::write(source_v3.join("payload.txt"), "v3 payload").unwrap();
+        std::fs::write(source_v3.join("settings.json"), r#"{"theme":"light"}"#).unwrap();
+
+        let mut packer_v2 = ArchivePacker::new(3).unwrap();
+        packer_v2.add_directory(&source_v2, "").unwrap();
+        let full_v2 = packer_v2.finalize().unwrap();
+
+        let mut packer_v3 = ArchivePacker::new(3).unwrap();
+        packer_v3.add_directory(&source_v3, "").unwrap();
+        let full_v3 = packer_v3.finalize().unwrap();
+
+        let patch_v3 = build_sparse_file_patch(&full_v2, &full_v3, 3, 0, &ChunkedDiffOptions::default()).unwrap();
+        let delta_v3 = zstd::encode_all(patch_v3.as_slice(), 3).unwrap();
+
+        let full_v2_name = format!("{app_id}-1.1.0-{rid}-full.tar.zst");
+        let full_v3_name = format!("{app_id}-1.2.0-{rid}-full.tar.zst");
+        let delta_v3_name = format!("{app_id}-1.2.0-{rid}-delta.tar.zst");
+
+        std::fs::write(app_store.join(&full_v2_name), &full_v2).unwrap();
+        std::fs::write(app_store.join(&delta_v3_name), &delta_v3).unwrap();
+
+        let persistent_assets = vec!["settings.json".to_string()];
+        let index = ReleaseIndex {
+            app_id: app_id.to_string(),
+            releases: vec![
+                ReleaseEntry {
+                    version: "1.1.0".to_string(),
+                    channels: vec!["stable".to_string()],
+                    os: os.clone(),
+                    rid: rid.clone(),
+                    is_genesis: true,
+                    full_filename: full_v2_name.clone(),
+                    full_size: full_v2.len() as i64,
+                    full_sha256: sha256_hex(&full_v2),
+                    deltas: Vec::new(),
+                    preferred_delta_id: String::new(),
+                    created_utc: chrono::Utc::now().to_rfc3339(),
+                    release_notes: String::new(),
+                    name: String::new(),
+                    main_exe: app_id.to_string(),
+                    install_directory: app_id.to_string(),
+                    supervisor_id: String::new(),
+                    icon: String::new(),
+                    shortcuts: Vec::new(),
+                    persistent_assets: persistent_assets.clone(),
+                    installers: Vec::new(),
+                    environment: std::collections::BTreeMap::new(),
+                },
+                ReleaseEntry {
+                    version: "1.2.0".to_string(),
+                    channels: vec!["stable".to_string()],
+                    os,
+                    rid: rid.clone(),
+                    is_genesis: false,
+                    full_filename: full_v3_name.clone(),
+                    full_size: full_v3.len() as i64,
+                    full_sha256: sha256_hex(&full_v3),
+                    deltas: vec![DeltaArtifact::sparse_file_ops_zstd(
+                        "primary",
+                        "1.1.0",
+                        &delta_v3_name,
+                        delta_v3.len() as i64,
+                        &sha256_hex(&delta_v3),
+                    )],
+                    preferred_delta_id: "primary".to_string(),
+                    created_utc: chrono::Utc::now().to_rfc3339(),
+                    release_notes: String::new(),
+                    name: String::new(),
+                    main_exe: app_id.to_string(),
+                    install_directory: app_id.to_string(),
+                    supervisor_id: String::new(),
+                    icon: String::new(),
+                    shortcuts: Vec::new(),
+                    persistent_assets,
+                    installers: Vec::new(),
+                    environment: std::collections::BTreeMap::new(),
+                },
+            ],
+            ..ReleaseIndex::default()
+        };
+
+        write_app_scoped_release_index(&store_root, app_id, &index);
+
+        let active_app_dir = install_root.join("app");
+        std::fs::create_dir_all(active_app_dir.join(".surge")).unwrap();
+        std::fs::write(active_app_dir.join("payload.txt"), "v2 payload").unwrap();
+        std::fs::write(active_app_dir.join("settings.json"), r#"{"theme":"dark"}"#).unwrap();
+        std::fs::write(
+            active_app_dir.join(crate::install::RUNTIME_MANIFEST_RELATIVE_PATH),
+            format!("id: {app_id}\nversion: 1.1.0\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            active_app_dir.join(crate::install::LEGACY_RUNTIME_MANIFEST_RELATIVE_PATH),
+            format!("id: {app_id}\nversion: 1.1.0\n"),
+        )
+        .unwrap();
+
+        let ctx = Arc::new(Context::new());
+        ctx.set_storage(
+            StorageProvider::Filesystem,
+            store_root.to_str().unwrap(),
+            "",
+            "",
+            "",
+            "",
+        );
+
+        let mut manager = UpdateManager::new(ctx, app_id, "1.1.0", "stable", install_root.to_str().unwrap()).unwrap();
+        let info = manager.check_for_updates().await.unwrap().unwrap();
+        assert_eq!(info.apply_strategy, ApplyStrategy::Delta);
+        manager
+            .download_and_apply(&info, None::<fn(ProgressInfo)>)
+            .await
+            .unwrap();
+
+        let installed_payload = std::fs::read_to_string(install_root.join("app").join("payload.txt")).unwrap();
+        assert_eq!(installed_payload, "v3 payload");
+        let installed_settings = std::fs::read_to_string(install_root.join("app").join("settings.json")).unwrap();
+        assert_eq!(installed_settings, r#"{"theme":"dark"}"#);
+
+        let cached_latest_full = install_root.join(".surge-cache").join("artifacts").join(&full_v3_name);
+        assert!(cached_latest_full.exists());
+        let extracted_cached = tempfile::tempdir().unwrap();
+        crate::archive::extractor::extract_to(
+            &std::fs::read(&cached_latest_full).unwrap(),
+            extracted_cached.path(),
+            None,
+        )
+        .unwrap();
+        let cached_settings = std::fs::read_to_string(extracted_cached.path().join("settings.json")).unwrap();
+        assert_eq!(cached_settings, r#"{"theme":"light"}"#);
+    }
+
+    #[tokio::test]
     async fn test_download_and_apply_delta_prefers_app_scoped_release_index_lineage() {
         let tmp = tempfile::tempdir().unwrap();
         let store_root = tmp.path().join("store");

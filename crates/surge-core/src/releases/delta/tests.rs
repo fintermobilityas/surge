@@ -217,6 +217,13 @@ fn test_sparse_file_patch_can_apply_directly_to_directory() {
     .unwrap();
     std::fs::write(new_dir.join("config.json"), br#"{"version":2}"#).unwrap();
     std::fs::write(new_dir.join("models").join("model-v2.bin"), vec![b'Z'; 128 * 1024]).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(old_dir.join("bin"), std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(new_dir.join("bin"), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
 
     let mut old_packer = ArchivePacker::new(7).unwrap();
     old_packer.add_directory(&old_dir, "").unwrap();
@@ -248,7 +255,7 @@ fn test_sparse_file_patch_can_apply_directly_to_directory() {
     assert!(is_sparse_file_ops_delta(&delta));
 
     let working_dir = tempfile::tempdir().unwrap();
-    crate::platform::fs::copy_directory(&old_dir, working_dir.path()).unwrap();
+    crate::archive::extractor::extract_to(&full_v1, working_dir.path(), None).unwrap();
 
     let decoded = decode_delta_patch(&delta_bytes, &delta).unwrap();
     let archive_settings = apply_sparse_file_patch_to_directory(working_dir.path(), &decoded).unwrap();
@@ -263,4 +270,15 @@ fn test_sparse_file_patch_can_apply_directly_to_directory() {
         std::fs::read_to_string(working_dir.path().join("config.json")).unwrap(),
         r#"{"version":2}"#
     );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = std::fs::metadata(working_dir.path().join("bin"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+    }
 }

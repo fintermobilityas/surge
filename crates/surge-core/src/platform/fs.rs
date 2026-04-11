@@ -1,6 +1,5 @@
-use std::collections::BTreeSet;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::error::{Result, SurgeError};
 
@@ -78,90 +77,6 @@ pub fn copy_directory(src: &Path, dst: &Path) -> Result<()> {
         }
     }
 
-    Ok(())
-}
-
-/// Recursively copy a directory tree, skipping any relative paths in `excluded_relative_paths`.
-pub fn copy_directory_filtered(src: &Path, dst: &Path, excluded_relative_paths: &BTreeSet<String>) -> Result<()> {
-    copy_directory_filtered_recursive(src, dst, Path::new(""), excluded_relative_paths)
-}
-
-fn copy_directory_filtered_recursive(
-    src: &Path,
-    dst: &Path,
-    relative_root: &Path,
-    excluded_relative_paths: &BTreeSet<String>,
-) -> Result<()> {
-    fs::create_dir_all(dst)?;
-
-    let mut entries = fs::read_dir(src)?.collect::<std::result::Result<Vec<_>, std::io::Error>>()?;
-    entries.sort_by_key(std::fs::DirEntry::file_name);
-
-    for entry in entries {
-        let relative_path = copy_child_relative_path(relative_root, &entry.file_name());
-        if excluded_relative_paths.contains(&copy_relative_path_to_string(&relative_path)) {
-            continue;
-        }
-
-        let source = entry.path();
-        let target = dst.join(entry.file_name());
-        let metadata = fs::symlink_metadata(&source)?;
-        let file_type = metadata.file_type();
-
-        if file_type.is_dir() {
-            copy_directory_filtered_recursive(&source, &target, &relative_path, excluded_relative_paths)?;
-        } else if file_type.is_symlink() {
-            copy_symlink(&source, &target)?;
-        } else if file_type.is_file() {
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::copy(&source, &target)?;
-        } else {
-            return Err(SurgeError::Io(std::io::Error::other(format!(
-                "unsupported filesystem entry while copying '{}'",
-                source.display()
-            ))));
-        }
-    }
-
-    Ok(())
-}
-
-fn copy_child_relative_path(prefix: &Path, child_name: &std::ffi::OsStr) -> PathBuf {
-    if prefix.as_os_str().is_empty() {
-        PathBuf::from(child_name)
-    } else {
-        prefix.join(child_name)
-    }
-}
-
-fn copy_relative_path_to_string(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
-}
-
-fn copy_symlink(source: &Path, dst: &Path) -> Result<()> {
-    if let Some(parent) = dst.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let target = fs::read_link(source)?;
-    create_symlink(&target, dst)
-}
-
-#[cfg(unix)]
-fn create_symlink(target: &Path, dst: &Path) -> Result<()> {
-    std::os::unix::fs::symlink(target, dst)?;
-    Ok(())
-}
-
-#[cfg(windows)]
-fn create_symlink(target: &Path, dst: &Path) -> Result<()> {
-    let metadata = fs::metadata(target)?;
-    if metadata.is_dir() {
-        std::os::windows::fs::symlink_dir(target, dst)?;
-    } else {
-        std::os::windows::fs::symlink_file(target, dst)?;
-    }
     Ok(())
 }
 

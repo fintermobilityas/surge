@@ -5,14 +5,14 @@ use std::time::Instant;
 
 use tracing::{debug, warn};
 
-use crate::archive::extractor::extract_file_to_with_progress;
+use crate::archive::extractor::{extract_file_to_with_progress, extract_to};
 use crate::config::constants::RELEASES_FILE_COMPRESSED;
 use crate::context::Context;
 use crate::crypto::sha256::sha256_hex;
 use crate::error::{Result, SurgeError};
 use crate::pack::builder::build_canonical_archive_from_directory;
 use crate::platform::detect::current_rid;
-use crate::platform::fs::{copy_directory_filtered, write_file_atomic};
+use crate::platform::fs::write_file_atomic;
 use crate::releases::artifact_cache::cache_path_for_key;
 use crate::releases::delta::{
     apply_delta_patch, apply_sparse_file_patch_to_directory, decode_delta_patch, is_sparse_file_ops_delta,
@@ -100,8 +100,7 @@ where
         release
             .selected_delta()
             .is_some_and(|delta| is_sparse_file_ops_delta(&delta))
-    }) && find_previous_app_dir(&manager.install_dir, &manager.current_version).is_some()
-    {
+    }) {
         return materialize_sparse_delta_payload_direct(
             manager,
             info,
@@ -255,7 +254,8 @@ where
         },
     );
 
-    stage_installed_app_tree_for_sparse_apply(&manager.install_dir, &manager.current_version, extract_dir)?;
+    let base_archive = restore_base_full_archive(manager, artifact_cache_dir).await?;
+    extract_to(&base_archive, extract_dir, None)?;
 
     let mut apply_delta_items_done = 0i64;
     let mut apply_delta_bytes_done = 0i64;
@@ -396,20 +396,6 @@ async fn restore_base_full_archive(manager: &UpdateManager, artifact_cache_dir: 
             ))
         }),
     }
-}
-
-fn stage_installed_app_tree_for_sparse_apply(
-    install_dir: &Path,
-    current_version: &str,
-    extract_dir: &Path,
-) -> Result<()> {
-    let app_dir = find_previous_app_dir(install_dir, current_version).ok_or_else(|| {
-        SurgeError::NotFound(format!(
-            "No active installed app directory was found for current version {current_version}"
-        ))
-    })?;
-    let excluded_relative_paths = installed_app_archive_exclusions(&app_dir)?;
-    copy_directory_filtered(&app_dir, extract_dir, &excluded_relative_paths)
 }
 
 fn cache_rebuilt_full_archive(artifact_cache_dir: &Path, release: &ReleaseEntry, archive: &[u8]) -> Result<()> {

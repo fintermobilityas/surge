@@ -8,6 +8,7 @@ use surge_core::config::constants::{DEFAULT_ZSTD_LEVEL, RELEASES_FILE_COMPRESSED
 use surge_core::config::manifest::SurgeManifest;
 use surge_core::error::{Result, SurgeError};
 use surge_core::releases::manifest::{compress_release_index, decompress_release_index};
+use surge_core::releases::version::canonicalize_version;
 use surge_core::storage::{self, StorageBackend};
 
 /// Demote (remove) a release version from a channel.
@@ -19,6 +20,7 @@ pub async fn execute(
     channel: &str,
 ) -> Result<()> {
     const TOTAL_STAGES: usize = 4;
+    let version = canonicalize_version(version, "release version")?;
 
     let theme = UiTheme::global();
     let started = Instant::now();

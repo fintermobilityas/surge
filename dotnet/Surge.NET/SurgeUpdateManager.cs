@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
+using Semver;
 
 namespace Surge
 {
@@ -15,7 +16,7 @@ namespace Surge
         private IntPtr _nativeMgr;
         private bool _disposed;
         private string _channel = "stable";
-        private string _currentVersion = "0.0.0";
+        private SemVersion _currentVersion = SemanticVersions.Zero;
         private int _releaseRetentionLimit = 1;
 
         /// <summary>
@@ -71,7 +72,7 @@ namespace Surge
             _nativeMgr = NativeMethods.UpdateManagerCreate(
                 _nativeCtx,
                 appInfo.Id,
-                appInfo.Version,
+                appInfo.Version.ToString(),
                 appInfo.Channel,
                 appInfo.InstallDirectory);
 
@@ -83,7 +84,7 @@ namespace Surge
             }
 
             _channel = string.IsNullOrWhiteSpace(appInfo.Channel) ? "stable" : appInfo.Channel;
-            _currentVersion = string.IsNullOrWhiteSpace(appInfo.Version) ? "0.0.0" : appInfo.Version;
+            _currentVersion = appInfo.Version ?? SemanticVersions.Zero;
         }
 
         /// <summary>
@@ -94,7 +95,7 @@ namespace Surge
         /// <summary>
         /// The current installed version baseline used for update checks.
         /// </summary>
-        public string CurrentVersion => _currentVersion;
+        public SemVersion CurrentVersion => _currentVersion;
 
         /// <summary>
         /// Switch update channel at runtime (for example, from production to test).
@@ -141,8 +142,8 @@ namespace Surge
         /// <summary>
         /// Update the current version baseline used for future update checks.
         /// </summary>
-        /// <param name="version">Installed version string.</param>
-        public void SetCurrentVersion(string version)
+        /// <param name="version">Installed semantic version.</param>
+        public void SetCurrentVersion(SemVersion version)
         {
             ThrowIfDisposed();
             SetCurrentVersionInternal(version);
@@ -219,7 +220,9 @@ namespace Surge
 
                             releases.Add(new SurgeRelease
                             {
-                                Version = MarshalUtf8(versionPtr),
+                                Version = SemanticVersions.ParseRuntimeValue(
+                                    MarshalUtf8(versionPtr),
+                                    "Native release version"),
                                 Channel = MarshalUtf8(channelPtr),
                                 FullSize = fullSize,
                                 IsGenesis = isGenesis
@@ -359,12 +362,16 @@ namespace Surge
             return string.IsNullOrWhiteSpace(value) ? null : value;
         }
 
-        private void SetCurrentVersionInternal(string version)
+        private void SetCurrentVersionInternal(SemVersion version)
         {
-            if (string.IsNullOrWhiteSpace(version))
-                throw new ArgumentException("Version cannot be empty.", nameof(version));
+#if NET6_0_OR_GREATER
+            ArgumentNullException.ThrowIfNull(version);
+#else
+            if (version == null)
+                throw new ArgumentNullException(nameof(version));
+#endif
 
-            int result = NativeMethods.UpdateManagerSetCurrentVersion(_nativeMgr, version);
+            int result = NativeMethods.UpdateManagerSetCurrentVersion(_nativeMgr, version.ToString());
             if (result != 0)
             {
                 var errorMsg = GetLastError();

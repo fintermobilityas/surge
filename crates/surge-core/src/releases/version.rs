@@ -1,130 +1,57 @@
-//! Semantic version comparison for dotted-integer version strings.
+//! Strict Semantic Versioning 2.0 parsing and comparison helpers.
 
 use std::cmp::Ordering;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum PrereleaseIdentifier<'a> {
-    Numeric(u64),
-    Text(&'a str),
-}
+use semver::Version;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ParsedVersion<'a> {
-    core: Vec<u64>,
-    prerelease: Option<Vec<PrereleaseIdentifier<'a>>>,
-}
+use crate::error::{Result, SurgeError};
 
-fn parse_core_version(version: &str) -> Vec<u64> {
-    let parts: Vec<u64> = version
-        .split('.')
-        .filter_map(|p| p.trim().parse::<u64>().ok())
-        .collect();
-
-    let mut result = parts;
-    while result.len() < 3 {
-        result.push(0);
+fn parse_semver(version: &str, label: &str) -> Result<Version> {
+    if version.is_empty() {
+        return Err(SurgeError::Config(format!("{label} cannot be empty")));
     }
-    result
+
+    if version.trim() != version {
+        return Err(SurgeError::Config(format!(
+            "{label} must not contain leading or trailing whitespace: '{version}'"
+        )));
+    }
+
+    Version::parse(version)
+        .map_err(|error| SurgeError::Config(format!("Invalid {label} semantic version '{version}': {error}")))
 }
 
-fn parse_prerelease(version: &str) -> Option<Vec<PrereleaseIdentifier<'_>>> {
-    let (_, raw_prerelease) = version.split_once('-')?;
-    let identifiers = raw_prerelease
-        .split('.')
-        .filter(|segment| !segment.is_empty())
-        .map(|segment| {
-            segment
-                .parse::<u64>()
-                .map_or(PrereleaseIdentifier::Text(segment), PrereleaseIdentifier::Numeric)
-        })
-        .collect::<Vec<_>>();
-
-    if identifiers.is_empty() {
-        None
-    } else {
-        Some(identifiers)
+fn parse_semver_for_compare(version: &str) -> Version {
+    match parse_semver(version, "version") {
+        Ok(version) => version,
+        Err(error) => panic!("internal semantic-version invariant violated: {error}"),
     }
 }
 
-fn parse_version(version: &str) -> ParsedVersion<'_> {
-    let without_build_metadata = version.split_once('+').map_or(version, |(base, _)| base);
-    let core = without_build_metadata
-        .split_once('-')
-        .map_or(without_build_metadata, |(base, _)| base);
-
-    ParsedVersion {
-        core: parse_core_version(core),
-        prerelease: parse_prerelease(without_build_metadata),
-    }
+/// Parse and validate a strict Semantic Versioning 2.0 version string.
+pub fn validate_version_string(version: &str, label: &str) -> Result<()> {
+    parse_semver(version, label).map(|_| ())
 }
 
-fn compare_prerelease_identifiers(a: &[PrereleaseIdentifier<'_>], b: &[PrereleaseIdentifier<'_>]) -> Ordering {
-    let max_len = a.len().max(b.len());
-
-    for i in 0..max_len {
-        match (a.get(i), b.get(i)) {
-            (Some(PrereleaseIdentifier::Numeric(lhs)), Some(PrereleaseIdentifier::Numeric(rhs))) => {
-                let ordering = lhs.cmp(rhs);
-                if ordering != Ordering::Equal {
-                    return ordering;
-                }
-            }
-            (Some(PrereleaseIdentifier::Text(lhs)), Some(PrereleaseIdentifier::Text(rhs))) => {
-                let ordering = lhs.cmp(rhs);
-                if ordering != Ordering::Equal {
-                    return ordering;
-                }
-            }
-            (Some(PrereleaseIdentifier::Numeric(_)), Some(PrereleaseIdentifier::Text(_))) | (None, Some(_)) => {
-                return Ordering::Less;
-            }
-            (Some(PrereleaseIdentifier::Text(_)), Some(PrereleaseIdentifier::Numeric(_))) => {
-                return Ordering::Greater;
-            }
-            (Some(_), None) => return Ordering::Greater,
-            (None, None) => return Ordering::Equal,
-        }
-    }
-
-    Ordering::Equal
+/// Parse and canonicalize a strict Semantic Versioning 2.0 version string.
+pub fn canonicalize_version(version: &str, label: &str) -> Result<String> {
+    parse_semver(version, label).map(|parsed| parsed.to_string())
 }
 
-/// Compare two dotted-integer version strings.
+/// Return whether the provided string is a valid strict Semantic Versioning 2.0 value.
+#[must_use]
+pub fn is_valid_version_string(version: &str) -> bool {
+    parse_semver(version, "version").is_ok()
+}
+
+/// Compare two validated semantic versions by precedence.
 ///
-/// Parses "major.minor.patch" format, filling missing parts with 0.
-/// Supports versions with more than 3 parts (e.g., "1.2.3.4").
-///
-/// # Examples
-///
-/// ```
-/// use surge_core::releases::version::compare_versions;
-/// use std::cmp::Ordering;
-///
-/// assert_eq!(compare_versions("1.2.3", "1.2.3"), Ordering::Equal);
-/// assert_eq!(compare_versions("2.0.0", "1.9.9"), Ordering::Greater);
-/// assert_eq!(compare_versions("1.0", "1.0.0"), Ordering::Equal);
-/// ```
+/// This ignores build metadata as required by SemVer 2.0 precedence rules.
 #[must_use]
 pub fn compare_versions(a: &str, b: &str) -> Ordering {
-    let parts_a = parse_version(a);
-    let parts_b = parse_version(b);
-
-    let max_len = parts_a.core.len().max(parts_b.core.len());
-
-    for i in 0..max_len {
-        let va = parts_a.core.get(i).copied().unwrap_or(0);
-        let vb = parts_b.core.get(i).copied().unwrap_or(0);
-        if va != vb {
-            return va.cmp(&vb);
-        }
-    }
-
-    match (&parts_a.prerelease, &parts_b.prerelease) {
-        (None, None) => Ordering::Equal,
-        (None, Some(_)) => Ordering::Greater,
-        (Some(_), None) => Ordering::Less,
-        (Some(lhs), Some(rhs)) => compare_prerelease_identifiers(lhs, rhs),
-    }
+    let left = parse_semver_for_compare(a);
+    let right = parse_semver_for_compare(b);
+    left.cmp_precedence(&right)
 }
 
 #[cfg(test)]
@@ -132,66 +59,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_equal_versions() {
-        assert_eq!(compare_versions("1.0.0", "1.0.0"), Ordering::Equal);
-        assert_eq!(compare_versions("0.0.0", "0.0.0"), Ordering::Equal);
-        assert_eq!(compare_versions("10.20.30", "10.20.30"), Ordering::Equal);
+    fn compare_versions_follows_semver_precedence_examples() {
+        let ordered = [
+            "1.0.0-alpha",
+            "1.0.0-alpha.1",
+            "1.0.0-alpha.beta",
+            "1.0.0-beta",
+            "1.0.0-beta.2",
+            "1.0.0-beta.11",
+            "1.0.0-rc.1",
+            "1.0.0",
+        ];
+
+        for pair in ordered.windows(2) {
+            assert_eq!(compare_versions(pair[0], pair[1]), Ordering::Less);
+        }
     }
 
     #[test]
-    fn test_greater_major() {
-        assert_eq!(compare_versions("2.0.0", "1.0.0"), Ordering::Greater);
-        assert_eq!(compare_versions("10.0.0", "9.0.0"), Ordering::Greater);
+    fn compare_versions_ignores_build_metadata() {
+        assert_eq!(compare_versions("1.2.3+build.1", "1.2.3+build.9"), Ordering::Equal);
+        assert_eq!(
+            compare_versions("1.2.3-beta.1+build.1", "1.2.3-beta.1"),
+            Ordering::Equal
+        );
     }
 
     #[test]
-    fn test_greater_minor() {
-        assert_eq!(compare_versions("1.2.0", "1.1.0"), Ordering::Greater);
-        assert_eq!(compare_versions("1.10.0", "1.9.0"), Ordering::Greater);
-    }
-
-    #[test]
-    fn test_greater_patch() {
-        assert_eq!(compare_versions("1.0.2", "1.0.1"), Ordering::Greater);
-        assert_eq!(compare_versions("1.0.10", "1.0.9"), Ordering::Greater);
-    }
-
-    #[test]
-    fn test_less_than() {
-        assert_eq!(compare_versions("1.0.0", "2.0.0"), Ordering::Less);
-        assert_eq!(compare_versions("1.0.0", "1.1.0"), Ordering::Less);
-        assert_eq!(compare_versions("1.0.0", "1.0.1"), Ordering::Less);
-    }
-
-    #[test]
-    fn test_missing_parts_filled_with_zero() {
-        assert_eq!(compare_versions("1", "1.0.0"), Ordering::Equal);
-        assert_eq!(compare_versions("1.2", "1.2.0"), Ordering::Equal);
-        assert_eq!(compare_versions("1", "1.0.1"), Ordering::Less);
-    }
-
-    #[test]
-    fn test_four_part_versions() {
-        assert_eq!(compare_versions("1.0.0.1", "1.0.0.0"), Ordering::Greater);
-        assert_eq!(compare_versions("1.0.0", "1.0.0.0"), Ordering::Equal);
-        assert_eq!(compare_versions("1.0.0.1", "1.0.0.2"), Ordering::Less);
-    }
-
-    #[test]
-    fn test_complex_comparisons() {
-        assert_eq!(compare_versions("2.0.0", "1.9.9"), Ordering::Greater);
-        assert_eq!(compare_versions("1.0.0", "0.99.99"), Ordering::Greater);
-        assert_eq!(compare_versions("0.0.1", "0.0.0"), Ordering::Greater);
-    }
-
-    #[test]
-    fn test_large_version_numbers() {
-        assert_eq!(compare_versions("100.200.300", "100.200.300"), Ordering::Equal);
-        assert_eq!(compare_versions("100.200.301", "100.200.300"), Ordering::Greater);
-    }
-
-    #[test]
-    fn test_stable_release_is_newer_than_matching_prerelease() {
+    fn compare_versions_treats_release_as_newer_than_matching_prerelease() {
         assert_eq!(
             compare_versions("2859.0.0", "2859.0.0-prerelease.56"),
             Ordering::Greater
@@ -200,23 +95,52 @@ mod tests {
     }
 
     #[test]
-    fn test_prerelease_versions_compare_by_numeric_suffix() {
+    fn validate_version_string_accepts_strict_semver_values() {
+        for version in [
+            "0.0.0",
+            "1.2.3",
+            "10.20.30",
+            "1.0.0-alpha",
+            "1.0.0-alpha.1",
+            "1.0.0-0A.is.legal",
+            "1.0.0+build.1",
+            "1.0.0-alpha+build.1",
+        ] {
+            validate_version_string(version, "version").unwrap();
+        }
+    }
+
+    #[test]
+    fn validate_version_string_rejects_non_compliant_inputs() {
+        for version in [
+            "",
+            "1",
+            "1.2",
+            "1.2.3.4",
+            "01.2.3",
+            "1.02.3",
+            "1.2.03",
+            "1.2.3-01",
+            "1.2.3-alpha..1",
+            "1.2.3+meta+meta",
+            " 1.2.3",
+            "1.2.3 ",
+        ] {
+            assert!(validate_version_string(version, "version").is_err(), "{version}");
+        }
+    }
+
+    #[test]
+    fn canonicalize_version_preserves_valid_semver_shape() {
         assert_eq!(
-            compare_versions("2859.0.0-prerelease.56", "2859.0.0-prerelease.55"),
-            Ordering::Greater
-        );
-        assert_eq!(
-            compare_versions("2859.0.0-prerelease.54", "2859.0.0-prerelease.56"),
-            Ordering::Less
+            canonicalize_version("1.2.3-rc.1+build.5", "version").unwrap(),
+            "1.2.3-rc.1+build.5"
         );
     }
 
     #[test]
-    fn test_build_metadata_does_not_affect_ordering() {
-        assert_eq!(compare_versions("1.2.3+build.1", "1.2.3+build.9"), Ordering::Equal);
-        assert_eq!(
-            compare_versions("1.2.3-beta.1+build.1", "1.2.3-beta.1"),
-            Ordering::Equal
-        );
+    fn is_valid_version_string_reports_strict_semver_status() {
+        assert!(is_valid_version_string("1.2.3"));
+        assert!(!is_valid_version_string("1.2"));
     }
 }

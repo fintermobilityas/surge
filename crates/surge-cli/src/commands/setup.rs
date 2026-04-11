@@ -120,6 +120,7 @@ pub async fn execute(dir: &Path, no_start: bool, stage: bool) -> Result<()> {
 
     let manifest_bytes = std::fs::read(&manifest_path)?;
     let manifest: InstallerManifest = serde_yaml::from_slice(&manifest_bytes)?;
+    manifest.validate()?;
 
     logline::info(&format!(
         "Setting up {} v{} ({}/{})",

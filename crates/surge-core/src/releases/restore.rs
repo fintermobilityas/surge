@@ -62,7 +62,7 @@ mod tests {
             full_sha256: String::new(),
             deltas: vec![DeltaArtifact::bsdiff_zstd(
                 "primary",
-                "",
+                "0.0.0",
                 &format!("demo-{version}-linux-x64-delta.tar.zst"),
                 0,
                 "",

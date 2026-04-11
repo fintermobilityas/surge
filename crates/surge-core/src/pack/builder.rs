@@ -17,6 +17,7 @@ use crate::config::manifest::{PackPolicy, ShortcutLocation, SurgeManifest};
 use crate::context::Context;
 use crate::error::{Result, SurgeError};
 use crate::platform::fs::write_file_atomic;
+use crate::releases::version::canonicalize_version;
 use crate::storage::{StorageBackend, create_storage_backend};
 
 pub(crate) use self::staging::build_canonical_archive_from_directory;
@@ -114,6 +115,7 @@ impl PackBuilder {
         version: &str,
         artifacts_dir: &str,
     ) -> Result<Self> {
+        let version = canonicalize_version(version, "release version")?;
         let manifest = SurgeManifest::from_file(Path::new(manifest_path))?;
         let pack_policy = manifest.effective_pack_policy();
         let (app, target) = manifest
@@ -157,7 +159,7 @@ impl PackBuilder {
             ctx,
             app_id: app_id.to_string(),
             rid: rid.to_string(),
-            version: version.to_string(),
+            version,
             name: app.effective_name(),
             main_exe,
             install_directory: app.effective_install_directory(),

@@ -8,6 +8,7 @@ use surge_core::config::constants::{DEFAULT_ZSTD_LEVEL, RELEASES_FILE_COMPRESSED
 use surge_core::config::manifest::SurgeManifest;
 use surge_core::error::{Result, SurgeError};
 use surge_core::releases::manifest::compress_release_index;
+use surge_core::releases::version::canonicalize_version;
 use surge_core::storage;
 
 /// Promote a release version to a target channel.
@@ -19,6 +20,7 @@ pub async fn execute(
     channel: &str,
 ) -> Result<()> {
     const TOTAL_STAGES: usize = 5;
+    let version = canonicalize_version(version, "release version")?;
 
     let theme = UiTheme::global();
     let started = Instant::now();
@@ -71,7 +73,7 @@ pub async fn execute(
     }
 
     print_stage(theme, 3, TOTAL_STAGES, "Ensuring release full artifact exists");
-    let full_materialized = super::ensure_release_full_artifact(&*backend, &index, &rid, version).await?;
+    let full_materialized = super::ensure_release_full_artifact(&*backend, &index, &rid, &version).await?;
     print_stage_done(
         theme,
         3,

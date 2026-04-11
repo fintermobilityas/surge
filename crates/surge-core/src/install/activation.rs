@@ -7,7 +7,7 @@ use crate::error::{Result, SurgeError};
 use crate::platform::fs::list_directories;
 use crate::platform::paths::default_install_root;
 use crate::platform::shortcuts::install_shortcuts;
-use crate::releases::version::compare_versions;
+use crate::releases::version::{compare_versions, is_valid_version_string};
 use crate::supervisor::stub::find_latest_app_dir;
 
 use super::persistent_assets::copy_persistent_assets;
@@ -211,7 +211,7 @@ pub fn install_package_locally_at_root_with_progress(
 
 fn app_snapshot_version(dir_name: &str) -> Option<&str> {
     let version = dir_name.strip_prefix("app-")?;
-    if version.is_empty() || !version.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+    if !is_valid_version_string(version) {
         return None;
     }
     Some(version)

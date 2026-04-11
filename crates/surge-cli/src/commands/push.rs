@@ -27,7 +27,9 @@ use surge_core::releases::manifest::{
     DeltaArtifact, PATCH_FORMAT_BSDIFF4, PATCH_FORMAT_CHUNKED_BSDIFF_V1, PATCH_FORMAT_SPARSE_FILE_OPS_V1, ReleaseEntry,
     ReleaseIndex, compress_release_index, decompress_release_index,
 };
+use surge_core::releases::restore::find_previous_release_for_rid;
 use surge_core::releases::restore::required_artifacts_for_index;
+use surge_core::releases::version::canonicalize_version;
 use surge_core::releases::version::compare_versions;
 use surge_core::storage::{self, StorageBackend};
 
@@ -41,6 +43,7 @@ pub async fn execute(
     packages_dir: &Path,
 ) -> Result<()> {
     const TOTAL_STAGES: usize = 5;
+    let version = canonicalize_version(version, "release version")?;
 
     let theme = UiTheme::global();
     let started = Instant::now();
@@ -159,7 +162,7 @@ pub async fn execute(
     let pruned = update_release_index(
         &*backend,
         &app_id,
-        version,
+        &version,
         &rid,
         channel,
         full_filename,
@@ -290,6 +293,19 @@ async fn update_release_index(
         .releases
         .iter()
         .any(|release| release.rid == rid || release.rid.is_empty());
+    let delta_from_version = if delta_filename.trim().is_empty() {
+        None
+    } else {
+        Some(
+            find_previous_release_for_rid(&index, rid, version)
+                .map(|release| release.version.clone())
+                .ok_or_else(|| {
+                    SurgeError::Config(format!(
+                        "Cannot publish delta artifact for {app_id}/{rid} v{version} without a previous release baseline"
+                    ))
+                })?,
+        )
+    };
 
     index
         .releases
@@ -318,41 +334,43 @@ async fn update_release_index(
         installers,
         environment,
     };
-    let primary_delta = if delta_filename.trim().is_empty() {
-        None
-    } else if delta_patch_format.eq_ignore_ascii_case(PATCH_FORMAT_SPARSE_FILE_OPS_V1) {
-        Some(DeltaArtifact::sparse_file_ops_zstd(
+    let primary_delta = match delta_from_version.as_deref() {
+        None => None,
+        Some(delta_from_version) if delta_patch_format.eq_ignore_ascii_case(PATCH_FORMAT_SPARSE_FILE_OPS_V1) => {
+            Some(DeltaArtifact::sparse_file_ops_zstd(
+                "primary",
+                delta_from_version,
+                &delta_filename,
+                delta_size,
+                &delta_sha256,
+            ))
+        }
+        Some(delta_from_version) if delta_patch_format.eq_ignore_ascii_case(PATCH_FORMAT_CHUNKED_BSDIFF_V1) => {
+            Some(DeltaArtifact::chunked_bsdiff_zstd(
+                "primary",
+                delta_from_version,
+                &delta_filename,
+                delta_size,
+                &delta_sha256,
+            ))
+        }
+        Some(delta_from_version) if delta_patch_format.eq_ignore_ascii_case(PATCH_FORMAT_BSDIFF4) => {
+            Some(DeltaArtifact::bsdiff_zstd(
+                "primary",
+                delta_from_version,
+                &delta_filename,
+                delta_size,
+                &delta_sha256,
+            ))
+        }
+        Some(delta_from_version) => Some(DeltaArtifact::with_patch_format(
             "primary",
-            "",
-            &delta_filename,
-            delta_size,
-            &delta_sha256,
-        ))
-    } else if delta_patch_format.eq_ignore_ascii_case(PATCH_FORMAT_CHUNKED_BSDIFF_V1) {
-        Some(DeltaArtifact::chunked_bsdiff_zstd(
-            "primary",
-            "",
-            &delta_filename,
-            delta_size,
-            &delta_sha256,
-        ))
-    } else if delta_patch_format.eq_ignore_ascii_case(PATCH_FORMAT_BSDIFF4) {
-        Some(DeltaArtifact::bsdiff_zstd(
-            "primary",
-            "",
-            &delta_filename,
-            delta_size,
-            &delta_sha256,
-        ))
-    } else {
-        Some(DeltaArtifact::with_patch_format(
-            "primary",
-            "",
+            delta_from_version,
             &delta_patch_format,
             &delta_filename,
             delta_size,
             &delta_sha256,
-        ))
+        )),
     };
     entry.set_primary_delta(primary_delta);
     index.releases.push(entry);

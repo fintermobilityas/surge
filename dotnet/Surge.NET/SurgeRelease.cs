@@ -1,3 +1,5 @@
+using Semver;
+
 namespace Surge
 {
     /// <summary>
@@ -6,9 +8,9 @@ namespace Surge
     public sealed class SurgeRelease
     {
         /// <summary>
-        /// Version string (semver) of this release.
+        /// Semantic version of this release.
         /// </summary>
-        public string Version { get; init; } = "";
+        public SemVersion Version { get; init; } = SemanticVersions.Zero;
 
         /// <summary>
         /// Release channel this release belongs to.

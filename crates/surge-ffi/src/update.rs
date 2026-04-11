@@ -1,6 +1,7 @@
 use std::ffi::{c_char, c_int, c_void};
 use std::ptr;
 
+use surge_core::releases::version::canonicalize_version;
 use surge_core::update::manager::{ProgressInfo, UpdateManager};
 
 use crate::handles::{ReleaseEntryFfi, SurgeReleasesInfoHandle, SurgeUpdateManagerHandle};
@@ -44,6 +45,14 @@ pub unsafe extern "C" fn surge_update_manager_create(
             set_ctx_error(handle, &e);
             return ptr::null_mut();
         }
+
+        let version_s = match canonicalize_version(&version_s, "current version") {
+            Ok(version) => version,
+            Err(error) => {
+                set_ctx_error(handle, &error);
+                return ptr::null_mut();
+            }
+        };
 
         let mgr = Box::new(SurgeUpdateManagerHandle {
             ctx: handle.ctx.clone(),
@@ -118,13 +127,15 @@ pub unsafe extern "C" fn surge_update_manager_set_current_version(
 
         // SAFETY: `current_version` follows the nullable C string contract.
         let version_s = unsafe { cstr_to_string(current_version) };
-        let version_s = version_s.trim().to_string();
         if version_s.is_empty() {
             let e = surge_core::error::SurgeError::Config("current_version is required".into());
             return set_shared_error(&mgr_ref.ctx, &mgr_ref.last_error, &e);
         }
 
-        mgr_ref.current_version = version_s;
+        mgr_ref.current_version = match canonicalize_version(&version_s, "current version") {
+            Ok(version) => version,
+            Err(error) => return set_shared_error(&mgr_ref.ctx, &mgr_ref.last_error, &error),
+        };
         SURGE_OK
     }))
 }

@@ -35,6 +35,7 @@ use surge_core::releases::artifact_cache::{CacheFetchOutcome, fetch_or_reuse_fil
 use surge_core::releases::restore::{
     RestoreOptions, plan_full_archive_restore, restore_full_archive_for_version_with_options,
 };
+use surge_core::releases::version::canonicalize_version;
 use surge_core::storage_config::build_storage_config;
 
 /// Build release packages (full + delta) for a given app version and RID.
@@ -47,6 +48,7 @@ pub async fn execute(
     output_dir: &Path,
 ) -> Result<()> {
     const TOTAL_STAGES: usize = 5;
+    let version = canonicalize_version(version, "release version")?;
 
     let theme = UiTheme::global();
     let started = Instant::now();
@@ -62,7 +64,7 @@ pub async fn execute(
 
     print_stage(theme, 2, TOTAL_STAGES, "Validating artifacts and output directories");
     let artifacts_dir = artifacts_dir.map_or_else(
-        || default_artifacts_dir(manifest_path, &app_id, &rid, version),
+        || default_artifacts_dir(manifest_path, &app_id, &rid, &version),
         PathBuf::from,
     );
     if !artifacts_dir.is_dir() {
@@ -96,7 +98,7 @@ pub async fn execute(
         ))
     })?;
 
-    let mut builder = PackBuilder::new(ctx, manifest_path_s, &app_id, &rid, version, artifacts_dir_s)?;
+    let mut builder = PackBuilder::new(ctx, manifest_path_s, &app_id, &rid, &version, artifacts_dir_s)?;
     let build_started = Instant::now();
     let build_running = Arc::new(AtomicBool::new(true));
     let build_step = Arc::new(AtomicI32::new(0));
@@ -168,7 +170,7 @@ pub async fn execute(
         &target,
         &app_id,
         &rid,
-        version,
+        &version,
         &self::resolution::default_channel_for_app(&manifest, app),
         manifest_path.parent().unwrap_or_else(|| Path::new(".")),
         artifacts_dir.as_path(),

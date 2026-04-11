@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Result, SurgeError};
 use crate::platform::fs::list_directories;
-use crate::releases::version::compare_versions;
+use crate::releases::version::{compare_versions, is_valid_version_string};
 
 /// Resolve the active app directory under `install_dir`.
 ///
@@ -24,12 +24,7 @@ pub fn find_latest_app_dir(install_dir: &Path) -> Result<PathBuf> {
 
     for dir_name in &dirs {
         if let Some(version) = dir_name.strip_prefix("app-") {
-            if version.is_empty() {
-                continue;
-            }
-
-            // Validate it looks like a version (starts with a digit)
-            if !version.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+            if !is_valid_version_string(version) {
                 continue;
             }
 

@@ -1,8 +1,14 @@
 using System;
+using Semver;
 using Xunit;
 
 namespace Surge.Tests
 {
+    internal static class TestSemVersions
+    {
+        internal static SemVersion Parse(string value) => SemVersion.Parse(value, SemVersionStyles.Strict);
+    }
+
     public class SurgeAppTests
     {
         private static readonly string[] FallbackCommandLineArgs = { "/opt/fallback" };
@@ -10,7 +16,7 @@ namespace Surge.Tests
         [Fact]
         public void Version_ReturnsExpectedVersion()
         {
-            Assert.Equal("0.1.0", SurgeApp.Version);
+            Assert.Equal("0.1.0", SurgeApp.Version.ToString());
         }
 
         [Fact]
@@ -101,7 +107,7 @@ namespace Surge.Tests
         {
             var info = new SurgeAppInfo();
             Assert.Equal("", info.Id);
-            Assert.Equal("", info.Version);
+            Assert.Equal("0.0.0", info.Version.ToString());
             Assert.Equal("", info.Channel);
             Assert.Equal("", info.InstallDirectory);
             Assert.Equal("", info.SupervisorId);
@@ -118,7 +124,7 @@ namespace Surge.Tests
             var info = new SurgeAppInfo
             {
                 Id = "myapp",
-                Version = "1.2.3",
+                Version = TestSemVersions.Parse("1.2.3"),
                 Channel = "stable",
                 InstallDirectory = "/opt/myapp",
                 SupervisorId = "myapp-supervisor",
@@ -129,7 +135,7 @@ namespace Surge.Tests
             };
 
             Assert.Equal("myapp", info.Id);
-            Assert.Equal("1.2.3", info.Version);
+            Assert.Equal("1.2.3", info.Version.ToString());
             Assert.Equal("stable", info.Channel);
             Assert.Equal("/opt/myapp", info.InstallDirectory);
             Assert.Equal("myapp-supervisor", info.SupervisorId);
@@ -238,7 +244,7 @@ namespace Surge.Tests
         public void DefaultValues_AreEmpty()
         {
             var release = new SurgeRelease();
-            Assert.Equal("", release.Version);
+            Assert.Equal("0.0.0", release.Version.ToString());
             Assert.Equal("", release.Channel);
             Assert.Equal(0L, release.FullSize);
             Assert.Equal(0L, release.DeltaSize);
@@ -251,7 +257,7 @@ namespace Surge.Tests
         {
             var release = new SurgeRelease
             {
-                Version = "2.0.0",
+                Version = TestSemVersions.Parse("2.0.0"),
                 Channel = "beta",
                 FullSize = 1024 * 1024,
                 DeltaSize = 256 * 1024,
@@ -259,7 +265,7 @@ namespace Surge.Tests
                 IsGenesis = true
             };
 
-            Assert.Equal("2.0.0", release.Version);
+            Assert.Equal("2.0.0", release.Version.ToString());
             Assert.Equal("beta", release.Channel);
             Assert.Equal(1024 * 1024, release.FullSize);
             Assert.Equal(256 * 1024, release.DeltaSize);
@@ -338,15 +344,89 @@ namespace Surge.Tests
         {
             var list = new System.Collections.Generic.List<SurgeRelease>
             {
-                new SurgeRelease { Version = "1.0.0", Channel = "stable" },
-                new SurgeRelease { Version = "2.0.0", Channel = "stable" }
+                new SurgeRelease { Version = TestSemVersions.Parse("1.0.0"), Channel = "stable" },
+                new SurgeRelease { Version = TestSemVersions.Parse("2.0.0"), Channel = "stable" }
             };
 
             var releases = new SurgeChannelReleases("stable", list);
             Assert.Equal("stable", releases.Channel);
             Assert.Equal(2, releases.Count);
             Assert.NotNull(releases.Latest);
-            Assert.Equal("2.0.0", releases.Latest!.Version);
+            Assert.Equal("2.0.0", releases.Latest!.Version.ToString());
+        }
+    }
+
+    public class SemVersionIntegrationTests
+    {
+        [Theory]
+        [InlineData("0.0.0")]
+        [InlineData("1.2.3")]
+        [InlineData("1.0.0-alpha")]
+        [InlineData("1.0.0-alpha.1")]
+        [InlineData("1.0.0-0A.is.legal")]
+        [InlineData("1.0.0+build.5")]
+        [InlineData("1.0.0-rc.1+build.9")]
+        public void StrictParse_Accepts_CompliantSemVer(string value)
+        {
+            var version = SemVersion.Parse(value, SemVersionStyles.Strict);
+            Assert.Equal(value, version.ToString());
+        }
+
+        [Theory]
+        [InlineData("")]
+        [InlineData("1")]
+        [InlineData("1.2")]
+        [InlineData("1.2.3.4")]
+        [InlineData("01.2.3")]
+        [InlineData("1.02.3")]
+        [InlineData("1.2.03")]
+        [InlineData("1.2.3-01")]
+        [InlineData("1.2.3-alpha..1")]
+        [InlineData("1.2.3 ")]
+        [InlineData(" 1.2.3")]
+        public void StrictParse_Rejects_InvalidSemVer(string value)
+        {
+            Assert.False(SemVersion.TryParse(value, SemVersionStyles.Strict, out _));
+        }
+
+        [Fact]
+        public void ComparePrecedence_Follows_SemVerExamples()
+        {
+            string[] ordered =
+            {
+                "1.0.0-alpha",
+                "1.0.0-alpha.1",
+                "1.0.0-alpha.beta",
+                "1.0.0-beta",
+                "1.0.0-beta.2",
+                "1.0.0-beta.11",
+                "1.0.0-rc.1",
+                "1.0.0"
+            };
+
+            for (int i = 0; i < ordered.Length - 1; i++)
+            {
+                var left = SemVersion.Parse(ordered[i], SemVersionStyles.Strict);
+                var right = SemVersion.Parse(ordered[i + 1], SemVersionStyles.Strict);
+                Assert.True(left.ComparePrecedenceTo(right) < 0, $"{left} should precede {right}");
+            }
+        }
+
+        [Fact]
+        public void ComparePrecedence_Ignores_BuildMetadata()
+        {
+            var left = SemVersion.Parse("1.2.3-beta.1+build.1", SemVersionStyles.Strict);
+            var right = SemVersion.Parse("1.2.3-beta.1+build.9", SemVersionStyles.Strict);
+
+            Assert.Equal(0, left.ComparePrecedenceTo(right));
+            Assert.True(left.CompareSortOrderTo(right) < 0);
+        }
+
+        [Fact]
+        public void ParseArgument_Rejects_InvalidPublicInput()
+        {
+            var ex = Assert.Throws<ArgumentException>(() => SemanticVersions.ParseArgument("1.2", "version"));
+            Assert.Contains("Semantic Versioning 2.0", ex.Message);
         }
     }
 }

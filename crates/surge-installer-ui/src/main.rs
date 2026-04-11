@@ -53,6 +53,7 @@ fn run() -> Result<()> {
     })?;
     let manifest: InstallerManifest = serde_yaml::from_slice(&manifest_bytes)
         .map_err(|e| SurgeError::Config(format!("Failed to parse installer.yml: {e}")))?;
+    manifest.validate()?;
 
     if headless || !has_display() {
         return run_headless(&manifest, extracted.path(), simulator);

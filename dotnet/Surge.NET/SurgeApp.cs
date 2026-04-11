@@ -2,7 +2,9 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Runtime.ExceptionServices;
 using System.Runtime.InteropServices;
+using Semver;
 
 namespace Surge
 {
@@ -53,7 +55,7 @@ namespace Surge
         /// <summary>
         /// The Surge library version.
         /// </summary>
-        public static string Version => "0.1.0";
+        public static SemVersion Version => SemanticVersions.LibraryVersion;
 
         /// <summary>
         /// Process application lifecycle events. Should be called early in the
@@ -66,13 +68,14 @@ namespace Surge
         /// <returns>True if a lifecycle event was handled.</returns>
         public static bool ProcessEvents(
             string[] args,
-            Action<string>? onFirstRun = null,
-            Action<string>? onInstalled = null,
-            Action<string>? onUpdated = null)
+            Action<SemVersion>? onFirstRun = null,
+            Action<SemVersion>? onInstalled = null,
+            Action<SemVersion>? onUpdated = null)
         {
             var lifecycleAction = DetermineLifecycleAction(args);
             var argPtrs = new IntPtr[args.Length];
             var pinnedHandles = new GCHandle[args.Length];
+            Exception? callbackException = null;
 
             try
             {
@@ -95,8 +98,20 @@ namespace Surge
                     {
                         firstRunCb = (versionPtr, _) =>
                         {
-                            var version = MarshalUtf8(versionPtr);
-                            onFirstRun(version);
+                            if (callbackException != null)
+                                return;
+
+                            try
+                            {
+                                var version = SemanticVersions.ParseRuntimeValue(
+                                    MarshalUtf8(versionPtr),
+                                    "Surge first-run version");
+                                onFirstRun(version);
+                            }
+                            catch (Exception ex)
+                            {
+                                callbackException = ex;
+                            }
                         };
                     }
 
@@ -104,8 +119,20 @@ namespace Surge
                     {
                         installedCb = (versionPtr, _) =>
                         {
-                            var version = MarshalUtf8(versionPtr);
-                            onInstalled(version);
+                            if (callbackException != null)
+                                return;
+
+                            try
+                            {
+                                var version = SemanticVersions.ParseRuntimeValue(
+                                    MarshalUtf8(versionPtr),
+                                    "Surge installed version");
+                                onInstalled(version);
+                            }
+                            catch (Exception ex)
+                            {
+                                callbackException = ex;
+                            }
                         };
                     }
 
@@ -113,8 +140,20 @@ namespace Surge
                     {
                         updatedCb = (versionPtr, _) =>
                         {
-                            var version = MarshalUtf8(versionPtr);
-                            onUpdated(version);
+                            if (callbackException != null)
+                                return;
+
+                            try
+                            {
+                                var version = SemanticVersions.ParseRuntimeValue(
+                                    MarshalUtf8(versionPtr),
+                                    "Surge updated version");
+                                onUpdated(version);
+                            }
+                            catch (Exception ex)
+                            {
+                                callbackException = ex;
+                            }
                         };
                     }
 
@@ -125,6 +164,9 @@ namespace Surge
                         installedCb,
                         updatedCb,
                         IntPtr.Zero);
+
+                    if (callbackException != null)
+                        ExceptionDispatchInfo.Capture(callbackException).Throw();
 
                     if (result != 0 || lifecycleAction == LifecycleAction.None)
                     {
@@ -376,10 +418,14 @@ namespace Surge
                     return null;
 
                 var resolvedAppId = appId!.Trim();
+                var resolvedVersion = version ?? "0.0.0";
+                if (!SemanticVersions.TryParseRuntimeValue(resolvedVersion, out var parsedVersion))
+                    return null;
+
                 return new SurgeAppInfo
                 {
                     Id = resolvedAppId,
-                    Version = version ?? "0.0.0",
+                    Version = parsedVersion,
                     Channel = channel ?? "stable",
                     InstallDirectory = ResolveInstallDirectory(resolvedAppId, installDir, assemblyDir),
                     SupervisorId = supervisorId ?? "",

@@ -4,6 +4,7 @@ use serde::Serialize;
 
 use crate::context::StorageProvider;
 use crate::error::{Result, SurgeError};
+use crate::releases::version::canonicalize_version;
 
 use super::InstallProfile;
 
@@ -125,9 +126,11 @@ pub fn write_runtime_manifest(
     profile: &InstallProfile<'_>,
     metadata: &RuntimeManifestMetadata<'_>,
 ) -> Result<PathBuf> {
+    let version = canonicalize_version(metadata.version, "runtime manifest version")?;
+
     let manifest = RuntimeManifestFile {
         id: profile.app_id.trim(),
-        version: metadata.version.trim(),
+        version: &version,
         channel: metadata.channel.trim(),
         install_directory: profile.install_directory.trim(),
         supervisor_id: profile.supervisor_id.trim(),

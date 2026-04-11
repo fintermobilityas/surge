@@ -6,6 +6,7 @@ use crate::config::constants::RELEASES_FILE_COMPRESSED;
 use crate::context::Context;
 use crate::error::{Result, SurgeError};
 use crate::releases::manifest::{ReleaseEntry, ReleaseIndex, compress_release_index, decompress_release_index};
+use crate::releases::version::canonicalize_version;
 
 /// Manages release channels: fetching, saving, promoting, and demoting releases.
 pub struct ChannelManager {
@@ -46,6 +47,7 @@ impl ChannelManager {
     /// not on the source channel.
     pub async fn promote(&self, version: &str, source_channel: &str, target_channel: &str) -> Result<()> {
         self.ctx.check_cancelled()?;
+        let version = canonicalize_version(version, "release version")?;
 
         let mut index = self.fetch_index().await?;
         let mut found = false;
@@ -82,6 +84,7 @@ impl ChannelManager {
     /// if the version is not found or not on the channel.
     pub async fn demote(&self, version: &str, channel: &str) -> Result<()> {
         self.ctx.check_cancelled()?;
+        let version = canonicalize_version(version, "release version")?;
 
         let mut index = self.fetch_index().await?;
         let mut found = false;

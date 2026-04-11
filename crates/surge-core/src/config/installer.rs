@@ -3,6 +3,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::config::manifest::ShortcutLocation;
+use crate::error::Result;
+use crate::releases::version::validate_version_string;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -75,4 +77,10 @@ pub struct InstallerRuntime {
     pub installers: Vec<String>,
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
+}
+
+impl InstallerManifest {
+    pub fn validate(&self) -> Result<()> {
+        validate_version_string(&self.version, "installer manifest version")
+    }
 }

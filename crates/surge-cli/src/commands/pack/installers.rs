@@ -193,6 +193,7 @@ pub(super) fn build_installers_with_launcher(
                 environment: target.environment.clone(),
             },
         };
+        manifest_payload.validate()?;
         let manifest_yaml = serde_yaml::to_string(&manifest_payload)?;
         std::fs::write(staging.join("installer.yml"), manifest_yaml.as_bytes())?;
 

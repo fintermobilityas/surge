@@ -23,6 +23,7 @@ use crate::platform::shortcuts::install_shortcuts;
 use crate::releases::artifact_cache::prune_cached_artifacts;
 use crate::releases::manifest::{ReleaseEntry, ReleaseIndex, decompress_release_index};
 use crate::releases::restore::{local_checkpoint_artifacts_for_index, required_artifacts_for_index};
+use crate::releases::version::canonicalize_version;
 use crate::storage::{StorageBackend, create_storage_backend};
 use crate::supervisor::state::supervisor_pid_file;
 
@@ -91,6 +92,7 @@ impl UpdateManager {
         channel: &str,
         install_dir: &str,
     ) -> Result<Self> {
+        let current_version = canonicalize_version(current_version, "current version")?;
         let storage_cfg = ctx.storage_config();
         if !storage_cfg.access_key.trim().is_empty() || !storage_cfg.secret_key.trim().is_empty() {
             return Err(SurgeError::Config(
@@ -102,7 +104,7 @@ impl UpdateManager {
         Ok(Self {
             ctx,
             app_id: app_id.to_string(),
-            current_version: current_version.to_string(),
+            current_version,
             channel: channel.to_string(),
             release_retention_limit: DEFAULT_RELEASE_RETENTION_LIMIT,
             install_dir: PathBuf::from(install_dir),
@@ -144,11 +146,7 @@ impl UpdateManager {
 
     /// Update the local version baseline used for update checks.
     pub fn set_current_version(&mut self, version: &str) -> Result<()> {
-        let normalized = version.trim();
-        if normalized.is_empty() {
-            return Err(SurgeError::Config("Current version cannot be empty".to_string()));
-        }
-        self.current_version = normalized.to_string();
+        self.current_version = canonicalize_version(version, "current version")?;
         self.cached_index = None;
         Ok(())
     }
@@ -501,7 +499,7 @@ mod tests {
             full_sha256: String::new(),
             deltas: vec![DeltaArtifact::bsdiff_zstd(
                 "primary",
-                "",
+                "0.0.0",
                 &format!("{version}-delta.tar.zst"),
                 100,
                 "",
@@ -630,7 +628,9 @@ mod tests {
         let err = manager.set_channel("  ").unwrap_err();
         assert!(err.to_string().contains("channel cannot be empty"));
         let err = manager.set_current_version("").unwrap_err();
-        assert!(err.to_string().contains("Current version cannot be empty"));
+        assert!(err.to_string().contains("current version cannot be empty"));
+        let err = manager.set_current_version("1.0").unwrap_err();
+        assert!(err.to_string().contains("Invalid current version semantic version"));
     }
 
     #[test]

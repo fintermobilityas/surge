@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 use crate::config::manifest::ShortcutLocation;
 use crate::error::{Result, SurgeError};
-use crate::releases::version::compare_versions;
+use crate::releases::version::{compare_versions, validate_version_string};
 
 pub const DIFF_ALGORITHM_BSDIFF: &str = "bsdiff";
 pub const DIFF_ALGORITHM_FILE_OPS: &str = "file-ops";
@@ -186,6 +186,16 @@ pub struct ReleaseEntry {
 }
 
 impl ReleaseEntry {
+    fn validate_versions(&self) -> Result<()> {
+        validate_version_string(&self.version, "release version")?;
+
+        for delta in &self.deltas {
+            validate_version_string(&delta.from_version, "delta base version")?;
+        }
+
+        Ok(())
+    }
+
     /// Returns the best display name, falling back through `name → main_exe → app_id`.
     #[must_use]
     pub fn display_name<'a>(&'a self, app_id: &'a str) -> &'a str {
@@ -280,14 +290,26 @@ impl Default for ReleaseIndex {
     }
 }
 
+impl ReleaseIndex {
+    fn validate_versions(&self) -> Result<()> {
+        for release in &self.releases {
+            release.validate_versions()?;
+        }
+
+        Ok(())
+    }
+}
+
 /// Parse a release index from YAML bytes.
 pub fn parse_release_index(data: &[u8]) -> Result<ReleaseIndex> {
     let index: ReleaseIndex = serde_yaml::from_slice(data)?;
+    index.validate_versions()?;
     Ok(index)
 }
 
 /// Serialize a release index to YAML bytes.
 pub fn serialize_release_index(index: &ReleaseIndex) -> Result<Vec<u8>> {
+    index.validate_versions()?;
     let yaml = serde_yaml::to_string(index)?;
     Ok(yaml.into_bytes())
 }
@@ -386,7 +408,7 @@ mod tests {
         let delta = if has_delta {
             Some(DeltaArtifact::bsdiff_zstd(
                 "primary",
-                "",
+                "0.0.0",
                 &format!("app-{version}-delta.tar.zst"),
                 200,
                 "def456",

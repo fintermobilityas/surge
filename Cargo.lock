@@ -3109,7 +3109,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "surge-bench"
-version = "1.0.0-beta.14"
+version = "1.0.0"
 dependencies = [
  "clap",
  "serde",
@@ -3123,7 +3123,7 @@ dependencies = [
 
 [[package]]
 name = "surge-cli"
-version = "1.0.0-beta.14"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "clap",
@@ -3145,7 +3145,7 @@ dependencies = [
 
 [[package]]
 name = "surge-core"
-version = "1.0.0-beta.14"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -3172,7 +3172,7 @@ dependencies = [
 
 [[package]]
 name = "surge-ffi"
-version = "1.0.0-beta.14"
+version = "1.0.0"
 dependencies = [
  "surge-core",
  "tokio",
@@ -3182,7 +3182,7 @@ dependencies = [
 
 [[package]]
 name = "surge-installer"
-version = "1.0.0-beta.14"
+version = "1.0.0"
 dependencies = [
  "surge-core",
  "tempfile",
@@ -3190,7 +3190,7 @@ dependencies = [
 
 [[package]]
 name = "surge-installer-ui"
-version = "1.0.0-beta.14"
+version = "1.0.0"
 dependencies = [
  "eframe",
  "image",
@@ -3204,7 +3204,7 @@ dependencies = [
 
 [[package]]
 name = "surge-supervisor"
-version = "1.0.0-beta.14"
+version = "1.0.0"
 dependencies = [
  "clap",
  "nix",

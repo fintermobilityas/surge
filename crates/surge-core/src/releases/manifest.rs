@@ -226,6 +226,39 @@ impl ReleaseEntry {
             .collect()
     }
 
+    /// Return the delta whose `from_version` matches `from_version`, if one exists.
+    ///
+    /// A release can carry multiple deltas with different sources (for example one
+    /// built against the previous test version and one built against the previous
+    /// production version). The chain walker uses this lookup so each apply step
+    /// picks the delta whose basis matches the prior step's version.
+    #[must_use]
+    pub fn delta_from_source(&self, from_version: &str) -> Option<DeltaArtifact> {
+        let from_version = from_version.trim();
+        if from_version.is_empty() {
+            return None;
+        }
+        self.deltas
+            .iter()
+            .find(|delta| !delta.filename.trim().is_empty() && delta.from_version == from_version)
+            .cloned()
+    }
+
+    /// Add a delta descriptor, replacing any existing delta with the same `id`.
+    ///
+    /// Empty descriptors are ignored. The `preferred_delta_id` is left untouched
+    /// so callers control which delta becomes the default for `selected_delta`.
+    pub fn upsert_delta(&mut self, delta: DeltaArtifact) {
+        if delta.filename.trim().is_empty() {
+            return;
+        }
+        if let Some(existing) = self.deltas.iter_mut().find(|existing| existing.id == delta.id) {
+            *existing = delta;
+        } else {
+            self.deltas.push(delta);
+        }
+    }
+
     /// Set one canonical delta descriptor.
     pub fn set_primary_delta(&mut self, delta: Option<DeltaArtifact>) {
         match delta {

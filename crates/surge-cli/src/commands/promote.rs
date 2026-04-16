@@ -6,9 +6,11 @@ use crate::logline;
 use crate::ui::UiTheme;
 use surge_core::config::constants::{DEFAULT_ZSTD_LEVEL, RELEASES_FILE_COMPRESSED};
 use surge_core::config::manifest::SurgeManifest;
+use surge_core::context::ResourceBudget;
 use surge_core::crypto::sha256::sha256_hex;
-use surge_core::diff::chunked::{ChunkedDiffOptions, chunked_bsdiff};
+use surge_core::diff::chunked::ChunkedDiffOptions;
 use surge_core::error::{Result, SurgeError};
+use surge_core::releases::delta::{build_sparse_file_patch, decode_delta_patch, delta_target_archive_encoding};
 use surge_core::releases::manifest::{DeltaArtifact, ReleaseEntry, ReleaseIndex, compress_release_index};
 use surge_core::releases::restore::restore_full_archive_for_version;
 use surge_core::releases::version::compare_versions;
@@ -195,8 +197,16 @@ async fn ensure_channel_delta(
 
     let prev_archive = restore_full_archive_for_version(backend, index, rid, from_version).await?;
     let new_archive = restore_full_archive_for_version(backend, index, rid, version).await?;
+    let (archive_compression_level, archive_zstd_workers) =
+        resolve_target_archive_encoding(backend, &index.releases[release_idx]).await?;
 
-    let patch = chunked_bsdiff(&prev_archive, &new_archive, &ChunkedDiffOptions::default())?;
+    let patch = build_sparse_file_patch(
+        &prev_archive,
+        &new_archive,
+        archive_compression_level,
+        archive_zstd_workers,
+        &ChunkedDiffOptions::default(),
+    )?;
     let compressed = zstd::encode_all(patch.as_slice(), DEFAULT_ZSTD_LEVEL)
         .map_err(|err| SurgeError::Archive(format!("Failed to compress channel delta: {err}")))?;
 
@@ -211,12 +221,31 @@ async fn ensure_channel_delta(
     let delta_sha256 = sha256_hex(&compressed);
     let delta_id = format!("from-{from_version_slug}");
 
-    let delta = DeltaArtifact::chunked_bsdiff_zstd(&delta_id, from_version, &delta_filename, delta_size, &delta_sha256);
+    let delta =
+        DeltaArtifact::sparse_file_ops_zstd(&delta_id, from_version, &delta_filename, delta_size, &delta_sha256);
     index.releases[release_idx].upsert_delta(delta);
 
     Ok(format!(
         "rebuilt delta from v{from_version} ({delta_size} bytes) and stored as {delta_filename}"
     ))
+}
+
+async fn resolve_target_archive_encoding(backend: &dyn StorageBackend, release: &ReleaseEntry) -> Result<(i32, u32)> {
+    if let Some(delta) = release.selected_delta() {
+        match backend.get_object(&delta.filename).await {
+            Ok(delta_bytes) => {
+                let patch = decode_delta_patch(&delta_bytes, &delta)?;
+                if let Some((compression_level, zstd_workers)) = delta_target_archive_encoding(&patch, &delta)? {
+                    return Ok((compression_level, zstd_workers));
+                }
+            }
+            Err(SurgeError::NotFound(_)) => {}
+            Err(err) => return Err(err),
+        }
+    }
+
+    let budget = ResourceBudget::default();
+    Ok((budget.zstd_compression_level, budget.effective_zstd_workers()))
 }
 
 fn sanitize_version_for_filename(version: &str) -> String {
@@ -450,6 +479,8 @@ mod tests {
         use surge_core::archive::packer::ArchivePacker;
         use surge_core::releases::delta::{apply_delta_patch, build_sparse_file_patch, decode_delta_patch};
         const FULL_ARCHIVE_ZSTD_LEVEL: i32 = 7;
+        const SYNTH_ARCHIVE_ZSTD_LEVEL: i32 = 9;
+        const SYNTH_ARCHIVE_ZSTD_WORKERS: u32 = 4;
 
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let store_dir = temp_dir.path().join("store");
@@ -487,6 +518,15 @@ mod tests {
         let v100_full = pack_dir(&v100_dir);
         let v110_full = pack_dir(&v110_dir);
         let v120_full = pack_dir(&v120_dir);
+        let v100_synth = {
+            let synth_extract = tempfile::tempdir().unwrap();
+            surge_core::archive::extractor::extract_to(&v100_full, synth_extract.path(), None).unwrap();
+            let mut synth_packer =
+                ArchivePacker::with_threads(SYNTH_ARCHIVE_ZSTD_LEVEL, SYNTH_ARCHIVE_ZSTD_WORKERS).unwrap();
+            synth_packer.add_directory(synth_extract.path(), "").unwrap();
+            synth_packer.finalize().unwrap()
+        };
+        assert_ne!(v100_synth, v100_full);
 
         // Build the v1.1.0 → v1.2.0 sparse delta the same way `surge pack` would,
         // basing it on the immediate previous overall version (v1.1.0). This is
@@ -577,7 +617,7 @@ mod tests {
         assert_eq!(production_delta.from_version, "1.0.0");
         assert_eq!(
             production_delta.patch_format,
-            surge_core::releases::manifest::PATCH_FORMAT_CHUNKED_BSDIFF_V1
+            surge_core::releases::manifest::PATCH_FORMAT_SPARSE_FILE_OPS_V1
         );
 
         // Original test-channel delta from v1.1.0 must still be present so test
@@ -596,9 +636,11 @@ mod tests {
         // when applied — this is the apply path that previously crashed with
         // "Sparse delta file hash mismatch for camera-tuner.deps.json". It also
         // must reproduce the exact target archive bytes when the release was
-        // packed with non-default compression settings.
+        // packed with non-default compression settings, even if the updater had
+        // to synthesize a tree-equivalent base archive with different zstd
+        // settings from the installed app contents.
         let decoded = decode_delta_patch(&production_delta_bytes, &production_delta).unwrap();
-        let rebuilt = apply_delta_patch(&v100_full, &decoded, &production_delta).unwrap();
+        let rebuilt = apply_delta_patch(&v100_synth, &decoded, &production_delta).unwrap();
         assert_eq!(rebuilt, v120_full);
         let working_dir = tempfile::tempdir().unwrap();
         surge_core::archive::extractor::extract_to(&rebuilt, working_dir.path(), None).unwrap();

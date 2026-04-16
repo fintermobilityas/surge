@@ -198,3 +198,25 @@ fn test_sparse_file_patch_roundtrip_rebuilds_full_archive_bytes() {
     let rebuilt = apply_delta_patch(&full_v1, &decoded, &delta).unwrap();
     assert_eq!(rebuilt, full_v2);
 }
+
+#[test]
+fn test_delta_target_archive_encoding_reads_sparse_file_patch_settings() {
+    let full_v1 = make_archive("1.0.0", 7, 0);
+    let full_v2 = make_archive("1.1.0", 7, 4);
+    let patch = build_sparse_file_patch(&full_v1, &full_v2, 7, 4, &ChunkedDiffOptions::default()).unwrap();
+    let delta = DeltaArtifact::sparse_file_ops_zstd("primary", "1.0.0", "demo-1.1.0-delta.tar.zst", 1, "sha");
+
+    let encoding = delta_target_archive_encoding(&patch, &delta).unwrap();
+    assert_eq!(encoding, Some((7, 4)));
+}
+
+#[test]
+fn test_delta_target_archive_encoding_reads_archive_chunked_settings() {
+    let full_v1 = make_archive("1.0.0", 11, 0);
+    let full_v2 = make_archive("1.1.0", 11, 4);
+    let patch = build_archive_chunked_patch(&full_v1, &full_v2, 11, 4, &ChunkedDiffOptions::default()).unwrap();
+    let delta = DeltaArtifact::chunked_bsdiff_archive_zstd("primary", "1.0.0", "demo-1.1.0-delta.tar.zst", 1, "sha");
+
+    let encoding = delta_target_archive_encoding(&patch, &delta).unwrap();
+    assert_eq!(encoding, Some((11, 4)));
+}

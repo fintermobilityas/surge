@@ -71,6 +71,30 @@ pub(super) fn apply_archive_chunked_patch(older: &[u8], patch: &[u8]) -> Result<
     encode_archive_bytes(&newer_tar, compression_level, zstd_workers)
 }
 
+pub(super) fn archive_patch_archive_encoding(data: &[u8], patch_format: &str) -> Result<Option<(i32, u32)>> {
+    if patch_format.eq_ignore_ascii_case(crate::releases::manifest::PATCH_FORMAT_BSDIFF4_ARCHIVE_V3) {
+        let (compression_level, zstd_workers, _) = decode_archive_patch_payload(
+            data,
+            *ARCHIVE_BSDIFF_MAGIC,
+            Some(*LEGACY_ARCHIVE_BSDIFF_MAGIC),
+            Some(b"BSDIFF40"),
+        )?;
+        return Ok(Some((compression_level, zstd_workers)));
+    }
+
+    if patch_format.eq_ignore_ascii_case(crate::releases::manifest::PATCH_FORMAT_CHUNKED_BSDIFF_ARCHIVE_V3) {
+        let (compression_level, zstd_workers, _) = decode_archive_patch_payload(
+            data,
+            *ARCHIVE_CHUNKED_MAGIC,
+            Some(*LEGACY_ARCHIVE_CHUNKED_MAGIC),
+            Some(b"CSDF"),
+        )?;
+        return Ok(Some((compression_level, zstd_workers)));
+    }
+
+    Ok(None)
+}
+
 fn encode_archive_patch_payload(magic: [u8; 4], compression_level: i32, zstd_workers: u32, patch: &[u8]) -> Vec<u8> {
     let mut payload = Vec::with_capacity(ARCHIVE_PATCH_HEADER_LEN + patch.len());
     payload.extend_from_slice(&magic);

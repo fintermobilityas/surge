@@ -75,3 +75,28 @@ pub fn apply_delta_patch(older: &[u8], patch: &[u8], delta: &DeltaArtifact) -> R
         delta.algorithm, delta.patch_format
     )))
 }
+
+pub fn delta_target_archive_encoding(patch: &[u8], delta: &DeltaArtifact) -> Result<Option<(i32, u32)>> {
+    let patch_format = normalized_or_default(&delta.patch_format, PATCH_FORMAT_BSDIFF4);
+    let algorithm = delta.algorithm.trim();
+
+    if patch_format.eq_ignore_ascii_case(PATCH_FORMAT_SPARSE_FILE_OPS_V1) {
+        if !algorithm.is_empty() && !algorithm.eq_ignore_ascii_case(DIFF_ALGORITHM_FILE_OPS) {
+            return Err(SurgeError::Update(format!(
+                "Unsupported delta algorithm/format '{}/{}'",
+                delta.algorithm, delta.patch_format
+            )));
+        }
+        return sparse_ops::sparse_file_patch_archive_encoding(patch).map(Some);
+    }
+
+    let algorithm = normalized_or_default(&delta.algorithm, DIFF_ALGORITHM_BSDIFF);
+    if !algorithm.eq_ignore_ascii_case(DIFF_ALGORITHM_BSDIFF) {
+        return Err(SurgeError::Update(format!(
+            "Unsupported delta algorithm/format '{}/{}'",
+            delta.algorithm, delta.patch_format
+        )));
+    }
+
+    archive::archive_patch_archive_encoding(patch, patch_format)
+}

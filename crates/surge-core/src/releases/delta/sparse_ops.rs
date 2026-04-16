@@ -176,6 +176,11 @@ pub fn build_sparse_file_patch(
     )
 }
 
+pub(super) fn sparse_file_patch_archive_encoding(patch: &[u8]) -> Result<(i32, u32)> {
+    let (manifest, _) = decode_sparse_file_ops_payload(patch)?;
+    Ok((manifest.compression_level, manifest.zstd_workers))
+}
+
 pub(super) fn apply_sparse_file_patch(older: &[u8], patch: &[u8]) -> Result<Vec<u8>> {
     let (manifest, payloads) = decode_sparse_file_ops_payload(patch)?;
     let working_dir = tempfile::tempdir()?;

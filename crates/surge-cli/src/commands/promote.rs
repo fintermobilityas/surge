@@ -7,9 +7,8 @@ use crate::ui::UiTheme;
 use surge_core::config::constants::{DEFAULT_ZSTD_LEVEL, RELEASES_FILE_COMPRESSED};
 use surge_core::config::manifest::SurgeManifest;
 use surge_core::crypto::sha256::sha256_hex;
-use surge_core::diff::chunked::ChunkedDiffOptions;
+use surge_core::diff::chunked::{ChunkedDiffOptions, chunked_bsdiff};
 use surge_core::error::{Result, SurgeError};
-use surge_core::releases::delta::build_sparse_file_patch;
 use surge_core::releases::manifest::{DeltaArtifact, ReleaseEntry, ReleaseIndex, compress_release_index};
 use surge_core::releases::restore::restore_full_archive_for_version;
 use surge_core::releases::version::compare_versions;
@@ -169,11 +168,11 @@ fn previous_release_on_channel(index: &ReleaseIndex, rid: &str, channel: &str, v
         .map(|release| release.version.clone())
 }
 
-/// Make sure the release at `version` carries a sparse delta whose basis is the
+/// Make sure the release at `version` carries a delta whose basis is the
 /// previous release on the target channel. Builds and uploads the delta when
 /// missing so production nodes can transition from `from_version` to `version`
-/// without hitting a basis hash mismatch on files that changed across an
-/// in-between test-only release.
+/// even when the target release's primary delta was built against a different
+/// in-between test-only version.
 ///
 /// Returns a one-line summary suitable for inclusion in the promote stage log.
 async fn ensure_channel_delta(
@@ -197,8 +196,7 @@ async fn ensure_channel_delta(
     let prev_archive = restore_full_archive_for_version(backend, index, rid, from_version).await?;
     let new_archive = restore_full_archive_for_version(backend, index, rid, version).await?;
 
-    let diff_options = ChunkedDiffOptions::default();
-    let patch = build_sparse_file_patch(&prev_archive, &new_archive, DEFAULT_ZSTD_LEVEL, 0, &diff_options)?;
+    let patch = chunked_bsdiff(&prev_archive, &new_archive, &ChunkedDiffOptions::default())?;
     let compressed = zstd::encode_all(patch.as_slice(), DEFAULT_ZSTD_LEVEL)
         .map_err(|err| SurgeError::Archive(format!("Failed to compress channel delta: {err}")))?;
 
@@ -213,8 +211,7 @@ async fn ensure_channel_delta(
     let delta_sha256 = sha256_hex(&compressed);
     let delta_id = format!("from-{from_version_slug}");
 
-    let delta =
-        DeltaArtifact::sparse_file_ops_zstd(&delta_id, from_version, &delta_filename, delta_size, &delta_sha256);
+    let delta = DeltaArtifact::chunked_bsdiff_zstd(&delta_id, from_version, &delta_filename, delta_size, &delta_sha256);
     index.releases[release_idx].upsert_delta(delta);
 
     Ok(format!(
@@ -451,7 +448,8 @@ mod tests {
     #[tokio::test]
     async fn execute_rebuilds_channel_delta_when_promoting_across_skipped_versions() {
         use surge_core::archive::packer::ArchivePacker;
-        use surge_core::releases::delta::{apply_delta_patch, decode_delta_patch};
+        use surge_core::releases::delta::{apply_delta_patch, build_sparse_file_patch, decode_delta_patch};
+        const FULL_ARCHIVE_ZSTD_LEVEL: i32 = 7;
 
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let store_dir = temp_dir.path().join("store");
@@ -481,7 +479,7 @@ mod tests {
         }
 
         let pack_dir = |dir: &Path| -> Vec<u8> {
-            let mut packer = ArchivePacker::new(3).unwrap();
+            let mut packer = ArchivePacker::new(FULL_ARCHIVE_ZSTD_LEVEL).unwrap();
             packer.add_directory(dir, "").unwrap();
             packer.finalize().unwrap()
         };
@@ -494,9 +492,15 @@ mod tests {
         // basing it on the immediate previous overall version (v1.1.0). This is
         // exactly what production nodes cannot apply when v1.0.0 is their installed
         // version because the basis-hash check on `camera-tuner.deps.json` fails.
-        let raw_v120_patch =
-            build_sparse_file_patch(&v110_full, &v120_full, 3, 0, &ChunkedDiffOptions::default()).unwrap();
-        let v120_delta_bytes = zstd::encode_all(raw_v120_patch.as_slice(), 3).unwrap();
+        let raw_v120_patch = build_sparse_file_patch(
+            &v110_full,
+            &v120_full,
+            FULL_ARCHIVE_ZSTD_LEVEL,
+            0,
+            &ChunkedDiffOptions::default(),
+        )
+        .unwrap();
+        let v120_delta_bytes = zstd::encode_all(raw_v120_patch.as_slice(), FULL_ARCHIVE_ZSTD_LEVEL).unwrap();
 
         let v100_full_key = format!("demo-1.0.0-{rid}-full.tar.zst");
         let v110_full_key = format!("demo-1.1.0-{rid}-full.tar.zst");
@@ -571,6 +575,10 @@ mod tests {
             .delta_from_source("1.0.0")
             .expect("delta from previous-on-channel release should exist after promote");
         assert_eq!(production_delta.from_version, "1.0.0");
+        assert_eq!(
+            production_delta.patch_format,
+            surge_core::releases::manifest::PATCH_FORMAT_CHUNKED_BSDIFF_V1
+        );
 
         // Original test-channel delta from v1.1.0 must still be present so test
         // nodes can keep updating without regression.
@@ -586,9 +594,12 @@ mod tests {
 
         // Verify the new delta actually transforms a v1.0.0 archive into v1.2.0
         // when applied — this is the apply path that previously crashed with
-        // "Sparse delta file hash mismatch for camera-tuner.deps.json".
+        // "Sparse delta file hash mismatch for camera-tuner.deps.json". It also
+        // must reproduce the exact target archive bytes when the release was
+        // packed with non-default compression settings.
         let decoded = decode_delta_patch(&production_delta_bytes, &production_delta).unwrap();
         let rebuilt = apply_delta_patch(&v100_full, &decoded, &production_delta).unwrap();
+        assert_eq!(rebuilt, v120_full);
         let working_dir = tempfile::tempdir().unwrap();
         surge_core::archive::extractor::extract_to(&rebuilt, working_dir.path(), None).unwrap();
         assert_eq!(

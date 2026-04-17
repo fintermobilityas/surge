@@ -151,6 +151,8 @@ mod tests {
             full_filename: format!("app-{version}-full.tar.zst"),
             full_size: 1000,
             full_sha256: "abc123".to_string(),
+            full_compression_level: 0,
+            full_zstd_workers: 0,
             deltas: Vec::new(),
             preferred_delta_id: String::new(),
             created_utc: "2025-01-01T00:00:00Z".to_string(),

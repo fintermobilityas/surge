@@ -354,6 +354,8 @@ apps:
             full_filename: format!("compact-app-{version}-{rid}-full.tar.zst"),
             full_size: i64::try_from(full_bytes.len()).unwrap(),
             full_sha256: sha256_hex(full_bytes),
+            full_compression_level: 0,
+            full_zstd_workers: 0,
             deltas: Vec::new(),
             preferred_delta_id: String::new(),
             created_utc: String::new(),

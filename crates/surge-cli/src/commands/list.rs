@@ -479,6 +479,8 @@ mod tests {
             full_filename: format!("{version}-full"),
             full_size: full,
             full_sha256: String::new(),
+            full_compression_level: 0,
+            full_zstd_workers: 0,
             deltas,
             preferred_delta_id: if delta > 0 {
                 "primary".to_string()

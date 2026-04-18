@@ -241,8 +241,8 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn test_add_directory_roundtrip_is_deterministic_with_symlinks_and_exec_bits() {
-        use std::os::unix::fs::symlink;
         use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::symlink;
 
         let tmp = tempfile::tempdir().unwrap();
         let source_dir = tmp.path().join("source");
@@ -309,6 +309,9 @@ mod tests {
         second.add_directory(&extracted_dir, "").unwrap();
         let repacked = second.finalize().unwrap();
 
-        assert_eq!(repacked, archive, "multithreaded zstd must be deterministic for extract+repack");
+        assert_eq!(
+            repacked, archive,
+            "multithreaded zstd must be deterministic for extract+repack"
+        );
     }
 }

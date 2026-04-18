@@ -111,7 +111,9 @@ pub async fn execute(
     // and the missing channel delta is built in place without a demote/repromote
     // cycle.
     let channel_delta_summary = match previous_on_channel {
-        Some(prev_version) => ensure_channel_delta(&*backend, &mut index, &app_id, &rid, version, &prev_version).await?,
+        Some(prev_version) => {
+            ensure_channel_delta(&*backend, &mut index, &app_id, &rid, version, &prev_version).await?
+        }
         None => "no previous release on channel; skipped delta rebuild".to_string(),
     };
 
@@ -271,7 +273,9 @@ async fn ensure_channel_delta(
 /// 3. No fallback: if both sources are unavailable we return an error so the
 ///    caller can refuse to upload a delta whose rebuild SHA nobody can predict.
 async fn resolve_target_archive_encoding(backend: &dyn StorageBackend, release: &ReleaseEntry) -> Result<(i32, u32)> {
-    if release.full_compression_level != UNRECORDED_COMPRESSION_LEVEL && release.full_zstd_workers != UNRECORDED_ZSTD_WORKERS {
+    if release.full_compression_level != UNRECORDED_COMPRESSION_LEVEL
+        && release.full_zstd_workers != UNRECORDED_ZSTD_WORKERS
+    {
         let workers = u32::try_from(release.full_zstd_workers.max(0)).unwrap_or(0);
         return Ok((release.full_compression_level, workers));
     }

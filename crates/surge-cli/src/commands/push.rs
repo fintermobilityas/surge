@@ -25,7 +25,8 @@ use surge_core::error::{Result, SurgeError};
 use surge_core::releases::delta::patch_format_from_magic_prefix;
 use surge_core::releases::manifest::{
     DeltaArtifact, PATCH_FORMAT_BSDIFF4, PATCH_FORMAT_CHUNKED_BSDIFF_V1, PATCH_FORMAT_SPARSE_FILE_OPS_V1, ReleaseEntry,
-    ReleaseIndex, compress_release_index, decompress_release_index,
+    ReleaseIndex, UNRECORDED_COMPRESSION_LEVEL, UNRECORDED_ZSTD_WORKERS, compress_release_index,
+    decompress_release_index,
 };
 use surge_core::releases::restore::required_artifacts_for_index;
 use surge_core::releases::version::compare_versions;
@@ -304,6 +305,12 @@ async fn update_release_index(
         full_filename,
         full_size,
         full_sha256,
+        // `surge push` uploads a pre-built archive without knowing how it was
+        // compressed, so we mark the encoding as unrecorded. Promotes of this
+        // release will have to fall back to `selected_delta` to recover the
+        // encoding (and error out if they can't), which is safer than guessing.
+        full_compression_level: UNRECORDED_COMPRESSION_LEVEL,
+        full_zstd_workers: UNRECORDED_ZSTD_WORKERS,
         deltas: Vec::new(),
         preferred_delta_id: String::new(),
         created_utc: chrono::Utc::now().to_rfc3339(),

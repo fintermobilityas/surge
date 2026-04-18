@@ -36,6 +36,15 @@ pub struct PackageArtifact {
     pub from_version: String,
     /// Delta patch format identifier, empty for full packages.
     pub patch_format: String,
+    /// zstd compression level that was actually used to build this artifact.
+    /// Recorded on full-archive artifacts so the release index can persist it;
+    /// future promotes read this to rebuild channel-aware deltas without
+    /// guessing what the original `pack` configuration was.
+    pub zstd_compression_level: i32,
+    /// zstd worker count that was actually used to build this artifact
+    /// (0 = single-threaded). Recorded for the same reason as
+    /// `zstd_compression_level`.
+    pub zstd_workers: u32,
     bytes: Vec<u8>,
 }
 
@@ -396,6 +405,8 @@ mod tests {
             is_delta: false,
             from_version: String::new(),
             patch_format: String::new(),
+            zstd_compression_level: 0,
+            zstd_workers: 0,
             bytes: b"test".to_vec(),
         };
         assert!(!artifact.is_delta);
@@ -661,6 +672,8 @@ apps:
                     full_filename: full_v1_name,
                     full_size: full_v1.len() as i64,
                     full_sha256: sha256_hex(&full_v1),
+                    full_compression_level: 0,
+                    full_zstd_workers: 0,
                     deltas: Vec::new(),
                     preferred_delta_id: String::new(),
                     created_utc: chrono::Utc::now().to_rfc3339(),
@@ -684,6 +697,8 @@ apps:
                     full_filename: full_v2_name,
                     full_size: full_v2.len() as i64,
                     full_sha256: sha256_hex(&full_v2),
+                    full_compression_level: 0,
+                    full_zstd_workers: 0,
                     deltas: vec![DeltaArtifact::bsdiff_zstd(
                         "primary",
                         "1.0.0",
@@ -845,6 +860,8 @@ apps:
                 full_filename: full_v1_name,
                 full_size: full_v1.len() as i64,
                 full_sha256: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+                full_compression_level: 0,
+                full_zstd_workers: 0,
                 deltas: Vec::new(),
                 preferred_delta_id: String::new(),
                 created_utc: chrono::Utc::now().to_rfc3339(),
@@ -954,6 +971,8 @@ apps:
                     full_filename: full_v1_name.clone(),
                     full_size: full_v1.len() as i64,
                     full_sha256: sha256_hex(&full_v1),
+                    full_compression_level: 0,
+                    full_zstd_workers: 0,
                     deltas: Vec::new(),
                     preferred_delta_id: String::new(),
                     created_utc: chrono::Utc::now().to_rfc3339(),
@@ -977,6 +996,8 @@ apps:
                     full_filename: full_v2_name.clone(),
                     full_size: full_v2.len() as i64,
                     full_sha256: sha256_hex(&full_v2),
+                    full_compression_level: 0,
+                    full_zstd_workers: 0,
                     deltas: vec![DeltaArtifact::bsdiff_zstd(
                         "primary",
                         "1.0.0",

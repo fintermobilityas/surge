@@ -112,6 +112,8 @@ impl PackBuilder {
             is_delta: true,
             from_version: previous_release.version.clone(),
             patch_format,
+            zstd_compression_level: budget.zstd_compression_level,
+            zstd_workers: n_workers,
             bytes: compressed,
         }))
     }

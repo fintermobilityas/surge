@@ -38,7 +38,8 @@ impl PackBuilder {
             .as_ref()
             .map_or(self.artifacts_dir.as_path(), tempfile::TempDir::path);
 
-        let mut packer = ArchivePacker::with_threads(budget.zstd_compression_level, n_workers)?;
+        let compression_level = budget.zstd_compression_level;
+        let mut packer = ArchivePacker::with_threads(compression_level, n_workers)?;
         packer.add_directory(pack_root, "")?;
 
         let archive_bytes = packer.finalize()?;
@@ -53,6 +54,8 @@ impl PackBuilder {
             is_delta: false,
             from_version: String::new(),
             patch_format: String::new(),
+            zstd_compression_level: compression_level,
+            zstd_workers: n_workers,
             bytes: archive_bytes,
         })
     }

@@ -131,6 +131,8 @@ mod tests {
             full_filename: format!("demo-{version}-{rid}-full.tar.zst"),
             full_size: 1,
             full_sha256: "hash".to_string(),
+            full_compression_level: 0,
+            full_zstd_workers: 0,
             deltas: Vec::new(),
             preferred_delta_id: String::new(),
             created_utc: chrono::Utc::now().to_rfc3339(),

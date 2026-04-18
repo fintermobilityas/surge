@@ -232,4 +232,86 @@ mod tests {
 
         assert_eq!(repacked, archive);
     }
+
+    // Probes roundtrip determinism for file-tree shapes that match a real
+    // youpark install: executable binaries with 0o755 permissions, symlinks
+    // between native runtime paths, and nested subdirectories. If any of
+    // these survives extract but diverges on repack we get the
+    // "SHA-256 mismatch for rebuilt full archive" in production.
+    #[test]
+    #[cfg(unix)]
+    fn test_add_directory_roundtrip_is_deterministic_with_symlinks_and_exec_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source_dir = tmp.path().join("source");
+        std::fs::create_dir_all(source_dir.join("bin")).unwrap();
+        std::fs::create_dir_all(source_dir.join("native")).unwrap();
+
+        let exe_path = source_dir.join("bin/app");
+        std::fs::write(&exe_path, b"#!/bin/sh\necho hello\n").unwrap();
+        std::fs::set_permissions(&exe_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let libso = source_dir.join("native/libfoo.so.1.2.3");
+        std::fs::write(&libso, vec![0xfe; 64 * 1024]).unwrap();
+        std::fs::set_permissions(&libso, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Two symlinks pointing at the real library — mirrors .so.MAJOR and
+        // unversioned links that ship with libnativesdk.
+        symlink("libfoo.so.1.2.3", source_dir.join("native/libfoo.so.1")).unwrap();
+        symlink("libfoo.so.1.2.3", source_dir.join("native/libfoo.so")).unwrap();
+
+        std::fs::write(source_dir.join("readme.txt"), b"readme\n").unwrap();
+        std::fs::set_permissions(source_dir.join("readme.txt"), std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let mut first = ArchivePacker::with_threads(9, 4).unwrap();
+        first.add_directory(&source_dir, "").unwrap();
+        let archive = first.finalize().unwrap();
+
+        let extracted_dir = tmp.path().join("extracted");
+        extract_to(&archive, &extracted_dir, None).unwrap();
+
+        let mut second = ArchivePacker::with_threads(9, 4).unwrap();
+        second.add_directory(&extracted_dir, "").unwrap();
+        let repacked = second.finalize().unwrap();
+
+        assert_eq!(
+            repacked, archive,
+            "extract→repack must be byte-identical with exec bits + symlinks"
+        );
+    }
+
+    // Determinism probe for multithreaded zstd. This mirrors what happens on a
+    // production node: pack creates a full archive with multithreaded zstd, the
+    // node extracts + applies a sparse-file-ops delta + repacks with the same
+    // (level, workers). If multithreaded zstd is not deterministic (or differs
+    // from single-threaded when n_workers=1), the rebuilt archive SHA won't
+    // match the manifest and the update fails with
+    // "SHA-256 mismatch for rebuilt full archive".
+    #[test]
+    fn test_add_directory_roundtrip_is_deterministic_with_multithreaded_zstd() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source_dir = tmp.path().join("source");
+        std::fs::create_dir_all(source_dir.join("nested")).unwrap();
+        std::fs::write(source_dir.join("root.txt"), b"root content").unwrap();
+        std::fs::write(source_dir.join("nested").join("payload.bin"), vec![0xab; 512 * 1024]).unwrap();
+        std::fs::write(source_dir.join("nested").join("changing.json"), br#"{"v":"1.0.0"}"#).unwrap();
+
+        let mut first = ArchivePacker::with_threads(9, 4).unwrap();
+        first.add_directory(&source_dir, "").unwrap();
+        let archive = first.finalize().unwrap();
+
+        let extracted_dir = tmp.path().join("extracted");
+        extract_to(&archive, &extracted_dir, None).unwrap();
+
+        let mut second = ArchivePacker::with_threads(9, 4).unwrap();
+        second.add_directory(&extracted_dir, "").unwrap();
+        let repacked = second.finalize().unwrap();
+
+        assert_eq!(
+            repacked, archive,
+            "multithreaded zstd must be deterministic for extract+repack"
+        );
+    }
 }

@@ -1,8 +1,8 @@
 use crate::config::constants::{RELEASES_FILE_COMPRESSED, SCHEMA_VERSION};
 use crate::error::{Result, SurgeError};
 use crate::releases::manifest::{
-    DeltaArtifact, PATCH_FORMAT_SPARSE_FILE_OPS_V1, ReleaseEntry, ReleaseIndex, compress_release_index,
-    decompress_release_index,
+    DeltaArtifact, PATCH_FORMAT_SPARSE_FILE_OPS_V1, ReleaseEntry, ReleaseIndex, UNRECORDED_COMPRESSION_LEVEL,
+    UNRECORDED_ZSTD_WORKERS, compress_release_index, decompress_release_index,
 };
 
 use super::PackBuilder;
@@ -42,6 +42,10 @@ impl PackBuilder {
             full_filename: full.map_or(String::new(), |a| a.filename.clone()),
             full_size: full.map_or(0, |a| a.size),
             full_sha256: full.map_or(String::new(), |a| a.sha256.clone()),
+            full_compression_level: full.map_or(UNRECORDED_COMPRESSION_LEVEL, |a| a.zstd_compression_level),
+            full_zstd_workers: full.map_or(UNRECORDED_ZSTD_WORKERS, |a| {
+                i32::try_from(a.zstd_workers).unwrap_or(UNRECORDED_ZSTD_WORKERS)
+            }),
             deltas: Vec::new(),
             preferred_delta_id: String::new(),
             created_utc: chrono::Utc::now().to_rfc3339(),

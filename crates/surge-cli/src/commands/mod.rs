@@ -736,6 +736,8 @@ apps:
                 full_filename: format!("{app_b}-0.9.0-{rid}-full.tar.zst"),
                 full_size: 1,
                 full_sha256: String::new(),
+                full_compression_level: 0,
+                full_zstd_workers: 0,
                 deltas: Vec::new(),
                 preferred_delta_id: String::new(),
                 created_utc: String::new(),

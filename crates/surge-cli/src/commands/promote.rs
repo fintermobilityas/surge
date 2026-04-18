@@ -6,12 +6,16 @@ use crate::logline;
 use crate::ui::UiTheme;
 use surge_core::config::constants::{DEFAULT_ZSTD_LEVEL, RELEASES_FILE_COMPRESSED};
 use surge_core::config::manifest::SurgeManifest;
-use surge_core::context::ResourceBudget;
 use surge_core::crypto::sha256::sha256_hex;
 use surge_core::diff::chunked::ChunkedDiffOptions;
 use surge_core::error::{Result, SurgeError};
-use surge_core::releases::delta::{build_sparse_file_patch, decode_delta_patch, delta_target_archive_encoding};
-use surge_core::releases::manifest::{DeltaArtifact, ReleaseEntry, ReleaseIndex, compress_release_index};
+use surge_core::releases::delta::{
+    apply_delta_patch, build_sparse_file_patch, decode_delta_patch, delta_target_archive_encoding,
+};
+use surge_core::releases::manifest::{
+    DeltaArtifact, ReleaseEntry, ReleaseIndex, UNRECORDED_COMPRESSION_LEVEL, UNRECORDED_ZSTD_WORKERS,
+    compress_release_index,
+};
 use surge_core::releases::restore::restore_full_archive_for_version;
 use surge_core::releases::version::compare_versions;
 use surge_core::storage::{self, StorageBackend};
@@ -197,8 +201,8 @@ async fn ensure_channel_delta(
 
     let prev_archive = restore_full_archive_for_version(backend, index, rid, from_version).await?;
     let new_archive = restore_full_archive_for_version(backend, index, rid, version).await?;
-    let (archive_compression_level, archive_zstd_workers) =
-        resolve_target_archive_encoding(backend, &index.releases[release_idx]).await?;
+    let target = &index.releases[release_idx];
+    let (archive_compression_level, archive_zstd_workers) = resolve_target_archive_encoding(backend, target).await?;
 
     let patch = build_sparse_file_patch(
         &prev_archive,
@@ -207,6 +211,32 @@ async fn ensure_channel_delta(
         archive_zstd_workers,
         &ChunkedDiffOptions::default(),
     )?;
+
+    // Self-verify: apply the freshly built delta to `prev_archive` and require
+    // the rebuilt archive's SHA-256 to match `target.full_sha256`. This is the
+    // exact invariant every node enforces in
+    // `update/manager/apply.rs::materialize_delta_payload`, so we must not
+    // upload a delta that would fail it. Without this check, any stale or
+    // missing encoding metadata (older release entries, FFI-overridden
+    // ResourceBudget, etc.) would silently produce a non-applicable delta and
+    // the entire promoted release would be poison on the fleet.
+    let rebuilt = apply_delta_patch(
+        &prev_archive,
+        &patch,
+        &DeltaArtifact::sparse_file_ops_zstd("self-verify", from_version, "", 0, ""),
+    )?;
+    let rebuilt_sha256 = sha256_hex(&rebuilt);
+    if rebuilt_sha256 != target.full_sha256 {
+        return Err(SurgeError::Pack(format!(
+            "Refusing to upload channel delta for {version} ({rid}): rebuilt full archive SHA-256 \
+             {rebuilt_sha256} does not match release manifest full_sha256 {} \
+             (tried compression_level={archive_compression_level}, zstd_workers={archive_zstd_workers}). \
+             Re-pack the release with a recorded full_compression_level/full_zstd_workers so promote \
+             can reproduce the original encoding, or rerun `surge pack` to refresh the full artifact.",
+            target.full_sha256
+        )));
+    }
+
     let compressed = zstd::encode_all(patch.as_slice(), DEFAULT_ZSTD_LEVEL)
         .map_err(|err| SurgeError::Archive(format!("Failed to compress channel delta: {err}")))?;
 
@@ -230,7 +260,26 @@ async fn ensure_channel_delta(
     ))
 }
 
+/// Resolve the `(compression_level, zstd_workers)` to use when re-packing
+/// `target`'s full archive from a freshly-built sparse-file-ops delta.
+///
+/// Order of preference:
+/// 1. `target.full_compression_level` / `target.full_zstd_workers` — these are
+///    recorded by `pack/builder/full.rs` and are the only source of truth
+///    that survives subsequent manifest changes or FFI budget overrides.
+/// 2. The `target.selected_delta()` manifest — older release entries that
+///    predate the recorded fields still have a primary delta with the right
+///    settings baked into its `SparseFileDeltaManifest`.
+/// 3. No fallback: if both sources are unavailable we return an error so the
+///    caller can refuse to upload a delta whose rebuild SHA nobody can predict.
 async fn resolve_target_archive_encoding(backend: &dyn StorageBackend, release: &ReleaseEntry) -> Result<(i32, u32)> {
+    if release.full_compression_level != UNRECORDED_COMPRESSION_LEVEL
+        && release.full_zstd_workers != UNRECORDED_ZSTD_WORKERS
+    {
+        let workers = u32::try_from(release.full_zstd_workers.max(0)).unwrap_or(0);
+        return Ok((release.full_compression_level, workers));
+    }
+
     if let Some(delta) = release.selected_delta() {
         match backend.get_object(&delta.filename).await {
             Ok(delta_bytes) => {
@@ -244,8 +293,13 @@ async fn resolve_target_archive_encoding(backend: &dyn StorageBackend, release: 
         }
     }
 
-    let budget = ResourceBudget::default();
-    Ok((budget.zstd_compression_level, budget.effective_zstd_workers()))
+    Err(SurgeError::Pack(format!(
+        "Cannot determine original pack encoding for release {} ({}): no recorded \
+         full_compression_level/full_zstd_workers on the release entry and no readable \
+         selected_delta to infer them from. Re-run `surge pack` for this release so the new \
+         encoding metadata is written into the release index.",
+        release.version, release.rid
+    )))
 }
 
 fn sanitize_version_for_filename(version: &str) -> String {
@@ -298,6 +352,8 @@ mod tests {
             full_filename: format!("demo-{version}-{rid}-full.tar.zst"),
             full_size: 1,
             full_sha256: "hash".to_string(),
+            full_compression_level: 0,
+            full_zstd_workers: 0,
             deltas: Vec::new(),
             preferred_delta_id: String::new(),
             created_utc: chrono::Utc::now().to_rfc3339(),
@@ -412,6 +468,8 @@ mod tests {
                         full_filename: v1_full_key.clone(),
                         full_size: i64::try_from(v1.len()).unwrap(),
                         full_sha256: sha256_hex(&v1),
+                        full_compression_level: 0,
+                        full_zstd_workers: 0,
                         deltas: Vec::new(),
                         preferred_delta_id: String::new(),
                         created_utc: chrono::Utc::now().to_rfc3339(),
@@ -435,6 +493,8 @@ mod tests {
                         full_filename: v2_full_key.clone(),
                         full_size: i64::try_from(v2.len()).unwrap(),
                         full_sha256: sha256_hex(&v2),
+                        full_compression_level: 0,
+                        full_zstd_workers: 0,
                         deltas: vec![DeltaArtifact::bsdiff_zstd(
                             "primary",
                             "1.0.0",
@@ -561,6 +621,8 @@ mod tests {
             full_filename: full_key.to_string(),
             full_size: i64::try_from(full_bytes.len()).unwrap(),
             full_sha256: sha256_hex(full_bytes),
+            full_compression_level: FULL_ARCHIVE_ZSTD_LEVEL,
+            full_zstd_workers: 0,
             deltas: Vec::new(),
             preferred_delta_id: String::new(),
             created_utc: chrono::Utc::now().to_rfc3339(),
@@ -647,6 +709,442 @@ mod tests {
         assert_eq!(
             std::fs::read(working_dir.path().join("camera-tuner.deps.json")).unwrap(),
             br#"{"version":"1.2.0"}"#,
+        );
+    }
+
+    // Reproduces the production crashloop where nodes reject the promoted
+    // 2996.0.0 release with "SHA-256 mismatch for rebuilt full archive".
+    //
+    // Root cause: 2996.0.0 was a **checkpoint full** — the primary delta chain
+    // hit `pack_policy.max_chain_length` (default 8) so pack skipped the
+    // primary delta and only uploaded a full archive. When `ensure_channel_delta`
+    // then runs during promote, `resolve_target_archive_encoding` finds no
+    // selected_delta on the target release and falls back to
+    // `ResourceBudget::default()` — but that default has
+    // `zstd_compression_level = 9`, while the full archive was actually packed
+    // with `PackPolicy::default().compression_level = 3`.
+    //
+    // The fallback therefore builds the channel-aware delta at level 9, a node
+    // on the previous production release applies it, and the rebuilt archive
+    // bytes no longer match the level-3 `full_sha256` recorded at pack time.
+    #[tokio::test]
+    async fn execute_channel_delta_preserves_full_sha256_when_target_is_checkpoint_full() {
+        use surge_core::archive::packer::ArchivePacker;
+        use surge_core::releases::delta::{apply_delta_patch, decode_delta_patch};
+        // PackPolicy::default().compression_level
+        const PACK_ZSTD_LEVEL: i32 = 3;
+        // Whatever pack happened to use on the build runner (capped by CPU count).
+        const PACK_ZSTD_WORKERS: u32 = 4;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store_dir = temp_dir.path().join("store");
+        let manifest_path = temp_dir.path().join("surge.yml");
+        let rid = current_rid();
+
+        std::fs::create_dir_all(&store_dir).expect("store dir");
+        write_manifest(&manifest_path, &store_dir, "demo", &rid);
+
+        let stage = temp_dir.path();
+        let v100_dir = stage.join("v100");
+        let v120_dir = stage.join("v120");
+        for dir in [&v100_dir, &v120_dir] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        // Realistic file mix: a small config that changes (PatchFile op) and a
+        // larger payload that also changes (WriteFile/PatchFile). The specific
+        // content doesn't matter; the point is that the resulting repack is
+        // sensitive to the zstd compression level.
+        std::fs::write(v100_dir.join("app.config"), br#"{"version":"1.0.0"}"#).unwrap();
+        std::fs::write(v120_dir.join("app.config"), br#"{"version":"1.2.0"}"#).unwrap();
+        std::fs::write(v100_dir.join("payload.bin"), vec![b'A'; 256 * 1024]).unwrap();
+        std::fs::write(v120_dir.join("payload.bin"), {
+            let mut bytes = vec![b'A'; 256 * 1024];
+            bytes[128] = b'B';
+            bytes
+        })
+        .unwrap();
+
+        let pack_dir = |dir: &Path| -> Vec<u8> {
+            let mut packer = ArchivePacker::with_threads(PACK_ZSTD_LEVEL, PACK_ZSTD_WORKERS).unwrap();
+            packer.add_directory(dir, "").unwrap();
+            packer.finalize().unwrap()
+        };
+
+        let v100_full = pack_dir(&v100_dir);
+        let v120_full = pack_dir(&v120_dir);
+
+        let v100_full_key = format!("demo-1.0.0-{rid}-full.tar.zst");
+        let v120_full_key = format!("demo-1.2.0-{rid}-full.tar.zst");
+        std::fs::write(store_dir.join(&v100_full_key), &v100_full).unwrap();
+        std::fs::write(store_dir.join(&v120_full_key), &v120_full).unwrap();
+
+        let make_release = |version: &str,
+                            channels: &[&str],
+                            full_key: &str,
+                            full_bytes: &[u8],
+                            full_compression_level: i32,
+                            full_zstd_workers: i32|
+         -> ReleaseEntry {
+            ReleaseEntry {
+                version: version.to_string(),
+                channels: channels.iter().map(|c| (*c).to_string()).collect(),
+                os: "linux".to_string(),
+                rid: rid.clone(),
+                is_genesis: version == "1.0.0",
+                full_filename: full_key.to_string(),
+                full_size: i64::try_from(full_bytes.len()).unwrap(),
+                full_sha256: sha256_hex(full_bytes),
+                full_compression_level,
+                full_zstd_workers,
+                deltas: Vec::new(),
+                preferred_delta_id: String::new(),
+                created_utc: chrono::Utc::now().to_rfc3339(),
+                release_notes: String::new(),
+                name: String::new(),
+                main_exe: "demoapp".to_string(),
+                install_directory: "demoapp".to_string(),
+                supervisor_id: String::new(),
+                icon: String::new(),
+                shortcuts: Vec::new(),
+                persistent_assets: Vec::new(),
+                installers: Vec::new(),
+                environment: std::collections::BTreeMap::new(),
+            }
+        };
+
+        // v1.2.0 is a checkpoint full — no primary delta. This is what
+        // `should_publish_checkpoint_full` in `pack/builder/delta.rs` produces
+        // when `deltas_since_checkpoint >= max_chain_length`. The new pack
+        // records the real (level, workers) on the release entry, so promote
+        // can rebuild a channel delta whose apply produces matching bytes.
+        write_index(
+            &store_dir,
+            &ReleaseIndex {
+                app_id: "demo".to_string(),
+                releases: vec![
+                    make_release(
+                        "1.0.0",
+                        &["production", "test"],
+                        &v100_full_key,
+                        &v100_full,
+                        PACK_ZSTD_LEVEL,
+                        i32::try_from(PACK_ZSTD_WORKERS).unwrap(),
+                    ),
+                    make_release(
+                        "1.2.0",
+                        &["test"],
+                        &v120_full_key,
+                        &v120_full,
+                        PACK_ZSTD_LEVEL,
+                        i32::try_from(PACK_ZSTD_WORKERS).unwrap(),
+                    ),
+                ],
+                ..ReleaseIndex::default()
+            },
+        );
+
+        execute(&manifest_path, Some("demo"), "1.2.0", Some(&rid), "production")
+            .await
+            .expect("promote should succeed");
+
+        let index = read_index(&store_dir);
+        let promoted = index
+            .releases
+            .iter()
+            .find(|release| release.version == "1.2.0" && release.rid == rid)
+            .expect("promoted release should exist");
+        let production_delta = promoted
+            .delta_from_source("1.0.0")
+            .expect("production-channel delta from 1.0.0 must be produced by promote");
+
+        let production_delta_path = store_dir.join(&production_delta.filename);
+        let production_delta_bytes = std::fs::read(&production_delta_path).expect("production delta artifact uploaded");
+
+        let decoded = decode_delta_patch(&production_delta_bytes, &production_delta).unwrap();
+        let rebuilt = apply_delta_patch(&v100_full, &decoded, &production_delta).unwrap();
+        let rebuilt_sha256 = sha256_hex(&rebuilt);
+        assert_eq!(
+            rebuilt_sha256, promoted.full_sha256,
+            "rebuilt full archive SHA must match manifest `full_sha256`"
+        );
+    }
+
+    // Guard rail for the reviewer's concern: if a release pre-dates the
+    // `full_compression_level`/`full_zstd_workers` fields AND its primary
+    // delta was pruned (e.g. by a previous `surge compact`), promote has no
+    // way to reproduce the exact pack encoding. Rather than silently uploading
+    // a delta that every node will reject, promote must refuse and surface a
+    // clear error so the operator can re-pack the target release.
+    #[tokio::test]
+    async fn execute_channel_delta_refuses_when_encoding_is_unknowable() {
+        use surge_core::archive::packer::ArchivePacker;
+        use surge_core::releases::manifest::{UNRECORDED_COMPRESSION_LEVEL, UNRECORDED_ZSTD_WORKERS};
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store_dir = temp_dir.path().join("store");
+        let manifest_path = temp_dir.path().join("surge.yml");
+        let rid = current_rid();
+
+        std::fs::create_dir_all(&store_dir).expect("store dir");
+        write_manifest(&manifest_path, &store_dir, "demo", &rid);
+
+        let stage = temp_dir.path();
+        let v100_dir = stage.join("v100");
+        let v120_dir = stage.join("v120");
+        for dir in [&v100_dir, &v120_dir] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(v100_dir.join("app.config"), br#"{"v":"1.0"}"#).unwrap();
+        std::fs::write(v120_dir.join("app.config"), br#"{"v":"1.2"}"#).unwrap();
+
+        let pack_dir = |dir: &Path| -> Vec<u8> {
+            let mut packer = ArchivePacker::with_threads(3, 4).unwrap();
+            packer.add_directory(dir, "").unwrap();
+            packer.finalize().unwrap()
+        };
+        let v100_full = pack_dir(&v100_dir);
+        let v120_full = pack_dir(&v120_dir);
+
+        let v100_full_key = format!("demo-1.0.0-{rid}-full.tar.zst");
+        let v120_full_key = format!("demo-1.2.0-{rid}-full.tar.zst");
+        std::fs::write(store_dir.join(&v100_full_key), &v100_full).unwrap();
+        std::fs::write(store_dir.join(&v120_full_key), &v120_full).unwrap();
+
+        let make_legacy_release = |version: &str, channels: &[&str], full_key: &str, full_bytes: &[u8]| ReleaseEntry {
+            version: version.to_string(),
+            channels: channels.iter().map(|c| (*c).to_string()).collect(),
+            os: "linux".to_string(),
+            rid: rid.clone(),
+            is_genesis: version == "1.0.0",
+            full_filename: full_key.to_string(),
+            full_size: i64::try_from(full_bytes.len()).unwrap(),
+            full_sha256: sha256_hex(full_bytes),
+            // Simulate a legacy release entry packed before the fields existed.
+            full_compression_level: UNRECORDED_COMPRESSION_LEVEL,
+            full_zstd_workers: UNRECORDED_ZSTD_WORKERS,
+            deltas: Vec::new(),
+            preferred_delta_id: String::new(),
+            created_utc: chrono::Utc::now().to_rfc3339(),
+            release_notes: String::new(),
+            name: String::new(),
+            main_exe: "demoapp".to_string(),
+            install_directory: "demoapp".to_string(),
+            supervisor_id: String::new(),
+            icon: String::new(),
+            shortcuts: Vec::new(),
+            persistent_assets: Vec::new(),
+            installers: Vec::new(),
+            environment: std::collections::BTreeMap::new(),
+        };
+
+        write_index(
+            &store_dir,
+            &ReleaseIndex {
+                app_id: "demo".to_string(),
+                releases: vec![
+                    make_legacy_release("1.0.0", &["production", "test"], &v100_full_key, &v100_full),
+                    make_legacy_release("1.2.0", &["test"], &v120_full_key, &v120_full),
+                ],
+                ..ReleaseIndex::default()
+            },
+        );
+
+        let err = execute(&manifest_path, Some("demo"), "1.2.0", Some(&rid), "production")
+            .await
+            .expect_err("promote should refuse when encoding is unknowable");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Cannot determine original pack encoding"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    // End-to-end reproduction of the production crash where nodes reject the
+    // promoted 2996.0.0 release with:
+    //   "SHA-256 mismatch for rebuilt full archive 2996.0.0: expected ..., got ..."
+    //
+    // Mirrors the real production flow:
+    //   * full archives and primary deltas are packed with MULTITHREADED zstd
+    //     (workers = 4), matching `ResourceBudget::default()` in CI.
+    //   * v1.0.0 is on `production`; v1.1.0 and v1.2.0 live only on `test`.
+    //   * `surge promote 1.2.0 production` must build a sparse-file-ops delta
+    //     directly from v1.0.0's full to v1.2.0's full (skipping v1.1.0).
+    //   * a node sitting at v1.0.0 fetches that new production-channel delta
+    //     and expects the rebuilt archive to hash to v1.2.0's full_sha256.
+    #[tokio::test]
+    async fn execute_rebuilds_channel_delta_with_multithreaded_pack_preserves_full_sha256() {
+        use surge_core::archive::packer::ArchivePacker;
+        use surge_core::releases::delta::{apply_delta_patch, build_sparse_file_patch, decode_delta_patch};
+        const ZSTD_LEVEL: i32 = 9;
+        const ZSTD_WORKERS: u32 = 4;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store_dir = temp_dir.path().join("store");
+        let manifest_path = temp_dir.path().join("surge.yml");
+        let rid = current_rid();
+
+        std::fs::create_dir_all(&store_dir).expect("store dir");
+        write_manifest(&manifest_path, &store_dir, "demo", &rid);
+
+        let stage = temp_dir.path();
+        let v100_dir = stage.join("v100");
+        let v110_dir = stage.join("v110");
+        let v120_dir = stage.join("v120");
+        for dir in [&v100_dir, &v110_dir, &v120_dir] {
+            std::fs::create_dir_all(dir.join("bin")).unwrap();
+            std::fs::create_dir_all(dir.join("assets")).unwrap();
+        }
+        // Non-trivial changing files — mix of small text and a larger binary
+        // so the delta exercises both WriteFile and PatchFile ops.
+        std::fs::write(v100_dir.join("bin/app.config"), br#"{"version":"1.0.0"}"#).unwrap();
+        std::fs::write(v110_dir.join("bin/app.config"), br#"{"version":"1.1.0"}"#).unwrap();
+        std::fs::write(v120_dir.join("bin/app.config"), br#"{"version":"1.2.0"}"#).unwrap();
+        std::fs::write(v100_dir.join("bin/runtime.bin"), vec![b'A'; 1024 * 1024]).unwrap();
+        std::fs::write(v110_dir.join("bin/runtime.bin"), {
+            let mut bytes = vec![b'A'; 1024 * 1024];
+            bytes[512] = b'B';
+            bytes
+        })
+        .unwrap();
+        std::fs::write(v120_dir.join("bin/runtime.bin"), {
+            let mut bytes = vec![b'A'; 1024 * 1024];
+            bytes[512] = b'B';
+            bytes[1024] = b'C';
+            bytes
+        })
+        .unwrap();
+        // Unchanged file — should be omitted from the sparse-file-ops delta.
+        for dir in [&v100_dir, &v110_dir, &v120_dir] {
+            std::fs::write(dir.join("assets/shared.bin"), vec![b'Z'; 256 * 1024]).unwrap();
+        }
+
+        let pack_dir = |dir: &Path| -> Vec<u8> {
+            let mut packer = ArchivePacker::with_threads(ZSTD_LEVEL, ZSTD_WORKERS).unwrap();
+            packer.add_directory(dir, "").unwrap();
+            packer.finalize().unwrap()
+        };
+
+        let v100_full = pack_dir(&v100_dir);
+        let v110_full = pack_dir(&v110_dir);
+        let v120_full = pack_dir(&v120_dir);
+
+        // Primary delta is built the same way `surge pack` builds it in CI: with
+        // the production ResourceBudget (level 9, workers 4).
+        let raw_v110_patch = build_sparse_file_patch(
+            &v100_full,
+            &v110_full,
+            ZSTD_LEVEL,
+            ZSTD_WORKERS,
+            &ChunkedDiffOptions::default(),
+        )
+        .unwrap();
+        let v110_delta_bytes = zstd::encode_all(raw_v110_patch.as_slice(), DEFAULT_ZSTD_LEVEL).unwrap();
+        let raw_v120_patch = build_sparse_file_patch(
+            &v110_full,
+            &v120_full,
+            ZSTD_LEVEL,
+            ZSTD_WORKERS,
+            &ChunkedDiffOptions::default(),
+        )
+        .unwrap();
+        let v120_delta_bytes = zstd::encode_all(raw_v120_patch.as_slice(), DEFAULT_ZSTD_LEVEL).unwrap();
+
+        let v100_full_key = format!("demo-1.0.0-{rid}-full.tar.zst");
+        let v110_full_key = format!("demo-1.1.0-{rid}-full.tar.zst");
+        let v120_full_key = format!("demo-1.2.0-{rid}-full.tar.zst");
+        let v110_delta_key = format!("demo-1.1.0-{rid}-delta.tar.zst");
+        let v120_delta_key = format!("demo-1.2.0-{rid}-delta.tar.zst");
+
+        std::fs::write(store_dir.join(&v100_full_key), &v100_full).unwrap();
+        std::fs::write(store_dir.join(&v110_full_key), &v110_full).unwrap();
+        std::fs::write(store_dir.join(&v120_full_key), &v120_full).unwrap();
+        std::fs::write(store_dir.join(&v110_delta_key), &v110_delta_bytes).unwrap();
+        std::fs::write(store_dir.join(&v120_delta_key), &v120_delta_bytes).unwrap();
+
+        let make_release = |version: &str, channels: &[&str], full_key: &str, full_bytes: &[u8]| ReleaseEntry {
+            version: version.to_string(),
+            channels: channels.iter().map(|c| (*c).to_string()).collect(),
+            os: "linux".to_string(),
+            rid: rid.clone(),
+            is_genesis: version == "1.0.0",
+            full_filename: full_key.to_string(),
+            full_size: i64::try_from(full_bytes.len()).unwrap(),
+            full_sha256: sha256_hex(full_bytes),
+            full_compression_level: ZSTD_LEVEL,
+            full_zstd_workers: i32::try_from(ZSTD_WORKERS).unwrap(),
+            deltas: Vec::new(),
+            preferred_delta_id: String::new(),
+            created_utc: chrono::Utc::now().to_rfc3339(),
+            release_notes: String::new(),
+            name: String::new(),
+            main_exe: "demoapp".to_string(),
+            install_directory: "demoapp".to_string(),
+            supervisor_id: String::new(),
+            icon: String::new(),
+            shortcuts: Vec::new(),
+            persistent_assets: Vec::new(),
+            installers: Vec::new(),
+            environment: std::collections::BTreeMap::new(),
+        };
+
+        let mut v110 = make_release("1.1.0", &["test"], &v110_full_key, &v110_full);
+        v110.deltas = vec![DeltaArtifact::sparse_file_ops_zstd(
+            "primary",
+            "1.0.0",
+            &v110_delta_key,
+            i64::try_from(v110_delta_bytes.len()).unwrap(),
+            &sha256_hex(&v110_delta_bytes),
+        )];
+        v110.preferred_delta_id = "primary".to_string();
+        let mut v120 = make_release("1.2.0", &["test"], &v120_full_key, &v120_full);
+        v120.deltas = vec![DeltaArtifact::sparse_file_ops_zstd(
+            "primary",
+            "1.1.0",
+            &v120_delta_key,
+            i64::try_from(v120_delta_bytes.len()).unwrap(),
+            &sha256_hex(&v120_delta_bytes),
+        )];
+        v120.preferred_delta_id = "primary".to_string();
+
+        write_index(
+            &store_dir,
+            &ReleaseIndex {
+                app_id: "demo".to_string(),
+                releases: vec![
+                    make_release("1.0.0", &["production", "test"], &v100_full_key, &v100_full),
+                    v110,
+                    v120,
+                ],
+                ..ReleaseIndex::default()
+            },
+        );
+
+        execute(&manifest_path, Some("demo"), "1.2.0", Some(&rid), "production")
+            .await
+            .expect("promote should succeed");
+
+        let index = read_index(&store_dir);
+        let promoted = index
+            .releases
+            .iter()
+            .find(|release| release.version == "1.2.0" && release.rid == rid)
+            .expect("promoted release should exist");
+        let production_delta = promoted
+            .delta_from_source("1.0.0")
+            .expect("production-channel delta from 1.0.0 must be produced by promote");
+
+        let production_delta_path = store_dir.join(&production_delta.filename);
+        let production_delta_bytes = std::fs::read(&production_delta_path).expect("production delta artifact uploaded");
+
+        // Simulate a node sitting on v1.0.0 applying the new production-channel
+        // delta. This is the exact invariant the node checks at
+        // update/manager/apply.rs after `apply_delta_patch`.
+        let decoded = decode_delta_patch(&production_delta_bytes, &production_delta).unwrap();
+        let rebuilt = apply_delta_patch(&v100_full, &decoded, &production_delta).unwrap();
+        let rebuilt_sha256 = sha256_hex(&rebuilt);
+        assert_eq!(
+            rebuilt_sha256, promoted.full_sha256,
+            "rebuilt full archive SHA must match manifest `full_sha256` (prod regression: nodes reject the update otherwise)"
         );
     }
 

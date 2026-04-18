@@ -16,6 +16,25 @@ pub const PATCH_FORMAT_CHUNKED_BSDIFF_ARCHIVE_V3: &str = "chunked-bsdiff-archive
 pub const PATCH_FORMAT_SPARSE_FILE_OPS_V1: &str = "sparse-file-ops-v1";
 pub const COMPRESSION_ZSTD: &str = "zstd";
 
+/// Sentinel value in serialized release entries meaning "the full archive's
+/// zstd compression level was not recorded when the release was packed."
+/// Newer `surge pack` invocations always record the actual value, so this
+/// only appears on older entries. Consumers must not treat this as a valid
+/// compression level.
+pub const UNRECORDED_COMPRESSION_LEVEL: i32 = i32::MIN;
+
+/// Sentinel value in serialized release entries meaning "the full archive's
+/// zstd worker count was not recorded when the release was packed."
+pub const UNRECORDED_ZSTD_WORKERS: i32 = -1;
+
+fn unrecorded_compression_level() -> i32 {
+    UNRECORDED_COMPRESSION_LEVEL
+}
+
+fn unrecorded_zstd_workers() -> i32 {
+    UNRECORDED_ZSTD_WORKERS
+}
+
 /// A single delta artifact descriptor.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DeltaArtifact {
@@ -137,7 +156,7 @@ impl DeltaArtifact {
 }
 
 /// A single release entry in the release index.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ReleaseEntry {
     pub version: String,
     #[serde(default)]
@@ -155,6 +174,18 @@ pub struct ReleaseEntry {
     pub full_size: i64,
     #[serde(default)]
     pub full_sha256: String,
+    /// zstd compression level that `pack` used when building the full archive
+    /// (negative = unrecorded, treated as "unknown" by promote). Promotions
+    /// must rebuild checkpoint-full channel deltas with these exact settings
+    /// or the rebuilt archive's SHA will not match `full_sha256` on nodes.
+    #[serde(default = "unrecorded_compression_level")]
+    pub full_compression_level: i32,
+    /// zstd worker thread count that `pack` used when building the full
+    /// archive. 0 = single-threaded; any value > 0 changes the compressed
+    /// output at most compression levels, so promote must preserve it.
+    /// Negative = unrecorded.
+    #[serde(default = "unrecorded_zstd_workers")]
+    pub full_zstd_workers: i32,
 
     #[serde(default)]
     pub deltas: Vec<DeltaArtifact>,
@@ -437,6 +468,8 @@ mod tests {
             full_filename: format!("app-{version}-full.tar.zst"),
             full_size: 1000,
             full_sha256: "abc123".to_string(),
+            full_compression_level: 0,
+            full_zstd_workers: 0,
             deltas: delta.into_iter().collect(),
             preferred_delta_id: if has_delta {
                 "primary".to_string()

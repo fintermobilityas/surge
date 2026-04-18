@@ -474,6 +474,8 @@ mod tests {
             full_filename: full.to_string(),
             full_size: 1,
             full_sha256: "x".to_string(),
+            full_compression_level: 0,
+            full_zstd_workers: 0,
             deltas: Vec::new(),
             preferred_delta_id: String::new(),
             created_utc: String::new(),

@@ -60,6 +60,8 @@ mod tests {
             full_filename: format!("demo-{version}-linux-x64-full.tar.zst"),
             full_size: 0,
             full_sha256: String::new(),
+            full_compression_level: 0,
+            full_zstd_workers: 0,
             deltas: vec![DeltaArtifact::bsdiff_zstd(
                 "primary",
                 "",

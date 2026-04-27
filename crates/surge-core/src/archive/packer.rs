@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Result, SurgeError};
 
+pub type PackProgress<'a> = dyn Fn(u64, u64, u64, u64) + 'a;
+
 pub struct ArchivePacker {
     builder: tar::Builder<zstd::Encoder<'static, Vec<u8>>>,
 }
@@ -36,7 +38,28 @@ impl ArchivePacker {
     }
 
     pub fn add_directory(&mut self, source_dir: &Path, prefix: &str) -> Result<()> {
-        self.add_directory_recursive(source_dir, Path::new(prefix))
+        self.add_directory_with_progress(source_dir, prefix, None)
+    }
+
+    pub fn add_directory_with_progress(
+        &mut self,
+        source_dir: &Path,
+        prefix: &str,
+        progress: Option<&PackProgress<'_>>,
+    ) -> Result<()> {
+        let archive_prefix = Path::new(prefix);
+        let totals = if progress.is_some() {
+            count_directory_entries(source_dir, archive_prefix)?
+        } else {
+            PackTotals::default()
+        };
+        let mut progress_state = PackProgressState {
+            progress,
+            totals,
+            items_done: 0,
+            bytes_done: 0,
+        };
+        self.add_directory_recursive(source_dir, archive_prefix, &mut progress_state)
     }
 
     pub fn add_buffer(&mut self, archive_path: &str, data: &[u8], mode: u32) -> Result<()> {
@@ -72,9 +95,15 @@ impl ArchivePacker {
         Ok(())
     }
 
-    fn add_directory_recursive(&mut self, source_dir: &Path, archive_prefix: &Path) -> Result<()> {
+    fn add_directory_recursive(
+        &mut self,
+        source_dir: &Path,
+        archive_prefix: &Path,
+        progress: &mut PackProgressState<'_>,
+    ) -> Result<()> {
         if !archive_prefix.as_os_str().is_empty() {
             self.add_directory_entry(archive_prefix, source_dir)?;
+            progress.advance(0);
         }
 
         let mut entries = fs::read_dir(source_dir)?.collect::<std::result::Result<Vec<_>, std::io::Error>>()?;
@@ -91,17 +120,19 @@ impl ArchivePacker {
             let metadata = fs::symlink_metadata(&source_path)?;
 
             if metadata.is_dir() {
-                self.add_directory_recursive(&source_path, &archive_path)?;
+                self.add_directory_recursive(&source_path, &archive_path, progress)?;
                 continue;
             }
 
             if metadata.is_file() {
                 self.add_file_entry(&source_path, &archive_path, &metadata)?;
+                progress.advance(metadata.len());
                 continue;
             }
 
             if metadata.file_type().is_symlink() {
                 self.add_symlink_entry(&source_path, &archive_path, &metadata)?;
+                progress.advance(0);
                 continue;
             }
 
@@ -160,6 +191,75 @@ impl ArchivePacker {
             .map_err(|e| SurgeError::Archive(format!("Failed to add symlink: {e}")))?;
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PackTotals {
+    items: u64,
+    bytes: u64,
+}
+
+struct PackProgressState<'a> {
+    progress: Option<&'a PackProgress<'a>>,
+    totals: PackTotals,
+    items_done: u64,
+    bytes_done: u64,
+}
+
+impl PackProgressState<'_> {
+    fn advance(&mut self, bytes: u64) {
+        self.items_done = self.items_done.saturating_add(1);
+        self.bytes_done = self.bytes_done.saturating_add(bytes);
+        if let Some(cb) = self.progress {
+            cb(self.items_done, self.totals.items, self.bytes_done, self.totals.bytes);
+        }
+    }
+}
+
+fn count_directory_entries(source_dir: &Path, archive_prefix: &Path) -> Result<PackTotals> {
+    let mut totals = PackTotals::default();
+    if !archive_prefix.as_os_str().is_empty() {
+        totals.items = totals.items.saturating_add(1);
+    }
+
+    let mut entries = fs::read_dir(source_dir)?.collect::<std::result::Result<Vec<_>, std::io::Error>>()?;
+    entries.sort_by(|left, right| {
+        archive_child_path(archive_prefix, left.path().file_name().unwrap_or_default()).cmp(&archive_child_path(
+            archive_prefix,
+            right.path().file_name().unwrap_or_default(),
+        ))
+    });
+
+    for entry in entries {
+        let source_path = entry.path();
+        let archive_path = archive_child_path(archive_prefix, &entry.file_name());
+        let metadata = fs::symlink_metadata(&source_path)?;
+
+        if metadata.is_dir() {
+            let child_totals = count_directory_entries(&source_path, &archive_path)?;
+            totals.items = totals.items.saturating_add(child_totals.items);
+            totals.bytes = totals.bytes.saturating_add(child_totals.bytes);
+            continue;
+        }
+
+        if metadata.is_file() {
+            totals.items = totals.items.saturating_add(1);
+            totals.bytes = totals.bytes.saturating_add(metadata.len());
+            continue;
+        }
+
+        if metadata.file_type().is_symlink() {
+            totals.items = totals.items.saturating_add(1);
+            continue;
+        }
+
+        return Err(SurgeError::Archive(format!(
+            "Unsupported filesystem entry while packing: {}",
+            source_path.display()
+        )));
+    }
+
+    Ok(totals)
 }
 
 fn archive_child_path(prefix: &Path, child_name: &std::ffi::OsStr) -> PathBuf {

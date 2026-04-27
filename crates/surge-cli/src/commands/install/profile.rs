@@ -34,8 +34,7 @@ fn has_local_nvidia_gpu() -> bool {
     std::process::Command::new("nvidia-smi")
         .arg("-L")
         .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|output| output.status.success())
 }
 
 pub(super) fn warn_if_local_rid_looks_incompatible(rid: &str, profile: &RuntimeProfile) {

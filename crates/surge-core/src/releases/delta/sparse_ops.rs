@@ -8,8 +8,9 @@ use crate::crypto::sha256::sha256_hex_file;
 use crate::diff::chunked::{ChunkedDiffOptions, chunked_bsdiff_files};
 use crate::error::{Result, SurgeError};
 
-use super::fs_apply::apply_sparse_file_ops;
+use super::fs_apply::{apply_sparse_file_ops_with_progress, sparse_file_ops_work_units};
 use super::tree::{TreeEntryKind, collect_tree_entries, files_identical};
+use super::{DeltaApplyProgress, DeltaApplyProgressCallback};
 
 pub(super) const SPARSE_FILE_OPS_MAGIC: &[u8; 4] = b"SFD1";
 
@@ -181,19 +182,83 @@ pub(super) fn sparse_file_patch_archive_encoding(patch: &[u8]) -> Result<(i32, u
     Ok((manifest.compression_level, manifest.zstd_workers))
 }
 
-pub(super) fn apply_sparse_file_patch(older: &[u8], patch: &[u8]) -> Result<Vec<u8>> {
+pub(super) fn apply_sparse_file_patch_with_progress(
+    older: &[u8],
+    patch: &[u8],
+    progress: Option<&DeltaApplyProgressCallback<'_>>,
+) -> Result<Vec<u8>> {
     let (manifest, payloads) = decode_sparse_file_ops_payload(patch)?;
     let working_dir = tempfile::tempdir()?;
-    extract_to(older, working_dir.path(), None)?;
-    apply_sparse_file_ops(working_dir.path(), &manifest.ops, payloads)?;
+
+    let extract_units = usize_to_u64_saturating(older.len()).max(1);
+    let ops_units = sparse_file_ops_work_units(&manifest.ops);
+    let repack_units = extract_units
+        .saturating_add(usize_to_u64_saturating(payloads.len()))
+        .max(1);
+    let total_units = extract_units.saturating_add(ops_units).saturating_add(repack_units);
+
+    emit_progress(progress, 0, total_units);
+
+    let extract_progress = |items_done: u64, items_total: u64, bytes_done: u64, bytes_total: u64| {
+        let units_done = if bytes_total > 0 {
+            scale_units(extract_units, bytes_done, bytes_total)
+        } else {
+            scale_units(extract_units, items_done, items_total)
+        };
+        emit_progress(progress, units_done, total_units);
+    };
+    extract_to(
+        older,
+        working_dir.path(),
+        progress.map(|_| &extract_progress as &crate::archive::extractor::ExtractProgress<'_>),
+    )?;
+    emit_progress(progress, extract_units, total_units);
+
+    let ops_progress = |done: u64, total: u64| {
+        emit_progress(
+            progress,
+            extract_units.saturating_add(scale_units(ops_units, done, total)),
+            total_units,
+        );
+    };
+    apply_sparse_file_ops_with_progress(
+        working_dir.path(),
+        &manifest.ops,
+        payloads,
+        progress.map(|_| &ops_progress as &super::fs_apply::SparseOpProgress<'_>),
+    )?;
+    let repack_start_units = extract_units.saturating_add(ops_units);
+    emit_progress(progress, repack_start_units, total_units);
 
     let mut packer = if manifest.zstd_workers > 1 {
         ArchivePacker::with_threads(manifest.compression_level, manifest.zstd_workers)?
     } else {
         ArchivePacker::new(manifest.compression_level)?
     };
-    packer.add_directory(working_dir.path(), "")?;
-    packer.finalize()
+
+    let add_directory_units = repack_units.saturating_mul(9) / 10;
+    let repack_progress = |items_done: u64, items_total: u64, bytes_done: u64, bytes_total: u64| {
+        let units_done = if bytes_total > 0 {
+            scale_units(add_directory_units, bytes_done, bytes_total)
+        } else {
+            scale_units(add_directory_units, items_done, items_total)
+        };
+        emit_progress(progress, repack_start_units.saturating_add(units_done), total_units);
+    };
+    packer.add_directory_with_progress(
+        working_dir.path(),
+        "",
+        progress.map(|_| &repack_progress as &crate::archive::packer::PackProgress<'_>),
+    )?;
+    emit_progress(
+        progress,
+        repack_start_units.saturating_add(add_directory_units),
+        total_units,
+    );
+
+    let rebuilt = packer.finalize()?;
+    emit_progress(progress, total_units, total_units);
+    Ok(rebuilt)
 }
 
 fn encode_sparse_file_ops_payload(manifest: &SparseFileDeltaManifest, payloads: &[u8]) -> Result<Vec<u8>> {
@@ -241,4 +306,24 @@ fn append_payload(buffer: &mut Vec<u8>, payload: &[u8]) -> Result<(u64, u64)> {
 
 fn path_depth(path: &str) -> usize {
     std::path::Path::new(path).components().count()
+}
+
+fn emit_progress(progress: Option<&DeltaApplyProgressCallback<'_>>, units_done: u64, units_total: u64) {
+    if let Some(cb) = progress {
+        cb(DeltaApplyProgress {
+            units_done: units_done.min(units_total),
+            units_total,
+        });
+    }
+}
+
+fn scale_units(units: u64, done: u64, total: u64) -> u64 {
+    if total == 0 {
+        return 0;
+    }
+    units.saturating_mul(done.min(total)) / total
+}
+
+fn usize_to_u64_saturating(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }

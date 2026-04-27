@@ -183,9 +183,7 @@ pub(crate) fn configure_context(manifest_path: &Path, manifest: &SurgeManifest, 
     let ctx = super::super::build_app_scoped_storage_context(manifest, manifest_path, app_id)?;
     let pack_policy = manifest.effective_pack_policy();
     let mut budget = ctx.resource_budget();
-    let available_threads = std::thread::available_parallelism()
-        .map(std::num::NonZeroUsize::get)
-        .unwrap_or(1);
+    let available_threads = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
 
     budget.max_threads = i32::try_from(available_threads).unwrap_or(i32::MAX);
     budget.max_memory_bytes = PACK_DEFAULT_MAX_MEMORY_BYTES;

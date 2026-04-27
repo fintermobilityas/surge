@@ -23,6 +23,18 @@ pub use self::format::{
 };
 pub use self::sparse_ops::build_sparse_file_patch;
 
+/// Progress information for CPU/disk work while applying one delta artifact.
+#[derive(Debug, Clone, Copy)]
+pub struct DeltaApplyProgress {
+    /// Work units completed within the current delta artifact.
+    pub units_done: u64,
+    /// Total work units expected for the current delta artifact.
+    pub units_total: u64,
+}
+
+/// Callback used while rebuilding an archive from a delta artifact.
+pub type DeltaApplyProgressCallback<'a> = dyn Fn(DeltaApplyProgress) + Send + Sync + 'a;
+
 pub fn decode_delta_patch(data: &[u8], delta: &DeltaArtifact) -> Result<Vec<u8>> {
     let compression = normalized_or_default(&delta.compression, COMPRESSION_ZSTD);
     if compression.eq_ignore_ascii_case(COMPRESSION_ZSTD) {
@@ -35,6 +47,15 @@ pub fn decode_delta_patch(data: &[u8], delta: &DeltaArtifact) -> Result<Vec<u8>>
 }
 
 pub fn apply_delta_patch(older: &[u8], patch: &[u8], delta: &DeltaArtifact) -> Result<Vec<u8>> {
+    apply_delta_patch_with_progress(older, patch, delta, None)
+}
+
+pub fn apply_delta_patch_with_progress(
+    older: &[u8],
+    patch: &[u8],
+    delta: &DeltaArtifact,
+    progress: Option<&DeltaApplyProgressCallback<'_>>,
+) -> Result<Vec<u8>> {
     let patch_format = normalized_or_default(&delta.patch_format, PATCH_FORMAT_BSDIFF4);
     let algorithm = delta.algorithm.trim();
 
@@ -45,7 +66,7 @@ pub fn apply_delta_patch(older: &[u8], patch: &[u8], delta: &DeltaArtifact) -> R
                 delta.algorithm, delta.patch_format
             )));
         }
-        return sparse_ops::apply_sparse_file_patch(older, patch);
+        return sparse_ops::apply_sparse_file_patch_with_progress(older, patch, progress);
     }
 
     let algorithm = normalized_or_default(&delta.algorithm, DIFF_ALGORITHM_BSDIFF);
@@ -57,23 +78,34 @@ pub fn apply_delta_patch(older: &[u8], patch: &[u8], delta: &DeltaArtifact) -> R
         )));
     }
 
-    if patch_format.eq_ignore_ascii_case(PATCH_FORMAT_BSDIFF4) {
-        return bspatch_buffers(older, patch);
+    emit_delta_apply_progress(progress, 0, 1);
+    let result = if patch_format.eq_ignore_ascii_case(PATCH_FORMAT_BSDIFF4) {
+        bspatch_buffers(older, patch)
+    } else if patch_format.eq_ignore_ascii_case(PATCH_FORMAT_CHUNKED_BSDIFF_V1) {
+        chunked_bspatch(older, patch, &ChunkedDiffOptions::default())
+    } else if patch_format.eq_ignore_ascii_case(PATCH_FORMAT_BSDIFF4_ARCHIVE_V3) {
+        archive::apply_archive_bsdiff_patch(older, patch)
+    } else if patch_format.eq_ignore_ascii_case(PATCH_FORMAT_CHUNKED_BSDIFF_ARCHIVE_V3) {
+        archive::apply_archive_chunked_patch(older, patch)
+    } else {
+        Err(SurgeError::Update(format!(
+            "Unsupported delta algorithm/format '{}/{}'",
+            delta.algorithm, delta.patch_format
+        )))
+    };
+    if result.is_ok() {
+        emit_delta_apply_progress(progress, 1, 1);
     }
-    if patch_format.eq_ignore_ascii_case(PATCH_FORMAT_CHUNKED_BSDIFF_V1) {
-        return chunked_bspatch(older, patch, &ChunkedDiffOptions::default());
-    }
-    if patch_format.eq_ignore_ascii_case(PATCH_FORMAT_BSDIFF4_ARCHIVE_V3) {
-        return archive::apply_archive_bsdiff_patch(older, patch);
-    }
-    if patch_format.eq_ignore_ascii_case(PATCH_FORMAT_CHUNKED_BSDIFF_ARCHIVE_V3) {
-        return archive::apply_archive_chunked_patch(older, patch);
-    }
+    result
+}
 
-    Err(SurgeError::Update(format!(
-        "Unsupported delta algorithm/format '{}/{}'",
-        delta.algorithm, delta.patch_format
-    )))
+fn emit_delta_apply_progress(progress: Option<&DeltaApplyProgressCallback<'_>>, units_done: u64, units_total: u64) {
+    if let Some(cb) = progress {
+        cb(DeltaApplyProgress {
+            units_done: units_done.min(units_total),
+            units_total,
+        });
+    }
 }
 
 pub fn delta_target_archive_encoding(patch: &[u8], delta: &DeltaArtifact) -> Result<Option<(i32, u32)>> {

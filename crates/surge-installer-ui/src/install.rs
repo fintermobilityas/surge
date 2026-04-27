@@ -227,11 +227,7 @@ fn resolve_package_with_progress(
     send(progress_tx, ctx, ProgressUpdate::Progress(DOWNLOAD_START_PROGRESS));
 
     let download_progress = |done: u64, total: u64| {
-        let phase_percent = if total > 0 {
-            ((done.saturating_mul(100)) / total).clamp(0, 100) as u32
-        } else {
-            0
-        };
+        let phase_percent = percentage_u64(done, total);
         send(
             progress_tx,
             ctx,
@@ -388,6 +384,12 @@ fn percentage(done: i64, total: i64) -> i32 {
     let done = done.max(0);
     let total = total.max(done);
     ((done.saturating_mul(100)) / total).clamp(0, 100) as i32
+}
+
+fn percentage_u64(done: u64, total: u64) -> u32 {
+    done.saturating_mul(100)
+        .checked_div(total)
+        .map_or(0, |percent| percent.clamp(0, 100) as u32)
 }
 
 fn format_bytes(bytes: u64) -> String {

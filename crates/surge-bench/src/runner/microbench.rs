@@ -73,7 +73,7 @@ pub fn run_sha256_memory(archive_data: &[u8]) -> BenchmarkResult {
 }
 
 pub fn run_sha256_file(file_path: &Path) -> BenchmarkResult {
-    let input_size = fs::metadata(file_path).map(|m| m.len()).unwrap_or(0);
+    let input_size = fs::metadata(file_path).map_or(0, |m| m.len());
 
     let (_hash, duration) = time(|| {
         sha256::sha256_hex_file(file_path).expect("Failed to hash file");

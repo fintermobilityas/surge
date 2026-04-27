@@ -150,9 +150,7 @@ fn chunked_diff_options(budget: &ResourceBudget, older_len: usize, newer_len: us
 
     let requested_threads = usize::try_from(budget.max_threads).ok().unwrap_or(0);
     let planning_threads = if requested_threads == 0 {
-        std::thread::available_parallelism()
-            .map(std::num::NonZeroUsize::get)
-            .unwrap_or(1)
+        std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
     } else {
         requested_threads
     };

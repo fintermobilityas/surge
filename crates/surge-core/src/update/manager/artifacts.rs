@@ -47,7 +47,7 @@ where
 
     let storage = manager.storage.as_ref();
     let download_progress_state = Arc::new(Mutex::new(DownloadProgressState::new()));
-    let mut download_stream = stream::iter(artifacts.into_iter())
+    let mut download_stream = stream::iter(artifacts)
         .map(|artifact| {
             let download_progress_state = Arc::clone(&download_progress_state);
             let progress = progress.clone();

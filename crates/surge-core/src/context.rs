@@ -64,12 +64,8 @@ impl ResourceBudget {
         if requested <= 1 {
             return 0;
         }
-        let cpus = u32::try_from(
-            std::thread::available_parallelism()
-                .map(std::num::NonZeroUsize::get)
-                .unwrap_or(1),
-        )
-        .unwrap_or(u32::MAX);
+        let cpus = u32::try_from(std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get))
+            .unwrap_or(u32::MAX);
         requested.min(cpus)
     }
 }

@@ -99,7 +99,7 @@ fn build_console_installer(
     };
     let installer_path = output_dir.join(format!("Setup-{rid}-{installer_type}.{installer_ext}"));
     let staged_surge_name = surge_binary_name_for_rid(rid);
-    let input_size = fs::metadata(full_package_path).map(|meta| meta.len()).unwrap_or(0);
+    let input_size = fs::metadata(full_package_path).map_or(0, |meta| meta.len());
 
     let (build_result, duration) = time(|| -> Result<()> {
         let staging_dir = tempfile::tempdir()
@@ -149,7 +149,7 @@ fn build_console_installer(
         Ok(())
     });
     build_result?;
-    let output_size = fs::metadata(&installer_path).map(|meta| meta.len()).unwrap_or(0);
+    let output_size = fs::metadata(&installer_path).map_or(0, |meta| meta.len());
 
     Ok((
         installer_path,
@@ -173,7 +173,7 @@ fn run_console_installer(
         fs::remove_dir_all(install_root)?;
     }
     fs::create_dir_all(home_dir)?;
-    let input_size = fs::metadata(installer_path).map(|meta| meta.len()).unwrap_or(0);
+    let input_size = fs::metadata(installer_path).map_or(0, |meta| meta.len());
     let (status, duration) = time(|| {
         Command::new(installer_path)
             .arg("--no-start")

@@ -26,6 +26,9 @@ const VERSION: u8 = 1;
 /// Default chunk size: 64 MiB.
 pub const DEFAULT_CHUNK_SIZE: usize = 64 * 1024 * 1024;
 
+/// Progress callback for file-backed patch application: (bytes_done, bytes_total).
+pub type ByteProgress<'a> = dyn Fn(u64, u64) + 'a;
+
 /// Returns whether `data` starts with the chunked patch magic bytes.
 #[must_use]
 pub fn has_magic_prefix(data: &[u8]) -> bool {
@@ -51,7 +54,7 @@ impl Default for ChunkedDiffOptions {
 
 impl ChunkedDiffOptions {
     fn effective_threads(&self) -> usize {
-        let cpu_count = thread::available_parallelism().map(std::num::NonZero::get).unwrap_or(1);
+        let cpu_count = thread::available_parallelism().map_or(1, std::num::NonZero::get);
 
         if self.max_threads != 0 {
             return self.max_threads.min(cpu_count);
@@ -371,6 +374,17 @@ pub fn chunked_bsdiff_files(older_path: &Path, newer_path: &Path, opts: &Chunked
 /// reconstructed file to `output_path` without materializing the entire output
 /// in memory.
 pub fn chunked_bspatch_file(older_path: &Path, patch: &[u8], output_path: &Path) -> Result<()> {
+    chunked_bspatch_file_with_progress(older_path, patch, output_path, None)
+}
+
+/// Apply a chunked binary diff patch directly against a file and report output
+/// bytes as chunks are reconstructed.
+pub fn chunked_bspatch_file_with_progress(
+    older_path: &Path,
+    patch: &[u8],
+    output_path: &Path,
+    progress: Option<&ByteProgress<'_>>,
+) -> Result<()> {
     let (old_size, new_size, chunk_size, chunk_patches) = deserialize_patch(patch)?;
     let actual_old_size = usize::try_from(fs::metadata(older_path)?.len())
         .map_err(|_| SurgeError::Diff("old file exceeds platform limits".into()))?;
@@ -400,6 +414,12 @@ pub fn chunked_bspatch_file(older_path: &Path, patch: &[u8], output_path: &Path)
         };
         output.write_all(&new_chunk)?;
         bytes_written = bytes_written.saturating_add(new_chunk.len());
+        if let Some(cb) = progress {
+            cb(
+                usize_to_u64_saturating(bytes_written),
+                usize_to_u64_saturating(new_size),
+            );
+        }
     }
     output.flush()?;
 
@@ -410,6 +430,10 @@ pub fn chunked_bspatch_file(older_path: &Path, patch: &[u8], output_path: &Path)
     }
 
     Ok(())
+}
+
+fn usize_to_u64_saturating(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 /// Patch format:

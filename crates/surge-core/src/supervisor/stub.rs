@@ -126,10 +126,7 @@ fn find_main_executable(app_dir: &Path) -> Result<PathBuf> {
 #[cfg(unix)]
 fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
-    path.is_file()
-        && std::fs::metadata(path)
-            .map(|m| m.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
+    path.is_file() && std::fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
 }
 
 #[cfg(not(unix))]

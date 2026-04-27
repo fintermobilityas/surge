@@ -68,9 +68,15 @@ pub fn install_package_locally_at_root_with_progress(
     );
     let extract_progress = |items_done: u64, items_total: u64, bytes_done: u64, bytes_total: u64| {
         let phase_percent = if bytes_total > 0 {
-            ((bytes_done.saturating_mul(100)) / bytes_total).clamp(0, 100) as i32
+            bytes_done
+                .saturating_mul(100)
+                .checked_div(bytes_total)
+                .map_or(0, |percent| percent.clamp(0, 100) as i32)
         } else if items_total > 0 {
-            ((items_done.saturating_mul(100)) / items_total).clamp(0, 100) as i32
+            items_done
+                .saturating_mul(100)
+                .checked_div(items_total)
+                .map_or(0, |percent| percent.clamp(0, 100) as i32)
         } else {
             0
         };

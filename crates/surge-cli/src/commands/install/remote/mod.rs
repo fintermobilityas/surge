@@ -282,9 +282,7 @@ pub(super) async fn install_release_via_tailscale(
             installer_mode,
         )?
     };
-    let installer_size = std::fs::metadata(&installer_path)
-        .map(|metadata| metadata.len())
-        .unwrap_or(0);
+    let installer_size = std::fs::metadata(&installer_path).map_or(0, |metadata| metadata.len());
     logline::info(&format!(
         "Transferring installer to '{file_target}' ({})...",
         crate::formatters::format_bytes(installer_size),

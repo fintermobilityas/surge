@@ -67,9 +67,7 @@ pub(super) fn configure_benchmark_context(
     );
 
     let mut budget = ctx.resource_budget();
-    let available_threads = std::thread::available_parallelism()
-        .map(std::num::NonZeroUsize::get)
-        .unwrap_or(1);
+    let available_threads = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
     let requested_threads = pack_max_threads.unwrap_or(available_threads).max(1);
     budget.max_threads = i32::try_from(requested_threads).unwrap_or(i32::MAX);
     budget.max_memory_bytes = i64::try_from(pack_memory_mb.saturating_mul(1024 * 1024)).unwrap_or(i64::MAX);
@@ -181,9 +179,7 @@ pub async fn run_update_scenario(
         let version = version_label(version_index);
         let publication =
             publish_release(Arc::clone(&ctx), &manifest_path, app_id, &rid, &version, &artifacts_dir).await?;
-        let release_index_size = fs::metadata(store_dir.join(RELEASES_FILE_COMPRESSED))
-            .map(|meta| meta.len())
-            .unwrap_or(0);
+        let release_index_size = fs::metadata(store_dir.join(RELEASES_FILE_COMPRESSED)).map_or(0, |meta| meta.len());
         release_index_updates.push(publication.release_index_update);
         release_index_sizes.push(release_index_size);
 
@@ -300,7 +296,7 @@ pub async fn run_update_scenario(
     )?;
 
     let releases_index_path = store_dir.join(RELEASES_FILE_COMPRESSED);
-    let releases_index_size = fs::metadata(&releases_index_path).map(|meta| meta.len()).unwrap_or(0);
+    let releases_index_size = fs::metadata(&releases_index_path).map_or(0, |meta| meta.len());
     let check_started = Instant::now();
     let info = update_manager
         .check_for_updates()

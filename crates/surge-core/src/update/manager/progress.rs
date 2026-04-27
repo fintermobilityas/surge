@@ -49,7 +49,9 @@ where
 
 pub(super) fn clamp_progress_percent(done: i64, total: i64) -> i32 {
     if total > 0 {
-        ((done.saturating_mul(100)) / total).clamp(0, 100) as i32
+        done.saturating_mul(100)
+            .checked_div(total)
+            .map_or(0, |percent| percent.clamp(0, 100) as i32)
     } else {
         0
     }
@@ -57,7 +59,9 @@ pub(super) fn clamp_progress_percent(done: i64, total: i64) -> i32 {
 
 pub(super) fn clamp_progress_percent_u64(done: u64, total: u64) -> i32 {
     if total > 0 {
-        ((done.saturating_mul(100)) / total).clamp(0, 100) as i32
+        done.saturating_mul(100)
+            .checked_div(total)
+            .map_or(0, |percent| percent.clamp(0, 100) as i32)
     } else {
         0
     }

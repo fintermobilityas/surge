@@ -199,6 +199,78 @@ fn test_sparse_file_patch_roundtrip_rebuilds_full_archive_bytes() {
     assert_eq!(rebuilt, full_v2);
 }
 
+#[test]
+fn test_sparse_file_patch_reports_incremental_apply_progress() {
+    let dir = tempfile::tempdir().unwrap();
+    let old_dir = dir.path().join("old");
+    let new_dir = dir.path().join("new");
+    std::fs::create_dir_all(old_dir.join("bin")).unwrap();
+    std::fs::create_dir_all(new_dir.join("bin")).unwrap();
+    std::fs::create_dir_all(new_dir.join("models")).unwrap();
+    std::fs::write(old_dir.join("bin").join("runtime.bin"), vec![b'A'; 512 * 1024]).unwrap();
+    std::fs::write(new_dir.join("bin").join("runtime.bin"), {
+        let mut bytes = vec![b'A'; 512 * 1024];
+        bytes[4096] = b'B';
+        bytes
+    })
+    .unwrap();
+    std::fs::write(new_dir.join("models").join("model-v2.bin"), vec![b'Z'; 512 * 1024]).unwrap();
+
+    let mut old_packer = ArchivePacker::new(7).unwrap();
+    old_packer.add_directory(&old_dir, "").unwrap();
+    let full_v1 = old_packer.finalize().unwrap();
+
+    let mut new_packer = ArchivePacker::new(7).unwrap();
+    new_packer.add_directory(&new_dir, "").unwrap();
+    let full_v2 = new_packer.finalize().unwrap();
+
+    let patch = build_sparse_file_patch(
+        &full_v1,
+        &full_v2,
+        7,
+        0,
+        &ChunkedDiffOptions {
+            chunk_size: 128 * 1024,
+            max_threads: 1,
+        },
+    )
+    .unwrap();
+    let delta_bytes = zstd::encode_all(patch.as_slice(), 3).unwrap();
+    let delta = DeltaArtifact::sparse_file_ops_zstd(
+        "primary",
+        "1.0.0",
+        "demo-1.1.0-delta.tar.zst",
+        i64::try_from(delta_bytes.len()).unwrap(),
+        &sha256_hex(&delta_bytes),
+    );
+
+    let observed = std::sync::Mutex::new(Vec::new());
+    let decoded = decode_delta_patch(&delta_bytes, &delta).unwrap();
+    let rebuilt = apply_delta_patch_with_progress(
+        &full_v1,
+        &decoded,
+        &delta,
+        Some(&|progress| {
+            observed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(progress);
+        }),
+    )
+    .unwrap();
+
+    assert_eq!(rebuilt, full_v2);
+    let observed = observed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        observed
+            .iter()
+            .any(|progress| progress.units_done > 0 && progress.units_done < progress.units_total),
+        "expected at least one intermediate sparse delta apply progress event"
+    );
+    let final_progress = observed.last().expect("expected sparse delta apply progress");
+    assert_eq!(final_progress.units_done, final_progress.units_total);
+}
+
 // Multithreaded-zstd variant of the roundtrip test. Mirrors what production
 // pack actually does: full archive and sparse delta are both built with the
 // same (level, workers) as provided by ResourceBudget (by default 4 workers).

@@ -1626,6 +1626,176 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_download_and_apply_reports_incremental_progress_for_single_sparse_delta() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("store");
+        let install_root = tmp.path().join("install");
+        let app_id = "test-app";
+        std::fs::create_dir_all(&store_root).unwrap();
+        std::fs::create_dir_all(&install_root).unwrap();
+        let app_store = app_scoped_store_root(&store_root, app_id);
+
+        let rid = current_rid();
+        let os = current_os_label_for_tests();
+
+        let source_v1 = tmp.path().join("source-v1");
+        let source_v2 = tmp.path().join("source-v2");
+        std::fs::create_dir_all(source_v1.join("bin")).unwrap();
+        std::fs::create_dir_all(source_v2.join("bin")).unwrap();
+        std::fs::create_dir_all(source_v2.join("models")).unwrap();
+        std::fs::write(
+            source_v1.join("bin").join("runtime.bin"),
+            pseudo_random_bytes(384 * 1024),
+        )
+        .unwrap();
+        std::fs::write(
+            source_v2.join("bin").join("runtime.bin"),
+            pseudo_random_bytes(384 * 1024),
+        )
+        .unwrap();
+        std::fs::write(
+            source_v2.join("models").join("model.bin"),
+            pseudo_random_bytes(256 * 1024),
+        )
+        .unwrap();
+
+        let mut packer_v1 = ArchivePacker::new(3).unwrap();
+        packer_v1.add_directory(&source_v1, "").unwrap();
+        let full_v1 = packer_v1.finalize().unwrap();
+
+        let mut packer_v2 = ArchivePacker::new(3).unwrap();
+        packer_v2.add_directory(&source_v2, "").unwrap();
+        let full_v2 = packer_v2.finalize().unwrap();
+
+        let patch_v2 = build_sparse_file_patch(
+            &full_v1,
+            &full_v2,
+            3,
+            0,
+            &ChunkedDiffOptions {
+                chunk_size: 128 * 1024,
+                max_threads: 1,
+            },
+        )
+        .unwrap();
+        let delta_v2 = zstd::encode_all(patch_v2.as_slice(), 3).unwrap();
+
+        let full_v1_name = format!("{app_id}-1.0.0-{rid}-full.tar.zst");
+        let full_v2_name = format!("{app_id}-1.1.0-{rid}-full.tar.zst");
+        let delta_v2_name = format!("{app_id}-1.1.0-{rid}-delta.tar.zst");
+        std::fs::write(app_store.join(&full_v1_name), &full_v1).unwrap();
+        std::fs::write(app_store.join(&delta_v2_name), &delta_v2).unwrap();
+
+        let index = ReleaseIndex {
+            app_id: app_id.to_string(),
+            releases: vec![
+                ReleaseEntry {
+                    version: "1.0.0".to_string(),
+                    channels: vec!["stable".to_string()],
+                    os: os.clone(),
+                    rid: rid.clone(),
+                    is_genesis: true,
+                    full_filename: full_v1_name,
+                    full_size: full_v1.len() as i64,
+                    full_sha256: sha256_hex(&full_v1),
+                    full_compression_level: 0,
+                    full_zstd_workers: 0,
+                    deltas: Vec::new(),
+                    preferred_delta_id: String::new(),
+                    created_utc: chrono::Utc::now().to_rfc3339(),
+                    release_notes: String::new(),
+                    name: String::new(),
+                    main_exe: app_id.to_string(),
+                    install_directory: app_id.to_string(),
+                    supervisor_id: String::new(),
+                    icon: String::new(),
+                    shortcuts: Vec::new(),
+                    persistent_assets: Vec::new(),
+                    installers: Vec::new(),
+                    environment: std::collections::BTreeMap::new(),
+                },
+                ReleaseEntry {
+                    version: "1.1.0".to_string(),
+                    channels: vec!["stable".to_string()],
+                    os,
+                    rid: rid.clone(),
+                    is_genesis: false,
+                    full_filename: full_v2_name,
+                    full_size: full_v2.len() as i64,
+                    full_sha256: sha256_hex(&full_v2),
+                    full_compression_level: 0,
+                    full_zstd_workers: 0,
+                    deltas: vec![DeltaArtifact::sparse_file_ops_zstd(
+                        "primary",
+                        "1.0.0",
+                        &delta_v2_name,
+                        delta_v2.len() as i64,
+                        &sha256_hex(&delta_v2),
+                    )],
+                    preferred_delta_id: "primary".to_string(),
+                    created_utc: chrono::Utc::now().to_rfc3339(),
+                    release_notes: String::new(),
+                    name: String::new(),
+                    main_exe: app_id.to_string(),
+                    install_directory: app_id.to_string(),
+                    supervisor_id: String::new(),
+                    icon: String::new(),
+                    shortcuts: Vec::new(),
+                    persistent_assets: Vec::new(),
+                    installers: Vec::new(),
+                    environment: std::collections::BTreeMap::new(),
+                },
+            ],
+            ..ReleaseIndex::default()
+        };
+
+        write_app_scoped_release_index(&store_root, app_id, &index);
+
+        let ctx = Arc::new(Context::new());
+        ctx.set_storage(
+            StorageProvider::Filesystem,
+            store_root.to_str().unwrap(),
+            "",
+            "",
+            "",
+            "",
+        );
+
+        let mut manager = UpdateManager::new(ctx, app_id, "1.0.0", "stable", install_root.to_str().unwrap()).unwrap();
+        let info = manager.check_for_updates().await.unwrap().unwrap();
+        assert_eq!(info.apply_strategy, ApplyStrategy::Delta);
+
+        let observed = Arc::new(Mutex::new(Vec::<ProgressInfo>::new()));
+        let observed_for_progress = Arc::clone(&observed);
+        manager
+            .download_and_apply(
+                &info,
+                Some(move |progress: ProgressInfo| {
+                    observed_for_progress
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(progress);
+                }),
+            )
+            .await
+            .unwrap();
+
+        let observed = observed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert!(observed.iter().any(|progress| {
+            progress.phase == 5
+                && progress.phase_percent > 0
+                && progress.phase_percent < 100
+                && progress.bytes_done > 0
+                && progress.bytes_done < progress.bytes_total
+                && progress.items_done == 0
+                && progress.items_total == 1
+        }));
+    }
+
+    #[tokio::test]
     async fn test_download_and_apply_delta_restores_missing_base_full() {
         let tmp = tempfile::tempdir().unwrap();
         let store_root = tmp.path().join("store");

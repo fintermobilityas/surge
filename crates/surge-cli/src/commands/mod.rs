@@ -210,6 +210,7 @@ mod tests {
     };
     use surge_core::config::manifest::{ShortcutLocation, SurgeManifest};
     use surge_core::context::{StorageConfig, StorageProvider};
+    use surge_core::crypto::sha256::sha256_hex;
     use surge_core::diff::chunked::{ChunkedDiffOptions, chunked_bsdiff};
     use surge_core::diff::wrapper::bsdiff_buffers;
     use surge_core::installer_bundle::read_embedded_payload;
@@ -774,6 +775,71 @@ apps:
         assert_eq!(scoped_index.releases[0].version, version);
         assert_eq!(scoped_index.releases[0].channels, vec!["test"]);
         assert_eq!(scoped_index.releases[0].name, "App A");
+    }
+
+    #[tokio::test]
+    async fn test_push_preserves_pack_recorded_full_encoding() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_dir = tmp.path().join("store");
+        let packages_dir = tmp.path().join("packages");
+        let manifest_path = tmp.path().join("surge.yml");
+        let rid = current_rid();
+        let app_id = "full-encoding-app";
+        let version = "1.0.0";
+        let full_package_bytes = b"full-package";
+        let full_package_key = format!("{app_id}-{version}-{rid}-full.tar.zst");
+
+        std::fs::create_dir_all(&store_dir).unwrap();
+        std::fs::create_dir_all(&packages_dir).unwrap();
+        write_manifest(&manifest_path, &store_dir, app_id, &rid);
+        std::fs::write(packages_dir.join(&full_package_key), full_package_bytes).unwrap();
+
+        let packed_index = ReleaseIndex {
+            app_id: app_id.to_string(),
+            releases: vec![ReleaseEntry {
+                version: version.to_string(),
+                channels: vec!["test".to_string()],
+                os: "linux".to_string(),
+                rid: rid.clone(),
+                is_genesis: false,
+                full_filename: full_package_key.clone(),
+                full_size: i64::try_from(full_package_bytes.len()).expect("fixture size fits in i64"),
+                full_sha256: sha256_hex(full_package_bytes),
+                full_compression_level: 3,
+                full_zstd_workers: 8,
+                deltas: Vec::new(),
+                preferred_delta_id: String::new(),
+                created_utc: String::new(),
+                release_notes: String::new(),
+                name: String::new(),
+                main_exe: "demoapp".to_string(),
+                install_directory: "demoapp".to_string(),
+                supervisor_id: String::new(),
+                icon: String::new(),
+                shortcuts: Vec::new(),
+                persistent_assets: Vec::new(),
+                installers: Vec::new(),
+                environment: BTreeMap::new(),
+            }],
+            ..ReleaseIndex::default()
+        };
+        let packed_index_bytes = compress_release_index(&packed_index, DEFAULT_ZSTD_LEVEL).unwrap();
+        std::fs::write(store_dir.join(RELEASES_FILE_COMPRESSED), packed_index_bytes).unwrap();
+
+        super::push::execute(&manifest_path, Some(app_id), version, Some(&rid), "test", &packages_dir)
+            .await
+            .unwrap();
+
+        let index = read_index(&store_dir);
+        let release = index
+            .releases
+            .iter()
+            .find(|release| release.version == version && release.rid == rid)
+            .expect("pushed release should exist");
+        assert_eq!(release.full_compression_level, 3);
+        assert_eq!(release.full_zstd_workers, 8);
+        assert_eq!(release.full_filename, full_package_key);
+        assert_eq!(release.full_sha256, sha256_hex(full_package_bytes));
     }
 
     #[tokio::test]

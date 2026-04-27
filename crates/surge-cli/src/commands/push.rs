@@ -279,6 +279,9 @@ async fn update_release_index(
     let mut channels = BTreeSet::new();
     channels.insert(channel.to_string());
 
+    let existing_full_encoding =
+        recorded_full_encoding_for_existing_release(&index, version, rid, &full_filename, full_size, &full_sha256);
+
     for existing in &index.releases {
         if existing.version == version && existing.rid == rid {
             for existing_channel in &existing.channels {
@@ -305,12 +308,8 @@ async fn update_release_index(
         full_filename,
         full_size,
         full_sha256,
-        // `surge push` uploads a pre-built archive without knowing how it was
-        // compressed, so we mark the encoding as unrecorded. Promotes of this
-        // release will have to fall back to `selected_delta` to recover the
-        // encoding (and error out if they can't), which is safer than guessing.
-        full_compression_level: UNRECORDED_COMPRESSION_LEVEL,
-        full_zstd_workers: UNRECORDED_ZSTD_WORKERS,
+        full_compression_level: existing_full_encoding.map_or(UNRECORDED_COMPRESSION_LEVEL, |encoding| encoding.0),
+        full_zstd_workers: existing_full_encoding.map_or(UNRECORDED_ZSTD_WORKERS, |encoding| encoding.1),
         deltas: Vec::new(),
         preferred_delta_id: String::new(),
         created_utc: chrono::Utc::now().to_rfc3339(),
@@ -373,6 +372,33 @@ async fn update_release_index(
     let pruned = prune_redundant_artifacts(backend, &index).await?;
 
     Ok(pruned)
+}
+
+fn recorded_full_encoding_for_existing_release(
+    index: &ReleaseIndex,
+    version: &str,
+    rid: &str,
+    full_filename: &str,
+    full_size: i64,
+    full_sha256: &str,
+) -> Option<(i32, i32)> {
+    let existing = index
+        .releases
+        .iter()
+        .find(|release| release.version == version && release.rid == rid)?;
+
+    if existing.full_filename != full_filename || existing.full_size != full_size || existing.full_sha256 != full_sha256
+    {
+        return None;
+    }
+
+    if existing.full_compression_level == UNRECORDED_COMPRESSION_LEVEL
+        || existing.full_zstd_workers == UNRECORDED_ZSTD_WORKERS
+    {
+        return None;
+    }
+
+    Some((existing.full_compression_level, existing.full_zstd_workers))
 }
 
 async fn prune_redundant_artifacts(backend: &dyn StorageBackend, index: &ReleaseIndex) -> Result<usize> {

@@ -6,6 +6,7 @@ use surge_core::config::constants::RELEASES_FILE_COMPRESSED;
 use surge_core::config::installer::{
     InstallerManifest, InstallerRelease, InstallerRuntime, InstallerStorage, InstallerUi,
 };
+use surge_core::config::manifest::CacheManifestConfig;
 use surge_core::error::Result;
 
 use super::BENCH_APP_NAME;
@@ -57,6 +58,7 @@ pub(super) fn installer_manifest(
             installers: vec![installer_type.to_string()],
             environment: BTreeMap::new(),
         },
+        cache: CacheManifestConfig::default(),
     }
 }
 

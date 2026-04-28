@@ -61,6 +61,94 @@ pub struct PackRetentionManifestConfig {
     pub checkpoint_every: Option<u32>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct CacheManifestConfig {
+    #[serde(
+        default,
+        rename = "installArtifacts",
+        alias = "install_artifacts",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub install_artifacts: Option<InstallArtifactCacheManifestConfig>,
+}
+
+impl CacheManifestConfig {
+    #[must_use]
+    pub fn from_install_artifact_cache_policy(policy: InstallArtifactCachePolicy) -> Self {
+        Self {
+            install_artifacts: Some(InstallArtifactCacheManifestConfig {
+                retention: Some(policy.retention),
+                keep_full_count: Some(policy.keep_full_count),
+            }),
+        }
+    }
+
+    #[must_use]
+    pub fn effective_install_artifact_cache_policy(&self) -> InstallArtifactCachePolicy {
+        let mut policy = InstallArtifactCachePolicy::default();
+        if let Some(install_artifacts) = self.install_artifacts {
+            if let Some(retention) = install_artifacts.retention {
+                policy.retention = retention;
+            }
+            if let Some(keep_full_count) = install_artifacts.keep_full_count {
+                policy.keep_full_count = keep_full_count;
+            }
+        }
+        policy
+    }
+
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        self.install_artifacts.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct InstallArtifactCacheManifestConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention: Option<InstallArtifactCacheRetention>,
+    #[serde(
+        default,
+        rename = "keepFullCount",
+        alias = "keep_full_count",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub keep_full_count: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum InstallArtifactCacheRetention {
+    #[default]
+    ReleaseGraph,
+    LatestFull,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstallArtifactCachePolicy {
+    #[serde(default)]
+    pub retention: InstallArtifactCacheRetention,
+    #[serde(
+        default = "default_install_artifact_cache_keep_full_count",
+        rename = "keepFullCount",
+        alias = "keep_full_count"
+    )]
+    pub keep_full_count: u32,
+}
+
+impl Default for InstallArtifactCachePolicy {
+    fn default() -> Self {
+        Self {
+            retention: InstallArtifactCacheRetention::ReleaseGraph,
+            keep_full_count: default_install_artifact_cache_keep_full_count(),
+        }
+    }
+}
+
+const fn default_install_artifact_cache_keep_full_count() -> u32 {
+    1
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TargetConfig {
     pub rid: String,
@@ -260,6 +348,8 @@ pub struct SurgeManifest {
     pub channels: Vec<ChannelManifestConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pack: Option<PackManifestConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<CacheManifestConfig>,
     #[serde(default)]
     pub apps: Vec<AppConfig>,
 }

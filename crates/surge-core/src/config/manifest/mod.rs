@@ -10,9 +10,11 @@ use serde_yaml::Value;
 use crate::error::{Result, SurgeError};
 
 pub use self::types::{
-    AppConfig, ChannelManifestConfig, InstallerType, LockManifestConfig, PackCompressionFormat,
-    PackCompressionManifestConfig, PackDeltaManifestConfig, PackDeltaStrategy, PackManifestConfig, PackPolicy,
-    PackRetentionManifestConfig, ShortcutLocation, StorageManifestConfig, SurgeManifest, TargetConfig,
+    AppConfig, CacheManifestConfig, ChannelManifestConfig, InstallArtifactCacheManifestConfig,
+    InstallArtifactCachePolicy, InstallArtifactCacheRetention, InstallerType, LockManifestConfig,
+    PackCompressionFormat, PackCompressionManifestConfig, PackDeltaManifestConfig, PackDeltaStrategy,
+    PackManifestConfig, PackPolicy, PackRetentionManifestConfig, ShortcutLocation, StorageManifestConfig,
+    SurgeManifest, TargetConfig,
 };
 
 impl SurgeManifest {
@@ -39,7 +41,7 @@ impl SurgeManifest {
 
 #[cfg(test)]
 mod tests {
-    use super::{PackDeltaStrategy, SurgeManifest};
+    use super::{InstallArtifactCacheRetention, PackDeltaStrategy, SurgeManifest};
     use crate::config::constants::{
         PACK_DEFAULT_CHECKPOINT_EVERY, PACK_DEFAULT_KEEP_LATEST_FULLS, PACK_DEFAULT_MAX_CHAIN_LENGTH,
         PACK_DEFAULT_ZSTD_LEVEL,
@@ -135,6 +137,49 @@ apps:
         assert_eq!(policy.max_chain_length, 4);
         assert_eq!(policy.keep_latest_fulls, 3);
         assert_eq!(policy.checkpoint_every, 9);
+    }
+
+    #[test]
+    fn parse_accepts_install_artifact_cache_policy_override() {
+        let yaml = br"schema: 1
+storage:
+  provider: filesystem
+  bucket: /tmp/store
+cache:
+  installArtifacts:
+    retention: latest_full
+    keepFullCount: 1
+apps:
+  - id: demoapp
+    target:
+      rid: linux-x64
+";
+
+        let manifest = SurgeManifest::parse(yaml).expect("manifest should parse");
+        let policy = manifest.effective_install_artifact_cache_policy();
+
+        assert_eq!(policy.retention, InstallArtifactCacheRetention::LatestFull);
+        assert_eq!(policy.keep_full_count, 1);
+    }
+
+    #[test]
+    fn parse_rejects_zero_install_artifact_cache_keep_full_count() {
+        let yaml = br"schema: 1
+storage:
+  provider: filesystem
+  bucket: /tmp/store
+cache:
+  installArtifacts:
+    retention: latest_full
+    keepFullCount: 0
+apps:
+  - id: demoapp
+    target:
+      rid: linux-x64
+";
+
+        let err = SurgeManifest::parse(yaml).expect_err("manifest should be rejected");
+        assert!(err.to_string().contains("cache.installArtifacts.keepFullCount"));
     }
 
     #[test]

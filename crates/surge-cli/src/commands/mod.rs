@@ -208,7 +208,7 @@ mod tests {
     use surge_core::config::installer::{
         InstallerManifest, InstallerRelease, InstallerRuntime, InstallerStorage, InstallerUi,
     };
-    use surge_core::config::manifest::{ShortcutLocation, SurgeManifest};
+    use surge_core::config::manifest::{CacheManifestConfig, ShortcutLocation, SurgeManifest};
     use surge_core::context::{StorageConfig, StorageProvider};
     use surge_core::diff::chunked::{ChunkedDiffOptions, chunked_bsdiff};
     use surge_core::diff::wrapper::bsdiff_buffers;
@@ -580,6 +580,7 @@ apps:
                         installers: Vec::new(),
                         environment: BTreeMap::new(),
                     },
+                    cache: CacheManifestConfig::default(),
                 };
 
                 let config = super::build_storage_config_from_installer_manifest(&manifest, setup_dir).unwrap();

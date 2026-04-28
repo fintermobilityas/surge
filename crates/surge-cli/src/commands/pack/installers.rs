@@ -5,7 +5,7 @@ use surge_core::config::constants::RELEASES_FILE_COMPRESSED;
 use surge_core::config::installer::{
     InstallerManifest, InstallerRelease, InstallerRuntime, InstallerStorage, InstallerUi,
 };
-use surge_core::config::manifest::{AppConfig, InstallerType, SurgeManifest, TargetConfig};
+use surge_core::config::manifest::{AppConfig, CacheManifestConfig, InstallerType, SurgeManifest, TargetConfig};
 use surge_core::crypto::sha256::sha256_hex_file;
 use surge_core::error::{Result, SurgeError};
 use surge_core::installer_bundle;
@@ -192,6 +192,9 @@ pub(super) fn build_installers_with_launcher(
                 installers: target.installers.clone(),
                 environment: target.environment.clone(),
             },
+            cache: CacheManifestConfig::from_install_artifact_cache_policy(
+                manifest.effective_install_artifact_cache_policy(),
+            ),
         };
         let manifest_yaml = serde_yaml::to_string(&manifest_payload)?;
         std::fs::write(staging.join("installer.yml"), manifest_yaml.as_bytes())?;

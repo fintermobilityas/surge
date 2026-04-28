@@ -455,8 +455,9 @@ mod tests {
     use surge_core::archive::extractor::read_entry;
     use surge_core::archive::packer::ArchivePacker;
     use surge_core::config::constants::DEFAULT_ZSTD_LEVEL;
-    use surge_core::config::manifest::ShortcutLocation;
-    use surge_core::config::manifest::SurgeManifest;
+    use surge_core::config::manifest::{
+        CacheManifestConfig, InstallArtifactCachePolicy, InstallArtifactCacheRetention, ShortcutLocation, SurgeManifest,
+    };
     use surge_core::crypto::sha256::sha256_hex;
     use surge_core::diff::wrapper::bsdiff_buffers;
     use surge_core::installer_bundle::read_embedded_payload;
@@ -519,6 +520,13 @@ mod tests {
             "schema: 1\napps:\n  - id: {app_id}\n    channels:\n{channels_yaml}    targets:\n      - rid: {rid}\n        installers:\n{installers_yaml}"
         );
         serde_yaml::from_str(&yaml).expect("manifest should parse")
+    }
+
+    fn latest_full_cache_policy() -> CacheManifestConfig {
+        CacheManifestConfig::from_install_artifact_cache_policy(InstallArtifactCachePolicy {
+            retention: InstallArtifactCacheRetention::LatestFull,
+            keep_full_count: 1,
+        })
     }
 
     fn create_published_installer(dir: &Path, installer_name: &str, manifest: &InstallerManifest) -> PathBuf {
@@ -589,6 +597,7 @@ mod tests {
             &storage_config("/tmp/releases"),
             &launch_env,
             RemoteInstallerMode::Online,
+            CacheManifestConfig::default(),
         );
 
         assert_eq!(
@@ -1015,6 +1024,44 @@ mod tests {
     }
 
     #[test]
+    fn plan_remote_published_installer_carries_manifest_cache_policy() {
+        let yaml = br"schema: 1
+cache:
+  installArtifacts:
+    retention: latest_full
+    keepFullCount: 1
+apps:
+  - id: demo
+    channels:
+      - production
+    targets:
+      - rid: linux-arm64
+        installers:
+          - online
+";
+        let manifest: SurgeManifest = serde_yaml::from_slice(yaml).expect("manifest should parse");
+        let mut entry = release("1.2.3", "production", "linux-arm64", "demo.tar.zst");
+        entry.installers = vec!["online".to_string()];
+
+        let plan = plan_remote_published_installer(
+            &manifest,
+            "demo",
+            "linux-arm64",
+            "production",
+            &entry,
+            RemoteInstallerMode::Online,
+        )
+        .expect("plan should resolve");
+        let policy = plan
+            .cache
+            .expect("manifest-backed plan should carry cache policy")
+            .effective_install_artifact_cache_policy();
+
+        assert_eq!(policy.retention, InstallArtifactCacheRetention::LatestFull);
+        assert_eq!(policy.keep_full_count, 1);
+    }
+
+    #[test]
     fn plan_remote_published_installer_drops_default_channel_mismatch_blocker() {
         let manifest = remote_manifest("demo", "linux-arm64", &["test", "production"], &["online"]);
         let mut entry = release("1.2.3", "production", "linux-arm64", "demo.tar.zst");
@@ -1089,6 +1136,7 @@ mod tests {
                 installers: vec!["online".to_string()],
                 environment: BTreeMap::new(),
             },
+            cache: CacheManifestConfig::default(),
         };
         create_published_installer(
             &store_dir.join("installers"),
@@ -1168,6 +1216,98 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn try_prepare_published_installer_without_manifest_preserves_embedded_cache_policy() {
+        let tmp = tempfile::tempdir().expect("temp dir should exist");
+        let store_dir = tmp.path().join("store");
+        let download_dir = tmp.path().join("downloads");
+        std::fs::create_dir_all(store_dir.join("installers")).expect("installers dir should exist");
+
+        let mut entry = release("1.2.3", "test", "linux-arm64", "demo.tar.zst");
+        entry.installers = vec!["online".to_string()];
+        entry.main_exe = "demoapp".to_string();
+        entry.install_directory = "demo".to_string();
+        entry.full_filename = "demo.tar.zst".to_string();
+
+        let generic_installer_manifest = InstallerManifest {
+            schema: 1,
+            format: "surge-installer-v1".to_string(),
+            ui: InstallerUi::Console,
+            installer_type: "online".to_string(),
+            app_id: "demo".to_string(),
+            rid: "linux-arm64".to_string(),
+            version: "1.2.3".to_string(),
+            channel: "test".to_string(),
+            generated_utc: "2026-03-13T00:00:00Z".to_string(),
+            headless_default_if_no_display: true,
+            release_index_key: RELEASES_FILE_COMPRESSED.to_string(),
+            storage: InstallerStorage {
+                provider: "filesystem".to_string(),
+                bucket: store_dir.to_string_lossy().to_string(),
+                region: String::new(),
+                endpoint: String::new(),
+                prefix: String::new(),
+            },
+            release: InstallerRelease {
+                full_filename: "demo.tar.zst".to_string(),
+                full_sha256: String::new(),
+                delta_filename: String::new(),
+                delta_algorithm: String::new(),
+                delta_patch_format: String::new(),
+                delta_compression: String::new(),
+            },
+            runtime: InstallerRuntime {
+                name: "Demo".to_string(),
+                main_exe: "demoapp".to_string(),
+                install_directory: "demo".to_string(),
+                supervisor_id: "demo-supervisor".to_string(),
+                icon: String::new(),
+                shortcuts: Vec::new(),
+                persistent_assets: Vec::new(),
+                installers: vec!["online".to_string()],
+                environment: BTreeMap::new(),
+            },
+            cache: latest_full_cache_policy(),
+        };
+        create_published_installer(
+            &store_dir.join("installers"),
+            "Setup-linux-arm64-demo-test-online.bin",
+            &generic_installer_manifest,
+        );
+
+        let backend = FilesystemBackend::new(store_dir.to_str().expect("utf-8 path"), "");
+        let plan = plan_remote_published_installer_without_manifest(
+            "demo",
+            "linux-arm64",
+            "test",
+            &entry,
+            RemoteInstallerMode::Online,
+        );
+
+        let customized_installer = try_prepare_published_installer_for_tailscale(
+            &backend,
+            &download_dir,
+            &plan,
+            "demo",
+            &entry,
+            "test",
+            &storage_config(store_dir.to_str().expect("utf-8 path")),
+            &RemoteLaunchEnvironment::default(),
+            RemoteInstallerMode::Online,
+        )
+        .await
+        .expect("published installer should prepare")
+        .expect("customized installer should exist");
+
+        let payload = read_embedded_payload(&customized_installer).expect("payload should be readable");
+        let installer_manifest: InstallerManifest =
+            serde_yaml::from_slice(&read_entry(&payload, "installer.yml").expect("installer manifest should exist"))
+                .expect("installer manifest should parse");
+        let policy = installer_manifest.effective_install_artifact_cache_policy();
+        assert_eq!(policy.retention, InstallArtifactCacheRetention::LatestFull);
+        assert_eq!(policy.keep_full_count, 1);
+    }
+
     #[test]
     fn missing_remote_installer_error_mentions_keys_and_host_mismatch() {
         let err = missing_remote_installer_error(
@@ -1175,6 +1315,7 @@ mod tests {
             &RemotePublishedInstallerPlan {
                 candidate_keys: vec!["installers/Setup-linux-arm64-demo-test-online.bin".to_string()],
                 blockers: vec!["published installer was not found in storage".to_string()],
+                cache: None,
             },
             RemoteInstallerMode::Online,
         );

@@ -68,6 +68,7 @@ pub async fn execute(
         lock: None,
         channels: vec![],
         pack: None,
+        cache: None,
         apps: vec![AppConfig {
             id: init.app_id.clone(),
             name: init.name,

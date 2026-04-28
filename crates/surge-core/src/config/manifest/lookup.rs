@@ -1,4 +1,7 @@
-use super::types::{AppConfig, PackCompressionFormat, PackDeltaStrategy, PackPolicy, SurgeManifest, TargetConfig};
+use super::types::{
+    AppConfig, InstallArtifactCachePolicy, PackCompressionFormat, PackDeltaStrategy, PackPolicy, SurgeManifest,
+    TargetConfig,
+};
 use super::validate::canonicalize_installers;
 
 impl SurgeManifest {
@@ -36,6 +39,13 @@ impl SurgeManifest {
         }
 
         policy
+    }
+
+    #[must_use]
+    pub fn effective_install_artifact_cache_policy(&self) -> InstallArtifactCachePolicy {
+        self.cache.map_or_else(InstallArtifactCachePolicy::default, |cache| {
+            cache.effective_install_artifact_cache_policy()
+        })
     }
 
     pub fn find_app(&self, app_id: &str) -> Option<&AppConfig> {

@@ -625,6 +625,11 @@ pack:                             # optional; omitted uses built-in defaults
     format: zstd
     level: 3
 
+cache:                            # optional device-side installer cache policy
+  installArtifacts:
+    retention: release_graph       # release_graph | latest_full
+    keepFullCount: 1               # full archives retained when retention is latest_full
+
 apps:
   - id: my-app                    # unique identifier
     name: My App                  # display name
@@ -643,6 +648,7 @@ apps:
 
 Target-level settings override app-level defaults for `icon`, `shortcuts`, `persistentAssets`, `installers`, and `environment`.
 `pack` policy is global and currently controls delta strategy plus compression format/level for `surge pack`.
+`cache.installArtifacts.retention: latest_full` keeps the installed full archive warm on each device and lets future deltas be downloaded again from storage when needed, instead of retaining the full release graph locally.
 
 ### Architecture
 

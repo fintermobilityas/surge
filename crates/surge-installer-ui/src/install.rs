@@ -12,7 +12,7 @@ use std::time::Duration;
 use eframe::egui;
 
 use surge_core::config::installer::InstallerManifest;
-use surge_core::config::manifest::ShortcutLocation;
+use surge_core::config::manifest::{InstallArtifactCacheRetention, ShortcutLocation};
 use surge_core::install::{self as core_install, InstallProfile, InstallProgress, InstallProgressStage};
 use surge_core::installer_package::{
     InstallerPackageStage, ResolveInstallerPackageOptions, ResolvedInstallerPackage, prune_install_artifact_cache,
@@ -170,9 +170,7 @@ fn run_install_inner(
         &manifest.storage.endpoint,
     );
     core_install::write_runtime_manifest(&install_root.join("app"), &profile, &runtime_manifest)?;
-    if let Some(required_artifacts) = package.required_artifacts.as_ref() {
-        let _ = prune_install_artifact_cache(&install_root, required_artifacts, &manifest.release.full_filename);
-    }
+    prune_artifact_cache_for_package(&install_root, &package, manifest);
 
     send(progress_tx, ctx, ProgressUpdate::Progress(1.0));
     send(progress_tx, ctx, ProgressUpdate::Complete(install_root));
@@ -451,12 +449,24 @@ pub fn run_headless(
         &manifest.storage.endpoint,
     );
     core_install::write_runtime_manifest(&install_root.join("app"), &profile, &runtime_manifest)?;
-    if let Some(required_artifacts) = package.required_artifacts.as_ref() {
-        let _ = prune_install_artifact_cache(&install_root, required_artifacts, &manifest.release.full_filename);
-    }
+    prune_artifact_cache_for_package(&install_root, &package, manifest);
     eprintln!("Installed '{}' to '{}'", manifest.app_id, install_root.display());
 
     Ok(install_root)
+}
+
+fn prune_artifact_cache_for_package(install_root: &Path, package: &ResolvedPackage, manifest: &InstallerManifest) {
+    let empty_retained_artifacts = std::collections::BTreeSet::new();
+    let retained_artifacts = match package.retained_artifacts.as_ref() {
+        Some(retained_artifacts) => retained_artifacts,
+        None if manifest.effective_install_artifact_cache_policy().retention
+            == InstallArtifactCacheRetention::LatestFull =>
+        {
+            &empty_retained_artifacts
+        }
+        None => return,
+    };
+    let _ = prune_install_artifact_cache(install_root, retained_artifacts, &manifest.release.full_filename);
 }
 
 #[cfg(test)]
@@ -467,6 +477,7 @@ mod tests {
     use surge_core::archive::packer::ArchivePacker;
     use surge_core::config::constants::RELEASES_FILE_COMPRESSED;
     use surge_core::config::installer::{InstallerRelease, InstallerRuntime, InstallerStorage, InstallerUi};
+    use surge_core::config::manifest::CacheManifestConfig;
     use surge_core::crypto::sha256::sha256_hex;
     use surge_core::diff::wrapper::bsdiff_buffers;
     use surge_core::platform::detect::current_rid;
@@ -511,6 +522,7 @@ mod tests {
                 installers: Vec::new(),
                 environment: BTreeMap::new(),
             },
+            cache: CacheManifestConfig::default(),
         }
     }
 

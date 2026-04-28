@@ -101,6 +101,15 @@ impl SurgeManifest {
             }
         }
 
+        if let Some(cache) = &self.cache
+            && let Some(install_artifacts) = &cache.install_artifacts
+            && install_artifacts.keep_full_count == Some(0)
+        {
+            return Err(SurgeError::Config(
+                "cache.installArtifacts.keepFullCount must be greater than zero".to_string(),
+            ));
+        }
+
         for app in &self.apps {
             if app.id.is_empty() {
                 return Err(SurgeError::Config(

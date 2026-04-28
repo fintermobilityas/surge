@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use crate::logline;
 use surge_core::config::installer::InstallerManifest;
+use surge_core::config::manifest::InstallArtifactCacheRetention;
 use surge_core::error::{Result, SurgeError};
 use surge_core::install::{self as core_install, InstallProfile};
 use surge_core::installer_package::{
@@ -131,6 +132,7 @@ pub async fn execute(dir: &Path, no_start: bool, stage: bool) -> Result<()> {
     if stage {
         let package = resolve_package(dir, &manifest, &install_root).await?;
         ensure_stage_cache_entry(&package, &manifest, &install_root)?;
+        prune_setup_artifact_cache(&install_root, &package, &manifest);
         persist_staged_installer_cache(dir, &manifest, &install_root)?;
         logline::success(&format!(
             "Staged '{}' v{} in artifact cache at '{}'",
@@ -162,20 +164,7 @@ pub async fn execute(dir: &Path, no_start: bool, stage: bool) -> Result<()> {
     );
     core_install::write_runtime_manifest(&active_app_dir, &profile, &runtime_manifest)?;
 
-    if let Some(required_artifacts) = package.required_artifacts.as_ref() {
-        match prune_install_artifact_cache(&install_root, required_artifacts, &manifest.release.full_filename) {
-            Ok(0) => {}
-            Ok(pruned) => {
-                logline::info(&format!(
-                    "Pruned {pruned} stale artifact cache entr{}.",
-                    if pruned == 1 { "y" } else { "ies" }
-                ));
-            }
-            Err(e) => {
-                logline::warn(&format!("Artifact cache pruning failed: {e}"));
-            }
-        }
-    }
+    prune_setup_artifact_cache(&install_root, &package, &manifest);
 
     logline::success(&format!(
         "Installed '{}' to '{}'",
@@ -290,6 +279,31 @@ fn ensure_stage_cache_entry(
     Ok(())
 }
 
+fn prune_setup_artifact_cache(install_root: &Path, package: &ResolvedPackage, manifest: &InstallerManifest) {
+    let empty_retained_artifacts = std::collections::BTreeSet::new();
+    let retained_artifacts = match package.retained_artifacts.as_ref() {
+        Some(retained_artifacts) => retained_artifacts,
+        None if manifest.effective_install_artifact_cache_policy().retention
+            == InstallArtifactCacheRetention::LatestFull =>
+        {
+            &empty_retained_artifacts
+        }
+        None => return,
+    };
+    match prune_install_artifact_cache(install_root, retained_artifacts, &manifest.release.full_filename) {
+        Ok(0) => {}
+        Ok(pruned) => {
+            logline::info(&format!(
+                "Pruned {pruned} stale artifact cache entr{}.",
+                if pruned == 1 { "y" } else { "ies" }
+            ));
+        }
+        Err(e) => {
+            logline::warn(&format!("Artifact cache pruning failed: {e}"));
+        }
+    }
+}
+
 fn persist_staged_installer_cache(dir: &Path, manifest: &InstallerManifest, install_root: &Path) -> Result<()> {
     if !manifest.installer_type.trim().eq_ignore_ascii_case("online") {
         return Ok(());
@@ -402,6 +416,9 @@ mod tests {
     use surge_core::archive::packer::ArchivePacker;
     use surge_core::config::constants::RELEASES_FILE_COMPRESSED;
     use surge_core::config::installer::{InstallerRelease, InstallerRuntime, InstallerStorage, InstallerUi};
+    use surge_core::config::manifest::{
+        CacheManifestConfig, InstallArtifactCachePolicy, InstallArtifactCacheRetention,
+    };
     use surge_core::crypto::sha256::sha256_hex;
     use surge_core::diff::wrapper::bsdiff_buffers;
     use surge_core::platform::detect::current_rid;
@@ -451,7 +468,15 @@ mod tests {
                 installers: Vec::new(),
                 environment: BTreeMap::new(),
             },
+            cache: CacheManifestConfig::default(),
         }
+    }
+
+    fn latest_full_cache_policy() -> CacheManifestConfig {
+        CacheManifestConfig::from_install_artifact_cache_policy(InstallArtifactCachePolicy {
+            retention: InstallArtifactCacheRetention::LatestFull,
+            keep_full_count: 1,
+        })
     }
 
     fn write_archive(path: &Path, payload: &[u8]) {
@@ -664,7 +689,7 @@ mod tests {
             std::fs::read(package.path()).expect("downloaded bytes"),
             std::fs::read(stored_archive).expect("stored bytes")
         );
-        assert!(package.required_artifacts.is_some());
+        assert!(package.retained_artifacts.is_some());
     }
 
     #[tokio::test]
@@ -814,6 +839,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_prunes_release_graph_artifacts_when_cache_policy_keeps_latest_full() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let installer_dir = temp_dir.path().join("installer");
+        let install_root = temp_dir.path().join("installed-app");
+        let store_root = temp_dir.path().join("store");
+        let rid = current_rid();
+        let base_full_filename = "demo-app-1.0.0-full.tar.zst";
+        let target_full_filename = "demo-app-1.2.3-full.tar.zst";
+        let delta_filename = "demo-app-1.2.3-delta.tar.zst";
+        let base_archive_path = store_root.join(base_full_filename);
+        let target_archive_path = temp_dir.path().join(target_full_filename);
+        let delta_path = store_root.join(delta_filename);
+
+        std::fs::create_dir_all(&installer_dir).expect("installer dir");
+        std::fs::create_dir_all(&store_root).expect("store dir");
+        write_archive(&base_archive_path, b"base payload");
+        write_archive(&target_archive_path, b"target payload");
+
+        let base_archive = std::fs::read(&base_archive_path).expect("base archive");
+        let target_archive = std::fs::read(&target_archive_path).expect("target archive");
+        let patch = bsdiff_buffers(&base_archive, &target_archive).expect("delta patch");
+        let delta_bytes = zstd::encode_all(patch.as_slice(), 3).expect("delta bytes");
+        std::fs::write(&delta_path, &delta_bytes).expect("write delta");
+
+        let mut manifest = make_manifest(&install_root, &store_root, target_full_filename, "online");
+        manifest.cache = latest_full_cache_policy();
+        let installer_yaml = serde_yaml::to_string(&manifest).expect("installer yaml");
+        std::fs::write(installer_dir.join("installer.yml"), installer_yaml).expect("installer manifest");
+
+        let mut base_release = ReleaseEntry {
+            version: "1.0.0".to_string(),
+            channels: vec![manifest.channel.clone()],
+            os: "linux".to_string(),
+            rid: rid.clone(),
+            is_genesis: false,
+            full_filename: base_full_filename.to_string(),
+            full_size: i64::try_from(base_archive.len()).expect("base size"),
+            full_sha256: sha256_hex(&base_archive),
+            full_compression_level: 0,
+            full_zstd_workers: 0,
+            deltas: Vec::new(),
+            preferred_delta_id: String::new(),
+            created_utc: manifest.generated_utc.clone(),
+            release_notes: String::new(),
+            name: manifest.runtime.name.clone(),
+            main_exe: manifest.runtime.main_exe.clone(),
+            install_directory: manifest.runtime.install_directory.clone(),
+            supervisor_id: manifest.runtime.supervisor_id.clone(),
+            icon: manifest.runtime.icon.clone(),
+            shortcuts: manifest.runtime.shortcuts.clone(),
+            persistent_assets: manifest.runtime.persistent_assets.clone(),
+            installers: manifest.runtime.installers.clone(),
+            environment: manifest.runtime.environment.clone(),
+        };
+        base_release.set_primary_delta(None);
+
+        let mut target_release = ReleaseEntry {
+            version: manifest.version.clone(),
+            channels: vec![manifest.channel.clone()],
+            os: "linux".to_string(),
+            rid,
+            is_genesis: false,
+            full_filename: target_full_filename.to_string(),
+            full_size: i64::try_from(target_archive.len()).expect("target size"),
+            full_sha256: sha256_hex(&target_archive),
+            full_compression_level: 0,
+            full_zstd_workers: 0,
+            deltas: Vec::new(),
+            preferred_delta_id: String::new(),
+            created_utc: manifest.generated_utc.clone(),
+            release_notes: String::new(),
+            name: manifest.runtime.name.clone(),
+            main_exe: manifest.runtime.main_exe.clone(),
+            install_directory: manifest.runtime.install_directory.clone(),
+            supervisor_id: manifest.runtime.supervisor_id.clone(),
+            icon: manifest.runtime.icon.clone(),
+            shortcuts: manifest.runtime.shortcuts.clone(),
+            persistent_assets: manifest.runtime.persistent_assets.clone(),
+            installers: manifest.runtime.installers.clone(),
+            environment: manifest.runtime.environment.clone(),
+        };
+        target_release.set_primary_delta(Some(DeltaArtifact::bsdiff_zstd(
+            "primary",
+            "1.0.0",
+            delta_filename,
+            i64::try_from(delta_bytes.len()).expect("delta size"),
+            &sha256_hex(&delta_bytes),
+        )));
+
+        write_release_index_entries(&store_root, &manifest.app_id, vec![base_release, target_release]);
+
+        execute(&installer_dir, true, false)
+            .await
+            .expect("setup should succeed");
+
+        let artifact_cache = install_root.join(".surge-cache").join("artifacts");
+        assert!(
+            !artifact_cache.join(base_full_filename).exists(),
+            "base full should be pruned by latest_full device cache retention"
+        );
+        assert!(
+            !artifact_cache.join(delta_filename).exists(),
+            "delta should be pruned by latest_full device cache retention"
+        );
+        assert!(
+            artifact_cache.join(target_full_filename).is_file(),
+            "installed target full should remain as a warm cache entry"
+        );
+    }
+
+    #[tokio::test]
     async fn execute_stage_persists_bundled_payload_in_artifact_cache_without_installing() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let installer_dir = temp_dir.path().join("installer");
@@ -822,9 +958,12 @@ mod tests {
         let store_root = temp_dir.path().join("store");
         let full_filename = "demo-app-1.2.3-full.tar.zst";
         let bundled_payload = payload_dir.join(full_filename);
+        let stale_path = install_root.join(".surge-cache").join("artifacts").join("stale.bin");
 
         std::fs::create_dir_all(&payload_dir).expect("payload dir");
         std::fs::create_dir_all(&store_root).expect("store dir");
+        std::fs::create_dir_all(stale_path.parent().expect("stale parent")).expect("cache dir");
+        std::fs::write(&stale_path, b"stale").expect("stale cache entry");
 
         let manifest = make_manifest(&install_root, &store_root, full_filename, "offline");
         let installer_yaml = serde_yaml::to_string(&manifest).expect("installer yaml");
@@ -844,6 +983,54 @@ mod tests {
         assert_eq!(
             std::fs::read(&cached_package).expect("cached package should exist"),
             bundled_archive
+        );
+        assert!(
+            stale_path.exists(),
+            "stage mode should not prune stale cache entries when release_graph artifacts are unknown"
+        );
+        assert!(
+            !install_root.join("app").exists(),
+            "stage mode should not activate the install"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_stage_prunes_bundled_payload_cache_when_policy_keeps_latest_full() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let installer_dir = temp_dir.path().join("installer");
+        let payload_dir = installer_dir.join("payload");
+        let install_root = temp_dir.path().join("installed-app");
+        let store_root = temp_dir.path().join("store");
+        let full_filename = "demo-app-1.2.3-full.tar.zst";
+        let bundled_payload = payload_dir.join(full_filename);
+        let stale_path = install_root.join(".surge-cache").join("artifacts").join("stale.bin");
+
+        std::fs::create_dir_all(&payload_dir).expect("payload dir");
+        std::fs::create_dir_all(&store_root).expect("store dir");
+        std::fs::create_dir_all(stale_path.parent().expect("stale parent")).expect("cache dir");
+        std::fs::write(&stale_path, b"stale").expect("stale cache entry");
+
+        let mut manifest = make_manifest(&install_root, &store_root, full_filename, "offline");
+        manifest.cache = latest_full_cache_policy();
+        let installer_yaml = serde_yaml::to_string(&manifest).expect("installer yaml");
+        std::fs::write(installer_dir.join("installer.yml"), installer_yaml).expect("installer manifest");
+        write_archive(&bundled_payload, b"bundled payload");
+
+        execute(&installer_dir, true, true)
+            .await
+            .expect("setup stage should succeed");
+
+        assert!(
+            install_root
+                .join(".surge-cache")
+                .join("artifacts")
+                .join(full_filename)
+                .is_file(),
+            "bundled payload should be copied into the artifact cache"
+        );
+        assert!(
+            !stale_path.exists(),
+            "latest_full stage mode should prune stale cache entries"
         );
         assert!(
             !install_root.join("app").exists(),

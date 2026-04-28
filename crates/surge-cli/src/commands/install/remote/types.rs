@@ -1,4 +1,5 @@
 use super::{Deserialize, Result, Serialize, SurgeError, infer_os_from_rid, logline};
+use surge_core::config::manifest::CacheManifestConfig;
 
 pub(crate) fn ensure_supported_tailscale_rid(rid: &str) -> Result<()> {
     match infer_os_from_rid(rid) {
@@ -111,4 +112,5 @@ pub(crate) struct RemoteStagedPayloadIdentity {
 pub(crate) struct RemotePublishedInstallerPlan {
     pub(crate) candidate_keys: Vec<String>,
     pub(crate) blockers: Vec<String>,
+    pub(crate) cache: Option<CacheManifestConfig>,
 }

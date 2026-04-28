@@ -3,11 +3,12 @@ use std::path::{Path, PathBuf};
 
 use crate::config::constants::RELEASES_FILE_COMPRESSED;
 use crate::config::installer::InstallerManifest;
+use crate::config::manifest::InstallArtifactCacheRetention;
 use crate::error::{Result, SurgeError};
 use crate::releases::artifact_cache::{cache_path_for_key, cached_artifact_matches, prune_cached_artifacts};
 use crate::releases::manifest::{ReleaseEntry, ReleaseIndex, decompress_release_index};
 use crate::releases::restore::{
-    RestoreOptions, RestoreProgressCallback, required_artifacts_for_index,
+    RestoreOptions, RestoreProgressCallback, local_checkpoint_artifacts_for_index, required_artifacts_for_index,
     restore_full_archive_for_version_with_options,
 };
 use crate::storage::{self, StorageBackend, TransferProgress};
@@ -35,7 +36,7 @@ pub enum InstallerPackageAcquisition {
 #[derive(Debug)]
 pub struct ResolvedInstallerPackage {
     path: PathBuf,
-    pub required_artifacts: Option<BTreeSet<String>>,
+    pub retained_artifacts: Option<BTreeSet<String>>,
     pub acquisition: InstallerPackageAcquisition,
 }
 
@@ -71,7 +72,7 @@ pub async fn resolve_installer_package(
         notify_stage(options.stage, InstallerPackageStage::UsingBundledPayload);
         return Ok(ResolvedInstallerPackage {
             path: payload_path,
-            required_artifacts: None,
+            retained_artifacts: None,
             acquisition: InstallerPackageAcquisition::BundledPayload,
         });
     }
@@ -92,13 +93,15 @@ pub async fn resolve_installer_package(
             );
             return Ok(ResolvedInstallerPackage {
                 path: cached_package_path,
-                required_artifacts: None,
+                retained_artifacts: None,
                 acquisition: InstallerPackageAcquisition::ArtifactCacheFallback,
             });
         }
         Err(error) => return Err(error),
     };
-    let required_artifacts = index.as_ref().map(required_artifacts_for_index);
+    let retained_artifacts = index
+        .as_ref()
+        .map(|index| retained_artifacts_for_install_cache(index, manifest));
 
     if let Some(index) = index.as_ref()
         && let Some(release) = find_release_for_installer(index, manifest)
@@ -107,7 +110,7 @@ pub async fn resolve_installer_package(
             notify_stage(options.stage, InstallerPackageStage::UsingCachedPackage);
             return Ok(ResolvedInstallerPackage {
                 path: cached_package_path,
-                required_artifacts,
+                retained_artifacts,
                 acquisition: InstallerPackageAcquisition::ArtifactCache,
             });
         }
@@ -127,7 +130,7 @@ pub async fn resolve_installer_package(
         std::fs::write(&cached_package_path, restored)?;
         return Ok(ResolvedInstallerPackage {
             path: cached_package_path,
-            required_artifacts,
+            retained_artifacts,
             acquisition: InstallerPackageAcquisition::PreparedArtifactCache,
         });
     }
@@ -141,7 +144,7 @@ pub async fn resolve_installer_package(
         );
         return Ok(ResolvedInstallerPackage {
             path: cached_package_path,
-            required_artifacts,
+            retained_artifacts,
             acquisition: InstallerPackageAcquisition::ArtifactCacheFallback,
         });
     }
@@ -153,7 +156,7 @@ pub async fn resolve_installer_package(
 
     Ok(ResolvedInstallerPackage {
         path: cached_package_path,
-        required_artifacts,
+        retained_artifacts,
         acquisition: InstallerPackageAcquisition::Downloaded,
     })
 }
@@ -164,15 +167,26 @@ pub fn install_artifact_cache_dir(install_root: &Path) -> PathBuf {
 
 pub fn prune_install_artifact_cache(
     install_root: &Path,
-    required_artifacts: &BTreeSet<String>,
+    retained_artifacts: &BTreeSet<String>,
     warm_full_filename: &str,
 ) -> Result<usize> {
-    let mut retained_artifacts = required_artifacts.clone();
+    let mut retained_artifacts = retained_artifacts.clone();
     let warm_full_filename = warm_full_filename.trim();
     if !warm_full_filename.is_empty() {
         retained_artifacts.insert(warm_full_filename.to_string());
     }
     prune_cached_artifacts(&install_artifact_cache_dir(install_root), &retained_artifacts)
+}
+
+fn retained_artifacts_for_install_cache(index: &ReleaseIndex, manifest: &InstallerManifest) -> BTreeSet<String> {
+    let policy = manifest.effective_install_artifact_cache_policy();
+    match policy.retention {
+        InstallArtifactCacheRetention::ReleaseGraph => required_artifacts_for_index(index),
+        InstallArtifactCacheRetention::LatestFull => {
+            let keep_full_count = usize::try_from(policy.keep_full_count.max(1)).unwrap_or(usize::MAX);
+            local_checkpoint_artifacts_for_index(index, keep_full_count)
+        }
+    }
 }
 
 fn notify_stage(stage: Option<&InstallerPackageStageCallback<'_>>, value: InstallerPackageStage) {

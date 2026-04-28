@@ -4,6 +4,7 @@ use super::{
     Path, PathBuf, RELEASES_FILE_COMPRESSED, ReleaseEntry, Result, StorageBackend, SurgeError, SurgeManifest,
     cache_path_for_key, core_install, fetch_or_reuse_file, logline, pack,
 };
+use surge_core::config::manifest::CacheManifestConfig;
 
 fn remote_installer_extension_for_rid(rid: &str) -> &'static str {
     if rid.starts_with("win-") || rid.starts_with("windows-") {
@@ -54,6 +55,9 @@ pub(crate) fn plan_remote_published_installer(
     Ok(RemotePublishedInstallerPlan {
         candidate_keys: vec![candidate_key],
         blockers,
+        cache: Some(CacheManifestConfig::from_install_artifact_cache_policy(
+            manifest.effective_install_artifact_cache_policy(),
+        )),
     })
 }
 
@@ -90,6 +94,7 @@ pub(crate) fn plan_remote_published_installer_without_manifest(
     RemotePublishedInstallerPlan {
         candidate_keys: vec![candidate_key],
         blockers,
+        cache: None,
     }
 }
 
@@ -197,6 +202,7 @@ pub(crate) async fn try_prepare_published_installer_for_tailscale(
                 ));
                 return Ok(Some(customize_published_installer_for_tailscale(
                     &installer_path,
+                    plan.cache.as_ref(),
                     app_id,
                     release,
                     channel,
@@ -209,6 +215,7 @@ pub(crate) async fn try_prepare_published_installer_for_tailscale(
                 logline::info(&format!("Fetched published installer '{key}' for remote deployment."));
                 return Ok(Some(customize_published_installer_for_tailscale(
                     &installer_path,
+                    plan.cache.as_ref(),
                     app_id,
                     release,
                     channel,
@@ -225,6 +232,7 @@ pub(crate) async fn try_prepare_published_installer_for_tailscale(
                     ));
                     return Ok(Some(customize_published_installer_for_tailscale(
                         &installer_path,
+                        plan.cache.as_ref(),
                         app_id,
                         release,
                         channel,
@@ -243,6 +251,7 @@ pub(crate) async fn try_prepare_published_installer_for_tailscale(
 
 fn customize_published_installer_for_tailscale(
     published_installer_path: &Path,
+    cache: Option<&CacheManifestConfig>,
     app_id: &str,
     release: &ReleaseEntry,
     channel: &str,
@@ -250,14 +259,6 @@ fn customize_published_installer_for_tailscale(
     launch_env: &RemoteLaunchEnvironment,
     installer_mode: RemoteInstallerMode,
 ) -> Result<PathBuf> {
-    let installer_manifest =
-        build_remote_installer_manifest(app_id, release, channel, storage_config, launch_env, installer_mode);
-    let mut installer_yaml = serde_yaml::to_string(&installer_manifest)
-        .map_err(|e| SurgeError::Config(format!("Failed to serialize installer manifest: {e}")))?;
-    if !installer_yaml.ends_with('\n') {
-        installer_yaml.push('\n');
-    }
-
     let payload_bytes = surge_core::installer_bundle::read_embedded_payload(published_installer_path)?;
     let launcher_bytes = surge_core::installer_bundle::read_launcher_stub(published_installer_path)?;
 
@@ -265,6 +266,24 @@ fn customize_published_installer_for_tailscale(
         tempfile::tempdir().map_err(|e| SurgeError::Platform(format!("Failed to create staging directory: {e}")))?;
     let staging = staging_dir.path();
     surge_core::archive::extractor::extract_to(&payload_bytes, staging, None)?;
+    let cache = match cache {
+        Some(cache) => *cache,
+        None => read_embedded_installer_cache(staging)?,
+    };
+    let installer_manifest = build_remote_installer_manifest(
+        app_id,
+        release,
+        channel,
+        storage_config,
+        launch_env,
+        installer_mode,
+        cache,
+    );
+    let mut installer_yaml = serde_yaml::to_string(&installer_manifest)
+        .map_err(|e| SurgeError::Config(format!("Failed to serialize installer manifest: {e}")))?;
+    if !installer_yaml.ends_with('\n') {
+        installer_yaml.push('\n');
+    }
     std::fs::write(staging.join("installer.yml"), installer_yaml.as_bytes())?;
 
     let payload_archive = tempfile::NamedTempFile::new()
@@ -292,6 +311,22 @@ fn customize_published_installer_for_tailscale(
 
     std::mem::forget(staging_dir);
     Ok(installer_path)
+}
+
+fn read_embedded_installer_cache(staging: &Path) -> Result<CacheManifestConfig> {
+    let installer_manifest_path = staging.join("installer.yml");
+    if !installer_manifest_path.is_file() {
+        return Ok(CacheManifestConfig::default());
+    }
+
+    let bytes = std::fs::read(&installer_manifest_path)?;
+    let manifest: InstallerManifest = serde_yaml::from_slice(&bytes).map_err(|e| {
+        SurgeError::Config(format!(
+            "Failed to parse embedded installer manifest '{}': {e}",
+            installer_manifest_path.display()
+        ))
+    })?;
+    Ok(manifest.cache)
 }
 
 pub(crate) fn build_remote_runtime_environment(
@@ -328,6 +363,7 @@ pub(crate) fn build_remote_installer_manifest(
     storage_config: &surge_core::context::StorageConfig,
     launch_env: &RemoteLaunchEnvironment,
     installer_mode: RemoteInstallerMode,
+    cache: CacheManifestConfig,
 ) -> InstallerManifest {
     let environment = build_remote_runtime_environment(release, launch_env);
 
@@ -373,6 +409,7 @@ pub(crate) fn build_remote_installer_manifest(
             installers: release.installers.clone(),
             environment,
         },
+        cache,
     }
 }
 
@@ -396,8 +433,18 @@ pub(crate) fn build_installer_for_tailscale(
         })
         .filter(|icon| !icon.is_empty());
 
-    let installer_manifest =
-        build_remote_installer_manifest(app_id, release, channel, storage_config, launch_env, installer_mode);
+    let cache = manifest.map_or_else(CacheManifestConfig::default, |manifest| {
+        CacheManifestConfig::from_install_artifact_cache_policy(manifest.effective_install_artifact_cache_policy())
+    });
+    let installer_manifest = build_remote_installer_manifest(
+        app_id,
+        release,
+        channel,
+        storage_config,
+        launch_env,
+        installer_mode,
+        cache,
+    );
     let installer_yaml = serde_yaml::to_string(&installer_manifest)
         .map_err(|e| SurgeError::Config(format!("Failed to serialize installer manifest: {e}")))?;
 

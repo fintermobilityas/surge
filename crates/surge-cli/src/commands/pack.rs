@@ -441,6 +441,7 @@ mod tests {
     use surge_core::crypto::sha256::sha256_hex;
     use surge_core::diff::wrapper::bsdiff_buffers;
     use surge_core::installer_bundle::read_embedded_payload;
+    use surge_core::pack::builder::{PackageArtifactMetadata, package_metadata_filename};
     use surge_core::platform::detect::current_rid;
     use surge_core::platform::fs::make_executable;
     use surge_core::releases::manifest::{ReleaseEntry, ReleaseIndex, compress_release_index};
@@ -1109,6 +1110,17 @@ apps:
                 .join(format!("{app_id}-{version}-{rid}-full.tar.zst"))
                 .exists()
         );
+        let full_filename = format!("{app_id}-{version}-{rid}-full.tar.zst");
+        let metadata_path = packages_dir.join(package_metadata_filename(&full_filename));
+        let metadata: PackageArtifactMetadata =
+            serde_yaml::from_slice(&std::fs::read(&metadata_path).expect("package metadata should be readable"))
+                .expect("package metadata should parse");
+        assert_eq!(metadata.app_id, app_id);
+        assert_eq!(metadata.version, version);
+        assert_eq!(metadata.rid, rid);
+        assert_eq!(metadata.archive_filename, full_filename);
+        assert_eq!(metadata.full_compression_level, 3);
+        assert!(metadata.full_zstd_workers >= 0);
         let installer_ext = if rid.starts_with("win-") { "exe" } else { "bin" };
         assert!(
             packages_dir

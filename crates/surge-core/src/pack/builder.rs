@@ -17,9 +17,13 @@ use crate::config::manifest::{PackPolicy, ShortcutLocation, SurgeManifest};
 use crate::context::Context;
 use crate::error::{Result, SurgeError};
 use crate::platform::fs::write_file_atomic;
+use crate::releases::manifest::UNRECORDED_ZSTD_WORKERS;
 use crate::storage::{StorageBackend, create_storage_backend};
 
 pub(crate) use self::staging::build_canonical_archive_from_directory;
+
+pub const PACKAGE_METADATA_SCHEMA_VERSION: u32 = 1;
+pub const PACKAGE_METADATA_SUFFIX: &str = ".metadata.yml";
 
 /// A built package artifact ready for upload.
 #[derive(Debug, Clone)]
@@ -46,6 +50,22 @@ pub struct PackageArtifact {
     /// `zstd_compression_level`.
     pub zstd_workers: u32,
     bytes: Vec<u8>,
+}
+
+/// Metadata that `surge pack` writes next to a full package so a later
+/// `surge push` can preserve the original archive encoding in the release
+/// index.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PackageArtifactMetadata {
+    pub schema: u32,
+    pub app_id: String,
+    pub version: String,
+    pub rid: String,
+    pub archive_filename: String,
+    pub archive_size: i64,
+    pub archive_sha256: String,
+    pub full_compression_level: i32,
+    pub full_zstd_workers: i32,
 }
 
 #[derive(Debug, Clone)]
@@ -80,6 +100,28 @@ impl PackageArtifact {
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
+}
+
+impl PackageArtifactMetadata {
+    #[must_use]
+    pub fn for_full_artifact(app_id: &str, version: &str, rid: &str, artifact: &PackageArtifact) -> Self {
+        Self {
+            schema: PACKAGE_METADATA_SCHEMA_VERSION,
+            app_id: app_id.to_string(),
+            version: version.to_string(),
+            rid: rid.to_string(),
+            archive_filename: artifact.filename.clone(),
+            archive_size: artifact.size,
+            archive_sha256: artifact.sha256.clone(),
+            full_compression_level: artifact.zstd_compression_level,
+            full_zstd_workers: i32::try_from(artifact.zstd_workers).unwrap_or(UNRECORDED_ZSTD_WORKERS),
+        }
+    }
+}
+
+#[must_use]
+pub fn package_metadata_filename(archive_filename: &str) -> String {
+    format!("{archive_filename}{PACKAGE_METADATA_SUFFIX}")
 }
 
 /// Builds full and delta release packages from application artifacts.
@@ -340,14 +382,24 @@ impl PackBuilder {
     pub fn write_artifacts_to(&self, output_dir: &Path) -> Result<Vec<PathBuf>> {
         std::fs::create_dir_all(output_dir)?;
 
-        self.artifacts
+        let artifact_paths = self
+            .artifacts
             .iter()
             .map(|artifact| {
                 let path = output_dir.join(&artifact.filename);
                 write_file_atomic(&path, artifact.bytes())?;
                 Ok(path)
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+
+        for artifact in self.artifacts.iter().filter(|artifact| !artifact.is_delta) {
+            let metadata = PackageArtifactMetadata::for_full_artifact(&self.app_id, &self.version, &self.rid, artifact);
+            let metadata_yaml = serde_yaml::to_string(&metadata)?;
+            let metadata_path = output_dir.join(package_metadata_filename(&artifact.filename));
+            write_file_atomic(&metadata_path, metadata_yaml.as_bytes())?;
+        }
+
+        Ok(artifact_paths)
     }
 }
 

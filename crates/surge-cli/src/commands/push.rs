@@ -22,6 +22,7 @@ use surge_core::config::constants::{DEFAULT_ZSTD_LEVEL, RELEASES_FILE_COMPRESSED
 use surge_core::config::manifest::{ShortcutLocation, SurgeManifest};
 use surge_core::crypto::sha256::sha256_hex_file;
 use surge_core::error::{Result, SurgeError};
+use surge_core::pack::builder::{PACKAGE_METADATA_SCHEMA_VERSION, PackageArtifactMetadata, package_metadata_filename};
 use surge_core::releases::delta::patch_format_from_magic_prefix;
 use surge_core::releases::manifest::{
     DeltaArtifact, PATCH_FORMAT_BSDIFF4, PATCH_FORMAT_CHUNKED_BSDIFF_V1, PATCH_FORMAT_SPARSE_FILE_OPS_V1, ReleaseEntry,
@@ -97,6 +98,23 @@ pub async fn execute(
     print_stage(theme, 3, TOTAL_STAGES, "Uploading release artifacts");
     let full_size = std::fs::metadata(&full_archive)?.len() as i64;
     let full_sha256 = sha256_hex_file(&full_archive)?;
+    let full_metadata = load_full_package_metadata(
+        packages_dir,
+        &app_id,
+        version,
+        &rid,
+        &full_filename,
+        full_size,
+        &full_sha256,
+    )?;
+    let (full_compression_level, full_zstd_workers) = full_metadata
+        .as_ref()
+        .map_or((UNRECORDED_COMPRESSION_LEVEL, UNRECORDED_ZSTD_WORKERS), |metadata| {
+            (metadata.full_compression_level, metadata.full_zstd_workers)
+        });
+    if full_metadata.is_some() {
+        logline::subtle("  Loaded full package encoding metadata");
+    }
     let delta_filename = format!("{app_id}-{version}-{rid}-delta.tar.zst");
     let delta_archive = packages_dir.join(&delta_filename);
     let delta_available = delta_archive.is_file();
@@ -166,6 +184,8 @@ pub async fn execute(
         full_filename,
         full_size,
         full_sha256,
+        full_compression_level,
+        full_zstd_workers,
         delta_filename,
         delta_size,
         delta_sha256,
@@ -242,6 +262,8 @@ async fn update_release_index(
     full_filename: String,
     full_size: i64,
     full_sha256: String,
+    full_compression_level: i32,
+    full_zstd_workers: i32,
     delta_filename: String,
     delta_size: i64,
     delta_sha256: String,
@@ -305,12 +327,8 @@ async fn update_release_index(
         full_filename,
         full_size,
         full_sha256,
-        // `surge push` uploads a pre-built archive without knowing how it was
-        // compressed, so we mark the encoding as unrecorded. Promotes of this
-        // release will have to fall back to `selected_delta` to recover the
-        // encoding (and error out if they can't), which is safer than guessing.
-        full_compression_level: UNRECORDED_COMPRESSION_LEVEL,
-        full_zstd_workers: UNRECORDED_ZSTD_WORKERS,
+        full_compression_level,
+        full_zstd_workers,
         deltas: Vec::new(),
         preferred_delta_id: String::new(),
         created_utc: chrono::Utc::now().to_rfc3339(),
@@ -373,6 +391,68 @@ async fn update_release_index(
     let pruned = prune_redundant_artifacts(backend, &index).await?;
 
     Ok(pruned)
+}
+
+fn load_full_package_metadata(
+    packages_dir: &Path,
+    app_id: &str,
+    version: &str,
+    rid: &str,
+    full_filename: &str,
+    full_size: i64,
+    full_sha256: &str,
+) -> Result<Option<PackageArtifactMetadata>> {
+    let metadata_path = packages_dir.join(package_metadata_filename(full_filename));
+    if !metadata_path.is_file() {
+        return Ok(None);
+    }
+
+    let metadata: PackageArtifactMetadata = serde_yaml::from_slice(&std::fs::read(&metadata_path)?)?;
+    validate_full_package_metadata(
+        &metadata_path,
+        &metadata,
+        app_id,
+        version,
+        rid,
+        full_filename,
+        full_size,
+        full_sha256,
+    )?;
+    Ok(Some(metadata))
+}
+
+fn validate_full_package_metadata(
+    metadata_path: &Path,
+    metadata: &PackageArtifactMetadata,
+    app_id: &str,
+    version: &str,
+    rid: &str,
+    full_filename: &str,
+    full_size: i64,
+    full_sha256: &str,
+) -> Result<()> {
+    if metadata.schema != PACKAGE_METADATA_SCHEMA_VERSION {
+        return Err(SurgeError::Storage(format!(
+            "Package metadata {} uses unsupported schema {}",
+            metadata_path.display(),
+            metadata.schema
+        )));
+    }
+
+    if metadata.app_id != app_id
+        || metadata.version != version
+        || metadata.rid != rid
+        || metadata.archive_filename != full_filename
+        || metadata.archive_size != full_size
+        || metadata.archive_sha256 != full_sha256
+    {
+        return Err(SurgeError::Storage(format!(
+            "Package metadata {} does not match full archive {full_filename}",
+            metadata_path.display()
+        )));
+    }
+
+    Ok(())
 }
 
 async fn prune_redundant_artifacts(backend: &dyn StorageBackend, index: &ReleaseIndex) -> Result<usize> {
@@ -507,4 +587,83 @@ async fn upload_artifact_with_feedback(
     ));
 
     Ok(total_bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use surge_core::config::constants::RELEASES_FILE_COMPRESSED;
+    use surge_core::crypto::sha256::sha256_hex;
+    use surge_core::pack::builder::PACKAGE_METADATA_SCHEMA_VERSION;
+    use surge_core::platform::detect::current_rid;
+    use surge_core::releases::manifest::decompress_release_index;
+
+    fn write_manifest(path: &Path, store_dir: &Path, app_id: &str, rid: &str) {
+        let yaml = format!(
+            r"schema: 1
+storage:
+  provider: filesystem
+  bucket: {bucket}
+apps:
+  - id: {app_id}
+    main_exe: demoapp
+    channels: [test, production]
+    target:
+      rid: {rid}
+",
+            bucket = store_dir.display()
+        );
+        std::fs::write(path, yaml).expect("manifest write should succeed");
+    }
+
+    #[tokio::test]
+    async fn execute_records_full_encoding_from_package_metadata() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store_dir = temp_dir.path().join("store");
+        let packages_dir = temp_dir.path().join("packages");
+        let manifest_path = temp_dir.path().join("surge.yml");
+        let app_id = "demo";
+        let rid = current_rid();
+        let version = "1.2.3";
+
+        std::fs::create_dir_all(&store_dir).expect("store dir should be created");
+        std::fs::create_dir_all(&packages_dir).expect("packages dir should be created");
+        write_manifest(&manifest_path, &store_dir, app_id, &rid);
+
+        let full_filename = format!("{app_id}-{version}-{rid}-full.tar.zst");
+        let full_bytes = b"full package bytes with recorded pack metadata";
+        std::fs::write(packages_dir.join(&full_filename), full_bytes).expect("full package should be written");
+
+        let metadata = PackageArtifactMetadata {
+            schema: PACKAGE_METADATA_SCHEMA_VERSION,
+            app_id: app_id.to_string(),
+            version: version.to_string(),
+            rid: rid.clone(),
+            archive_filename: full_filename.clone(),
+            archive_size: i64::try_from(full_bytes.len()).expect("test bytes fit i64"),
+            archive_sha256: sha256_hex(full_bytes),
+            full_compression_level: 3,
+            full_zstd_workers: 4,
+        };
+        std::fs::write(
+            packages_dir.join(package_metadata_filename(&full_filename)),
+            serde_yaml::to_string(&metadata).expect("metadata should serialize"),
+        )
+        .expect("metadata should be written");
+
+        execute(&manifest_path, Some(app_id), version, Some(&rid), "test", &packages_dir)
+            .await
+            .expect("push should succeed");
+
+        let compressed_index =
+            std::fs::read(store_dir.join(RELEASES_FILE_COMPRESSED)).expect("release index should be written");
+        let index = decompress_release_index(&compressed_index).expect("release index should decompress");
+        let release = index
+            .releases
+            .iter()
+            .find(|release| release.version == version && release.rid == rid)
+            .expect("pushed release should exist");
+        assert_eq!(release.full_compression_level, 3);
+        assert_eq!(release.full_zstd_workers, 4);
+    }
 }

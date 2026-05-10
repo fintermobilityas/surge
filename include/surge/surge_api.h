@@ -66,6 +66,18 @@ typedef enum surge_storage_provider {
     SURGE_STORAGE_GITHUB_RELEASES = 4
 } surge_storage_provider;
 
+/** Device-side artifact cache retention applied after successful updates. */
+typedef enum surge_artifact_retention_policy {
+    /** Keep enough artifacts to rebuild the release graph offline. */
+    SURGE_ARTIFACT_RETENTION_RELEASE_GRAPH = 0,
+    /** Keep the newest N full archives per RID and drop deltas. */
+    SURGE_ARTIFACT_RETENTION_LATEST_FULL = 1,
+    /** Keep only the installed full archive when it is already cached. */
+    SURGE_ARTIFACT_RETENTION_JUST_INSTALLED = 2,
+    /** Keep no local package artifacts after a successful update. */
+    SURGE_ARTIFACT_RETENTION_NONE = 3
+} surge_artifact_retention_policy;
+
 /* -------------------------------------------------------------------------- */
 /*  Plain-data structures                                                     */
 /* -------------------------------------------------------------------------- */
@@ -237,6 +249,16 @@ SURGE_API surge_result SURGE_CALL surge_update_manager_set_current_version(surge
  */
 SURGE_API surge_result SURGE_CALL surge_update_manager_set_release_retention_limit(surge_update_manager* mgr,
                                                                                    int32_t release_retention_limit);
+
+/**
+ * Change local package-artifact cache retention after successful updates.
+ * @param mgr             Manager handle.
+ * @param retention       Cache retention policy.
+ * @param keep_full_count Number of full archives per RID for LATEST_FULL; pass 1 for other policies.
+ * @return SURGE_OK on success.
+ */
+SURGE_API surge_result SURGE_CALL surge_update_manager_set_artifact_retention_policy(
+    surge_update_manager* mgr, surge_artifact_retention_policy retention, int32_t keep_full_count);
 
 /**
  * Check for available updates.

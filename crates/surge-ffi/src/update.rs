@@ -1,6 +1,7 @@
 use std::ffi::{c_char, c_int, c_void};
 use std::ptr;
 
+use surge_core::config::manifest::{InstallArtifactCachePolicy, InstallArtifactCacheRetention};
 use surge_core::update::manager::{ProgressInfo, UpdateManager};
 
 use crate::handles::{ReleaseEntryFfi, SurgeReleasesInfoHandle, SurgeUpdateManagerHandle};
@@ -53,6 +54,7 @@ pub unsafe extern "C" fn surge_update_manager_create(
             current_version: version_s,
             channel: channel_s,
             release_retention_limit: 1,
+            artifact_retention_policy: InstallArtifactCachePolicy::default(),
             install_dir: install_s,
         });
 
@@ -154,6 +156,48 @@ pub unsafe extern "C" fn surge_update_manager_set_release_retention_limit(
     }))
 }
 
+/// Change local artifact cache retention applied after successful updates.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn surge_update_manager_set_artifact_retention_policy(
+    mgr: *mut SurgeUpdateManagerHandle,
+    retention: c_int,
+    keep_full_count: c_int,
+) -> i32 {
+    if mgr.is_null() {
+        return SURGE_ERROR;
+    }
+
+    catch_ffi(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: `mgr` is checked non-null above.
+        let mgr_ref = unsafe { &mut *mgr };
+        clear_shared_error(&mgr_ref.ctx, &mgr_ref.last_error);
+
+        let retention = match retention {
+            0 => InstallArtifactCacheRetention::ReleaseGraph,
+            1 => InstallArtifactCacheRetention::LatestFull,
+            2 => InstallArtifactCacheRetention::JustInstalled,
+            3 => InstallArtifactCacheRetention::None,
+            value => {
+                let e = surge_core::error::SurgeError::Config(format!(
+                    "artifact_retention_policy has unsupported mode {value}"
+                ));
+                return set_shared_error(&mgr_ref.ctx, &mgr_ref.last_error, &e);
+            }
+        };
+
+        if keep_full_count <= 0 {
+            let e = surge_core::error::SurgeError::Config("keep_full_count must be greater than zero".into());
+            return set_shared_error(&mgr_ref.ctx, &mgr_ref.last_error, &e);
+        }
+
+        mgr_ref.artifact_retention_policy = InstallArtifactCachePolicy {
+            retention,
+            keep_full_count: u32::try_from(keep_full_count).unwrap_or(u32::MAX),
+        };
+        SURGE_OK
+    }))
+}
+
 /// Check for available updates.
 ///
 /// Returns `SURGE_OK` if updates are available, `SURGE_NOT_FOUND` if up-to-date.
@@ -190,6 +234,9 @@ pub unsafe extern "C" fn surge_update_check(
             Err(e) => return set_shared_error(&mgr_ref.ctx, &mgr_ref.last_error, &e),
         };
         update_mgr.set_release_retention_limit(mgr_ref.release_retention_limit);
+        if let Err(e) = update_mgr.set_artifact_retention_policy(mgr_ref.artifact_retention_policy) {
+            return set_shared_error(&mgr_ref.ctx, &mgr_ref.last_error, &e);
+        }
 
         let result = mgr_ref.runtime.block_on(update_mgr.check_for_updates());
 
@@ -279,6 +326,9 @@ pub unsafe extern "C" fn surge_update_download_and_apply(
             Err(e) => return set_shared_error(&mgr_ref.ctx, &mgr_ref.last_error, &e),
         };
         update_mgr.set_release_retention_limit(mgr_ref.release_retention_limit);
+        if let Err(e) = update_mgr.set_artifact_retention_policy(mgr_ref.artifact_retention_policy) {
+            return set_shared_error(&mgr_ref.ctx, &mgr_ref.last_error, &e);
+        }
 
         let result = if let Some(cb) = progress_cb {
             let bridge = ProgressBridge {
@@ -312,8 +362,8 @@ mod tests {
 
     use super::{
         SURGE_OK, SurgeReleasesInfoHandle, surge_update_check, surge_update_manager_create,
-        surge_update_manager_destroy, surge_update_manager_set_channel,
-        surge_update_manager_set_release_retention_limit,
+        surge_update_manager_destroy, surge_update_manager_set_artifact_retention_policy,
+        surge_update_manager_set_channel, surge_update_manager_set_release_retention_limit,
     };
 
     #[test]
@@ -386,6 +436,58 @@ mod tests {
             .unwrap_or_default()
             .to_string();
         assert!(msg.contains("release_retention_limit"));
+
+        unsafe {
+            surge_update_manager_destroy(mgr);
+            surge_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn manager_set_artifact_retention_policy_validates_inputs() {
+        let ctx = surge_context_create();
+        assert!(!ctx.is_null());
+
+        let app_id = CString::new("demo").unwrap();
+        let version = CString::new("1.0.0").unwrap();
+        let channel = CString::new("stable").unwrap();
+        let install_dir = CString::new("/tmp/demo").unwrap();
+
+        let mgr = unsafe {
+            surge_update_manager_create(
+                ctx,
+                app_id.as_ptr(),
+                version.as_ptr(),
+                channel.as_ptr(),
+                install_dir.as_ptr(),
+            )
+        };
+        assert!(!mgr.is_null());
+
+        let rc = unsafe { surge_update_manager_set_artifact_retention_policy(mgr, 1, 2) };
+        assert_eq!(rc, SURGE_OK);
+
+        let rc = unsafe { surge_update_manager_set_artifact_retention_policy(mgr, 1, 0) };
+        assert_ne!(rc, SURGE_OK);
+
+        let last = unsafe { surge_context_last_error(ctx) };
+        assert!(!last.is_null());
+        let msg = unsafe { CStr::from_ptr((*last).message) }
+            .to_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(msg.contains("keep_full_count"));
+
+        let rc = unsafe { surge_update_manager_set_artifact_retention_policy(mgr, 99, 1) };
+        assert_ne!(rc, SURGE_OK);
+
+        let last = unsafe { surge_context_last_error(ctx) };
+        assert!(!last.is_null());
+        let msg = unsafe { CStr::from_ptr((*last).message) }
+            .to_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(msg.contains("artifact_retention_policy"));
 
         unsafe {
             surge_update_manager_destroy(mgr);

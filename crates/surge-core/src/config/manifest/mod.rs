@@ -163,6 +163,33 @@ apps:
     }
 
     #[test]
+    fn parse_accepts_bounded_install_artifact_cache_policies() {
+        for (retention, expected) in [
+            ("just_installed", InstallArtifactCacheRetention::JustInstalled),
+            ("none", InstallArtifactCacheRetention::None),
+        ] {
+            let yaml = format!(
+                r"schema: 1
+storage:
+  provider: filesystem
+  bucket: /tmp/store
+cache:
+  installArtifacts:
+    retention: {retention}
+apps:
+  - id: demoapp
+    target:
+      rid: linux-x64
+"
+            );
+
+            let manifest = SurgeManifest::parse(yaml.as_bytes()).expect("manifest should parse");
+            let policy = manifest.effective_install_artifact_cache_policy();
+            assert_eq!(policy.retention, expected);
+        }
+    }
+
+    #[test]
     fn parse_rejects_zero_install_artifact_cache_keep_full_count() {
         let yaml = br"schema: 1
 storage:

@@ -12,6 +12,7 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use crate::config::constants::RELEASES_FILE_COMPRESSED;
+use crate::config::manifest::{InstallArtifactCachePolicy, InstallArtifactCacheRetention};
 use crate::context::Context;
 use crate::error::{Result, SurgeError};
 use crate::install::{
@@ -22,7 +23,9 @@ use crate::platform::fs::atomic_rename;
 use crate::platform::shortcuts::install_shortcuts;
 use crate::releases::artifact_cache::prune_cached_artifacts;
 use crate::releases::manifest::{ReleaseEntry, ReleaseIndex, decompress_release_index};
-use crate::releases::restore::{local_checkpoint_artifacts_for_index, required_artifacts_for_index};
+use crate::releases::restore::{
+    retained_artifacts_for_cache_policy, retained_artifacts_for_cache_policy_without_index,
+};
 use crate::storage::{StorageBackend, create_storage_backend};
 use crate::supervisor::state::supervisor_pid_file;
 
@@ -57,6 +60,7 @@ pub struct UpdateInfo {
 }
 
 const DEFAULT_RELEASE_RETENTION_LIMIT: usize = 1;
+const RELEASE_GRAPH_CHECKPOINT_FULLS: usize = 3;
 
 /// Manages checking for and applying application updates.
 pub struct UpdateManager {
@@ -65,6 +69,7 @@ pub struct UpdateManager {
     current_version: String,
     channel: String,
     release_retention_limit: usize,
+    artifact_retention_policy: InstallArtifactCachePolicy,
     install_dir: PathBuf,
     storage: Box<dyn StorageBackend>,
     cached_index: Option<ReleaseIndex>,
@@ -105,6 +110,7 @@ impl UpdateManager {
             current_version: current_version.to_string(),
             channel: channel.to_string(),
             release_retention_limit: DEFAULT_RELEASE_RETENTION_LIMIT,
+            artifact_retention_policy: InstallArtifactCachePolicy::default(),
             install_dir: PathBuf::from(install_dir),
             storage,
             cached_index: None,
@@ -142,6 +148,12 @@ impl UpdateManager {
         self.release_retention_limit
     }
 
+    /// Return the local artifact cache retention policy applied after updates.
+    #[must_use]
+    pub fn artifact_retention_policy(&self) -> InstallArtifactCachePolicy {
+        self.artifact_retention_policy
+    }
+
     /// Update the local version baseline used for update checks.
     pub fn set_current_version(&mut self, version: &str) -> Result<()> {
         let normalized = version.trim();
@@ -156,6 +168,17 @@ impl UpdateManager {
     /// Update the number of old app snapshots retained after successful updates.
     pub fn set_release_retention_limit(&mut self, limit: usize) {
         self.release_retention_limit = limit;
+    }
+
+    /// Update the local artifact cache retention policy applied after successful updates.
+    pub fn set_artifact_retention_policy(&mut self, policy: InstallArtifactCachePolicy) -> Result<()> {
+        if policy.retention == InstallArtifactCacheRetention::LatestFull && policy.keep_full_count == 0 {
+            return Err(SurgeError::Config(
+                "artifact retention keep_full_count must be greater than zero for latest_full".to_string(),
+            ));
+        }
+        self.artifact_retention_policy = policy;
+        Ok(())
     }
 
     /// Check for available updates on the configured channel.
@@ -406,13 +429,17 @@ impl UpdateManager {
                 Err(e) => return Err(e),
             }
         };
-        if let Some(index) = prune_index {
-            let mut retained_artifacts = required_artifacts_for_index(&index);
-            retained_artifacts.extend(local_checkpoint_artifacts_for_index(&index, 3));
-            let warm_full_filename = latest.full_filename.trim();
-            if !warm_full_filename.is_empty() {
-                retained_artifacts.insert(warm_full_filename.to_string());
-            }
+        let retained_artifacts = if let Some(index) = prune_index {
+            Some(retained_artifacts_for_cache_policy(
+                &index,
+                self.artifact_retention_policy,
+                &latest.full_filename,
+                RELEASE_GRAPH_CHECKPOINT_FULLS,
+            ))
+        } else {
+            retained_artifacts_for_cache_policy_without_index(self.artifact_retention_policy, &latest.full_filename)
+        };
+        if let Some(retained_artifacts) = retained_artifacts {
             match prune_cached_artifacts(&artifact_cache_dir, &retained_artifacts) {
                 Ok(0) => {}
                 Ok(pruned) => {
@@ -621,18 +648,39 @@ mod tests {
         assert_eq!(manager.channel(), "stable");
         assert_eq!(manager.current_version(), "1.0.0");
         assert_eq!(manager.release_retention_limit(), 1);
+        assert_eq!(
+            manager.artifact_retention_policy(),
+            InstallArtifactCachePolicy::default()
+        );
 
         manager.set_channel("test").unwrap();
         manager.set_current_version("1.1.0").unwrap();
         manager.set_release_retention_limit(0);
+        manager
+            .set_artifact_retention_policy(InstallArtifactCachePolicy {
+                retention: InstallArtifactCacheRetention::None,
+                keep_full_count: 1,
+            })
+            .unwrap();
         assert_eq!(manager.channel(), "test");
         assert_eq!(manager.current_version(), "1.1.0");
         assert_eq!(manager.release_retention_limit(), 0);
+        assert_eq!(
+            manager.artifact_retention_policy().retention,
+            InstallArtifactCacheRetention::None
+        );
 
         let err = manager.set_channel("  ").unwrap_err();
         assert!(err.to_string().contains("channel cannot be empty"));
         let err = manager.set_current_version("").unwrap_err();
         assert!(err.to_string().contains("Current version cannot be empty"));
+        let err = manager
+            .set_artifact_retention_policy(InstallArtifactCachePolicy {
+                retention: InstallArtifactCacheRetention::LatestFull,
+                keep_full_count: 0,
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("keep_full_count"));
     }
 
     #[test]
@@ -2546,6 +2594,99 @@ mod tests {
         assert!(install_root.join("app").is_dir());
         assert!(!install_root.join("app-1.0.0").exists());
         assert!(!install_root.join("app-0.9.0").exists());
+    }
+
+    #[tokio::test]
+    async fn test_download_and_apply_none_artifact_retention_prunes_local_artifact_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("store");
+        let install_root = tmp.path().join("install");
+        let app_id = "test-app";
+        std::fs::create_dir_all(&store_root).unwrap();
+        std::fs::create_dir_all(&install_root).unwrap();
+        let app_store = app_scoped_store_root(&store_root, app_id);
+
+        let current_app_dir = install_root.join("app");
+        std::fs::create_dir_all(&current_app_dir).unwrap();
+        std::fs::write(current_app_dir.join("payload.txt"), "old payload").unwrap();
+
+        let artifact_cache = install_root.join(".surge-cache").join("artifacts");
+        std::fs::create_dir_all(&artifact_cache).unwrap();
+        std::fs::write(artifact_cache.join("stale-full.tar.zst"), b"stale").unwrap();
+        std::fs::write(artifact_cache.join("stale-delta.tar.zst"), b"stale").unwrap();
+
+        let rid = current_rid();
+        let full_filename = format!("{app_id}-1.1.0-{rid}-full.tar.zst");
+        let full_path = app_store.join(&full_filename);
+
+        let mut packer = ArchivePacker::new(3).unwrap();
+        packer.add_buffer("payload.txt", b"new payload", 0o644).unwrap();
+        packer.finalize_to_file(&full_path).unwrap();
+
+        let full_size = std::fs::metadata(&full_path).unwrap().len() as i64;
+        let full_sha256 = sha256_hex_file(&full_path).unwrap();
+
+        let index = ReleaseIndex {
+            app_id: app_id.to_string(),
+            releases: vec![ReleaseEntry {
+                version: "1.1.0".to_string(),
+                channels: vec!["stable".to_string()],
+                os: current_os_label_for_tests(),
+                rid,
+                is_genesis: true,
+                full_filename,
+                full_size,
+                full_sha256,
+                full_compression_level: 0,
+                full_zstd_workers: 0,
+                deltas: Vec::new(),
+                preferred_delta_id: String::new(),
+                created_utc: chrono::Utc::now().to_rfc3339(),
+                release_notes: String::new(),
+                name: String::new(),
+                main_exe: app_id.to_string(),
+                install_directory: app_id.to_string(),
+                supervisor_id: String::new(),
+                icon: String::new(),
+                shortcuts: Vec::new(),
+                persistent_assets: Vec::new(),
+                installers: Vec::new(),
+                environment: std::collections::BTreeMap::new(),
+            }],
+            ..ReleaseIndex::default()
+        };
+
+        write_app_scoped_release_index(&store_root, app_id, &index);
+
+        let ctx = Arc::new(Context::new());
+        ctx.set_storage(
+            StorageProvider::Filesystem,
+            store_root.to_str().unwrap(),
+            "",
+            "",
+            "",
+            "",
+        );
+
+        let mut manager = UpdateManager::new(ctx, app_id, "1.0.0", "stable", install_root.to_str().unwrap()).unwrap();
+        manager
+            .set_artifact_retention_policy(InstallArtifactCachePolicy {
+                retention: InstallArtifactCacheRetention::None,
+                keep_full_count: 1,
+            })
+            .unwrap();
+
+        let info = manager.check_for_updates().await.unwrap().unwrap();
+        manager
+            .download_and_apply(&info, None::<fn(ProgressInfo)>)
+            .await
+            .unwrap();
+
+        let remaining = std::fs::read_dir(&artifact_cache)
+            .unwrap()
+            .collect::<std::io::Result<Vec<_>>>()
+            .unwrap();
+        assert!(remaining.is_empty(), "none retention should prune all cached artifacts");
     }
 
     #[cfg(target_os = "linux")]

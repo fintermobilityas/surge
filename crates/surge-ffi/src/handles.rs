@@ -6,6 +6,7 @@
 use std::ffi::{CString, c_char};
 use std::sync::{Arc, Mutex};
 
+use surge_core::config::manifest::InstallArtifactCachePolicy;
 use surge_core::context::Context;
 use surge_core::pack::builder::PackBuilder;
 use surge_core::update::manager::UpdateInfo;
@@ -115,6 +116,7 @@ pub struct SurgeUpdateManagerHandle {
     pub current_version: String,
     pub channel: String,
     pub release_retention_limit: usize,
+    pub artifact_retention_policy: InstallArtifactCachePolicy,
     pub install_dir: String,
 }
 

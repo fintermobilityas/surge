@@ -48,8 +48,8 @@ use crate::shared::{
 };
 pub use crate::update::{
     surge_update_check, surge_update_download_and_apply, surge_update_manager_create, surge_update_manager_destroy,
-    surge_update_manager_set_channel, surge_update_manager_set_current_version,
-    surge_update_manager_set_release_retention_limit,
+    surge_update_manager_set_artifact_retention_policy, surge_update_manager_set_channel,
+    surge_update_manager_set_current_version, surge_update_manager_set_release_retention_limit,
 };
 use crate::utils::to_lossy_cstring;
 

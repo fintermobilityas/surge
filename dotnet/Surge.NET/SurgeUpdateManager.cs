@@ -6,6 +6,48 @@ using System.Threading.Tasks;
 
 namespace Surge
 {
+    public enum SurgeArtifactRetentionMode
+    {
+        ReleaseGraph = 0,
+        LatestFull = 1,
+        JustInstalled = 2,
+        None = 3
+    }
+
+    public readonly struct SurgeArtifactRetentionPolicy
+    {
+        public SurgeArtifactRetentionPolicy(SurgeArtifactRetentionMode mode, int keepFullCount = 1)
+        {
+            if (!IsValidMode(mode))
+                throw new ArgumentOutOfRangeException(nameof(mode), mode, "Unsupported artifact retention mode.");
+            if (keepFullCount <= 0)
+                throw new ArgumentOutOfRangeException(nameof(keepFullCount), keepFullCount, "Keep full count must be greater than zero.");
+
+            Mode = mode;
+            KeepFullCount = keepFullCount;
+        }
+
+        public SurgeArtifactRetentionMode Mode { get; }
+        public int KeepFullCount { get; }
+
+        public static SurgeArtifactRetentionPolicy ReleaseGraph => new SurgeArtifactRetentionPolicy(SurgeArtifactRetentionMode.ReleaseGraph);
+        public static SurgeArtifactRetentionPolicy JustInstalled => new SurgeArtifactRetentionPolicy(SurgeArtifactRetentionMode.JustInstalled);
+        public static SurgeArtifactRetentionPolicy None => new SurgeArtifactRetentionPolicy(SurgeArtifactRetentionMode.None);
+
+        public static SurgeArtifactRetentionPolicy LatestFull(int keepFullCount)
+        {
+            return new SurgeArtifactRetentionPolicy(SurgeArtifactRetentionMode.LatestFull, keepFullCount);
+        }
+
+        internal static bool IsValidMode(SurgeArtifactRetentionMode mode)
+        {
+            return mode == SurgeArtifactRetentionMode.ReleaseGraph
+                || mode == SurgeArtifactRetentionMode.LatestFull
+                || mode == SurgeArtifactRetentionMode.JustInstalled
+                || mode == SurgeArtifactRetentionMode.None;
+        }
+    }
+
     /// <summary>
     /// Manages checking for and applying application updates via the native Surge library.
     /// </summary>
@@ -17,6 +59,7 @@ namespace Surge
         private string _channel = "stable";
         private string _currentVersion = "0.0.0";
         private int _releaseRetentionLimit = 1;
+        private SurgeArtifactRetentionPolicy _artifactRetentionPolicy = SurgeArtifactRetentionPolicy.ReleaseGraph;
 
         /// <summary>
         /// Maximum number of old installed versions to retain on disk after updating.
@@ -30,6 +73,23 @@ namespace Surge
                     throw new ArgumentOutOfRangeException(nameof(ReleaseRetentionLimit), value, "Release retention limit cannot be negative.");
 
                 _releaseRetentionLimit = value;
+            }
+        }
+
+        /// <summary>
+        /// Local package-artifact cache retention applied after successful updates.
+        /// </summary>
+        public SurgeArtifactRetentionPolicy ArtifactRetentionPolicy
+        {
+            get => _artifactRetentionPolicy;
+            set
+            {
+                if (!SurgeArtifactRetentionPolicy.IsValidMode(value.Mode))
+                    throw new ArgumentOutOfRangeException(nameof(ArtifactRetentionPolicy), value.Mode, "Unsupported artifact retention mode.");
+                if (value.KeepFullCount <= 0)
+                    throw new ArgumentOutOfRangeException(nameof(ArtifactRetentionPolicy), value.KeepFullCount, "Keep full count must be greater than zero.");
+
+                _artifactRetentionPolicy = value;
             }
         }
 
@@ -204,7 +264,7 @@ namespace Surge
                     try
                     {
                         cancellationToken.ThrowIfCancellationRequested();
-                        ApplyReleaseRetentionLimit();
+                        ApplyRetentionSettings();
 
                         // Build releases list
                         int count = NativeMethods.ReleasesCount(releasesInfoPtr);
@@ -374,13 +434,23 @@ namespace Surge
             _currentVersion = version;
         }
 
-        private void ApplyReleaseRetentionLimit()
+        private void ApplyRetentionSettings()
         {
             int result = NativeMethods.UpdateManagerSetReleaseRetentionLimit(_nativeMgr, _releaseRetentionLimit);
             if (result != 0)
             {
                 var errorMsg = GetLastError();
                 throw new SurgeException(result, errorMsg ?? "Failed to set release retention limit.");
+            }
+
+            result = NativeMethods.UpdateManagerSetArtifactRetentionPolicy(
+                _nativeMgr,
+                (int)_artifactRetentionPolicy.Mode,
+                _artifactRetentionPolicy.KeepFullCount);
+            if (result != 0)
+            {
+                var errorMsg = GetLastError();
+                throw new SurgeException(result, errorMsg ?? "Failed to set artifact retention policy.");
             }
         }
 

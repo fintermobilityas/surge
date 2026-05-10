@@ -149,6 +149,17 @@ namespace Surge.Tests
             // the constructor should throw InvalidOperationException.
             Assert.Throws<InvalidOperationException>(() => new SurgeUpdateManager());
         }
+
+        [Fact]
+        public void ArtifactRetentionPolicy_ValidatesKeepFullCount()
+        {
+            var policy = SurgeArtifactRetentionPolicy.LatestFull(2);
+            Assert.Equal(SurgeArtifactRetentionMode.LatestFull, policy.Mode);
+            Assert.Equal(2, policy.KeepFullCount);
+
+            Assert.Throws<ArgumentOutOfRangeException>(() => SurgeArtifactRetentionPolicy.LatestFull(0));
+            Assert.Throws<ArgumentOutOfRangeException>(() => new SurgeArtifactRetentionPolicy((SurgeArtifactRetentionMode)99));
+        }
     }
 
     public class SurgeProgressTests

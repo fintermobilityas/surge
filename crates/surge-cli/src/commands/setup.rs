@@ -4,12 +4,11 @@ use std::time::{Duration, Instant};
 
 use crate::logline;
 use surge_core::config::installer::InstallerManifest;
-use surge_core::config::manifest::InstallArtifactCacheRetention;
 use surge_core::error::{Result, SurgeError};
 use surge_core::install::{self as core_install, InstallProfile};
 use surge_core::installer_package::{
     InstallerPackageAcquisition, ResolveInstallerPackageOptions, ResolvedInstallerPackage, install_artifact_cache_dir,
-    prune_install_artifact_cache, resolve_installer_package,
+    prune_install_artifact_cache, resolve_installer_package, retained_artifacts_for_install_cache_without_index,
 };
 use surge_core::platform::fs::make_executable;
 use surge_core::platform::paths::default_install_root;
@@ -280,17 +279,18 @@ fn ensure_stage_cache_entry(
 }
 
 fn prune_setup_artifact_cache(install_root: &Path, package: &ResolvedPackage, manifest: &InstallerManifest) {
-    let empty_retained_artifacts = std::collections::BTreeSet::new();
+    let owned_retained_artifacts;
     let retained_artifacts = match package.retained_artifacts.as_ref() {
         Some(retained_artifacts) => retained_artifacts,
-        None if manifest.effective_install_artifact_cache_policy().retention
-            == InstallArtifactCacheRetention::LatestFull =>
-        {
-            &empty_retained_artifacts
-        }
-        None => return,
+        None => match retained_artifacts_for_install_cache_without_index(manifest) {
+            Some(retained_artifacts) => {
+                owned_retained_artifacts = retained_artifacts;
+                &owned_retained_artifacts
+            }
+            None => return,
+        },
     };
-    match prune_install_artifact_cache(install_root, retained_artifacts, &manifest.release.full_filename) {
+    match prune_install_artifact_cache(install_root, retained_artifacts) {
         Ok(0) => {}
         Ok(pruned) => {
             logline::info(&format!(

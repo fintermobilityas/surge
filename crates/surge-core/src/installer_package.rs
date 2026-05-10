@@ -3,13 +3,12 @@ use std::path::{Path, PathBuf};
 
 use crate::config::constants::RELEASES_FILE_COMPRESSED;
 use crate::config::installer::InstallerManifest;
-use crate::config::manifest::InstallArtifactCacheRetention;
 use crate::error::{Result, SurgeError};
 use crate::releases::artifact_cache::{cache_path_for_key, cached_artifact_matches, prune_cached_artifacts};
 use crate::releases::manifest::{ReleaseEntry, ReleaseIndex, decompress_release_index};
 use crate::releases::restore::{
-    RestoreOptions, RestoreProgressCallback, local_checkpoint_artifacts_for_index, required_artifacts_for_index,
-    restore_full_archive_for_version_with_options,
+    RestoreOptions, RestoreProgressCallback, restore_full_archive_for_version_with_options,
+    retained_artifacts_for_cache_policy, retained_artifacts_for_cache_policy_without_index,
 };
 use crate::storage::{self, StorageBackend, TransferProgress};
 use crate::storage_config::build_storage_config_from_installer_manifest;
@@ -165,28 +164,21 @@ pub fn install_artifact_cache_dir(install_root: &Path) -> PathBuf {
     install_root.join(".surge-cache").join("artifacts")
 }
 
-pub fn prune_install_artifact_cache(
-    install_root: &Path,
-    retained_artifacts: &BTreeSet<String>,
-    warm_full_filename: &str,
-) -> Result<usize> {
-    let mut retained_artifacts = retained_artifacts.clone();
-    let warm_full_filename = warm_full_filename.trim();
-    if !warm_full_filename.is_empty() {
-        retained_artifacts.insert(warm_full_filename.to_string());
-    }
-    prune_cached_artifacts(&install_artifact_cache_dir(install_root), &retained_artifacts)
+pub fn prune_install_artifact_cache(install_root: &Path, retained_artifacts: &BTreeSet<String>) -> Result<usize> {
+    prune_cached_artifacts(&install_artifact_cache_dir(install_root), retained_artifacts)
+}
+
+#[must_use]
+pub fn retained_artifacts_for_install_cache_without_index(manifest: &InstallerManifest) -> Option<BTreeSet<String>> {
+    retained_artifacts_for_cache_policy_without_index(
+        manifest.effective_install_artifact_cache_policy(),
+        &manifest.release.full_filename,
+    )
 }
 
 fn retained_artifacts_for_install_cache(index: &ReleaseIndex, manifest: &InstallerManifest) -> BTreeSet<String> {
     let policy = manifest.effective_install_artifact_cache_policy();
-    match policy.retention {
-        InstallArtifactCacheRetention::ReleaseGraph => required_artifacts_for_index(index),
-        InstallArtifactCacheRetention::LatestFull => {
-            let keep_full_count = usize::try_from(policy.keep_full_count.max(1)).unwrap_or(usize::MAX);
-            local_checkpoint_artifacts_for_index(index, keep_full_count)
-        }
-    }
+    retained_artifacts_for_cache_policy(index, policy, &manifest.release.full_filename, 0)
 }
 
 fn notify_stage(stage: Option<&InstallerPackageStageCallback<'_>>, value: InstallerPackageStage) {

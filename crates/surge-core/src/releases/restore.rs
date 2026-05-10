@@ -11,7 +11,10 @@ pub use self::planning::{
     find_previous_release_for_rid, find_release_for_version_rid, plan_full_archive_restore, sorted_releases_for_rid,
 };
 pub use self::recovery::{restore_full_archive_for_version, restore_full_archive_for_version_with_options};
-pub use self::retention::{local_checkpoint_artifacts_for_index, required_artifacts_for_index};
+pub use self::retention::{
+    local_checkpoint_artifacts_for_index, required_artifacts_for_index, retained_artifacts_for_cache_policy,
+    retained_artifacts_for_cache_policy_without_index,
+};
 
 pub type RestoreProgressCallback<'a> = dyn Fn(RestoreProgress) + Send + Sync + 'a;
 

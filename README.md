@@ -625,9 +625,9 @@ pack:                             # optional; omitted uses built-in defaults
     format: zstd
     level: 3
 
-cache:                            # optional device-side installer cache policy
+cache:                            # optional device-side artifact cache policy
   installArtifacts:
-    retention: release_graph       # release_graph | latest_full
+    retention: release_graph       # release_graph | latest_full | just_installed | none
     keepFullCount: 1               # full archives retained when retention is latest_full
 
 apps:
@@ -648,7 +648,12 @@ apps:
 
 Target-level settings override app-level defaults for `icon`, `shortcuts`, `persistentAssets`, `installers`, and `environment`.
 `pack` policy is global and currently controls delta strategy plus compression format/level for `surge pack`.
-`cache.installArtifacts.retention: latest_full` keeps the installed full archive warm on each device and lets future deltas be downloaded again from storage when needed, instead of retaining the full release graph locally.
+`cache.installArtifacts` controls package artifacts kept under `.surge-cache/artifacts/` after setup and successful updates:
+
+- `release_graph` is the default. Use it when offline restore to older versions matters; it keeps the local release graph and uses the most disk.
+- `latest_full` keeps the newest `keepFullCount` full archives per RID and drops deltas. Use it when you want a small reinstall/restore cushion without retaining the full graph.
+- `just_installed` keeps only the installed full archive when that archive is already cached. Use it when full-update reinstall warmth is useful but disk should stay tight. Delta-only updates do not synthesize a new full archive just to warm this cache.
+- `none` keeps no package artifacts after a successful update. Use it when optimizing for minimum disk usage and accepting that restore/reinstall downloads from storage again.
 
 ### Architecture
 

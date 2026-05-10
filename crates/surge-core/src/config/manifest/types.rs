@@ -122,6 +122,8 @@ pub enum InstallArtifactCacheRetention {
     #[default]
     ReleaseGraph,
     LatestFull,
+    JustInstalled,
+    None,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

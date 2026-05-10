@@ -1226,6 +1226,108 @@ apps:
     }
 
     #[tokio::test]
+    async fn test_checkpoint_threshold_keeps_direct_delta() {
+        let tmp = tempfile::tempdir().expect("tempdir should be created");
+        let store_root = tmp.path().join("store");
+        let artifacts_root = tmp.path().join("artifacts");
+        std::fs::create_dir_all(&store_root).expect("store dir should exist");
+        std::fs::create_dir_all(&artifacts_root).expect("artifacts dir should exist");
+
+        let app_id = "demo";
+        let rid = current_rid();
+        let manifest_path = tmp.path().join("surge.yml");
+        let manifest_yaml = format!(
+            r"schema: 1
+storage:
+  provider: filesystem
+  bucket: {bucket}
+pack:
+  delta:
+    strategy: sparse-file-ops
+    max_chain_length: 1
+  compression:
+    format: zstd
+    level: 3
+  retention:
+    keep_latest_fulls: 2
+    checkpoint_every: 10
+apps:
+  - id: {app_id}
+    target:
+      rid: {rid}
+",
+            bucket = store_root.display()
+        );
+        std::fs::write(&manifest_path, manifest_yaml).expect("manifest should be written");
+
+        let ctx = Arc::new(Context::new());
+        ctx.set_storage(
+            StorageProvider::Filesystem,
+            store_root.to_str().expect("store root utf8"),
+            "",
+            "",
+            "",
+            "",
+        );
+
+        std::fs::write(
+            artifacts_root.join("stable.bin"),
+            deterministic_payload(2 * 1024 * 1024, 41),
+        )
+        .expect("stable payload should be written");
+
+        std::fs::write(artifacts_root.join("payload.txt"), b"v1 payload").expect("v1 payload should be written");
+        let mut builder_v1 = PackBuilder::new(
+            Arc::clone(&ctx),
+            manifest_path.to_str().expect("manifest path utf8"),
+            app_id,
+            &rid,
+            "1.0.0",
+            artifacts_root.to_str().expect("artifacts path utf8"),
+        )
+        .expect("builder v1");
+        builder_v1.build(None).await.expect("v1 build should succeed");
+        builder_v1.push("stable", None).await.expect("v1 push should succeed");
+
+        std::fs::write(artifacts_root.join("payload.txt"), b"v2 payload").expect("v2 payload should be written");
+        let mut builder_v2 = PackBuilder::new(
+            Arc::clone(&ctx),
+            manifest_path.to_str().expect("manifest path utf8"),
+            app_id,
+            &rid,
+            "1.1.0",
+            artifacts_root.to_str().expect("artifacts path utf8"),
+        )
+        .expect("builder v2");
+        builder_v2.build(None).await.expect("v2 build should succeed");
+        builder_v2.push("stable", None).await.expect("v2 push should succeed");
+
+        std::fs::write(artifacts_root.join("payload.txt"), b"v3 payload").expect("v3 payload should be written");
+        let mut builder_v3 = PackBuilder::new(
+            Arc::clone(&ctx),
+            manifest_path.to_str().expect("manifest path utf8"),
+            app_id,
+            &rid,
+            "1.2.0",
+            artifacts_root.to_str().expect("artifacts path utf8"),
+        )
+        .expect("builder v3");
+        builder_v3.build(None).await.expect("v3 build should succeed");
+
+        assert!(
+            builder_v3.artifacts().iter().any(|artifact| !artifact.is_delta),
+            "checkpoint build should still include the full fallback"
+        );
+        let delta = builder_v3
+            .artifacts()
+            .iter()
+            .find(|artifact| artifact.is_delta)
+            .expect("checkpoint build should keep the direct delta");
+        assert_eq!(delta.from_version, "1.1.0");
+        assert_eq!(delta.patch_format, PATCH_FORMAT_SPARSE_FILE_OPS_V1);
+    }
+
+    #[tokio::test]
     async fn test_demoapp_fixture_multi_release_delta_stays_small_and_restorable() {
         let tmp = tempfile::tempdir().unwrap();
         let store_root = tmp.path().join("store");

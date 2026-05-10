@@ -2,7 +2,11 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
-use surge_core::config::manifest::SurgeManifest;
+use surge_core::config::constants::{
+    PACK_DEFAULT_CHECKPOINT_EVERY, PACK_DEFAULT_COMPRESSION_FORMAT, PACK_DEFAULT_DELTA_STRATEGY,
+    PACK_DEFAULT_KEEP_LATEST_FULLS, PACK_DEFAULT_MAX_CHAIN_LENGTH, PACK_DEFAULT_ZSTD_LEVEL,
+};
+use surge_core::config::manifest::{InstallArtifactCacheRetention, SurgeManifest};
 use uuid::Uuid;
 
 fn run_wizard(current_dir: &Path, args: &[&str], stdin_input: &str) -> Output {
@@ -44,6 +48,34 @@ fn output_to_debug(output: &Output) -> String {
     )
 }
 
+fn assert_default_fleet_policy(manifest: &SurgeManifest) {
+    let pack = manifest.pack.as_ref().expect("pack policy should be explicit");
+    let delta = pack.delta.as_ref().expect("delta policy should be explicit");
+    assert_eq!(delta.strategy.as_deref(), Some(PACK_DEFAULT_DELTA_STRATEGY));
+    assert_eq!(delta.max_chain_length, Some(PACK_DEFAULT_MAX_CHAIN_LENGTH));
+
+    let compression = pack
+        .compression
+        .as_ref()
+        .expect("compression policy should be explicit");
+    assert_eq!(compression.format.as_deref(), Some(PACK_DEFAULT_COMPRESSION_FORMAT));
+    assert_eq!(compression.level, Some(PACK_DEFAULT_ZSTD_LEVEL));
+
+    let retention = pack.retention.as_ref().expect("retention policy should be explicit");
+    assert_eq!(retention.keep_latest_fulls, Some(PACK_DEFAULT_KEEP_LATEST_FULLS));
+    assert_eq!(retention.checkpoint_every, Some(PACK_DEFAULT_CHECKPOINT_EVERY));
+
+    let cache = manifest.cache.expect("cache policy should be explicit");
+    let install_artifacts = cache
+        .install_artifacts
+        .expect("install artifact cache policy should be explicit");
+    assert_eq!(
+        install_artifacts.retention,
+        Some(InstallArtifactCacheRetention::LatestFull)
+    );
+    assert_eq!(install_artifacts.keep_full_count, Some(1));
+}
+
 #[test]
 fn test_init_wizard_defaults_to_dot_surge_manifest() {
     let tmp = tempfile::tempdir().unwrap();
@@ -72,6 +104,7 @@ fn test_init_wizard_defaults_to_dot_surge_manifest() {
     assert_eq!(manifest.apps[0].install_directory, "my-app");
     assert!(Uuid::parse_str(&manifest.apps[0].supervisor_id).is_ok());
     assert_eq!(manifest.apps[0].targets.len(), 1);
+    assert_default_fleet_policy(&manifest);
 }
 
 #[test]
@@ -125,6 +158,7 @@ fn test_init_wizard_respects_custom_manifest_path() {
     assert_eq!(manifest.apps[0].install_directory, "demo-install");
     assert!(Uuid::parse_str(&manifest.apps[0].supervisor_id).is_ok());
     assert_eq!(manifest.apps[0].targets[0].rid, "linux-x64");
+    assert_default_fleet_policy(&manifest);
 
     // `packages` auto-creation only happens for `.surge` parent.
     assert!(!tmp.path().join("custom").join("packages").exists());
@@ -165,4 +199,5 @@ fn test_init_non_wizard_when_options_are_provided() {
     assert_eq!(app.main_exe, "demo-main");
     assert_eq!(app.install_directory, "demo-install");
     assert_eq!(app.targets[0].rid, "linux-x64");
+    assert_default_fleet_policy(&manifest);
 }

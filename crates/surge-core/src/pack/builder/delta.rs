@@ -40,7 +40,7 @@ impl PackBuilder {
             .find(|a| !a.is_delta)
             .map(PackageArtifact::bytes)
             .ok_or_else(|| SurgeError::Pack("Full package not yet built".to_string()))?;
-        if should_publish_checkpoint_full(
+        if should_retain_checkpoint_full(
             &index,
             &self.rid,
             self.pack_policy.max_chain_length,
@@ -50,9 +50,8 @@ impl PackBuilder {
                 app_id = %self.app_id,
                 version = %self.version,
                 rid = %self.rid,
-                "Skipping delta package and publishing a checkpoint full"
+                "Building direct delta while retaining checkpoint full fallback"
             );
-            return Ok(None);
         }
         let n_workers = budget.effective_zstd_workers();
         let diff_options = chunked_diff_options(&budget, prev_data.len(), new_data.len());
@@ -119,7 +118,7 @@ impl PackBuilder {
     }
 }
 
-fn should_publish_checkpoint_full(
+fn should_retain_checkpoint_full(
     index: &ReleaseIndex,
     rid: &str,
     max_chain_length: u32,

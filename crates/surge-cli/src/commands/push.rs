@@ -6,6 +6,8 @@
     clippy::too_many_lines
 )]
 
+mod checkpoint;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::Read;
@@ -19,7 +21,7 @@ use crate::formatters::{format_byte_progress, format_bytes, format_duration};
 use crate::logline;
 use crate::ui::UiTheme;
 use surge_core::config::constants::{DEFAULT_ZSTD_LEVEL, RELEASES_FILE_COMPRESSED, SCHEMA_VERSION};
-use surge_core::config::manifest::{ShortcutLocation, SurgeManifest};
+use surge_core::config::manifest::{PackPolicy, ShortcutLocation, SurgeManifest};
 use surge_core::crypto::sha256::sha256_hex_file;
 use surge_core::error::{Result, SurgeError};
 use surge_core::pack::builder::{PACKAGE_METADATA_SCHEMA_VERSION, PackageArtifactMetadata, package_metadata_filename};
@@ -29,8 +31,7 @@ use surge_core::releases::manifest::{
     ReleaseIndex, UNRECORDED_COMPRESSION_LEVEL, UNRECORDED_ZSTD_WORKERS, compress_release_index,
     decompress_release_index,
 };
-use surge_core::releases::restore::required_artifacts_for_index;
-use surge_core::releases::version::compare_versions;
+use surge_core::releases::restore::{find_previous_release_for_rid, required_artifacts_for_index};
 use surge_core::storage::{self, StorageBackend};
 
 /// Push built packages to cloud storage.
@@ -48,6 +49,7 @@ pub async fn execute(
     let started = Instant::now();
     print_stage(theme, 1, TOTAL_STAGES, "Resolving manifest and target");
     let manifest = SurgeManifest::from_file(manifest_path)?;
+    let pack_policy = manifest.effective_pack_policy();
     let app_id = super::resolve_app_id_with_rid_hint(&manifest, app_id, rid)?;
     let rid = super::resolve_rid(&manifest, &app_id, rid)?;
     let (app, target) = manifest
@@ -126,11 +128,20 @@ pub async fn execute(
 
     let existing_index = fetch_existing_release_index(&*backend).await?;
     let has_existing_full_for_rid = if let Some(index) = existing_index.as_ref() {
-        rid_has_uploaded_full_artifact(&*backend, index, &rid).await?
+        checkpoint::rid_has_uploaded_full_artifact(&*backend, index, &rid).await?
     } else {
         false
     };
-    let full_uploaded = !has_existing_full_for_rid || !delta_available;
+    let full_uploaded = checkpoint::should_upload_full_artifact(
+        &*backend,
+        existing_index.as_ref(),
+        &rid,
+        version,
+        delta_available,
+        has_existing_full_for_rid,
+        pack_policy,
+    )
+    .await?;
     let total_upload_bytes = (if full_uploaded { full_size } else { 0 })
         .saturating_add(delta_size_hint)
         .max(0) as u64;
@@ -199,6 +210,7 @@ pub async fn execute(
         persistent_assets,
         installers,
         environment,
+        pack_policy,
     )
     .await?;
     print_stage_done(
@@ -233,25 +245,6 @@ async fn fetch_existing_release_index(backend: &dyn StorageBackend) -> Result<Op
     }
 }
 
-async fn rid_has_uploaded_full_artifact(backend: &dyn StorageBackend, index: &ReleaseIndex, rid: &str) -> Result<bool> {
-    let mut candidates: Vec<&ReleaseEntry> = index
-        .releases
-        .iter()
-        .filter(|release| (release.rid == rid || release.rid.is_empty()) && !release.full_filename.trim().is_empty())
-        .collect();
-    candidates.sort_by(|a, b| compare_versions(&a.version, &b.version));
-
-    for release in candidates {
-        match backend.head_object(release.full_filename.trim()).await {
-            Ok(_) => return Ok(true),
-            Err(SurgeError::NotFound(_)) => continue,
-            Err(e) => return Err(e),
-        }
-    }
-
-    Ok(false)
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn update_release_index(
     backend: &dyn StorageBackend,
@@ -277,6 +270,7 @@ async fn update_release_index(
     persistent_assets: Vec<String>,
     installers: Vec<String>,
     environment: BTreeMap<String, String>,
+    pack_policy: PackPolicy,
 ) -> Result<usize> {
     let mut index = match backend.get_object(RELEASES_FILE_COMPRESSED).await {
         Ok(data) => decompress_release_index(&data)?,
@@ -313,6 +307,9 @@ async fn update_release_index(
         .releases
         .iter()
         .any(|release| release.rid == rid || release.rid.is_empty());
+    let previous_version = find_previous_release_for_rid(&index, rid, version)
+        .map(|release| release.version.clone())
+        .unwrap_or_default();
 
     index
         .releases
@@ -348,7 +345,7 @@ async fn update_release_index(
     } else if delta_patch_format.eq_ignore_ascii_case(PATCH_FORMAT_SPARSE_FILE_OPS_V1) {
         Some(DeltaArtifact::sparse_file_ops_zstd(
             "primary",
-            "",
+            &previous_version,
             &delta_filename,
             delta_size,
             &delta_sha256,
@@ -356,7 +353,7 @@ async fn update_release_index(
     } else if delta_patch_format.eq_ignore_ascii_case(PATCH_FORMAT_CHUNKED_BSDIFF_V1) {
         Some(DeltaArtifact::chunked_bsdiff_zstd(
             "primary",
-            "",
+            &previous_version,
             &delta_filename,
             delta_size,
             &delta_sha256,
@@ -364,7 +361,7 @@ async fn update_release_index(
     } else if delta_patch_format.eq_ignore_ascii_case(PATCH_FORMAT_BSDIFF4) {
         Some(DeltaArtifact::bsdiff_zstd(
             "primary",
-            "",
+            &previous_version,
             &delta_filename,
             delta_size,
             &delta_sha256,
@@ -372,7 +369,7 @@ async fn update_release_index(
     } else {
         Some(DeltaArtifact::with_patch_format(
             "primary",
-            "",
+            &previous_version,
             &delta_patch_format,
             &delta_filename,
             delta_size,
@@ -388,7 +385,7 @@ async fn update_release_index(
     backend
         .put_object(RELEASES_FILE_COMPRESSED, &compressed, "application/octet-stream")
         .await?;
-    let pruned = prune_redundant_artifacts(backend, &index).await?;
+    let pruned = prune_redundant_artifacts(backend, &index, pack_policy).await?;
 
     Ok(pruned)
 }
@@ -455,8 +452,15 @@ fn validate_full_package_metadata(
     Ok(())
 }
 
-async fn prune_redundant_artifacts(backend: &dyn StorageBackend, index: &ReleaseIndex) -> Result<usize> {
-    let required = required_artifacts_for_index(index);
+async fn prune_redundant_artifacts(
+    backend: &dyn StorageBackend,
+    index: &ReleaseIndex,
+    pack_policy: PackPolicy,
+) -> Result<usize> {
+    let mut required = required_artifacts_for_index(index);
+    required.extend(
+        checkpoint::retained_uploaded_full_artifacts_for_index(backend, index, pack_policy.keep_latest_fulls).await?,
+    );
 
     let mut candidates = BTreeSet::new();
     for release in &index.releases {
@@ -665,5 +669,133 @@ apps:
             .expect("pushed release should exist");
         assert_eq!(release.full_compression_level, 3);
         assert_eq!(release.full_zstd_workers, 4);
+    }
+
+    #[tokio::test]
+    async fn execute_uploads_checkpoint_full_without_dropping_direct_delta() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store_dir = temp_dir.path().join("store");
+        let packages_dir = temp_dir.path().join("packages");
+        let manifest_path = temp_dir.path().join("surge.yml");
+        let app_id = "demo";
+        let rid = current_rid();
+
+        std::fs::create_dir_all(&store_dir).expect("store dir should be created");
+        std::fs::create_dir_all(&packages_dir).expect("packages dir should be created");
+
+        let manifest_yaml = format!(
+            r"schema: 1
+storage:
+  provider: filesystem
+  bucket: {bucket}
+pack:
+  delta:
+    strategy: sparse-file-ops
+    max_chain_length: 1
+  compression:
+    format: zstd
+    level: 3
+  retention:
+    keep_latest_fulls: 2
+    checkpoint_every: 10
+apps:
+  - id: {app_id}
+    main_exe: demoapp
+    channels: [test, production]
+    target:
+      rid: {rid}
+",
+            bucket = store_dir.display()
+        );
+        std::fs::write(&manifest_path, manifest_yaml).expect("manifest should be written");
+
+        let v1_full_key = format!("{app_id}-1.0.0-{rid}-full.tar.zst");
+        let v2_full_key = format!("{app_id}-1.1.0-{rid}-full.tar.zst");
+        let v2_delta_key = format!("{app_id}-1.1.0-{rid}-delta.tar.zst");
+        std::fs::write(store_dir.join(&v1_full_key), b"v1 full").expect("v1 full should exist remotely");
+
+        let release = |version: &str, full_key: &str, delta: Option<DeltaArtifact>| {
+            let mut release = ReleaseEntry {
+                version: version.to_string(),
+                channels: vec!["test".to_string()],
+                os: detect_os_from_rid(&rid),
+                rid: rid.clone(),
+                is_genesis: version == "1.0.0",
+                full_filename: full_key.to_string(),
+                full_size: 100,
+                full_sha256: format!("{version}-full-sha"),
+                full_compression_level: UNRECORDED_COMPRESSION_LEVEL,
+                full_zstd_workers: UNRECORDED_ZSTD_WORKERS,
+                deltas: Vec::new(),
+                preferred_delta_id: String::new(),
+                created_utc: String::new(),
+                release_notes: String::new(),
+                name: "Demo".to_string(),
+                main_exe: "demoapp".to_string(),
+                install_directory: "demoapp".to_string(),
+                supervisor_id: String::new(),
+                icon: String::new(),
+                shortcuts: Vec::new(),
+                persistent_assets: Vec::new(),
+                installers: Vec::new(),
+                environment: BTreeMap::new(),
+            };
+            release.set_primary_delta(delta);
+            release
+        };
+        let index = ReleaseIndex {
+            schema: SCHEMA_VERSION,
+            app_id: app_id.to_string(),
+            releases: vec![
+                release("1.0.0", &v1_full_key, None),
+                release(
+                    "1.1.0",
+                    &v2_full_key,
+                    Some(DeltaArtifact::bsdiff_zstd(
+                        "primary",
+                        "1.0.0",
+                        &v2_delta_key,
+                        10,
+                        "v2-delta-sha",
+                    )),
+                ),
+            ],
+            ..ReleaseIndex::default()
+        };
+        let compressed_index = compress_release_index(&index, DEFAULT_ZSTD_LEVEL).expect("index should compress");
+        std::fs::write(store_dir.join(RELEASES_FILE_COMPRESSED), compressed_index)
+            .expect("release index should be written");
+
+        let version = "1.2.0";
+        let full_filename = format!("{app_id}-{version}-{rid}-full.tar.zst");
+        let delta_filename = format!("{app_id}-{version}-{rid}-delta.tar.zst");
+        std::fs::write(packages_dir.join(&full_filename), b"v3 full").expect("full package should be written");
+        std::fs::write(packages_dir.join(&delta_filename), b"v3 delta").expect("delta package should be written");
+
+        execute(&manifest_path, Some(app_id), version, Some(&rid), "test", &packages_dir)
+            .await
+            .expect("push should succeed");
+
+        assert!(
+            store_dir.join(&full_filename).is_file(),
+            "checkpoint full fallback should be uploaded"
+        );
+        assert!(
+            store_dir.join(&delta_filename).is_file(),
+            "direct delta should still be uploaded"
+        );
+
+        let compressed_index =
+            std::fs::read(store_dir.join(RELEASES_FILE_COMPRESSED)).expect("release index should be written");
+        let index = decompress_release_index(&compressed_index).expect("release index should decompress");
+        let release = index
+            .releases
+            .iter()
+            .find(|release| release.version == version && release.rid == rid)
+            .expect("pushed release should exist");
+        let delta = release
+            .delta_from_source("1.1.0")
+            .expect("pushed delta should target the previous release");
+        assert_eq!(delta.filename, delta_filename);
     }
 }

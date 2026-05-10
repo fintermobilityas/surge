@@ -62,10 +62,11 @@ pub async fn execute(
         .channels
         .iter()
         .any(|existing| existing == channel);
+    let release_uses_delta = index.releases[release_idx].selected_delta().is_some();
     let previous_on_channel = previous_release_on_channel(&index, &rid, channel, version);
     let needs_channel_delta = previous_on_channel
         .as_deref()
-        .is_some_and(|prev| index.releases[release_idx].delta_from_source(prev).is_none());
+        .is_some_and(|prev| release_uses_delta && index.releases[release_idx].delta_from_source(prev).is_none());
 
     if already_on_channel && !needs_channel_delta {
         print_stage(theme, 3, TOTAL_STAGES, "Updating channel membership");
@@ -106,14 +107,14 @@ pub async fn execute(
         release.channels.dedup();
     }
     // Even when the release is already on the channel, re-check that a
-    // production-compatible delta exists. This is what recovers a release that
-    // was previously promoted before this fix shipped: rerun `surge promote`
-    // and the missing channel delta is built in place without a demote/repromote
-    // cycle.
+    // production-compatible delta exists for delta releases. Full-only releases
+    // are already safe: update clients fall back to the full package when the
+    // channel has no applicable delta.
     let channel_delta_summary = match previous_on_channel {
-        Some(prev_version) => {
+        Some(prev_version) if release_uses_delta => {
             ensure_channel_delta(&*backend, &mut index, &app_id, &rid, version, &prev_version).await?
         }
+        Some(_) => "target release is full-only; skipped delta rebuild".to_string(),
         None => "no previous release on channel; skipped delta rebuild".to_string(),
     };
 
@@ -712,25 +713,9 @@ mod tests {
         );
     }
 
-    // Reproduces the production crashloop where nodes reject the promoted
-    // 2996.0.0 release with "SHA-256 mismatch for rebuilt full archive".
-    //
-    // Root cause: 2996.0.0 was a **checkpoint full** — the primary delta chain
-    // hit `pack_policy.max_chain_length` (default 8) so pack skipped the
-    // primary delta and only uploaded a full archive. When `ensure_channel_delta`
-    // then runs during promote, `resolve_target_archive_encoding` finds no
-    // selected_delta on the target release and falls back to
-    // `ResourceBudget::default()` — but that default has
-    // `zstd_compression_level = 9`, while the full archive was actually packed
-    // with `PackPolicy::default().compression_level = 3`.
-    //
-    // The fallback therefore builds the channel-aware delta at level 9, a node
-    // on the previous production release applies it, and the rebuilt archive
-    // bytes no longer match the level-3 `full_sha256` recorded at pack time.
     #[tokio::test]
-    async fn execute_channel_delta_preserves_full_sha256_when_target_is_checkpoint_full() {
+    async fn execute_promotes_checkpoint_full_without_channel_delta_rebuild() {
         use surge_core::archive::packer::ArchivePacker;
-        use surge_core::releases::delta::{apply_delta_patch, decode_delta_patch};
         // PackPolicy::default().compression_level
         const PACK_ZSTD_LEVEL: i32 = 3;
         // Whatever pack happened to use on the build runner (capped by CPU count).
@@ -814,9 +799,7 @@ mod tests {
 
         // v1.2.0 is a checkpoint full — no primary delta. This is what
         // `should_publish_checkpoint_full` in `pack/builder/delta.rs` produces
-        // when `deltas_since_checkpoint >= max_chain_length`. The new pack
-        // records the real (level, workers) on the release entry, so promote
-        // can rebuild a channel delta whose apply produces matching bytes.
+        // when `deltas_since_checkpoint >= max_chain_length`.
         write_index(
             &store_dir,
             &ReleaseIndex {
@@ -853,30 +836,15 @@ mod tests {
             .iter()
             .find(|release| release.version == "1.2.0" && release.rid == rid)
             .expect("promoted release should exist");
-        let production_delta = promoted
-            .delta_from_source("1.0.0")
-            .expect("production-channel delta from 1.0.0 must be produced by promote");
-
-        let production_delta_path = store_dir.join(&production_delta.filename);
-        let production_delta_bytes = std::fs::read(&production_delta_path).expect("production delta artifact uploaded");
-
-        let decoded = decode_delta_patch(&production_delta_bytes, &production_delta).unwrap();
-        let rebuilt = apply_delta_patch(&v100_full, &decoded, &production_delta).unwrap();
-        let rebuilt_sha256 = sha256_hex(&rebuilt);
-        assert_eq!(
-            rebuilt_sha256, promoted.full_sha256,
-            "rebuilt full archive SHA must match manifest `full_sha256`"
+        assert!(promoted.channels.iter().any(|channel| channel == "production"));
+        assert!(
+            promoted.delta_from_source("1.0.0").is_none(),
+            "full-only promotions should not require an optional channel delta"
         );
     }
 
-    // Guard rail for the reviewer's concern: if a release pre-dates the
-    // `full_compression_level`/`full_zstd_workers` fields AND its primary
-    // delta was pruned (e.g. by a previous `surge compact`), promote has no
-    // way to reproduce the exact pack encoding. Rather than silently uploading
-    // a delta that every node will reject, promote must refuse and surface a
-    // clear error so the operator can re-pack the target release.
     #[tokio::test]
-    async fn execute_channel_delta_refuses_when_encoding_is_unknowable() {
+    async fn execute_promotes_legacy_full_only_release_without_channel_delta() {
         use surge_core::archive::packer::ArchivePacker;
         use surge_core::releases::manifest::{UNRECORDED_COMPRESSION_LEVEL, UNRECORDED_ZSTD_WORKERS};
 
@@ -949,14 +917,59 @@ mod tests {
             },
         );
 
-        let err = execute(&manifest_path, Some("demo"), "1.2.0", Some(&rid), "production")
+        execute(&manifest_path, Some("demo"), "1.2.0", Some(&rid), "production")
             .await
-            .expect_err("promote should refuse when encoding is unknowable");
-        let msg = err.to_string();
+            .expect("full-only promote should not need target archive encoding");
+
+        let index = read_index(&store_dir);
+        let promoted = index
+            .releases
+            .iter()
+            .find(|release| release.version == "1.2.0" && release.rid == rid)
+            .expect("promoted release should exist");
+        assert!(promoted.channels.iter().any(|channel| channel == "production"));
         assert!(
-            msg.contains("Cannot determine original pack encoding"),
-            "unexpected error: {msg}"
+            promoted.delta_from_source("1.0.0").is_none(),
+            "legacy full-only promote should use the full package instead of synthesizing an unsafe delta"
         );
+    }
+
+    #[tokio::test]
+    async fn execute_promotes_full_only_release_when_previous_channel_full_cannot_be_restored() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store_dir = temp_dir.path().join("store");
+        let manifest_path = temp_dir.path().join("surge.yml");
+        let rid = current_rid();
+
+        std::fs::create_dir_all(&store_dir).expect("store dir");
+        write_manifest(&manifest_path, &store_dir, "demo", &rid);
+
+        let target = release("1.2.0", &rid, &["test"]);
+        std::fs::write(store_dir.join(format!("demo-1.2.0-{rid}-full.tar.zst")), b"target-full")
+            .expect("target full artifact should be present");
+
+        write_index(
+            &store_dir,
+            &ReleaseIndex {
+                app_id: "demo".to_string(),
+                releases: vec![release("1.1.0", &rid, &["production"]), target],
+                ..ReleaseIndex::default()
+            },
+        );
+
+        execute(&manifest_path, Some("demo"), "1.2.0", Some(&rid), "production")
+            .await
+            .expect("full-only promote should not depend on reconstructing the previous production release");
+
+        let index = read_index(&store_dir);
+        let promoted = index
+            .releases
+            .iter()
+            .find(|release| release.version == "1.2.0" && release.rid == rid)
+            .expect("promoted release should exist");
+        assert_eq!(promoted.channels, vec!["production".to_string(), "test".to_string()]);
+        assert!(promoted.deltas.is_empty());
+        assert!(!store_dir.join(format!("demo-1.1.0-{rid}-full.tar.zst")).exists());
     }
 
     // End-to-end reproduction of the production crash where nodes reject the

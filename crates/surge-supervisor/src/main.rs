@@ -371,29 +371,16 @@ fn install_signal_handlers() -> std::sync::Arc<std::sync::atomic::AtomicBool> {
 
     #[cfg(unix)]
     {
-        use nix::sys::signal::{SigSet, Signal};
+        use signal_hook::consts::signal::{SIGINT, SIGTERM};
+        use signal_hook::flag;
 
-        // Block SIGTERM/SIGINT on the main thread *before* spawning the
-        // handler thread. Spawned threads inherit the signal mask, so these
-        // signals will be blocked process-wide and can only be consumed by
-        // sigwait() in the handler thread. Without this, SIGTERM hits the
-        // main thread's default handler, killing the process before PID-file
-        // cleanup runs.
-        let mut sigset = SigSet::empty();
-        sigset.add(Signal::SIGTERM);
-        sigset.add(Signal::SIGINT);
-        let _ = sigset.thread_block();
+        if let Err(e) = flag::register(SIGTERM, shutdown.clone()) {
+            tracing::error!("Failed to register SIGTERM handler: {e}");
+        }
 
-        let shutdown_clone = shutdown.clone();
-        std::thread::spawn(move || match sigset.wait() {
-            Ok(sig) => {
-                tracing::info!("Received signal: {sig}");
-                shutdown_clone.store(true, std::sync::atomic::Ordering::Release);
-            }
-            Err(e) => {
-                tracing::error!("Signal wait error: {e}");
-            }
-        });
+        if let Err(e) = flag::register(SIGINT, shutdown.clone()) {
+            tracing::error!("Failed to register SIGINT handler: {e}");
+        }
     }
 
     #[cfg(windows)]

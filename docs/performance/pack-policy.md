@@ -15,6 +15,11 @@ pack:
   retention:
     keep_latest_fulls: 2
     checkpoint_every: 10
+
+cache:
+  installArtifacts:
+    retention: latest_full
+    keepFullCount: 1
 ```
 
 Current operational node policy:
@@ -60,6 +65,7 @@ Reason:
 - publisher cost otherwise grows with history reconstruction work
 - client update cost otherwise grows with chain length
 - broad churn can still produce poor file patches, so full fallback remains necessary
+- latest-following nodes should still receive a direct delta even when the release is also a checkpoint full
 
 ## What `surge tune pack` May Change
 
@@ -108,5 +114,9 @@ It should not become a hidden stage inside normal `surge pack`.
 
 Normal `surge pack` now applies two automatic safety rules:
 
-- if the sparse delta is larger than the full package, publish a full checkpoint instead
-- if the retained delta chain reaches the configured checkpoint thresholds, publish a full checkpoint instead
+- if the sparse delta is larger than the full package, skip the delta and publish/use the full package
+- if the retained delta chain reaches the configured checkpoint thresholds, retain or upload a full checkpoint fallback while still keeping the direct delta when it is valid and smaller than the full package
+
+## Compaction Timing
+
+Use `surge compact` after rollout convergence or for explicit recovery/cleanup. It should not be an automatic immediate step after every production push, because healthy latest-following nodes still need the newest direct delta while they are catching up.

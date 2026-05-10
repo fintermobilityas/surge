@@ -797,9 +797,9 @@ mod tests {
             }
         };
 
-        // v1.2.0 is a checkpoint full — no primary delta. This is what
-        // `should_publish_checkpoint_full` in `pack/builder/delta.rs` produces
-        // when `deltas_since_checkpoint >= max_chain_length`.
+        // v1.2.0 models a legacy full-only checkpoint that has no primary
+        // delta. Modern checkpoint releases can carry both a full fallback and
+        // the direct delta, but old indexes must remain promotable.
         write_index(
             &store_dir,
             &ReleaseIndex {

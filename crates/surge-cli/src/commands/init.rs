@@ -7,7 +7,15 @@ use std::io::{self, Write};
 use std::path::Path;
 use uuid::Uuid;
 
-use surge_core::config::manifest::{AppConfig, StorageManifestConfig, SurgeManifest, TargetConfig};
+use surge_core::config::constants::{
+    PACK_DEFAULT_CHECKPOINT_EVERY, PACK_DEFAULT_COMPRESSION_FORMAT, PACK_DEFAULT_DELTA_STRATEGY,
+    PACK_DEFAULT_KEEP_LATEST_FULLS, PACK_DEFAULT_MAX_CHAIN_LENGTH, PACK_DEFAULT_ZSTD_LEVEL,
+};
+use surge_core::config::manifest::{
+    AppConfig, CacheManifestConfig, InstallArtifactCachePolicy, InstallArtifactCacheRetention,
+    PackCompressionManifestConfig, PackDeltaManifestConfig, PackManifestConfig, PackRetentionManifestConfig,
+    StorageManifestConfig, SurgeManifest, TargetConfig,
+};
 use surge_core::error::{Result, SurgeError};
 use surge_core::platform::detect::current_rid;
 
@@ -67,8 +75,8 @@ pub async fn execute(
         },
         lock: None,
         channels: vec![],
-        pack: None,
-        cache: None,
+        pack: Some(default_pack_manifest_config()),
+        cache: Some(default_cache_manifest_config()),
         apps: vec![AppConfig {
             id: init.app_id.clone(),
             name: init.name,
@@ -114,6 +122,30 @@ pub async fn execute(
 
     logline::success(&format!("Created manifest at {}", manifest_path.display()));
     Ok(())
+}
+
+fn default_pack_manifest_config() -> PackManifestConfig {
+    PackManifestConfig {
+        delta: Some(PackDeltaManifestConfig {
+            strategy: Some(PACK_DEFAULT_DELTA_STRATEGY.to_string()),
+            max_chain_length: Some(PACK_DEFAULT_MAX_CHAIN_LENGTH),
+        }),
+        compression: Some(PackCompressionManifestConfig {
+            format: Some(PACK_DEFAULT_COMPRESSION_FORMAT.to_string()),
+            level: Some(PACK_DEFAULT_ZSTD_LEVEL),
+        }),
+        retention: Some(PackRetentionManifestConfig {
+            keep_latest_fulls: Some(PACK_DEFAULT_KEEP_LATEST_FULLS),
+            checkpoint_every: Some(PACK_DEFAULT_CHECKPOINT_EVERY),
+        }),
+    }
+}
+
+fn default_cache_manifest_config() -> CacheManifestConfig {
+    CacheManifestConfig::from_install_artifact_cache_policy(InstallArtifactCachePolicy {
+        retention: InstallArtifactCacheRetention::LatestFull,
+        keep_full_count: 1,
+    })
 }
 
 struct InitInput {

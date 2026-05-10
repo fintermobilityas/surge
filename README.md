@@ -620,14 +620,18 @@ lock:
 
 pack:                             # optional; omitted uses built-in defaults
   delta:
-    strategy: archive-chunked-bsdiff
+    strategy: sparse-file-ops
+    max_chain_length: 8
   compression:
     format: zstd
     level: 3
+  retention:
+    keep_latest_fulls: 2
+    checkpoint_every: 10
 
 cache:                            # optional device-side artifact cache policy
   installArtifacts:
-    retention: release_graph       # release_graph | latest_full | just_installed | none
+    retention: latest_full         # release_graph | latest_full | just_installed | none
     keepFullCount: 1               # full archives retained when retention is latest_full
 
 apps:
@@ -647,13 +651,16 @@ apps:
 ```
 
 Target-level settings override app-level defaults for `icon`, `shortcuts`, `persistentAssets`, `installers`, and `environment`.
-`pack` policy is global and currently controls delta strategy plus compression format/level for `surge pack`.
+`pack` policy is global and controls delta strategy, compression, and remote full fallback retention for `surge pack`/`surge push`.
+The generated `surge init` policy optimizes managed fleets for fast latest-following updates: a node on `N-1` should normally apply the direct `N-1 -> N` delta, while checkpoint fulls remain fallback baselines for recovery and stale installs.
 `cache.installArtifacts` controls package artifacts kept under `.surge-cache/artifacts/` after setup and successful updates:
 
-- `release_graph` is the default. Use it when offline restore to older versions matters; it keeps the local release graph and uses the most disk.
-- `latest_full` keeps the newest `keepFullCount` full archives per RID and drops deltas. Use it when you want a small reinstall/restore cushion without retaining the full graph.
+- `latest_full` is the recommended managed-fleet setting. It keeps the newest `keepFullCount` full archives per RID and drops deltas, so normal updates stay delta-based while each device keeps a compact reinstall/restore cushion.
+- `release_graph` keeps the local release graph plus warm full checkpoints. Use it when offline restore to older versions matters; it uses the most disk.
 - `just_installed` keeps only the installed full archive when that archive is already cached. Use it when full-update reinstall warmth is useful but disk should stay tight. Delta-only updates do not synthesize a new full archive just to warm this cache.
 - `none` keeps no package artifacts after a successful update. Use it when optimizing for minimum disk usage and accepting that restore/reinstall downloads from storage again.
+
+Use `surge compact` after rollout convergence, or for deliberate recovery/cleanup, when you want to prune old remote artifacts. Avoid making compaction the immediate default rollout step for a fleet that is still catching up.
 
 ### Architecture
 

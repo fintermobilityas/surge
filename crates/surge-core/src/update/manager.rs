@@ -1054,6 +1054,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_latest_following_node_uses_delta_after_many_checkpoint_releases() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("store");
+        let app_id = "test-app";
+        std::fs::create_dir_all(&store_root).unwrap();
+
+        let rid = current_rid();
+        let os = current_os_label_for_tests();
+        let mut releases = Vec::new();
+        for minor in 1..=100 {
+            let version = format!("1.{minor}.0");
+            let mut release = make_entry(&version, "stable", &os, &rid);
+            release.full_filename = format!("{app_id}-{version}-{rid}-full.tar.zst");
+            release.full_size = 10_000;
+            release.full_sha256 = format!("full-sha-{minor}");
+            release.is_genesis = minor == 1;
+
+            if minor == 1 {
+                release.set_primary_delta(None);
+            } else {
+                let previous_version = format!("1.{}.0", minor - 1);
+                release.set_primary_delta(Some(DeltaArtifact::sparse_file_ops_zstd(
+                    "primary",
+                    &previous_version,
+                    &format!("{app_id}-{version}-{rid}-delta.tar.zst"),
+                    100,
+                    &format!("delta-sha-{minor}"),
+                )));
+            }
+
+            releases.push(release);
+        }
+
+        let index = ReleaseIndex {
+            app_id: app_id.to_string(),
+            releases,
+            ..ReleaseIndex::default()
+        };
+        write_app_scoped_release_index(&store_root, app_id, &index);
+
+        let ctx = Arc::new(Context::new());
+        ctx.set_storage(
+            StorageProvider::Filesystem,
+            store_root.to_str().unwrap(),
+            "",
+            "",
+            "",
+            "",
+        );
+
+        let mut manager = UpdateManager::new(ctx, app_id, "1.99.0", "stable", tmp.path().to_str().unwrap()).unwrap();
+        let info = manager.check_for_updates().await.unwrap().unwrap();
+        assert!(info.delta_available);
+        assert_eq!(info.apply_strategy, ApplyStrategy::Delta);
+        assert_eq!(info.latest_version, "1.100.0");
+        assert_eq!(info.apply_releases.len(), 1);
+        let delta = info.apply_releases[0]
+            .selected_delta()
+            .expect("latest release should keep direct delta");
+        assert_eq!(delta.from_version, "1.99.0");
+        assert_eq!(delta.size, 100);
+        assert_eq!(info.download_size, 100);
+    }
+
+    #[tokio::test]
     async fn test_check_for_updates_falls_back_to_full_for_unsupported_descriptor() {
         let tmp = tempfile::tempdir().unwrap();
         let store_root = tmp.path().join("store");

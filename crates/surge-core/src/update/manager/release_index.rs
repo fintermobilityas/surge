@@ -81,28 +81,47 @@ fn app_scoped_prefix(base_prefix: &str, app_id: &str) -> Option<String> {
 }
 
 pub(super) fn resolve_update_info(manager: &mut UpdateManager, index: ReleaseIndex) -> Result<Option<UpdateInfo>> {
-    let current_rid = current_rid();
-    let current_os = normalize_os_label(current_rid.split('-').next().unwrap_or_default());
+    let planned = plan_update_from_index(
+        &index,
+        &manager.app_id,
+        &manager.current_version,
+        &manager.channel,
+        None,
+        &current_rid(),
+    )?;
+    manager.cached_index = Some(index);
+    Ok(planned)
+}
 
-    if !index.app_id.is_empty() && index.app_id != manager.app_id {
+pub fn plan_update_from_index(
+    index: &ReleaseIndex,
+    app_id: &str,
+    current_version: &str,
+    channel: &str,
+    target_version: Option<&str>,
+    target_rid: &str,
+) -> Result<Option<UpdateInfo>> {
+    let current_os = normalize_os_label(target_rid.split('-').next().unwrap_or_default());
+
+    if !index.app_id.is_empty() && index.app_id != app_id {
         return Err(SurgeError::Update(format!(
             "Release index app_id '{}' does not match requested app '{}'",
-            index.app_id, manager.app_id
+            index.app_id, app_id
         )));
     }
 
     let mut compatible_index = index.clone();
     compatible_index.releases.retain(|release| {
-        release.channels.iter().any(|channel| channel == &manager.channel)
-            && compare_versions(&release.version, &manager.current_version) == Ordering::Greater
-            && release_matches_rid(release, &current_rid)
+        release.channels.iter().any(|candidate| candidate == channel)
+            && compare_versions(&release.version, current_version) == Ordering::Greater
+            && target_version.is_none_or(|target| compare_versions(&release.version, target) != Ordering::Greater)
+            && release_matches_rid(release, target_rid)
             && release_matches_os(release, &current_os)
     });
 
-    let newer = get_releases_newer_than(&compatible_index, &manager.current_version, &manager.channel);
+    let newer = get_releases_newer_than(&compatible_index, current_version, channel);
     if newer.is_empty() {
         debug!("No updates available");
-        manager.cached_index = Some(index);
         return Ok(None);
     }
 
@@ -111,31 +130,32 @@ pub(super) fn resolve_update_info(manager: &mut UpdateManager, index: ReleaseInd
         .map(|release| (*release).clone())
         .ok_or_else(|| SurgeError::Update("No latest release found".to_string()))?;
     let latest_version = latest.version.clone();
-    let delta_chain = get_delta_chain(
-        &compatible_index,
-        &manager.current_version,
-        &latest_version,
-        &manager.channel,
-    );
+    if let Some(target_version) = target_version.map(str::trim).filter(|value| !value.is_empty())
+        && latest_version != target_version
+    {
+        return Ok(None);
+    }
+
+    let delta_chain = get_delta_chain(&compatible_index, current_version, &latest_version, channel);
 
     let available_releases: Vec<ReleaseEntry> = newer.into_iter().cloned().collect();
-    let resolved_delta_chain = delta_chain
-        .and_then(|chain| resolve_delta_chain_for_current_install(chain.as_slice(), &manager.current_version));
-    let supported_delta_chain = resolved_delta_chain.filter(|chain| {
-        chain
-            .iter()
-            .all(|release| release.selected_delta().is_some_and(|delta| is_supported_delta(&delta)))
-    });
+    let delta_resolution = resolve_supported_delta_chain(delta_chain.as_deref(), current_version, channel, &latest);
 
-    let (apply_releases, apply_strategy, download_size) = if let Some(chain) = supported_delta_chain {
-        let size = chain
-            .iter()
-            .filter_map(ReleaseEntry::selected_delta)
-            .map(|delta| delta.size)
-            .sum();
-        (chain, ApplyStrategy::Delta, size)
-    } else {
-        (vec![latest.clone()], ApplyStrategy::Full, latest.full_size)
+    let (apply_releases, apply_strategy, download_size, fallback_reason) = match delta_resolution {
+        Ok(chain) => {
+            let size = chain
+                .iter()
+                .filter_map(ReleaseEntry::selected_delta)
+                .map(|delta| delta.size)
+                .sum();
+            (chain, ApplyStrategy::Delta, size, None)
+        }
+        Err(reason) => (
+            vec![latest.clone()],
+            ApplyStrategy::Full,
+            latest.full_size,
+            Some(reason),
+        ),
     };
     let delta_available = matches!(apply_strategy, ApplyStrategy::Delta);
 
@@ -147,8 +167,6 @@ pub(super) fn resolve_update_info(manager: &mut UpdateManager, index: ReleaseInd
         "Updates available"
     );
 
-    manager.cached_index = Some(index);
-
     Ok(Some(UpdateInfo {
         available_releases,
         latest_version,
@@ -156,7 +174,42 @@ pub(super) fn resolve_update_info(manager: &mut UpdateManager, index: ReleaseInd
         download_size,
         apply_releases,
         apply_strategy,
+        fallback_reason,
     }))
+}
+
+fn resolve_supported_delta_chain(
+    chain: Option<&[&ReleaseEntry]>,
+    current_version: &str,
+    channel: &str,
+    latest: &ReleaseEntry,
+) -> std::result::Result<Vec<ReleaseEntry>, String> {
+    let chain = chain.ok_or_else(|| {
+        format!(
+            "no contiguous delta chain from v{current_version} to v{} on channel '{channel}'",
+            latest.version
+        )
+    })?;
+    let resolved = resolve_delta_chain_for_current_install(chain, current_version).ok_or_else(|| {
+        format!(
+            "no delta artifact matched the installed version chain from v{current_version} to v{}",
+            latest.version
+        )
+    })?;
+
+    for release in &resolved {
+        let Some(delta) = release.selected_delta() else {
+            return Err(format!("release v{} has no selected delta artifact", release.version));
+        };
+        if !is_supported_delta(&delta) {
+            return Err(format!(
+                "delta '{}' for v{} uses unsupported descriptor (algorithm='{}', format='{}', compression='{}')",
+                delta.filename, release.version, delta.algorithm, delta.patch_format, delta.compression
+            ));
+        }
+    }
+
+    Ok(resolved)
 }
 
 /// For each release in the chain, pick the delta whose `from_version` matches

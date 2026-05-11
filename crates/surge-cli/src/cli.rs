@@ -256,6 +256,10 @@ pub(crate) enum Commands {
         /// Only cache the package locally without installing (used by --stage)
         #[arg(long)]
         stage: bool,
+
+        /// Force the installer path instead of converging an existing install
+        #[arg(long, hide = true)]
+        reinstall: bool,
     },
 
     /// Print SHA-256 hash of a file

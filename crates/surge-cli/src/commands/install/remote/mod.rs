@@ -18,6 +18,7 @@ use super::{
 };
 use crate::commands::pack;
 use serde::Deserialize;
+use surge_core::update::manager::ApplyStrategy;
 
 pub(crate) use self::execution::{
     resolve_tailscale_targets, run_tailscale_streaming, stream_file_to_tailscale_node_with_command,
@@ -32,11 +33,12 @@ pub(crate) use self::staging::{
 pub(crate) use self::state::{
     check_remote_install_state, detect_remote_launch_environment, remote_install_matches,
     remote_staged_installer_matches_release, remote_staged_payload_matches_release, select_remote_installer_mode,
-    select_remote_tailscale_transfer_strategy, should_skip_remote_install, verify_remote_stage_readiness,
+    select_remote_tailscale_transfer_strategy, verify_remote_stage_readiness,
 };
 pub(crate) use self::types::{
-    RemoteHostInstallerAvailability, RemoteInstallerMode, RemoteTailscaleCachedState, RemoteTailscaleOperation,
-    RemoteTailscaleTransferInputs, RemoteTailscaleTransferStrategy, ensure_supported_tailscale_rid,
+    RemoteConvergenceAction, RemoteConvergencePlan, RemoteHostInstallerAvailability, RemoteInstallerMode,
+    RemoteTailscaleCachedState, RemoteTailscaleOperation, RemoteTailscaleTransferInputs,
+    RemoteTailscaleTransferStrategy, ensure_supported_tailscale_rid,
 };
 
 #[cfg(test)]
@@ -51,7 +53,8 @@ pub(crate) use self::staging::{
 #[cfg(test)]
 pub(crate) use self::state::{
     parse_remote_install_state, parse_remote_launch_environment, parse_remote_staged_payload_identity,
-    remote_launch_environment_probe, remote_staged_payload_identity,
+    plan_remote_convergence, remote_launch_environment_probe, remote_staged_payload_identity,
+    should_skip_remote_install,
 };
 #[cfg(test)]
 pub(crate) use self::types::{RemoteInstallState, RemoteLaunchEnvironment, RemotePublishedInstallerPlan};
@@ -80,8 +83,20 @@ pub(super) async fn install_release_via_tailscale(
         release.install_directory.trim()
     };
     let remote_state = check_remote_install_state(ssh_target, install_dir).await;
-    let install_matches = remote_install_matches(remote_state.as_ref(), &release.version, channel);
-    if should_skip_remote_install(install_matches, behavior.force) {
+    let convergence_plan = state::plan_remote_convergence(
+        remote_state.as_ref(),
+        index,
+        app_id,
+        selected_rid,
+        release,
+        channel,
+        storage_config,
+        installer_mode,
+        behavior.force,
+    )?;
+    log_remote_convergence_plan(file_target, app_id, channel, release, &convergence_plan);
+
+    if convergence_plan.action == RemoteConvergenceAction::Skip {
         logline::success(&format!(
             "'{app_id}' v{} ({channel}) is already installed on '{file_target}', skipping.",
             release.version
@@ -89,7 +104,8 @@ pub(super) async fn install_release_via_tailscale(
         return Ok(());
     }
 
-    if install_matches {
+    let install_matches = remote_install_matches(remote_state.as_ref(), &release.version, channel);
+    if install_matches && behavior.force {
         logline::info(&format!(
             "'{app_id}' v{} ({channel}) is already installed on '{file_target}'; reinstalling due to --force.",
             release.version
@@ -103,6 +119,16 @@ pub(super) async fn install_release_via_tailscale(
             remote_state.channel.as_deref().unwrap_or("unknown")
         ));
     }
+
+    if behavior.plan_only {
+        return Ok(());
+    }
+
+    let prefer_update_setup = matches!(
+        convergence_plan.action,
+        RemoteConvergenceAction::Update | RemoteConvergenceAction::RepairMetadata
+    ) && installer_mode == RemoteInstallerMode::Online
+        && !behavior.mode.is_stage();
 
     let launch_env = detect_remote_launch_environment(ssh_target).await;
     if let Some(display) = launch_env.display.as_deref() {
@@ -118,38 +144,45 @@ pub(super) async fn install_release_via_tailscale(
     }
 
     let host_can_build_installer = host_can_build_installer_locally(selected_rid);
-    let has_matching_pre_staged_app_copy_payload =
-        if host_can_build_installer && installer_mode == RemoteInstallerMode::Offline && !behavior.mode.is_stage() {
-            remote_staged_payload_matches_release(ssh_target, app_id, release, channel, storage_config).await?
-        } else {
-            false
-        };
+    let has_matching_pre_staged_app_copy_payload = if !prefer_update_setup
+        && host_can_build_installer
+        && installer_mode == RemoteInstallerMode::Offline
+        && !behavior.mode.is_stage()
+    {
+        remote_staged_payload_matches_release(ssh_target, app_id, release, channel, storage_config).await?
+    } else {
+        false
+    };
     let has_matching_pre_staged_installer_cache =
-        if installer_mode == RemoteInstallerMode::Online && !behavior.mode.is_stage() {
+        if !prefer_update_setup && installer_mode == RemoteInstallerMode::Online && !behavior.mode.is_stage() {
             remote_staged_installer_matches_release(ssh_target, app_id, release, channel, storage_config).await?
         } else {
             false
         };
-    let transfer_strategy = select_remote_tailscale_transfer_strategy(RemoteTailscaleTransferInputs {
-        host_installer_availability: if host_can_build_installer {
-            RemoteHostInstallerAvailability::Available
-        } else {
-            RemoteHostInstallerAvailability::Unavailable
-        },
-        installer_mode,
-        operation: if behavior.mode.is_stage() {
-            RemoteTailscaleOperation::Stage
-        } else {
-            RemoteTailscaleOperation::Install
-        },
-        cached_state: if has_matching_pre_staged_installer_cache {
-            RemoteTailscaleCachedState::InstallerCache
-        } else if has_matching_pre_staged_app_copy_payload {
-            RemoteTailscaleCachedState::AppCopyPayload
-        } else {
-            RemoteTailscaleCachedState::None
-        },
-    });
+    let transfer_strategy = if prefer_update_setup {
+        RemoteTailscaleTransferStrategy::Installer { prefer_published: true }
+    } else {
+        select_remote_tailscale_transfer_strategy(RemoteTailscaleTransferInputs {
+            host_installer_availability: if host_can_build_installer {
+                RemoteHostInstallerAvailability::Available
+            } else {
+                RemoteHostInstallerAvailability::Unavailable
+            },
+            installer_mode,
+            operation: if behavior.mode.is_stage() {
+                RemoteTailscaleOperation::Stage
+            } else {
+                RemoteTailscaleOperation::Install
+            },
+            cached_state: if has_matching_pre_staged_installer_cache {
+                RemoteTailscaleCachedState::InstallerCache
+            } else if has_matching_pre_staged_app_copy_payload {
+                RemoteTailscaleCachedState::AppCopyPayload
+            } else {
+                RemoteTailscaleCachedState::None
+            },
+        })
+    };
     if matches!(transfer_strategy, RemoteTailscaleTransferStrategy::AppCopy) {
         deploy_remote_app_copy_for_tailscale(
             backend,
@@ -171,6 +204,8 @@ pub(super) async fn install_release_via_tailscale(
         .await?;
         if !behavior.mode.is_stage() {
             warn_if_remote_stage_cleanup_fails(ssh_target, app_id, release).await;
+            verify_remote_runtime_after_install(ssh_target, file_target, install_dir, release, channel, storage_config)
+                .await?;
         }
         if behavior.mode.is_stage() {
             logline::success(&format!(
@@ -185,6 +220,8 @@ pub(super) async fn install_release_via_tailscale(
 
     if matches!(transfer_strategy, RemoteTailscaleTransferStrategy::StagedInstallerCache) {
         run_remote_staged_installer_setup(ssh_target, file_target, app_id, release, behavior.no_start).await?;
+        verify_remote_runtime_after_install(ssh_target, file_target, install_dir, release, channel, storage_config)
+            .await?;
         logline::success(&format!("Installed '{app_id}' on tailscale node '{file_target}'."));
         return Ok(());
     }
@@ -296,7 +333,13 @@ pub(super) async fn install_release_via_tailscale(
 
     let no_start_flag = if behavior.no_start { " --no-start" } else { "" };
     let stage_flag = if behavior.mode.is_stage() { " --stage" } else { "" };
-    let run_cmd = format!("/tmp/.surge-installer{no_start_flag}{stage_flag} && rm -f /tmp/.surge-installer");
+    let reinstall_flag = if matches!(convergence_plan.action, RemoteConvergenceAction::Reinstall) || behavior.force {
+        " --reinstall"
+    } else {
+        ""
+    };
+    let run_cmd =
+        format!("/tmp/.surge-installer{no_start_flag}{stage_flag}{reinstall_flag} && rm -f /tmp/.surge-installer");
     let ssh_command = format!("sh -lc {}", shell_single_quote(&run_cmd));
     if behavior.mode.is_stage() {
         logline::info(&format!("Running installer in stage mode on '{file_target}'..."));
@@ -306,6 +349,8 @@ pub(super) async fn install_release_via_tailscale(
     run_tailscale_streaming(&["ssh", ssh_target, ssh_command.as_str()], "remote").await?;
     if !behavior.mode.is_stage() {
         warn_if_remote_stage_cleanup_fails(ssh_target, app_id, release).await;
+        verify_remote_runtime_after_install(ssh_target, file_target, install_dir, release, channel, storage_config)
+            .await?;
     }
     if behavior.mode.is_stage() {
         logline::success(&format!(
@@ -317,4 +362,130 @@ pub(super) async fn install_release_via_tailscale(
     }
 
     Ok(())
+}
+
+fn log_remote_convergence_plan(
+    file_target: &str,
+    app_id: &str,
+    channel: &str,
+    release: &ReleaseEntry,
+    plan: &RemoteConvergencePlan,
+) {
+    let installed = plan.installed_version.as_deref().unwrap_or("<none>");
+    logline::info(&format!(
+        "Remote install plan for '{app_id}' on '{file_target}': {} ({} -> {}, channel '{channel}').",
+        remote_action_label(plan.action),
+        installed,
+        plan.target_version
+    ));
+
+    match plan.action {
+        RemoteConvergenceAction::Update => {
+            if let Some(update) = &plan.update_info {
+                let artifacts = selected_update_artifact_labels(update);
+                logline::info(&format!(
+                    "Selected update artifacts: {} ({} total), apply strategy: {}.",
+                    artifacts.join(", "),
+                    crate::formatters::format_bytes(u64::try_from(update.download_size.max(0)).unwrap_or(0)),
+                    update_strategy_label(update.apply_strategy)
+                ));
+                if let Some(reason) = &update.fallback_reason {
+                    logline::warn(&format!("Delta update unavailable; full package selected: {reason}"));
+                }
+            } else if let Some(reason) = &plan.reason {
+                logline::warn(&format!(
+                    "Update plan unavailable; full install transfer will be used: {reason}"
+                ));
+            }
+        }
+        RemoteConvergenceAction::CleanInstall | RemoteConvergenceAction::Reinstall => {
+            logline::info(&format!(
+                "Selected install artifact: {} ({}), transfer/apply strategy: full installer.",
+                release.full_filename,
+                crate::formatters::format_bytes(u64::try_from(release.full_size.max(0)).unwrap_or(0))
+            ));
+            if let Some(reason) = &plan.reason {
+                logline::info(&format!("Plan reason: {reason}"));
+            }
+        }
+        RemoteConvergenceAction::RepairMetadata => {
+            logline::info("Selected action only repairs runtime metadata; no package artifact should be downloaded.");
+        }
+        RemoteConvergenceAction::Skip => {}
+    }
+}
+
+fn selected_update_artifact_labels(update: &surge_core::update::manager::UpdateInfo) -> Vec<String> {
+    if matches!(update.apply_strategy, ApplyStrategy::Delta) {
+        update
+            .apply_releases
+            .iter()
+            .filter_map(ReleaseEntry::selected_delta)
+            .map(|delta| {
+                format!(
+                    "{} ({})",
+                    delta.filename,
+                    crate::formatters::format_bytes(u64::try_from(delta.size.max(0)).unwrap_or(0))
+                )
+            })
+            .collect()
+    } else {
+        update
+            .apply_releases
+            .last()
+            .map(|release| {
+                vec![format!(
+                    "{} ({})",
+                    release.full_filename,
+                    crate::formatters::format_bytes(u64::try_from(release.full_size.max(0)).unwrap_or(0))
+                )]
+            })
+            .unwrap_or_default()
+    }
+}
+
+fn remote_action_label(action: RemoteConvergenceAction) -> &'static str {
+    match action {
+        RemoteConvergenceAction::CleanInstall => "clean install",
+        RemoteConvergenceAction::Update => "update existing install",
+        RemoteConvergenceAction::RepairMetadata => "repair runtime metadata",
+        RemoteConvergenceAction::Reinstall => "reinstall",
+        RemoteConvergenceAction::Skip => "skip",
+    }
+}
+
+fn update_strategy_label(strategy: ApplyStrategy) -> &'static str {
+    match strategy {
+        ApplyStrategy::Full => "full package",
+        ApplyStrategy::Delta => "delta",
+    }
+}
+
+async fn verify_remote_runtime_after_install(
+    ssh_target: &str,
+    file_target: &str,
+    install_dir: &str,
+    release: &ReleaseEntry,
+    channel: &str,
+    storage_config: &surge_core::context::StorageConfig,
+) -> Result<()> {
+    let state = check_remote_install_state(ssh_target, install_dir)
+        .await
+        .ok_or_else(|| {
+            SurgeError::Update(format!(
+                "Remote runtime verification failed on '{file_target}': no runtime metadata found"
+            ))
+        })?;
+    if state.version.trim() == release.version.trim() && state.metadata_matches(channel, storage_config) {
+        logline::success(&format!(
+            "Verified remote runtime on '{file_target}': v{} ({channel}).",
+            release.version
+        ));
+        return Ok(());
+    }
+
+    Err(SurgeError::Update(format!(
+        "Remote runtime verification failed on '{file_target}': found v{} channel {:?}, expected v{} channel '{}'.",
+        state.version, state.channel, release.version, channel
+    )))
 }

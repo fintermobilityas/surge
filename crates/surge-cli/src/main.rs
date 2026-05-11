@@ -40,7 +40,7 @@ fn main() -> ExitCode {
                         return ExitCode::FAILURE;
                     }
                 };
-                return match rt.block_on(commands::setup::execute(&installer_dir, false, false)) {
+                return match rt.block_on(commands::setup::execute(&installer_dir, false, false, false)) {
                     Ok(()) => ExitCode::SUCCESS,
                     Err(e) => {
                         logline::error_chain(&e);
@@ -255,7 +255,12 @@ async fn run(cli: Cli) -> surge_core::error::Result<()> {
             }
         }
 
-        Commands::Setup { dir, no_start, stage } => commands::setup::execute(&dir, no_start, stage).await,
+        Commands::Setup {
+            dir,
+            no_start,
+            stage,
+            reinstall,
+        } => commands::setup::execute(&dir, no_start, stage, reinstall).await,
 
         Commands::Sha256 { file } => {
             let hash = surge_core::crypto::sha256::sha256_hex_file(&file)?;

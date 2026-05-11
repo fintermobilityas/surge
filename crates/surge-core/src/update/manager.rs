@@ -33,6 +33,7 @@ use self::apply::materialize_update_payload;
 use self::artifacts::prepare_update_artifacts;
 pub use self::progress::ProgressInfo;
 use self::progress::emit_progress;
+pub use self::release_index::plan_update_from_index;
 use self::release_index::{load_release_index as load_release_index_impl, resolve_update_info};
 
 /// Strategy used when applying an update.
@@ -57,6 +58,8 @@ pub struct UpdateInfo {
     pub apply_releases: Vec<ReleaseEntry>,
     /// Which strategy is used for this update.
     pub apply_strategy: ApplyStrategy,
+    /// Reason a full update was selected when a delta path was unavailable.
+    pub fallback_reason: Option<String>,
 }
 
 const DEFAULT_RELEASE_RETENTION_LIMIT: usize = 1;
@@ -598,6 +601,7 @@ mod tests {
             download_size: 1024,
             apply_releases: vec![],
             apply_strategy: ApplyStrategy::Full,
+            fallback_reason: Some("no delta chain".to_string()),
         };
         assert_eq!(info.latest_version, "2.0.0");
         assert!(!info.delta_available);

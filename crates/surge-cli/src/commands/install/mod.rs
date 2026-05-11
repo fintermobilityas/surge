@@ -367,12 +367,35 @@ pub async fn execute(
         match &install_target {
             InstallTarget::Local => {
                 logline::warn("Plan only mode: no download performed. Remove --plan-only to fetch the package.");
+                return Ok(());
             }
-            InstallTarget::Tailscale { file_target, .. } => logline::warn(&format!(
-                "Plan only mode: no transfer performed. Remove --plan-only to download and copy package to {file_target}."
-            )),
+            InstallTarget::Tailscale {
+                ssh_target,
+                file_target,
+            } => {
+                install_release_via_tailscale(
+                    manifest.as_ref(),
+                    &*backend,
+                    &index,
+                    download_dir,
+                    ssh_target,
+                    file_target,
+                    &app_id,
+                    &selected_rid,
+                    &rid_candidates,
+                    release,
+                    &channel,
+                    &storage_config,
+                    full_filename,
+                    behavior,
+                )
+                .await?;
+                logline::warn(&format!(
+                    "Plan only mode: no transfer performed. Remove --plan-only to apply the selected plan to {file_target}."
+                ));
+                return Ok(());
+            }
         }
-        return Ok(());
     }
 
     match &install_target {
@@ -430,13 +453,13 @@ mod tests {
     };
     use super::releases::{ArchiveAcquisition, download_release_archive, select_release};
     use super::remote::{
-        RemoteHostInstallerAvailability, RemoteInstallState, RemoteInstallerMode, RemoteLaunchEnvironment,
-        RemotePublishedInstallerPlan, RemoteTailscaleCachedState, RemoteTailscaleOperation,
+        RemoteConvergenceAction, RemoteHostInstallerAvailability, RemoteInstallState, RemoteInstallerMode,
+        RemoteLaunchEnvironment, RemotePublishedInstallerPlan, RemoteTailscaleCachedState, RemoteTailscaleOperation,
         RemoteTailscaleTransferInputs, RemoteTailscaleTransferStrategy, build_remote_app_copy_activation_script,
         build_remote_installer_manifest, build_remote_paths_exist_probe, build_remote_stage_cleanup_command,
         build_remote_staged_installer_setup_command, build_remote_stop_supervisor_command,
         missing_remote_installer_error, parse_remote_install_state, parse_remote_launch_environment,
-        parse_remote_staged_payload_identity, plan_remote_published_installer,
+        parse_remote_staged_payload_identity, plan_remote_convergence, plan_remote_published_installer,
         plan_remote_published_installer_without_manifest, published_installer_public_url, remote_install_matches,
         remote_launch_environment_probe, remote_staged_payload_identity, select_latest_remote_legacy_app_dir,
         select_remote_installer_mode, select_remote_tailscale_transfer_strategy, should_skip_remote_install,
@@ -498,6 +521,17 @@ mod tests {
             provider: Some(surge_core::context::StorageProvider::Filesystem),
             bucket: bucket.to_string(),
             ..surge_core::context::StorageConfig::default()
+        }
+    }
+
+    fn remote_state(version: &str, channel: &str, storage: &surge_core::context::StorageConfig) -> RemoteInstallState {
+        RemoteInstallState {
+            version: version.to_string(),
+            channel: Some(channel.to_string()),
+            storage_provider: Some(core_install::storage_provider_manifest_name(storage.provider).to_string()),
+            storage_bucket: Some(storage.bucket.clone()),
+            storage_region: Some(storage.region.clone()),
+            storage_endpoint: Some(storage.endpoint.clone()),
         }
     }
 
@@ -2070,10 +2104,14 @@ apps:
 
     #[test]
     fn parse_remote_install_state_extracts_version_and_channel() {
-        let state = parse_remote_install_state("version=1.2.3\nchannel=production\n")
-            .expect("remote install state should parse");
+        let state = parse_remote_install_state(
+            "version=1.2.3\nchannel=production\nprovider=filesystem\nbucket=/srv/releases\nregion=\nendpoint=\n",
+        )
+        .expect("remote install state should parse");
         assert_eq!(state.version, "1.2.3");
         assert_eq!(state.channel.as_deref(), Some("production"));
+        assert_eq!(state.storage_provider.as_deref(), Some("filesystem"));
+        assert_eq!(state.storage_bucket.as_deref(), Some("/srv/releases"));
     }
 
     #[test]
@@ -2086,10 +2124,18 @@ apps:
         let production = RemoteInstallState {
             version: "1.2.3".to_string(),
             channel: Some("production".to_string()),
+            storage_provider: None,
+            storage_bucket: None,
+            storage_region: None,
+            storage_endpoint: None,
         };
         let test = RemoteInstallState {
             version: "1.2.3".to_string(),
             channel: Some("test".to_string()),
+            storage_provider: None,
+            storage_bucket: None,
+            storage_region: None,
+            storage_endpoint: None,
         };
 
         assert!(remote_install_matches(Some(&production), "1.2.3", "production"));
@@ -2103,11 +2149,196 @@ apps:
         let remote_state = RemoteInstallState {
             version: "1.2.3".to_string(),
             channel: Some("test".to_string()),
+            storage_provider: None,
+            storage_bucket: None,
+            storage_region: None,
+            storage_endpoint: None,
         };
 
         let install_matches = remote_install_matches(Some(&remote_state), "1.2.3", "test");
 
         assert!(should_skip_remote_install(install_matches, false));
         assert!(!should_skip_remote_install(install_matches, true));
+    }
+
+    #[test]
+    fn remote_convergence_plan_uses_delta_for_stale_existing_install() {
+        let storage = storage_config("/srv/releases");
+        let mut target = release("1.2.0", "test", "linux-x64", "demo-1.2.0-linux-x64-full.tar.zst");
+        target.full_size = 1_000;
+        target.set_primary_delta(Some(DeltaArtifact::sparse_file_ops_zstd(
+            "primary",
+            "1.0.0",
+            "demo-1.2.0-linux-x64-delta.tar.zst",
+            123,
+            "delta-sha",
+        )));
+        let index = ReleaseIndex {
+            app_id: "demo".to_string(),
+            releases: vec![target.clone()],
+            ..ReleaseIndex::default()
+        };
+        let state = remote_state("1.0.0", "test", &storage);
+
+        let plan = plan_remote_convergence(
+            Some(&state),
+            &index,
+            "demo",
+            "linux-x64",
+            &target,
+            "test",
+            &storage,
+            RemoteInstallerMode::Online,
+            false,
+        )
+        .expect("plan should resolve");
+
+        assert_eq!(plan.action, RemoteConvergenceAction::Update);
+        assert!(plan.reason.is_none());
+        let update = plan.update_info.expect("update info should exist");
+        assert_eq!(update.apply_strategy, surge_core::update::manager::ApplyStrategy::Delta);
+        assert_eq!(update.download_size, 123);
+    }
+
+    #[test]
+    fn remote_convergence_plan_skips_current_install_unless_forced() {
+        let storage = storage_config("/srv/releases");
+        let target = release("1.2.0", "test", "linux-x64", "demo-1.2.0-linux-x64-full.tar.zst");
+        let index = ReleaseIndex {
+            app_id: "demo".to_string(),
+            releases: vec![target.clone()],
+            ..ReleaseIndex::default()
+        };
+        let state = remote_state("1.2.0", "test", &storage);
+
+        let plan = plan_remote_convergence(
+            Some(&state),
+            &index,
+            "demo",
+            "linux-x64",
+            &target,
+            "test",
+            &storage,
+            RemoteInstallerMode::Online,
+            false,
+        )
+        .expect("plan should resolve");
+        assert_eq!(plan.action, RemoteConvergenceAction::Skip);
+
+        let forced = plan_remote_convergence(
+            Some(&state),
+            &index,
+            "demo",
+            "linux-x64",
+            &target,
+            "test",
+            &storage,
+            RemoteInstallerMode::Online,
+            true,
+        )
+        .expect("forced plan should resolve");
+        assert_eq!(forced.action, RemoteConvergenceAction::Reinstall);
+    }
+
+    #[test]
+    fn remote_convergence_plan_uses_clean_install_when_no_install_exists() {
+        let storage = storage_config("/srv/releases");
+        let target = release("1.2.0", "test", "linux-x64", "demo-1.2.0-linux-x64-full.tar.zst");
+        let index = ReleaseIndex {
+            app_id: "demo".to_string(),
+            releases: vec![target.clone()],
+            ..ReleaseIndex::default()
+        };
+
+        let plan = plan_remote_convergence(
+            None,
+            &index,
+            "demo",
+            "linux-x64",
+            &target,
+            "test",
+            &storage,
+            RemoteInstallerMode::Online,
+            false,
+        )
+        .expect("plan should resolve");
+
+        assert_eq!(plan.action, RemoteConvergenceAction::CleanInstall);
+    }
+
+    #[test]
+    fn remote_convergence_plan_repairs_current_install_metadata() {
+        let storage = storage_config("/srv/releases");
+        let target = release("1.2.0", "test", "linux-x64", "demo-1.2.0-linux-x64-full.tar.zst");
+        let index = ReleaseIndex {
+            app_id: "demo".to_string(),
+            releases: vec![target.clone()],
+            ..ReleaseIndex::default()
+        };
+        let mut state = remote_state("1.2.0", "test", &storage);
+        state.storage_bucket = Some("/old/releases".to_string());
+
+        let plan = plan_remote_convergence(
+            Some(&state),
+            &index,
+            "demo",
+            "linux-x64",
+            &target,
+            "test",
+            &storage,
+            RemoteInstallerMode::Online,
+            false,
+        )
+        .expect("plan should resolve");
+
+        assert_eq!(plan.action, RemoteConvergenceAction::RepairMetadata);
+    }
+
+    #[test]
+    fn remote_convergence_plan_falls_back_to_full_when_delta_is_unsupported() {
+        let storage = storage_config("/srv/releases");
+        let mut target = release("1.2.0", "test", "linux-x64", "demo-1.2.0-linux-x64-full.tar.zst");
+        target.full_size = 2_000;
+        target.deltas = vec![DeltaArtifact {
+            id: "primary".to_string(),
+            from_version: "1.0.0".to_string(),
+            algorithm: "unsupported".to_string(),
+            patch_format: "unknown".to_string(),
+            compression: "zstd".to_string(),
+            filename: "demo-1.2.0-linux-x64-delta.tar.zst".to_string(),
+            size: 100,
+            sha256: "delta-sha".to_string(),
+        }];
+        target.preferred_delta_id = "primary".to_string();
+        let index = ReleaseIndex {
+            app_id: "demo".to_string(),
+            releases: vec![target.clone()],
+            ..ReleaseIndex::default()
+        };
+        let state = remote_state("1.0.0", "test", &storage);
+
+        let plan = plan_remote_convergence(
+            Some(&state),
+            &index,
+            "demo",
+            "linux-x64",
+            &target,
+            "test",
+            &storage,
+            RemoteInstallerMode::Online,
+            false,
+        )
+        .expect("plan should resolve");
+
+        assert_eq!(plan.action, RemoteConvergenceAction::Update);
+        let update = plan.update_info.expect("update info should exist");
+        assert_eq!(update.apply_strategy, surge_core::update::manager::ApplyStrategy::Full);
+        assert_eq!(update.download_size, 2_000);
+        assert!(
+            update
+                .fallback_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("unsupported descriptor"))
+        );
     }
 }

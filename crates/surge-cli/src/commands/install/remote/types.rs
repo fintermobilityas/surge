@@ -1,5 +1,8 @@
-use super::{Deserialize, Result, Serialize, SurgeError, infer_os_from_rid, logline};
+use super::{Deserialize, ReleaseEntry, Result, Serialize, SurgeError, infer_os_from_rid, logline};
 use surge_core::config::manifest::CacheManifestConfig;
+use surge_core::context::StorageConfig;
+use surge_core::install::storage_provider_manifest_name;
+use surge_core::update::manager::UpdateInfo;
 
 pub(crate) fn ensure_supported_tailscale_rid(rid: &str) -> Result<()> {
     match infer_os_from_rid(rid) {
@@ -90,6 +93,58 @@ pub(crate) struct RemoteTailscaleTransferInputs {
 pub(crate) struct RemoteInstallState {
     pub(crate) version: String,
     pub(crate) channel: Option<String>,
+    pub(crate) storage_provider: Option<String>,
+    pub(crate) storage_bucket: Option<String>,
+    pub(crate) storage_region: Option<String>,
+    pub(crate) storage_endpoint: Option<String>,
+}
+
+impl RemoteInstallState {
+    pub(crate) fn metadata_matches(&self, expected_channel: &str, storage_config: &StorageConfig) -> bool {
+        self.channel
+            .as_deref()
+            .is_some_and(|value| value.trim() == expected_channel)
+            && self
+                .storage_provider
+                .as_deref()
+                .is_some_and(|value| value.trim() == storage_provider_manifest_name(storage_config.provider))
+            && self
+                .storage_bucket
+                .as_deref()
+                .is_some_and(|value| value.trim() == storage_config.bucket.trim())
+            && self.storage_region.as_deref().unwrap_or("").trim() == storage_config.region.trim()
+            && self.storage_endpoint.as_deref().unwrap_or("").trim() == storage_config.endpoint.trim()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoteConvergenceAction {
+    CleanInstall,
+    Update,
+    RepairMetadata,
+    Reinstall,
+    Skip,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RemoteConvergencePlan {
+    pub(crate) action: RemoteConvergenceAction,
+    pub(crate) installed_version: Option<String>,
+    pub(crate) target_version: String,
+    pub(crate) update_info: Option<UpdateInfo>,
+    pub(crate) reason: Option<String>,
+}
+
+impl RemoteConvergencePlan {
+    pub(crate) fn clean_install(release: &ReleaseEntry) -> Self {
+        Self {
+            action: RemoteConvergenceAction::CleanInstall,
+            installed_version: None,
+            target_version: release.version.clone(),
+            update_info: None,
+            reason: Some("no existing install was detected".to_string()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

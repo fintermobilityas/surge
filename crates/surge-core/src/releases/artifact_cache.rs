@@ -1,9 +1,12 @@
 use std::collections::BTreeSet;
+use std::fs::{File, OpenOptions};
 use std::path::{Component, Path, PathBuf};
 
 use crate::crypto::sha256::sha256_hex_file;
 use crate::error::{Result, SurgeError};
+use crate::platform::fs::atomic_rename;
 use crate::storage::{StorageBackend, TransferProgress};
+use fs2::FileExt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheFetchOutcome {
@@ -58,6 +61,7 @@ pub async fn fetch_or_reuse_file(
     progress: Option<&TransferProgress<'_>>,
 ) -> Result<CacheFetchOutcome> {
     let expected = expected_sha256.trim();
+    let _lock = CacheFileLock::acquire(destination).await?;
     let had_local = destination.is_file();
     if !expected.is_empty() && had_local && sha256_matches_file(destination, expected)? {
         return Ok(CacheFetchOutcome::ReusedLocal);
@@ -66,18 +70,97 @@ pub async fn fetch_or_reuse_file(
     if let Some(parent) = destination.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    storage.download_to_file(key, destination, progress).await?;
+    let tmp_path = temporary_download_path(destination)?;
+    let download_result = storage.download_to_file(key, &tmp_path, progress).await;
+    if let Err(error) = download_result {
+        remove_file_if_exists(&tmp_path);
+        return Err(error);
+    }
 
-    if !expected.is_empty() && !sha256_matches_file(destination, expected)? {
+    if !expected.is_empty() && !sha256_matches_file(&tmp_path, expected)? {
+        remove_file_if_exists(&tmp_path);
         return Err(SurgeError::Storage(format!(
             "SHA-256 mismatch for '{key}' after download"
         )));
     }
 
+    atomic_rename(&tmp_path, destination)?;
+
     if had_local && !expected.is_empty() {
         Ok(CacheFetchOutcome::DownloadedAfterInvalidLocal)
     } else {
         Ok(CacheFetchOutcome::DownloadedFresh)
+    }
+}
+
+struct CacheFileLock {
+    #[allow(dead_code)]
+    file: File,
+}
+
+impl CacheFileLock {
+    async fn acquire(destination: &Path) -> Result<Self> {
+        let parent = destination.parent().ok_or_else(|| {
+            SurgeError::Storage(format!(
+                "Cannot lock cache path without parent directory: {}",
+                destination.display()
+            ))
+        })?;
+        std::fs::create_dir_all(parent)?;
+        let lock_path = cache_lock_path(destination);
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|e| SurgeError::Storage(format!("Failed to open cache lock '{}': {e}", lock_path.display())))?;
+        let file = tokio::task::spawn_blocking(move || {
+            lock_cache_file(&file, &lock_path)?;
+            Ok::<File, SurgeError>(file)
+        })
+        .await
+        .map_err(|e| SurgeError::Storage(format!("Failed to join cache lock task: {e}")))??;
+        Ok(Self { file })
+    }
+}
+
+fn lock_cache_file(file: &File, lock_path: &Path) -> Result<()> {
+    file.lock_exclusive()
+        .map_err(|e| SurgeError::Storage(format!("Failed to lock cache file '{}': {e}", lock_path.display())))
+}
+
+fn cache_lock_path(destination: &Path) -> PathBuf {
+    let file_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("artifact");
+    destination.with_file_name(format!(".{file_name}.lock"))
+}
+
+fn temporary_download_path(destination: &Path) -> Result<PathBuf> {
+    let parent = destination.parent().ok_or_else(|| {
+        SurgeError::Storage(format!(
+            "Cannot create temporary cache path without parent directory: {}",
+            destination.display()
+        ))
+    })?;
+    let file_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("artifact");
+    let temp = tempfile::Builder::new()
+        .prefix(&format!(".{file_name}."))
+        .suffix(".tmp")
+        .tempfile_in(parent)?;
+    let path = temp.path().to_path_buf();
+    drop(temp);
+    Ok(path)
+}
+
+fn remove_file_if_exists(path: &Path) {
+    if path.exists() {
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -156,7 +239,68 @@ fn prune_empty_directories(dir: &Path, root: &Path) -> Result<bool> {
 mod tests {
     use super::*;
     use crate::crypto::sha256::sha256_hex;
-    use crate::storage::filesystem::FilesystemBackend;
+    use crate::storage::{ListResult, ObjectInfo, TransferProgress, filesystem::FilesystemBackend};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+    use std::time::Duration;
+
+    struct SlowBackend {
+        payload: Vec<u8>,
+        downloads: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl StorageBackend for SlowBackend {
+        async fn put_object(&self, _key: &str, _data: &[u8], _content_type: &str) -> Result<()> {
+            unimplemented!("test backend is read-only")
+        }
+
+        async fn get_object(&self, _key: &str) -> Result<Vec<u8>> {
+            unimplemented!("test backend only supports file downloads")
+        }
+
+        async fn head_object(&self, _key: &str) -> Result<ObjectInfo> {
+            Ok(ObjectInfo {
+                size: i64::try_from(self.payload.len()).expect("payload length should fit i64"),
+                ..ObjectInfo::default()
+            })
+        }
+
+        async fn delete_object(&self, _key: &str) -> Result<()> {
+            unimplemented!("test backend is read-only")
+        }
+
+        async fn list_objects(&self, _prefix: &str, _marker: Option<&str>, _max_keys: i32) -> Result<ListResult> {
+            Ok(ListResult::default())
+        }
+
+        async fn download_to_file(
+            &self,
+            _key: &str,
+            dest: &Path,
+            progress: Option<&TransferProgress<'_>>,
+        ) -> Result<()> {
+            self.downloads.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::fs::write(dest, &self.payload).await?;
+            if let Some(progress) = progress {
+                let len = self.payload.len() as u64;
+                progress(len, len);
+            }
+            Ok(())
+        }
+
+        async fn upload_from_file(
+            &self,
+            _key: &str,
+            _src: &Path,
+            _progress: Option<&TransferProgress<'_>>,
+        ) -> Result<()> {
+            unimplemented!("test backend is read-only")
+        }
+    }
 
     #[test]
     fn cache_path_for_key_rejects_parent_traversal() {
@@ -239,6 +383,94 @@ mod tests {
 
         assert_eq!(outcome, CacheFetchOutcome::DownloadedFresh);
         assert_eq!(std::fs::read(&local).expect("read local"), b"remote-payload");
+    }
+
+    #[tokio::test]
+    async fn fetch_or_reuse_file_serializes_concurrent_writes_to_same_cache_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let destination = tmp.path().join("artifact.bin");
+        let payload = b"remote-payload".to_vec();
+        let expected_sha = sha256_hex(&payload);
+        let backend = Arc::new(SlowBackend {
+            payload,
+            downloads: AtomicUsize::new(0),
+        });
+
+        let first_backend = Arc::clone(&backend);
+        let first_destination = destination.clone();
+        let first_sha = expected_sha.clone();
+        let first = tokio::spawn(async move {
+            fetch_or_reuse_file(
+                first_backend.as_ref(),
+                "artifact.bin",
+                &first_destination,
+                &first_sha,
+                None,
+            )
+            .await
+        });
+
+        let second_backend = Arc::clone(&backend);
+        let second_destination = destination.clone();
+        let second_sha = expected_sha.clone();
+        let second = tokio::spawn(async move {
+            fetch_or_reuse_file(
+                second_backend.as_ref(),
+                "artifact.bin",
+                &second_destination,
+                &second_sha,
+                None,
+            )
+            .await
+        });
+
+        let outcomes = (first.await.expect("first task"), second.await.expect("second task"));
+        assert!(matches!(
+            outcomes,
+            (
+                Ok(CacheFetchOutcome::DownloadedFresh),
+                Ok(CacheFetchOutcome::ReusedLocal)
+            ) | (
+                Ok(CacheFetchOutcome::ReusedLocal),
+                Ok(CacheFetchOutcome::DownloadedFresh)
+            )
+        ));
+        assert_eq!(backend.downloads.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            std::fs::read(destination).expect("cache file should exist"),
+            b"remote-payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_or_reuse_file_does_not_expose_partial_download_at_final_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let destination = tmp.path().join("artifact.bin");
+        let payload = b"remote-payload".to_vec();
+        let expected_sha = sha256_hex(&payload);
+        let backend = SlowBackend {
+            payload,
+            downloads: AtomicUsize::new(0),
+        };
+        let observed_final_path_during_download = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&observed_final_path_during_download);
+        let watched_destination = destination.clone();
+        let progress = move |_done: u64, _total: u64| {
+            if watched_destination.exists() {
+                observed.store(true, Ordering::SeqCst);
+            }
+        };
+
+        let outcome = fetch_or_reuse_file(&backend, "artifact.bin", &destination, &expected_sha, Some(&progress))
+            .await
+            .expect("fetch should succeed");
+
+        assert_eq!(outcome, CacheFetchOutcome::DownloadedFresh);
+        assert!(!observed_final_path_during_download.load(Ordering::SeqCst));
+        assert_eq!(
+            std::fs::read(destination).expect("cache file should exist"),
+            b"remote-payload"
+        );
     }
 
     #[test]

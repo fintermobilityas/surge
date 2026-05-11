@@ -36,6 +36,7 @@ quick-xml = { workspace = true }
 async-trait = { workspace = true }
 futures-util = { workspace = true }
 tempfile = { workspace = true }
+fs2 = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["signal", "process", "fs"] }

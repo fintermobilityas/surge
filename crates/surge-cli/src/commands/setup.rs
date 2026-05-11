@@ -14,6 +14,9 @@ use surge_core::platform::fs::make_executable;
 use surge_core::platform::paths::default_install_root;
 use surge_core::releases::artifact_cache::cache_path_for_key;
 use surge_core::releases::restore::RestoreProgress;
+use surge_core::update::manager::ProgressInfo;
+
+mod convergence;
 
 const PACKAGE_PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(10);
 const PACKAGE_PROGRESS_PERCENT_STEP: u64 = 10;
@@ -95,6 +98,39 @@ impl ProgressReporter {
 
         Some(format!("{} step {items_done}/{items_total} ({}%)", self.label, percent))
     }
+
+    fn observe_update(&mut self, progress: &ProgressInfo) -> Option<String> {
+        let bytes_total = u64::try_from(progress.bytes_total.max(0)).unwrap_or(0);
+        let bytes_done = u64::try_from(progress.bytes_done.max(0)).unwrap_or(0);
+        if bytes_total > 0 {
+            return self.observe_bytes(bytes_done, bytes_total);
+        }
+
+        let items_total = u64::try_from(progress.items_total.max(0)).unwrap_or(0);
+        let items_done = u64::try_from(progress.items_done.max(0)).unwrap_or(0);
+        if items_total == 0 {
+            return None;
+        }
+
+        let percent = percent(items_done, items_total);
+        let now = Instant::now();
+        let crossed_percent = percent >= self.next_percent;
+        let timed_out =
+            now.duration_since(self.last_logged_at) >= PACKAGE_PROGRESS_LOG_INTERVAL && items_done > self.last_value;
+        let finished = items_done >= items_total && items_done > self.last_value;
+
+        if !crossed_percent && !timed_out && !finished {
+            return None;
+        }
+
+        self.last_logged_at = now;
+        self.last_value = items_done;
+        while self.next_percent <= percent && self.next_percent <= 100 {
+            self.next_percent = self.next_percent.saturating_add(PACKAGE_PROGRESS_PERCENT_STEP);
+        }
+
+        Some(format!("{} step {items_done}/{items_total} ({}%)", self.label, percent))
+    }
 }
 
 fn percent(done: u64, total: u64) -> u64 {
@@ -109,7 +145,7 @@ fn percent(done: u64, total: u64) -> u64 {
 ///
 /// This is called either directly via `surge setup [dir]` or auto-detected when
 /// warp extracts the bundle and runs `surge` with no arguments.
-pub async fn execute(dir: &Path, no_start: bool, stage: bool) -> Result<()> {
+pub async fn execute(dir: &Path, no_start: bool, stage: bool, reinstall: bool) -> Result<()> {
     let manifest_path = dir.join("installer.yml");
     if !manifest_path.is_file() {
         return Err(SurgeError::Config(format!(
@@ -139,6 +175,10 @@ pub async fn execute(dir: &Path, no_start: bool, stage: bool) -> Result<()> {
             manifest.version,
             install_root.display()
         ));
+        return Ok(());
+    }
+
+    if !reinstall && convergence::converge_existing_install(&manifest, &install_root, no_start).await? {
         return Ok(());
     }
 
@@ -479,6 +519,14 @@ mod tests {
         })
     }
 
+    fn os_label_for_rid(rid: &str) -> String {
+        match rid.split('-').next().unwrap_or_default() {
+            "macos" | "darwin" | "osx" => "osx".to_string(),
+            "win" | "windows" => "windows".to_string(),
+            value => value.to_string(),
+        }
+    }
+
     fn write_archive(path: &Path, payload: &[u8]) {
         let mut packer = ArchivePacker::new(3).expect("archive packer");
         packer
@@ -493,7 +541,7 @@ mod tests {
         let release = ReleaseEntry {
             version: manifest.version.clone(),
             channels: vec![manifest.channel.clone()],
-            os: "linux".to_string(),
+            os: os_label_for_rid(&manifest.rid),
             rid: manifest.rid.clone(),
             is_genesis: false,
             full_filename: manifest.release.full_filename.clone(),
@@ -574,7 +622,7 @@ mod tests {
         std::fs::write(installer_dir.join("installer.yml"), installer_yaml).expect("installer manifest");
         write_archive(&payload_dir.join(full_filename), b"bundled payload");
 
-        execute(&installer_dir, true, false)
+        execute(&installer_dir, true, false, false)
             .await
             .expect("setup should succeed");
 
@@ -634,7 +682,7 @@ mod tests {
             .finalize_to_file(&payload_dir.join(full_filename))
             .expect("archive file");
 
-        execute(&installer_dir, true, false)
+        execute(&installer_dir, true, false, false)
             .await
             .expect("setup should succeed");
 
@@ -713,7 +761,7 @@ mod tests {
         let installer_yaml = serde_yaml::to_string(&manifest).expect("installer yaml");
         std::fs::write(installer_dir.join("installer.yml"), installer_yaml).expect("installer manifest");
 
-        execute(&installer_dir, true, false)
+        execute(&installer_dir, true, false, false)
             .await
             .expect("setup should succeed");
 
@@ -725,6 +773,134 @@ mod tests {
                 .join(full_filename)
                 .is_file(),
             "resolved package should remain in cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_converges_existing_online_install_with_delta_chain_and_repairs_metadata() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let installer_dir = temp_dir.path().join("installer");
+        let install_root = temp_dir.path().join("installed-app");
+        let store_root = temp_dir.path().join("store");
+        let rid = current_rid();
+        let full_v1_name = format!("demo-app-1.0.0-{rid}-full.tar.zst");
+        let full_v2_name = format!("demo-app-1.1.0-{rid}-full.tar.zst");
+        let full_v3_name = format!("demo-app-1.2.0-{rid}-full.tar.zst");
+        let delta_v2_name = format!("demo-app-1.1.0-{rid}-delta.tar.zst");
+        let delta_v3_name = format!("demo-app-1.2.0-{rid}-delta.tar.zst");
+
+        std::fs::create_dir_all(&installer_dir).expect("installer dir");
+        std::fs::create_dir_all(&store_root).expect("store dir");
+        let app_store = store_root.join("demo-app");
+        std::fs::create_dir_all(&app_store).expect("app-scoped store dir");
+
+        let full_v1_path = temp_dir.path().join(&full_v1_name);
+        let full_v2_path = temp_dir.path().join(&full_v2_name);
+        let full_v3_path = temp_dir.path().join(&full_v3_name);
+        write_archive(&full_v1_path, b"payload v1");
+        write_archive(&full_v2_path, b"payload v2");
+        write_archive(&full_v3_path, b"payload v3");
+        let full_v1 = std::fs::read(&full_v1_path).expect("v1 full");
+        let full_v2 = std::fs::read(&full_v2_path).expect("v2 full");
+        let full_v3 = std::fs::read(&full_v3_path).expect("v3 full");
+
+        let delta_v2 = zstd::encode_all(bsdiff_buffers(&full_v1, &full_v2).expect("v2 delta").as_slice(), 3)
+            .expect("v2 delta zstd");
+        let delta_v3 = zstd::encode_all(bsdiff_buffers(&full_v2, &full_v3).expect("v3 delta").as_slice(), 3)
+            .expect("v3 delta zstd");
+
+        std::fs::write(app_store.join(&full_v1_name), &full_v1).expect("store v1 full");
+        std::fs::write(app_store.join(&delta_v2_name), &delta_v2).expect("store v2 delta");
+        std::fs::write(app_store.join(&delta_v3_name), &delta_v3).expect("store v3 delta");
+
+        let mut manifest = make_manifest(&install_root, &store_root, &full_v3_name, "online");
+        manifest.version = "1.2.0".to_string();
+        manifest.cache = latest_full_cache_policy();
+        let installer_yaml = serde_yaml::to_string(&manifest).expect("installer yaml");
+        std::fs::write(installer_dir.join("installer.yml"), installer_yaml).expect("installer manifest");
+
+        let profile = InstallProfile::from_installer_manifest(&manifest, &manifest.runtime.shortcuts);
+        core_install::install_package_locally_at_root(&profile, &full_v1_path, &install_root)
+            .expect("v1 install should succeed");
+        let active_app_dir = install_root.join("app");
+        let stale_runtime =
+            core_install::RuntimeManifestMetadata::new("1.0.0", "stable", "filesystem", "/old/store", "", "");
+        core_install::write_runtime_manifest(&active_app_dir, &profile, &stale_runtime)
+            .expect("stale runtime manifest");
+
+        let mut v1 = ReleaseEntry {
+            version: "1.0.0".to_string(),
+            channels: vec!["stable".to_string()],
+            os: os_label_for_rid(&rid),
+            rid: rid.clone(),
+            is_genesis: true,
+            full_filename: full_v1_name.clone(),
+            full_size: i64::try_from(full_v1.len()).expect("full_v1 length should fit i64"),
+            full_sha256: sha256_hex(&full_v1),
+            full_compression_level: 0,
+            full_zstd_workers: 0,
+            deltas: Vec::new(),
+            preferred_delta_id: String::new(),
+            created_utc: chrono::Utc::now().to_rfc3339(),
+            release_notes: String::new(),
+            name: manifest.runtime.name.clone(),
+            main_exe: manifest.runtime.main_exe.clone(),
+            install_directory: manifest.runtime.install_directory.clone(),
+            supervisor_id: manifest.runtime.supervisor_id.clone(),
+            icon: manifest.runtime.icon.clone(),
+            shortcuts: manifest.runtime.shortcuts.clone(),
+            persistent_assets: Vec::new(),
+            installers: manifest.runtime.installers.clone(),
+            environment: manifest.runtime.environment.clone(),
+        };
+        v1.set_primary_delta(None);
+        let mut v2 = v1.clone();
+        v2.version = "1.1.0".to_string();
+        v2.is_genesis = false;
+        v2.full_filename = full_v2_name;
+        v2.full_size = i64::try_from(full_v2.len()).expect("full_v2 length should fit i64");
+        v2.full_sha256 = sha256_hex(&full_v2);
+        v2.set_primary_delta(Some(DeltaArtifact::bsdiff_zstd(
+            "primary",
+            "1.0.0",
+            &delta_v2_name,
+            i64::try_from(delta_v2.len()).expect("delta_v2 length should fit i64"),
+            &sha256_hex(&delta_v2),
+        )));
+        let mut v3 = v1.clone();
+        v3.version = "1.2.0".to_string();
+        v3.is_genesis = false;
+        v3.full_filename = full_v3_name.clone();
+        v3.full_size = i64::try_from(full_v3.len()).expect("full_v3 length should fit i64");
+        v3.full_sha256 = sha256_hex(&full_v3);
+        v3.set_primary_delta(Some(DeltaArtifact::bsdiff_zstd(
+            "primary",
+            "1.1.0",
+            &delta_v3_name,
+            i64::try_from(delta_v3.len()).expect("delta_v3 length should fit i64"),
+            &sha256_hex(&delta_v3),
+        )));
+        write_release_index_entries(&app_store, &manifest.app_id, vec![v1, v2, v3]);
+
+        execute(&installer_dir, true, false, false)
+            .await
+            .expect("setup should converge existing install through update manager");
+
+        assert_eq!(
+            std::fs::read_to_string(active_app_dir.join("payload.txt")).expect("payload should exist"),
+            "payload v3"
+        );
+        let runtime_yaml = std::fs::read_to_string(active_app_dir.join(core_install::RUNTIME_MANIFEST_RELATIVE_PATH))
+            .expect("runtime manifest");
+        assert!(runtime_yaml.contains("version: 1.2.0"));
+        assert!(runtime_yaml.contains(&format!("bucket: {}", store_root.display())));
+        assert!(
+            !install_root
+                .join(".surge-cache")
+                .join("artifacts")
+                .join(&full_v3_name)
+                .exists(),
+            "target full package should not be fetched when the delta chain is usable"
         );
     }
 
@@ -819,7 +995,7 @@ mod tests {
 
         write_release_index_entries(&store_root, &manifest.app_id, vec![base_release, target_release]);
 
-        execute(&installer_dir, true, false)
+        execute(&installer_dir, true, false, false)
             .await
             .expect("setup should succeed");
 
@@ -930,7 +1106,7 @@ mod tests {
 
         write_release_index_entries(&store_root, &manifest.app_id, vec![base_release, target_release]);
 
-        execute(&installer_dir, true, false)
+        execute(&installer_dir, true, false, false)
             .await
             .expect("setup should succeed");
 
@@ -971,7 +1147,7 @@ mod tests {
         write_archive(&bundled_payload, b"bundled payload");
         let bundled_archive = std::fs::read(&bundled_payload).expect("bundled payload should exist");
 
-        execute(&installer_dir, true, true)
+        execute(&installer_dir, true, true, false)
             .await
             .expect("setup stage should succeed");
 
@@ -1016,7 +1192,7 @@ mod tests {
         std::fs::write(installer_dir.join("installer.yml"), installer_yaml).expect("installer manifest");
         write_archive(&bundled_payload, b"bundled payload");
 
-        execute(&installer_dir, true, true)
+        execute(&installer_dir, true, true, false)
             .await
             .expect("setup stage should succeed");
 
@@ -1060,7 +1236,7 @@ mod tests {
         std::fs::write(&surge_binary, b"#!/bin/sh\nexit 0\n").expect("surge stub");
         make_executable(&surge_binary).expect("surge stub should be executable");
 
-        execute(&installer_dir, true, true)
+        execute(&installer_dir, true, true, false)
             .await
             .expect("setup stage should succeed");
 

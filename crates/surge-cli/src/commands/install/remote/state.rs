@@ -3,13 +3,15 @@ use super::staging::{
     remote_install_root, remote_staged_app_copy_files_exist, remote_staged_installer_cache_files_exist,
 };
 use super::types::{
-    RemoteHostInstallerAvailability, RemoteInstallState, RemoteInstallerMode, RemoteLaunchEnvironment,
-    RemoteStagedPayloadIdentity, RemoteTailscaleCachedState, RemoteTailscaleOperation, RemoteTailscaleTransferInputs,
-    RemoteTailscaleTransferStrategy, VerifiedRemoteStage,
+    RemoteConvergenceAction, RemoteConvergencePlan, RemoteHostInstallerAvailability, RemoteInstallState,
+    RemoteInstallerMode, RemoteLaunchEnvironment, RemoteStagedPayloadIdentity, RemoteTailscaleCachedState,
+    RemoteTailscaleOperation, RemoteTailscaleTransferInputs, RemoteTailscaleTransferStrategy, VerifiedRemoteStage,
 };
 use super::{
-    Path, ReleaseEntry, Result, SurgeError, core_install, host_can_build_installer_locally, logline, shell_single_quote,
+    Path, ReleaseEntry, ReleaseIndex, Result, SurgeError, compare_versions, core_install,
+    host_can_build_installer_locally, logline, shell_single_quote,
 };
+use surge_core::update::manager::plan_update_from_index;
 
 pub(crate) fn select_remote_installer_mode(storage_config: &surge_core::context::StorageConfig) -> RemoteInstallerMode {
     match storage_config
@@ -55,7 +57,11 @@ if [ ! -f "$manifest" ]; then
 fi
 version="$(sed -n 's/^version:[[:space:]]*//p' "$manifest" | head -n1)"
 channel="$(sed -n 's/^channel:[[:space:]]*//p' "$manifest" | head -n1)"
-printf 'version=%s\nchannel=%s\n' "$version" "$channel""#,
+provider="$(sed -n 's/^provider:[[:space:]]*//p' "$manifest" | head -n1)"
+bucket="$(sed -n 's/^bucket:[[:space:]]*//p' "$manifest" | head -n1)"
+region="$(sed -n 's/^region:[[:space:]]*//p' "$manifest" | head -n1)"
+endpoint="$(sed -n 's/^endpoint:[[:space:]]*//p' "$manifest" | head -n1)"
+printf 'version=%s\nchannel=%s\nprovider=%s\nbucket=%s\nregion=%s\nendpoint=%s\n' "$version" "$channel" "$provider" "$bucket" "$region" "$endpoint""#,
         install_dir.replace('\'', ""),
     );
     let command = format!("sh -c {}", shell_single_quote(&probe));
@@ -68,6 +74,10 @@ printf 'version=%s\nchannel=%s\n' "$version" "$channel""#,
 pub(crate) fn parse_remote_install_state(output: &str) -> Option<RemoteInstallState> {
     let mut version = None;
     let mut channel = None;
+    let mut storage_provider = None;
+    let mut storage_bucket = None;
+    let mut storage_region = None;
+    let mut storage_endpoint = None;
 
     for line in output.lines() {
         if let Some(value) = line.strip_prefix("version=") {
@@ -83,10 +93,121 @@ pub(crate) fn parse_remote_install_state(output: &str) -> Option<RemoteInstallSt
             if !value.is_empty() {
                 channel = Some(value.to_string());
             }
+            continue;
+        }
+
+        if let Some(value) = line.strip_prefix("provider=") {
+            let value = value.trim();
+            if !value.is_empty() {
+                storage_provider = Some(value.to_string());
+            }
+            continue;
+        }
+
+        if let Some(value) = line.strip_prefix("bucket=") {
+            let value = value.trim();
+            if !value.is_empty() {
+                storage_bucket = Some(value.to_string());
+            }
+            continue;
+        }
+
+        if let Some(value) = line.strip_prefix("region=") {
+            let value = value.trim();
+            if !value.is_empty() {
+                storage_region = Some(value.to_string());
+            }
+            continue;
+        }
+
+        if let Some(value) = line.strip_prefix("endpoint=") {
+            let value = value.trim();
+            if !value.is_empty() {
+                storage_endpoint = Some(value.to_string());
+            }
         }
     }
 
-    version.map(|version| RemoteInstallState { version, channel })
+    version.map(|version| RemoteInstallState {
+        version,
+        channel,
+        storage_provider,
+        storage_bucket,
+        storage_region,
+        storage_endpoint,
+    })
+}
+
+pub(crate) fn plan_remote_convergence(
+    remote_state: Option<&RemoteInstallState>,
+    index: &ReleaseIndex,
+    app_id: &str,
+    selected_rid: &str,
+    release: &ReleaseEntry,
+    channel: &str,
+    storage_config: &surge_core::context::StorageConfig,
+    installer_mode: RemoteInstallerMode,
+    force: bool,
+) -> Result<RemoteConvergencePlan> {
+    let Some(remote_state) = remote_state else {
+        return Ok(RemoteConvergencePlan::clean_install(release));
+    };
+
+    let installed_version = Some(remote_state.version.clone());
+    let metadata_matches = remote_state.metadata_matches(channel, storage_config);
+    match compare_versions(&remote_state.version, &release.version) {
+        std::cmp::Ordering::Equal if metadata_matches && !force => Ok(RemoteConvergencePlan {
+            action: RemoteConvergenceAction::Skip,
+            installed_version,
+            target_version: release.version.clone(),
+            update_info: None,
+            reason: Some("installed version, channel, and storage metadata already match".to_string()),
+        }),
+        std::cmp::Ordering::Equal if !force => Ok(RemoteConvergencePlan {
+            action: RemoteConvergenceAction::RepairMetadata,
+            installed_version,
+            target_version: release.version.clone(),
+            update_info: None,
+            reason: Some("installed version matches but runtime channel or storage metadata is stale".to_string()),
+        }),
+        std::cmp::Ordering::Greater if !force => Err(SurgeError::Update(format!(
+            "Remote install is already on newer version {} than selected target {}. Use --force to reinstall the selected version.",
+            remote_state.version, release.version
+        ))),
+        std::cmp::Ordering::Less if installer_mode == RemoteInstallerMode::Online && !force => {
+            let update_info = plan_update_from_index(
+                index,
+                app_id,
+                &remote_state.version,
+                channel,
+                Some(&release.version),
+                selected_rid,
+            )?;
+            let reason = update_info.as_ref().and_then(|info| info.fallback_reason.clone());
+            Ok(RemoteConvergencePlan {
+                action: RemoteConvergenceAction::Update,
+                installed_version,
+                target_version: release.version.clone(),
+                reason: if update_info.is_some() {
+                    reason
+                } else {
+                    Some("release graph did not produce an exact update plan".to_string())
+                },
+                update_info,
+            })
+        }
+        _ => Ok(RemoteConvergencePlan {
+            action: RemoteConvergenceAction::Reinstall,
+            installed_version,
+            target_version: release.version.clone(),
+            update_info: None,
+            reason: if force {
+                Some("--force requested reinstall".to_string())
+            } else {
+                Some("remote update requires online storage; using full install transfer".to_string())
+            },
+        }),
+    }
 }
 
 pub(crate) fn remote_staged_payload_identity(
@@ -290,6 +411,7 @@ pub(crate) fn remote_install_matches(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn should_skip_remote_install(install_matches: bool, force: bool) -> bool {
     install_matches && !force
 }

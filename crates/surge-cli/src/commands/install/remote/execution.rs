@@ -9,6 +9,47 @@ use super::{
 const REMOTE_COPY_CONFIRMATION_TIMEOUT: Duration = Duration::from_mins(10);
 const TAILSCALE_STREAM_COMMAND_TIMEOUT: Duration = Duration::from_mins(30);
 
+pub(crate) const REMOTE_INSTALLER_FINAL_PATH: &str = "/tmp/.surge-installer";
+pub(crate) const REMOTE_INSTALLER_PARTIAL_PATH: &str = "/tmp/.surge-installer.partial";
+
+/// Build a shell command that receives the installer on stdin, validates it
+/// against the expected size + SHA-256, and atomically moves it into place.
+///
+/// The script writes to a `.partial` file, verifies size and hash, then renames
+/// to the final path. On any failure the partial file is cleaned up and the
+/// stderr contains an actionable reason that callers can surface to the user.
+pub(crate) fn build_remote_installer_install_command(expected_size: u64, expected_sha256: &str) -> String {
+    let partial = REMOTE_INSTALLER_PARTIAL_PATH;
+    let final_path = REMOTE_INSTALLER_FINAL_PATH;
+    let expected_sha256 = expected_sha256.trim();
+    format!(
+        "set -eu; \
+trap 'rm -f {partial}' EXIT; \
+cat > {partial}; \
+expected_size='{expected_size}'; \
+expected_sha256='{expected_sha256}'; \
+actual_size=\"$(wc -c < {partial} | tr -d '[:space:]')\"; \
+if [ \"$actual_size\" != \"$expected_size\" ]; then \
+  echo \"remote installer size mismatch at {partial}: expected $expected_size bytes, got $actual_size bytes\" >&2; \
+  exit 1; \
+fi; \
+if command -v sha256sum >/dev/null 2>&1; then \
+  actual_sha256=\"$(sha256sum {partial} | awk '{{print $1}}')\"; \
+elif command -v shasum >/dev/null 2>&1; then \
+  actual_sha256=\"$(shasum -a 256 {partial} | awk '{{print $1}}')\"; \
+else \
+  echo 'remote host has no sha256sum or shasum command available to verify installer transfer' >&2; \
+  exit 1; \
+fi; \
+if [ \"$actual_sha256\" != \"$expected_sha256\" ]; then \
+  echo \"remote installer sha256 mismatch at {partial}: expected $expected_sha256, got $actual_sha256\" >&2; \
+  exit 1; \
+fi; \
+chmod +x {partial}; \
+mv {partial} {final_path}"
+    )
+}
+
 pub(crate) fn resolve_tailscale_targets(node: &str, node_user: Option<&str>) -> Result<(String, String)> {
     let node = node.trim();
     if node.is_empty() {
@@ -372,4 +413,120 @@ where
     }
 
     Ok(captured)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+    use std::path::Path;
+    use std::process::{Command as StdCommand, Output, Stdio as StdStdio};
+
+    use super::*;
+
+    fn install_script_for_temp_paths(script: &str, partial_path: &Path, final_path: &Path) -> String {
+        script
+            .replace("/tmp/.surge-installer.partial", &partial_path.to_string_lossy())
+            .replace("/tmp/.surge-installer", &final_path.to_string_lossy())
+    }
+
+    fn run_install_script_with_stdin(script: &str, stdin_payload: &[u8]) -> Output {
+        let mut child = StdCommand::new("sh")
+            .arg("-c")
+            .arg(script)
+            .stdin(StdStdio::piped())
+            .stderr(StdStdio::piped())
+            .spawn()
+            .expect("spawn sh");
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin pipe")
+            .write_all(stdin_payload)
+            .expect("write payload");
+        drop(child.stdin.take());
+        child.wait_with_output().expect("wait sh")
+    }
+
+    #[test]
+    fn build_remote_installer_install_command_includes_expected_values_and_paths() {
+        let cmd = build_remote_installer_install_command(
+            4_702_432,
+            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+        );
+
+        assert!(cmd.contains("/tmp/.surge-installer.partial"));
+        assert!(cmd.contains("/tmp/.surge-installer"));
+        assert!(cmd.contains("expected_size='4702432'"));
+        assert!(cmd.contains("expected_sha256='abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789'"));
+        assert!(cmd.contains("trap 'rm -f /tmp/.surge-installer.partial' EXIT"));
+        assert!(cmd.contains("mv /tmp/.surge-installer.partial /tmp/.surge-installer"));
+        assert!(cmd.contains("chmod +x /tmp/.surge-installer.partial"));
+        assert!(cmd.contains("size mismatch"));
+        assert!(cmd.contains("sha256 mismatch"));
+        assert!(cmd.contains("sha256sum"));
+        assert!(cmd.contains("shasum -a 256"));
+        assert!(cmd.contains("set -eu"));
+    }
+
+    #[test]
+    fn build_remote_installer_install_command_trims_expected_hash() {
+        let cmd = build_remote_installer_install_command(123, "  deadbeef  ");
+        assert!(cmd.contains("expected_sha256='deadbeef'"));
+    }
+
+    #[test]
+    fn execute_remote_installer_install_command_round_trips_payload() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let payload = b"surge-installer-test-payload";
+        let expected_sha256 = surge_core::crypto::sha256::sha256_hex(payload);
+        let partial_path = temp_dir.path().join(".surge-installer.partial");
+        let final_path = temp_dir.path().join(".surge-installer");
+        let raw_script = build_remote_installer_install_command(payload.len() as u64, &expected_sha256);
+        let script = install_script_for_temp_paths(&raw_script, &partial_path, &final_path);
+
+        let output = run_install_script_with_stdin(&script, payload);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "script failed: {stderr}");
+        assert!(!partial_path.exists(), "partial file should have been moved");
+        assert!(final_path.exists(), "final file should exist");
+        let installed = std::fs::read(&final_path).expect("read final");
+        assert_eq!(installed, payload);
+    }
+
+    #[test]
+    fn execute_remote_installer_install_command_rejects_size_mismatch() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let payload = b"surge-installer-test-payload";
+        let expected_sha256 = surge_core::crypto::sha256::sha256_hex(payload);
+        let partial_path = temp_dir.path().join(".surge-installer.partial");
+        let final_path = temp_dir.path().join(".surge-installer");
+        let wrong_size = (payload.len() as u64) + 1;
+        let raw_script = build_remote_installer_install_command(wrong_size, &expected_sha256);
+        let script = install_script_for_temp_paths(&raw_script, &partial_path, &final_path);
+
+        let output = run_install_script_with_stdin(&script, payload);
+        assert!(!output.status.success(), "script should fail");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("size mismatch"), "stderr was: {stderr}");
+        assert!(!partial_path.exists(), "partial file should be cleaned up on failure");
+        assert!(!final_path.exists(), "final file should not be written on failure");
+    }
+
+    #[test]
+    fn execute_remote_installer_install_command_rejects_sha256_mismatch() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let payload = b"surge-installer-test-payload";
+        let wrong_hash = "0".repeat(64);
+        let partial_path = temp_dir.path().join(".surge-installer.partial");
+        let final_path = temp_dir.path().join(".surge-installer");
+        let raw_script = build_remote_installer_install_command(payload.len() as u64, &wrong_hash);
+        let script = install_script_for_temp_paths(&raw_script, &partial_path, &final_path);
+
+        let output = run_install_script_with_stdin(&script, payload);
+        assert!(!output.status.success(), "script should fail");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("sha256 mismatch"), "stderr was: {stderr}");
+        assert!(!partial_path.exists(), "partial file should be cleaned up on failure");
+        assert!(!final_path.exists(), "final file should not be written on failure");
+    }
 }

@@ -21,7 +21,8 @@ use serde::Deserialize;
 use surge_core::update::manager::ApplyStrategy;
 
 pub(crate) use self::execution::{
-    resolve_tailscale_targets, run_tailscale_streaming, stream_file_to_tailscale_node_with_command,
+    REMOTE_INSTALLER_FINAL_PATH, build_remote_installer_install_command, resolve_tailscale_targets,
+    run_tailscale_streaming, stream_file_to_tailscale_node_with_command,
 };
 pub(crate) use self::published_installer::{
     build_installer_for_tailscale, missing_remote_installer_error, plan_remote_published_installer,
@@ -341,17 +342,22 @@ pub(super) async fn install_release_via_tailscale(
             installer_mode,
         )?
     };
-    let installer_size = std::fs::metadata(&installer_path).map_or(0, |metadata| metadata.len());
+    let installer_size = std::fs::metadata(&installer_path)
+        .map_err(|e| {
+            SurgeError::Platform(format!(
+                "Failed to read installer metadata at '{}': {e}",
+                installer_path.display()
+            ))
+        })?
+        .len();
+    let installer_sha256 = surge_core::crypto::sha256::sha256_hex_file(&installer_path)?;
     logline::info(&format!(
-        "Transferring installer to '{file_target}' ({})...",
+        "Transferring installer to '{file_target}' ({}, sha256 {})...",
         crate::formatters::format_bytes(installer_size),
+        &installer_sha256[..installer_sha256.len().min(12)],
     ));
-    stream_file_to_tailscale_node_with_command(
-        ssh_target,
-        &installer_path,
-        "cat > /tmp/.surge-installer && chmod +x /tmp/.surge-installer",
-    )
-    .await?;
+    let install_command = build_remote_installer_install_command(installer_size, &installer_sha256);
+    stream_file_to_tailscale_node_with_command(ssh_target, &installer_path, &install_command).await?;
 
     let no_start_flag = if behavior.no_start { " --no-start" } else { "" };
     let stage_flag = if behavior.mode.is_stage() { " --stage" } else { "" };
@@ -360,8 +366,9 @@ pub(super) async fn install_release_via_tailscale(
     } else {
         ""
     };
-    let run_cmd =
-        format!("/tmp/.surge-installer{no_start_flag}{stage_flag}{reinstall_flag} && rm -f /tmp/.surge-installer");
+    let run_cmd = format!(
+        "{REMOTE_INSTALLER_FINAL_PATH}{no_start_flag}{stage_flag}{reinstall_flag} && rm -f {REMOTE_INSTALLER_FINAL_PATH}"
+    );
     let ssh_command = format!("sh -lc {}", shell_single_quote(&run_cmd));
     if behavior.mode.is_stage() {
         logline::info(&format!("Running installer in stage mode on '{file_target}'..."));

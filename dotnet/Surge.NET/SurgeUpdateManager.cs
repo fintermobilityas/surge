@@ -157,6 +157,25 @@ namespace Surge
         public string CurrentVersion => _currentVersion;
 
         /// <summary>
+        /// Read the most recently persisted update convergence record for this
+        /// installation. Returns null when no record has been written yet (e.g.
+        /// the install has never run through an update flow).
+        ///
+        /// This is the structured signal that distinguishes "in progress",
+        /// "applied but pending supervisor restart", "fully converged", and
+        /// "failed" so dashboards and repair tooling do not have to infer the
+        /// state from version drift alone.
+        /// </summary>
+        public SurgeUpdateStatus? GetCurrentStatus()
+        {
+            ThrowIfDisposed();
+            var appInfo = SurgeApp.Current;
+            if (appInfo == null || string.IsNullOrWhiteSpace(appInfo.InstallDirectory))
+                return null;
+            return SurgeUpdateStatus.Read(appInfo.InstallDirectory);
+        }
+
+        /// <summary>
         /// Switch update channel at runtime (for example, from production to test).
         /// </summary>
         /// <param name="channel">Target channel name.</param>

@@ -123,6 +123,12 @@ namespace Surge
             SurgeProgressCallbackDelegate? progressCb,
             IntPtr userData);
 
+        [LibraryImport(LibName, EntryPoint = "surge_update_status_read_json", StringMarshalling = StringMarshalling.Utf8)]
+        internal static partial int UpdateStatusReadJson(string installDir, out IntPtr jsonOut);
+
+        [LibraryImport(LibName, EntryPoint = "surge_free_cstring")]
+        internal static partial void FreeCString(IntPtr ptr);
+
         // --- Releases info accessors ---
 
         [LibraryImport(LibName, EntryPoint = "surge_releases_count")]
@@ -287,6 +293,12 @@ namespace Surge
             IntPtr info,
             SurgeProgressCallbackDelegate? progressCb,
             IntPtr userData);
+
+        [DllImport(LibName, EntryPoint = "surge_update_status_read_json", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
+        internal static extern int UpdateStatusReadJson(string installDir, out IntPtr jsonOut);
+
+        [DllImport(LibName, EntryPoint = "surge_free_cstring", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void FreeCString(IntPtr ptr);
 
         // --- Releases info accessors ---
 

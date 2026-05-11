@@ -51,6 +51,26 @@ namespace Surge
         public static string WorkingDirectory => GetWorkingDirectory();
 
         /// <summary>
+        /// Most recently persisted update convergence record for the currently
+        /// installed application, or null when there is no Surge-managed
+        /// installation or no record has been written yet.
+        ///
+        /// Use this to distinguish "installed and converged", "applied but
+        /// pending supervisor restart", and "update failed" without inferring
+        /// the state from version drift alone (see <see cref="SurgeUpdateConvergenceState"/>).
+        /// </summary>
+        public static SurgeUpdateStatus? LastUpdateStatus
+        {
+            get
+            {
+                var current = Current;
+                if (current == null || string.IsNullOrWhiteSpace(current.InstallDirectory))
+                    return null;
+                return SurgeUpdateStatus.Read(current.InstallDirectory);
+            }
+        }
+
+        /// <summary>
         /// The Surge library version.
         /// </summary>
         public static string Version => "0.1.0";

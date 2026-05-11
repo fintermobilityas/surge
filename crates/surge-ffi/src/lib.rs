@@ -50,6 +50,7 @@ pub use crate::update::{
     surge_update_check, surge_update_download_and_apply, surge_update_manager_create, surge_update_manager_destroy,
     surge_update_manager_set_artifact_retention_policy, surge_update_manager_set_channel,
     surge_update_manager_set_current_version, surge_update_manager_set_release_retention_limit,
+    surge_update_status_read_json,
 };
 use crate::utils::to_lossy_cstring;
 
@@ -421,4 +422,18 @@ pub unsafe extern "C" fn surge_cancel(ctx: *mut SurgeContextHandle) -> i32 {
         handle.ctx.cancel();
         SURGE_OK
     }))
+}
+
+// =========================================================================
+//  11. Allocator (1 function)
+// =========================================================================
+
+/// Free a NUL-terminated C string that was returned by a Surge FFI call which
+/// documents its output as `free()`-owned (for example
+/// `surge_update_status_read_json`). Safe to call with NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn surge_free_cstring(ptr: *mut c_char) {
+    // SAFETY: caller guarantees `ptr` was returned by a Surge FFI function
+    // documented as `free()`-owned, or is null.
+    unsafe { crate::shared::libc_free(ptr.cast::<c_void>()) };
 }

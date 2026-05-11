@@ -170,6 +170,24 @@ pub(crate) fn libc_malloc(size: usize) -> *mut u8 {
     unsafe { malloc(size).cast::<u8>() }
 }
 
+/// Counterpart to [`libc_malloc`]: frees a pointer returned by any Surge FFI
+/// function that documents its output as `free()`-owned.
+///
+/// # Safety
+/// `ptr` must have been returned by a Surge FFI call that allocated via
+/// [`libc_malloc`], or must be null. Passing a pointer that was allocated by a
+/// different allocator (e.g. .NET `Marshal.AllocHGlobal`) is undefined behavior.
+pub(crate) unsafe fn libc_free(ptr: *mut c_void) {
+    unsafe extern "C" {
+        fn free(ptr: *mut c_void);
+    }
+    if ptr.is_null() {
+        return;
+    }
+    // SAFETY: caller guarantees `ptr` came from libc `malloc`.
+    unsafe { free(ptr) };
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::CString;

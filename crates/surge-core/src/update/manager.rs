@@ -28,9 +28,11 @@ use crate::releases::restore::{
 };
 use crate::storage::{StorageBackend, create_storage_backend};
 use crate::supervisor::state::supervisor_pid_file;
+use crate::update::status::{self, UpdateStatusRecord};
 
 use self::apply::materialize_update_payload;
 use self::artifacts::prepare_update_artifacts;
+use self::lifecycle::SupervisorRestartOutcome;
 pub use self::progress::ProgressInfo;
 use self::progress::emit_progress;
 pub use self::release_index::plan_update_from_index;
@@ -212,12 +214,93 @@ impl UpdateManager {
     /// 4. Extract - extract the final archive into the install tree
     /// 5. Apply delta - rebuild the final archive when using delta updates
     /// 6. Finalize - move files into place, clean up
+    ///
+    /// On every attempt this method also writes an explicit convergence record
+    /// to `{install_dir}/.surge-update-status.json` so dashboards and repair
+    /// tooling can distinguish "update in progress", "applied but pending
+    /// supervisor restart", "fully converged", and "failed" without inferring
+    /// state from version drift alone (see [`status`]).
     pub async fn download_and_apply<F>(&self, info: &UpdateInfo, progress: Option<F>) -> Result<()>
     where
         F: Fn(ProgressInfo) + Send + Sync,
     {
-        self.ctx.check_cancelled()?;
+        let attempted_at_utc = status::now_utc_rfc3339();
+        let pre_attempt_version = self.current_version.clone();
+        let target_version = info.latest_version.clone();
+
+        let in_progress_record = UpdateStatusRecord::in_progress(
+            &self.app_id,
+            &pre_attempt_version,
+            &target_version,
+            &self.channel,
+            attempted_at_utc.clone(),
+        );
+        if let Err(e) = status::write_update_status(&self.install_dir, &in_progress_record) {
+            warn!(error = %e, "Failed to persist in-progress update status (continuing)");
+        }
+
         let progress = progress.map(Arc::new);
+        match self.download_and_apply_inner(info, progress).await {
+            Ok(restart_outcome) => {
+                let completed_at_utc = status::now_utc_rfc3339();
+                let record = match restart_outcome {
+                    SupervisorRestartOutcome::NotApplicable => UpdateStatusRecord::converged(
+                        &self.app_id,
+                        &target_version,
+                        &self.channel,
+                        Some(attempted_at_utc),
+                        completed_at_utc,
+                        false,
+                    ),
+                    SupervisorRestartOutcome::Confirmed => UpdateStatusRecord::converged(
+                        &self.app_id,
+                        &target_version,
+                        &self.channel,
+                        Some(attempted_at_utc),
+                        completed_at_utc,
+                        true,
+                    ),
+                    SupervisorRestartOutcome::Unconfirmed { reason } => UpdateStatusRecord::pending_restart(
+                        &self.app_id,
+                        &target_version,
+                        &target_version,
+                        &self.channel,
+                        attempted_at_utc,
+                        completed_at_utc,
+                        &reason,
+                    ),
+                };
+                if let Err(e) = status::write_update_status(&self.install_dir, &record) {
+                    warn!(error = %e, "Failed to persist post-update convergence status (continuing)");
+                }
+                Ok(())
+            }
+            Err(e) => {
+                let record = UpdateStatusRecord::failed(
+                    &self.app_id,
+                    &pre_attempt_version,
+                    &target_version,
+                    &self.channel,
+                    attempted_at_utc,
+                    &e.to_string(),
+                );
+                if let Err(write_err) = status::write_update_status(&self.install_dir, &record) {
+                    warn!(error = %write_err, "Failed to persist failed-update status (continuing)");
+                }
+                Err(e)
+            }
+        }
+    }
+
+    async fn download_and_apply_inner<F>(
+        &self,
+        info: &UpdateInfo,
+        progress: Option<Arc<F>>,
+    ) -> Result<SupervisorRestartOutcome>
+    where
+        F: Fn(ProgressInfo) + Send + Sync,
+    {
+        self.ctx.check_cancelled()?;
 
         // Phase 1: Check
         info!(version = %info.latest_version, "Starting update");
@@ -460,9 +543,11 @@ impl UpdateManager {
 
         lifecycle::invoke_post_update_hook(&self.install_dir, &active_app_dir, latest);
 
-        if supervisor_was_running {
-            lifecycle::restart_supervisor_after_update(&self.install_dir, &active_app_dir, latest);
-        }
+        let restart_outcome = if supervisor_was_running {
+            lifecycle::restart_supervisor_after_update(&self.install_dir, &active_app_dir, latest)
+        } else {
+            SupervisorRestartOutcome::NotApplicable
+        };
 
         emit_progress(
             progress.as_ref(),
@@ -479,7 +564,7 @@ impl UpdateManager {
             "Update applied successfully"
         );
 
-        Ok(())
+        Ok(restart_outcome)
     }
 }
 
@@ -1299,6 +1384,109 @@ mod tests {
         assert!(installed_file.exists());
         assert_eq!(std::fs::read_to_string(installed_file).unwrap(), "installed payload");
         assert!(runtime_manifest.is_file());
+
+        let status = status::read_update_status(&install_root).unwrap().unwrap();
+        assert_eq!(status.state, status::UpdateConvergenceState::Converged);
+        assert_eq!(status.installed_version, "1.1.0");
+        assert_eq!(status.target_version, "1.1.0");
+        assert_eq!(status.channel, "stable");
+        assert_eq!(status.app_id, app_id);
+        assert!(!status.supervisor_restart_confirmed);
+        assert!(status.completed_at_utc.is_some());
+        assert!(status.reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_download_and_apply_writes_failed_status_when_storage_artifact_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("store");
+        let install_root = tmp.path().join("install");
+        let app_id = "test-app";
+        std::fs::create_dir_all(&store_root).unwrap();
+        std::fs::create_dir_all(&install_root).unwrap();
+        let app_store = app_scoped_store_root(&store_root, app_id);
+
+        let rid = current_rid();
+        let full_filename = format!("{app_id}-1.1.0-{rid}-full.tar.zst");
+        let full_path = app_store.join(&full_filename);
+
+        let mut packer = ArchivePacker::new(3).unwrap();
+        packer.add_buffer("payload.txt", b"installed payload", 0o644).unwrap();
+        packer.finalize_to_file(&full_path).unwrap();
+
+        let full_size = std::fs::metadata(&full_path).unwrap().len() as i64;
+        let full_sha256 = sha256_hex_file(&full_path).unwrap();
+
+        let index = ReleaseIndex {
+            app_id: app_id.to_string(),
+            releases: vec![ReleaseEntry {
+                version: "1.1.0".to_string(),
+                channels: vec!["stable".to_string()],
+                os: current_os_label_for_tests(),
+                rid: rid.clone(),
+                is_genesis: true,
+                full_filename: full_filename.clone(),
+                full_size,
+                full_sha256,
+                full_compression_level: 0,
+                full_zstd_workers: 0,
+                deltas: Vec::new(),
+                preferred_delta_id: String::new(),
+                created_utc: chrono::Utc::now().to_rfc3339(),
+                release_notes: String::new(),
+                name: String::new(),
+                main_exe: app_id.to_string(),
+                install_directory: app_id.to_string(),
+                supervisor_id: String::new(),
+                icon: String::new(),
+                shortcuts: Vec::new(),
+                persistent_assets: Vec::new(),
+                installers: Vec::new(),
+                environment: std::collections::BTreeMap::new(),
+            }],
+            ..ReleaseIndex::default()
+        };
+
+        write_app_scoped_release_index(&store_root, app_id, &index);
+
+        let ctx = Arc::new(Context::new());
+        ctx.set_storage(
+            StorageProvider::Filesystem,
+            store_root.to_str().unwrap(),
+            "",
+            "",
+            "",
+            "",
+        );
+
+        let mut manager = UpdateManager::new(ctx, app_id, "1.0.0", "stable", install_root.to_str().unwrap()).unwrap();
+        let info = manager.check_for_updates().await.unwrap().unwrap();
+
+        // Remove the backing artifact so download_and_apply must fail.
+        std::fs::remove_file(&full_path).unwrap();
+
+        let err = manager
+            .download_and_apply(&info, None::<fn(ProgressInfo)>)
+            .await
+            .expect_err("download_and_apply should fail when the full artifact is missing");
+        let err_msg = err.to_string();
+
+        let status_record = status::read_update_status(&install_root).unwrap().unwrap();
+        assert_eq!(status_record.state, status::UpdateConvergenceState::Failed);
+        assert_eq!(
+            status_record.installed_version, "1.0.0",
+            "failed record preserves pre-attempt version"
+        );
+        assert_eq!(status_record.target_version, "1.1.0");
+        assert!(status_record.completed_at_utc.is_none());
+        let reason = status_record
+            .reason
+            .as_deref()
+            .expect("failed status records must include a reason");
+        assert!(
+            reason.contains(&err_msg) || err_msg.contains(reason),
+            "stored reason '{reason}' should match the propagated error '{err_msg}'"
+        );
     }
 
     #[tokio::test]

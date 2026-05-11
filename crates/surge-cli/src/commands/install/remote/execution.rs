@@ -417,18 +417,23 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
-    use std::path::Path;
-    use std::process::{Command as StdCommand, Output, Stdio as StdStdio};
-
     use super::*;
 
+    #[cfg(unix)]
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::path::Path;
+    #[cfg(unix)]
+    use std::process::{Command as StdCommand, Output, Stdio as StdStdio};
+
+    #[cfg(unix)]
     fn install_script_for_temp_paths(script: &str, partial_path: &Path, final_path: &Path) -> String {
         script
             .replace("/tmp/.surge-installer.partial", &partial_path.to_string_lossy())
             .replace("/tmp/.surge-installer", &final_path.to_string_lossy())
     }
 
+    #[cfg(unix)]
     fn run_install_script_with_stdin(script: &str, stdin_payload: &[u8]) -> Output {
         let mut child = StdCommand::new("sh")
             .arg("-c")
@@ -474,6 +479,13 @@ mod tests {
         assert!(cmd.contains("expected_sha256='deadbeef'"));
     }
 
+    // The remote install command is a POSIX sh script run on the *remote*
+    // tailscale node (always Linux/macOS in practice). The integration tests
+    // below run the script locally to drive its happy/error paths, which
+    // requires a POSIX `sh` plus `sha256sum`/`shasum` in PATH. Gate on Unix
+    // so CI on the Windows host (which runs the local invoker side, not the
+    // remote side) doesn't try to exec a missing `sh`.
+    #[cfg(unix)]
     #[test]
     fn execute_remote_installer_install_command_round_trips_payload() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -493,6 +505,7 @@ mod tests {
         assert_eq!(installed, payload);
     }
 
+    #[cfg(unix)]
     #[test]
     fn execute_remote_installer_install_command_rejects_size_mismatch() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -512,6 +525,7 @@ mod tests {
         assert!(!final_path.exists(), "final file should not be written on failure");
     }
 
+    #[cfg(unix)]
     #[test]
     fn execute_remote_installer_install_command_rejects_sha256_mismatch() {
         let temp_dir = tempfile::tempdir().expect("tempdir");

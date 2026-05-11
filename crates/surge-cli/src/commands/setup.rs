@@ -185,7 +185,7 @@ pub async fn execute(dir: &Path, no_start: bool, stage: bool, reinstall: bool) -
     if let Err(e) = super::stop_supervisor(&install_root, &manifest.runtime.supervisor_id).await {
         logline::warn(&format!("Could not stop supervisor: {e}"));
     }
-    stop_running_app(&install_root, &manifest.runtime.main_exe);
+    stop_running_app(&install_root, &manifest.runtime.main_exe)?;
 
     let package = resolve_package(dir, &manifest, &install_root).await?;
 
@@ -411,32 +411,116 @@ fn staged_installer_binary_name() -> &'static str {
 
 /// Kill any running process whose executable lives in the app directory.
 /// This catches orphaned app processes that outlived their supervisor.
-fn stop_running_app(install_root: &Path, main_exe: &str) {
+fn stop_running_app(install_root: &Path, main_exe: &str) -> Result<()> {
     let main_exe = main_exe.trim();
     if main_exe.is_empty() {
-        return;
+        return Ok(());
     }
 
     let exe_path = install_root.join("app").join(main_exe);
+    #[cfg(unix)]
     let exe_name = exe_path.to_string_lossy();
 
     #[cfg(unix)]
     {
-        let status = std::process::Command::new("pkill").args(["-f", &*exe_name]).status();
-        if matches!(status, Ok(s) if s.success()) {
-            logline::info(&format!("Stopped running app process '{main_exe}'."));
-            std::thread::sleep(std::time::Duration::from_millis(500));
+        let pids = running_app_pids(&exe_name)?;
+        if pids.is_empty() {
+            return Ok(());
         }
+
+        send_signal_to_pids("TERM", &pids)?;
+        if wait_until_app_processes_exit(&exe_name, Duration::from_secs(5))? {
+            logline::info(&format!("Stopped running app process '{main_exe}'."));
+            return Ok(());
+        }
+
+        let remaining = running_app_pids(&exe_name)?;
+        if !remaining.is_empty() {
+            send_signal_to_pids("KILL", &remaining)?;
+        }
+        if wait_until_app_processes_exit(&exe_name, Duration::from_secs(2))? {
+            logline::info(&format!("Force-stopped running app process '{main_exe}'."));
+            return Ok(());
+        }
+
+        Err(SurgeError::Platform(format!(
+            "Timed out waiting for running app process '{main_exe}' to exit"
+        )))
     }
 
     #[cfg(windows)]
     {
-        let _ = std::process::Command::new("taskkill")
+        let _ = exe_path;
+        let status = std::process::Command::new("taskkill")
             .args(["/F", "/FI", &format!("IMAGENAME eq {main_exe}")])
-            .status();
+            .status()
+            .map_err(|e| SurgeError::Platform(format!("Failed to stop running app process '{main_exe}': {e}")))?;
+        if status.success() {
+            logline::info(&format!("Stopped running app process '{main_exe}'."));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn running_app_pids(exe_name: &str) -> Result<Vec<String>> {
+    let output = std::process::Command::new("pgrep")
+        .args(["-f", exe_name])
+        .output()
+        .map_err(|e| SurgeError::Platform(format!("Failed to search for running app processes: {e}")))?;
+
+    if !output.status.success() {
+        return Ok(Vec::new());
     }
 
-    let _ = &exe_name;
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let pid = line.trim();
+            if pid.is_empty() {
+                return None;
+            }
+            Some(pid.to_string())
+        })
+        .collect())
+}
+
+#[cfg(unix)]
+fn send_signal_to_pids(signal: &str, pids: &[String]) -> Result<()> {
+    if pids.is_empty() {
+        return Ok(());
+    }
+
+    let mut args = Vec::with_capacity(pids.len() + 1);
+    args.push(format!("-{signal}"));
+    args.extend(pids.iter().cloned());
+    let output = std::process::Command::new("kill")
+        .args(&args)
+        .output()
+        .map_err(|e| SurgeError::Platform(format!("Failed to send {signal} to running app processes: {e}")))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(SurgeError::Platform(format!(
+        "Failed to send {signal} to running app processes: {stderr}"
+    )))
+}
+
+#[cfg(unix)]
+fn wait_until_app_processes_exit(exe_name: &str, timeout: Duration) -> Result<bool> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if running_app_pids(exe_name)?.is_empty() {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 fn file_size_label(path: &Path) -> String {

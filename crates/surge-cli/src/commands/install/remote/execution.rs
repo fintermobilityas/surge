@@ -1,7 +1,13 @@
+use std::process::ExitStatus;
+use std::time::Duration;
+
 use super::{
     AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, Command, Instant, Path, Result, Stdio,
     SurgeError, logline, make_progress_bar, make_spinner, shell_single_quote,
 };
+
+const REMOTE_COPY_CONFIRMATION_TIMEOUT: Duration = Duration::from_mins(10);
+const TAILSCALE_STREAM_COMMAND_TIMEOUT: Duration = Duration::from_mins(30);
 
 pub(crate) fn resolve_tailscale_targets(node: &str, node_user: Option<&str>) -> Result<(String, String)> {
     let node = node.trim();
@@ -57,6 +63,7 @@ pub(crate) async fn stream_directory_to_tailscale_node_with_command(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .kill_on_drop(true)
         .spawn()
         .map_err(|e| SurgeError::Platform(format!("Failed to run tailscale ssh stream copy: {e}")))?;
 
@@ -151,6 +158,7 @@ pub(crate) async fn stream_file_to_tailscale_node_with_command(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .kill_on_drop(true)
         .spawn()
         .map_err(|e| SurgeError::Platform(format!("Failed to run tailscale ssh stream copy: {e}")))?;
 
@@ -229,12 +237,21 @@ pub(crate) async fn stream_file_to_tailscale_node_with_command(
         logline::subtle("Waiting for remote copy confirmation...");
     }
 
-    let output = child.wait_with_output().await;
+    let output = tokio::time::timeout(REMOTE_COPY_CONFIRMATION_TIMEOUT, child.wait_with_output()).await;
     if let Some(spinner) = finalize_spinner {
         spinner.finish_and_clear();
     }
-    let output =
-        output.map_err(|e| SurgeError::Platform(format!("Failed to wait for tailscale ssh stream copy: {e}")))?;
+    let output = match output {
+        Ok(output) => {
+            output.map_err(|e| SurgeError::Platform(format!("Failed to wait for tailscale ssh stream copy: {e}")))?
+        }
+        Err(_) => {
+            return Err(SurgeError::Platform(format!(
+                "Timed out after {}s waiting for remote copy confirmation to '{node}'",
+                REMOTE_COPY_CONFIRMATION_TIMEOUT.as_secs()
+            )));
+        }
+    };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -275,6 +292,7 @@ pub(crate) async fn run_tailscale_streaming(args: &[&str], prefix: &str) -> Resu
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .kill_on_drop(true)
         .spawn()
         .map_err(|e| SurgeError::Platform(format!("Failed to run tailscale command: {e}")))?;
 
@@ -290,10 +308,8 @@ pub(crate) async fn run_tailscale_streaming(args: &[&str], prefix: &str) -> Resu
     let stdout_task = tokio::spawn(relay_tailscale_output(stdout, prefix.to_string()));
     let stderr_task = tokio::spawn(relay_tailscale_output(stderr, prefix.to_string()));
 
-    let status = child
-        .wait()
-        .await
-        .map_err(|e| SurgeError::Platform(format!("Failed to wait for tailscale command: {e}")))?;
+    let cmd = format!("tailscale {}", args.join(" "));
+    let status = wait_for_tailscale_command(&mut child, &cmd).await?;
     let stdout = stdout_task
         .await
         .map_err(|e| SurgeError::Platform(format!("Failed to read tailscale stdout: {e}")))?
@@ -304,7 +320,6 @@ pub(crate) async fn run_tailscale_streaming(args: &[&str], prefix: &str) -> Resu
         .map_err(|e| SurgeError::Platform(format!("Failed to read tailscale stderr: {e}")))?;
 
     if !status.success() {
-        let cmd = format!("tailscale {}", args.join(" "));
         let message = stderr
             .lines()
             .rev()
@@ -319,6 +334,18 @@ pub(crate) async fn run_tailscale_streaming(args: &[&str], prefix: &str) -> Resu
     }
 
     Ok(())
+}
+
+async fn wait_for_tailscale_command(child: &mut tokio::process::Child, cmd: &str) -> Result<ExitStatus> {
+    if let Ok(status) = tokio::time::timeout(TAILSCALE_STREAM_COMMAND_TIMEOUT, child.wait()).await {
+        return status.map_err(|e| SurgeError::Platform(format!("Failed to wait for tailscale command: {e}")));
+    }
+
+    let _ = child.kill().await;
+    Err(SurgeError::Platform(format!(
+        "Timed out after {}s running {cmd}",
+        TAILSCALE_STREAM_COMMAND_TIMEOUT.as_secs()
+    )))
 }
 
 async fn relay_tailscale_output<R>(reader: R, prefix: String) -> std::io::Result<String>

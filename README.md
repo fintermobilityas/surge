@@ -473,7 +473,7 @@ Surge can produce installer bundles in two modes:
 target:
   rid: win-x64
   installers:
-    - web       # Small bootstrap, downloads app on first run
+    - online    # Small bootstrap, downloads app on first run
     - offline   # Self-contained, includes full package
 ```
 

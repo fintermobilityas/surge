@@ -456,13 +456,14 @@ mod tests {
         RemoteConvergenceAction, RemoteHostInstallerAvailability, RemoteInstallState, RemoteInstallerMode,
         RemoteLaunchEnvironment, RemotePublishedInstallerPlan, RemoteTailscaleCachedState, RemoteTailscaleOperation,
         RemoteTailscaleTransferInputs, RemoteTailscaleTransferStrategy, build_remote_app_copy_activation_script,
-        build_remote_installer_manifest, build_remote_paths_exist_probe, build_remote_stage_cleanup_command,
-        build_remote_staged_installer_setup_command, build_remote_stop_supervisor_command,
-        missing_remote_installer_error, parse_remote_install_state, parse_remote_launch_environment,
-        parse_remote_staged_payload_identity, plan_remote_convergence, plan_remote_published_installer,
-        plan_remote_published_installer_without_manifest, published_installer_public_url, remote_install_matches,
-        remote_launch_environment_probe, remote_staged_payload_identity, select_latest_remote_legacy_app_dir,
-        select_remote_installer_mode, select_remote_tailscale_transfer_strategy, should_skip_remote_install,
+        build_remote_installer_manifest, build_remote_paths_exist_probe, build_remote_process_verification_probe,
+        build_remote_stage_cleanup_command, build_remote_staged_installer_setup_command,
+        build_remote_stop_supervisor_command, missing_remote_installer_error, parse_remote_install_state,
+        parse_remote_launch_environment, parse_remote_staged_payload_identity, plan_remote_convergence,
+        plan_remote_published_installer, plan_remote_published_installer_without_manifest,
+        published_installer_public_url, remote_install_matches, remote_launch_environment_probe,
+        remote_staged_payload_identity, select_latest_remote_legacy_app_dir, select_remote_installer_mode,
+        select_remote_tailscale_transfer_strategy, should_skip_remote_install,
         try_prepare_published_installer_for_tailscale,
     };
     use super::resolution::{
@@ -1032,6 +1033,26 @@ mod tests {
         assert!(command.contains("install_root='/home/demo/apps/customer'\"'\"'s app'"));
         assert!(command.contains("supervisor_id='demo-supervisor'"));
         assert!(command.contains("pid_file=\"$install_root/.surge-supervisor-$supervisor_id.pid\""));
+        assert!(command.contains("clear_if_stale"));
+        assert!(command.contains("rm -f \"$pid_file\""));
+        assert!(command.contains("kill -KILL \"$pid\""));
+    }
+
+    #[test]
+    fn build_remote_process_verification_probe_checks_app_version_and_supervisor() {
+        let probe = build_remote_process_verification_probe(
+            Path::new("/home/demo/apps/demo-app"),
+            "demoapp",
+            "demo-supervisor",
+            "1.2.3",
+        );
+
+        assert!(probe.contains("active_exe=\"$install_root/app/$main_exe\""));
+        assert!(probe.contains("--surge-first-run $version"));
+        assert!(probe.contains("surge-supervisor"));
+        assert!(probe.contains("--id $supervisor_id"));
+        assert!(probe.contains("app process for $active_exe was not found"));
+        assert!(probe.contains("supervisor process '$supervisor_id' was not found"));
     }
 
     #[test]

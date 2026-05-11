@@ -162,6 +162,17 @@ pub(crate) async fn stop_supervisor(install_dir: &std::path::Path, supervisor_id
         "Stopping supervisor '{supervisor_id}' (pid {pid}) before install..."
     ));
 
+    if supervisor_pid_file_is_stale(pid).await {
+        tokio::fs::remove_file(&pid_file).await.map_err(|e| {
+            SurgeError::Platform(format!(
+                "Failed to remove stale supervisor PID file '{}': {e}",
+                pid_file.display()
+            ))
+        })?;
+        crate::logline::success("Removed stale supervisor PID file.");
+        return Ok(());
+    }
+
     let output = tokio::process::Command::new(if cfg!(unix) { "kill" } else { "taskkill" })
         .args(if cfg!(unix) {
             vec![pid.to_string()]
@@ -177,6 +188,16 @@ pub(crate) async fn stop_supervisor(install_dir: &std::path::Path, supervisor_id
         })?;
 
     if !output.status.success() {
+        if supervisor_pid_file_is_stale(pid).await {
+            tokio::fs::remove_file(&pid_file).await.map_err(|e| {
+                SurgeError::Platform(format!(
+                    "Failed to remove stale supervisor PID file '{}': {e}",
+                    pid_file.display()
+                ))
+            })?;
+            crate::logline::success("Removed stale supervisor PID file.");
+            return Ok(());
+        }
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(SurgeError::Platform(format!(
             "Failed to stop supervisor '{supervisor_id}' (pid {pid}): {stderr}"
@@ -185,7 +206,27 @@ pub(crate) async fn stop_supervisor(install_dir: &std::path::Path, supervisor_id
 
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
     while pid_file.exists() {
+        if supervisor_pid_file_is_stale(pid).await {
+            tokio::fs::remove_file(&pid_file).await.map_err(|e| {
+                SurgeError::Platform(format!(
+                    "Failed to remove stale supervisor PID file '{}': {e}",
+                    pid_file.display()
+                ))
+            })?;
+            break;
+        }
         if tokio::time::Instant::now() >= deadline {
+            let _ = force_kill_supervisor_pid(pid).await;
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if supervisor_pid_file_is_stale(pid).await {
+                tokio::fs::remove_file(&pid_file).await.map_err(|e| {
+                    SurgeError::Platform(format!(
+                        "Failed to remove stale supervisor PID file '{}': {e}",
+                        pid_file.display()
+                    ))
+                })?;
+                break;
+            }
             return Err(SurgeError::Platform(format!(
                 "Timed out waiting for supervisor '{supervisor_id}' to exit"
             )));
@@ -195,6 +236,59 @@ pub(crate) async fn stop_supervisor(install_dir: &std::path::Path, supervisor_id
 
     crate::logline::success("Supervisor stopped.");
     Ok(())
+}
+
+async fn force_kill_supervisor_pid(pid: u32) -> Result<()> {
+    let output = tokio::process::Command::new(if cfg!(unix) { "kill" } else { "taskkill" })
+        .args(if cfg!(unix) {
+            vec!["-KILL".to_string(), pid.to_string()]
+        } else {
+            vec!["/F".to_string(), "/PID".to_string(), pid.to_string()]
+        })
+        .output()
+        .await
+        .map_err(|e| SurgeError::Platform(format!("Failed to force-kill supervisor (pid {pid}): {e}")))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(SurgeError::Platform(format!(
+        "Failed to force-kill supervisor (pid {pid}): {stderr}"
+    )))
+}
+
+async fn supervisor_pid_file_is_stale(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let pid_arg = pid.to_string();
+        let output = tokio::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid_arg])
+            .output()
+            .await;
+        let Ok(output) = output else {
+            return false;
+        };
+        if !output.status.success() {
+            return true;
+        }
+        let stat = String::from_utf8_lossy(&output.stdout);
+        let stat = stat.trim();
+        stat.is_empty() || stat.starts_with('Z')
+    }
+
+    #[cfg(not(unix))]
+    {
+        let filter = format!("PID eq {pid}");
+        let output = tokio::process::Command::new("tasklist")
+            .args(["/FI", &filter])
+            .output()
+            .await;
+        output.is_ok_and(|output| {
+            !output.status.success() || !String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
+        })
+    }
 }
 
 #[cfg(test)]

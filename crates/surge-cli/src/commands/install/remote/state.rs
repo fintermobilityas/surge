@@ -49,7 +49,10 @@ pub(crate) fn select_remote_tailscale_transfer_strategy(
     }
 }
 
-pub(crate) async fn check_remote_install_state(ssh_node: &str, install_dir: &str) -> Option<RemoteInstallState> {
+pub(crate) async fn check_remote_install_state(
+    ssh_node: &str,
+    install_dir: &str,
+) -> Result<Option<RemoteInstallState>> {
     let probe = format!(
         r#"manifest="$HOME/.local/share/{}/app/.surge/runtime.yml";
 if [ ! -f "$manifest" ]; then
@@ -65,10 +68,14 @@ printf 'version=%s\nchannel=%s\nprovider=%s\nbucket=%s\nregion=%s\nendpoint=%s\n
         install_dir.replace('\'', ""),
     );
     let command = format!("sh -c {}", shell_single_quote(&probe));
-    match run_tailscale_capture(&["ssh", ssh_node, command.as_str()]).await {
-        Ok(output) => parse_remote_install_state(&output),
-        Err(_) => None,
-    }
+    run_tailscale_capture(&["ssh", ssh_node, command.as_str()])
+        .await
+        .map(|output| parse_remote_install_state(&output))
+        .map_err(|error| {
+            SurgeError::Platform(format!(
+                "Could not read remote install state from '{ssh_node}'. This is a connectivity/probe failure, not a clean install state: {error}"
+            ))
+        })
 }
 
 pub(crate) fn parse_remote_install_state(output: &str) -> Option<RemoteInstallState> {

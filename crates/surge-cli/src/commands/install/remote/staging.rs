@@ -357,10 +357,19 @@ pub(crate) fn build_remote_stop_supervisor_command(install_root: &Path, supervis
 if [ ! -d \"$install_root\" ] || [ ! -f \"$pid_file\" ]; then exit 0; fi; \
 pid=\"$(tr -d '[:space:]' < \"$pid_file\")\"; \
 case \"$pid\" in ''|*[!0-9]*) echo \"Invalid PID in supervisor PID file: $pid_file\" >&2; exit 1 ;; esac; \
-kill \"$pid\"; \
+pid_stat() {{ if command -v ps >/dev/null 2>&1; then ps -o stat= -p \"$pid\" 2>/dev/null | tr -d '[:space:]' || true; elif kill -0 \"$pid\" 2>/dev/null; then printf R; fi; }}; \
+clear_if_stale() {{ stat=\"$(pid_stat)\"; if [ -z \"$stat\" ] || [ \"${{stat#Z}}\" != \"$stat\" ]; then rm -f \"$pid_file\"; exit 0; fi; }}; \
+clear_if_stale; \
+if ! kill \"$pid\" 2>/dev/null; then clear_if_stale; echo \"Failed to stop supervisor '$supervisor_id' (pid $pid)\" >&2; exit 1; fi; \
 i=0; \
 while [ -f \"$pid_file\" ]; do \
-  if [ \"$i\" -ge 200 ]; then echo \"Timed out waiting for supervisor '$supervisor_id' to exit\" >&2; exit 1; fi; \
+  clear_if_stale; \
+  if [ \"$i\" -ge 200 ]; then \
+    kill -KILL \"$pid\" 2>/dev/null || true; \
+    sleep 0.5; \
+    clear_if_stale; \
+    echo \"Timed out waiting for supervisor '$supervisor_id' to exit\" >&2; exit 1; \
+  fi; \
   sleep 0.1; \
   i=$((i + 1)); \
 done",

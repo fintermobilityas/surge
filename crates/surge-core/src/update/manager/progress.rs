@@ -7,6 +7,11 @@ use std::time::Instant;
 pub struct ProgressInfo {
     /// Current phase (1 = check, 2 = download, 3 = verify, 4 = extract, 5 = apply_delta, 6 = finalize).
     pub phase: i32,
+    /// Optional substep label that describes what is happening inside the
+    /// current phase. Used to surface progress for phases that are stuck at
+    /// 100% bytes/items while finalization or base reconstruction work is
+    /// still running.
+    pub phase_label: &'static str,
     /// Percentage complete within the current phase (0-100).
     pub phase_percent: i32,
     /// Overall percentage complete (0-100).
@@ -27,6 +32,7 @@ impl Default for ProgressInfo {
     fn default() -> Self {
         Self {
             phase: 0,
+            phase_label: "",
             phase_percent: 0,
             total_percent: 0,
             bytes_done: 0,
@@ -143,6 +149,7 @@ impl DownloadProgressState {
             items_done: self.items_done,
             items_total: total_items,
             speed_bytes_per_sec: average_speed_bytes_per_sec(self.bytes_done, self.started_at),
+            ..ProgressInfo::default()
         }
     }
 }

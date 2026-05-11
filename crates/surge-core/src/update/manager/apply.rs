@@ -173,6 +173,7 @@ where
                         u64::try_from(bytes_done.max(0)).unwrap_or(u64::MAX),
                         apply_delta_started_at,
                     ),
+                    ..ProgressInfo::default()
                 },
             );
         };
@@ -207,6 +208,7 @@ where
                     u64::try_from(apply_delta_bytes_done.max(0)).unwrap_or(u64::MAX),
                     apply_delta_started_at,
                 ),
+                ..ProgressInfo::default()
             },
         );
     }
@@ -225,6 +227,7 @@ where
                 u64::try_from(apply_delta_total_bytes.max(0)).unwrap_or(u64::MAX),
                 apply_delta_started_at,
             ),
+            ..ProgressInfo::default()
         },
     );
 
@@ -345,6 +348,7 @@ where
                 items_done: saturating_i64_from_u64(items_done),
                 items_total: saturating_i64_from_u64(items_total),
                 speed_bytes_per_sec: average_speed_bytes_per_sec(bytes_done, extract_started_at),
+                ..ProgressInfo::default()
             },
         );
     };

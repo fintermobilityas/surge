@@ -116,6 +116,7 @@ where
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 average_speed_bytes_per_sec(state.bytes_done(), state.started_at())
             },
+            ..ProgressInfo::default()
         },
     );
 

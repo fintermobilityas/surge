@@ -82,6 +82,12 @@ pub struct UpdateStatusRecord {
     pub completed_at_utc: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Coarse-grained label for the substep currently in progress (for
+    /// example "downloading artifacts" or "swapping app directory"). Only
+    /// meaningful for `InProgress` records; observers can use it to tell
+    /// "stuck in finalize" apart from "stuck in download".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_phase: Option<String>,
 }
 
 impl UpdateStatusRecord {
@@ -97,6 +103,7 @@ impl UpdateStatusRecord {
             attempted_at_utc: None,
             completed_at_utc: None,
             reason: None,
+            current_phase: None,
         }
     }
 
@@ -118,7 +125,19 @@ impl UpdateStatusRecord {
             attempted_at_utc: Some(attempted_at_utc),
             completed_at_utc: None,
             reason: None,
+            current_phase: None,
         }
+    }
+
+    /// Set the current substep label on an [`UpdateConvergenceState::InProgress`]
+    /// record. No-op for any other state.
+    #[must_use]
+    pub fn with_current_phase(mut self, phase: impl Into<String>) -> Self {
+        let label = phase.into();
+        if matches!(self.state, UpdateConvergenceState::InProgress) {
+            self.current_phase = Some(label);
+        }
+        self
     }
 
     #[must_use]
@@ -140,6 +159,7 @@ impl UpdateStatusRecord {
             attempted_at_utc,
             completed_at_utc: Some(completed_at_utc),
             reason: None,
+            current_phase: None,
         }
     }
 
@@ -163,6 +183,7 @@ impl UpdateStatusRecord {
             attempted_at_utc: Some(attempted_at_utc),
             completed_at_utc: Some(completed_at_utc),
             reason: Some(reason.to_string()),
+            current_phase: None,
         }
     }
 
@@ -185,6 +206,7 @@ impl UpdateStatusRecord {
             attempted_at_utc: Some(attempted_at_utc),
             completed_at_utc: None,
             reason: Some(reason.to_string()),
+            current_phase: None,
         }
     }
 }
@@ -323,6 +345,73 @@ mod tests {
     fn read_returns_none_when_file_missing() {
         let dir = tempfile::tempdir().unwrap();
         assert!(read_update_status(dir.path()).unwrap().is_none());
+    }
+
+    #[test]
+    fn with_current_phase_sets_only_for_in_progress_records() {
+        let in_progress = UpdateStatusRecord::in_progress(
+            "demo-app",
+            "9998.0.0",
+            "9999.0.0",
+            "stable",
+            "2026-05-11T14:00:00Z".to_string(),
+        )
+        .with_current_phase("swapping app directory");
+        assert_eq!(in_progress.current_phase.as_deref(), Some("swapping app directory"));
+
+        let converged = UpdateStatusRecord::converged(
+            "demo-app",
+            "9999.0.0",
+            "stable",
+            Some("2026-05-11T14:00:00Z".to_string()),
+            "2026-05-11T14:05:00Z".to_string(),
+            true,
+        )
+        .with_current_phase("ignored for non-in-progress records");
+        assert!(converged.current_phase.is_none());
+    }
+
+    #[test]
+    fn round_trip_in_progress_record_with_current_phase() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = UpdateStatusRecord::in_progress(
+            "demo-app",
+            "9998.0.0",
+            "9999.0.0",
+            "stable",
+            "2026-05-11T14:00:00Z".to_string(),
+        )
+        .with_current_phase("stopping supervisor");
+
+        write_update_status(dir.path(), &record).unwrap();
+        let loaded = read_update_status(dir.path()).unwrap().unwrap();
+
+        assert_eq!(loaded.state, UpdateConvergenceState::InProgress);
+        assert_eq!(loaded.current_phase.as_deref(), Some("stopping supervisor"));
+    }
+
+    #[test]
+    fn in_progress_record_serializes_current_phase_only_when_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let without_phase = UpdateStatusRecord::in_progress(
+            "demo-app",
+            "9998.0.0",
+            "9999.0.0",
+            "stable",
+            "2026-05-11T14:00:00Z".to_string(),
+        );
+        write_update_status(dir.path(), &without_phase).unwrap();
+        let raw = std::fs::read_to_string(update_status_path(dir.path())).unwrap();
+        assert!(
+            !raw.contains("current_phase"),
+            "expected current_phase to be skipped when None, got: {raw}"
+        );
+
+        let with_phase = without_phase.with_current_phase("swapping app directory");
+        write_update_status(dir.path(), &with_phase).unwrap();
+        let raw = std::fs::read_to_string(update_status_path(dir.path())).unwrap();
+        assert!(raw.contains("\"current_phase\""), "expected current_phase in: {raw}");
+        assert!(raw.contains("swapping app directory"), "expected label in: {raw}");
     }
 
     #[test]

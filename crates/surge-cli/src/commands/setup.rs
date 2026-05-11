@@ -27,6 +27,7 @@ struct ProgressReporter {
     last_logged_at: Instant,
     last_value: u64,
     next_percent: u64,
+    last_phase_label: Option<&'static str>,
 }
 
 impl ProgressReporter {
@@ -36,6 +37,7 @@ impl ProgressReporter {
             last_logged_at: Instant::now(),
             last_value: 0,
             next_percent: PACKAGE_PROGRESS_PERCENT_STEP,
+            last_phase_label: None,
         }
     }
 
@@ -100,6 +102,10 @@ impl ProgressReporter {
     }
 
     fn observe_update(&mut self, progress: &ProgressInfo) -> Option<String> {
+        if let Some(phase_message) = self.observe_phase_label(progress.phase_label) {
+            return Some(phase_message);
+        }
+
         let bytes_total = u64::try_from(progress.bytes_total.max(0)).unwrap_or(0);
         let bytes_done = u64::try_from(progress.bytes_done.max(0)).unwrap_or(0);
         if bytes_total > 0 {
@@ -130,6 +136,22 @@ impl ProgressReporter {
         }
 
         Some(format!("{} step {items_done}/{items_total} ({}%)", self.label, percent))
+    }
+
+    /// Convert phase-label transitions into log messages. Returns `Some` the
+    /// first time a new non-empty `phase_label` is observed so the operator
+    /// learns what the updater is doing during silent finalize substeps that
+    /// would otherwise leave the progress bar sitting at 100%.
+    fn observe_phase_label(&mut self, phase_label: &'static str) -> Option<String> {
+        if phase_label.is_empty() {
+            return None;
+        }
+        if self.last_phase_label == Some(phase_label) {
+            return None;
+        }
+        self.last_phase_label = Some(phase_label);
+        self.last_logged_at = Instant::now();
+        Some(format!("{} {phase_label}...", self.label))
     }
 }
 
@@ -686,6 +708,37 @@ mod tests {
         assert_eq!(
             reporter.observe_bytes_at(base + PACKAGE_PROGRESS_LOG_INTERVAL + Duration::from_millis(1), 6, 100),
             Some("Downloading package... 6 B / 100 B (6%)".to_string())
+        );
+    }
+
+    #[test]
+    fn progress_reporter_emits_message_for_each_distinct_phase_label() {
+        let mut reporter = ProgressReporter::new("Applying update...");
+        // No label -> nothing emitted.
+        assert!(reporter.observe_update(&ProgressInfo::default()).is_none());
+
+        let with_label = ProgressInfo {
+            phase: 6,
+            phase_label: "stopping supervisor",
+            total_percent: 91,
+            ..ProgressInfo::default()
+        };
+        assert_eq!(
+            reporter.observe_update(&with_label),
+            Some("Applying update... stopping supervisor...".to_string())
+        );
+        // Same label again is suppressed.
+        assert!(reporter.observe_update(&with_label).is_none());
+
+        let next_label = ProgressInfo {
+            phase: 6,
+            phase_label: "swapping app directory",
+            total_percent: 93,
+            ..ProgressInfo::default()
+        };
+        assert_eq!(
+            reporter.observe_update(&next_label),
+            Some("Applying update... swapping app directory...".to_string())
         );
     }
 

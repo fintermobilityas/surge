@@ -2,39 +2,31 @@
 
 mod apply;
 mod artifacts;
+mod finalize;
 mod lifecycle;
 mod progress;
+mod progress_substep;
 mod release_index;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
-use crate::config::constants::RELEASES_FILE_COMPRESSED;
 use crate::config::manifest::{InstallArtifactCachePolicy, InstallArtifactCacheRetention};
 use crate::context::Context;
 use crate::error::{Result, SurgeError};
-use crate::install::{
-    InstallProfile, RuntimeManifestMetadata, copy_persistent_assets, prune_version_snapshots,
-    storage_provider_manifest_name, write_runtime_manifest,
-};
-use crate::platform::fs::atomic_rename;
-use crate::platform::shortcuts::install_shortcuts;
-use crate::releases::artifact_cache::prune_cached_artifacts;
-use crate::releases::manifest::{ReleaseEntry, ReleaseIndex, decompress_release_index};
-use crate::releases::restore::{
-    retained_artifacts_for_cache_policy, retained_artifacts_for_cache_policy_without_index,
-};
+use crate::releases::manifest::{ReleaseEntry, ReleaseIndex};
 use crate::storage::{StorageBackend, create_storage_backend};
-use crate::supervisor::state::supervisor_pid_file;
 use crate::update::status::{self, UpdateStatusRecord};
 
 use self::apply::materialize_update_payload;
 use self::artifacts::prepare_update_artifacts;
+use self::finalize::finalize_update;
 use self::lifecycle::SupervisorRestartOutcome;
 pub use self::progress::ProgressInfo;
 use self::progress::emit_progress;
+use self::progress_substep::PhaseProgressEmitter;
 pub use self::release_index::plan_update_from_index;
 use self::release_index::{load_release_index as load_release_index_impl, resolve_update_info};
 
@@ -65,19 +57,19 @@ pub struct UpdateInfo {
 }
 
 const DEFAULT_RELEASE_RETENTION_LIMIT: usize = 1;
-const RELEASE_GRAPH_CHECKPOINT_FULLS: usize = 3;
+pub(super) const RELEASE_GRAPH_CHECKPOINT_FULLS: usize = 3;
 
 /// Manages checking for and applying application updates.
 pub struct UpdateManager {
-    ctx: Arc<Context>,
-    app_id: String,
-    current_version: String,
-    channel: String,
-    release_retention_limit: usize,
-    artifact_retention_policy: InstallArtifactCachePolicy,
-    install_dir: PathBuf,
-    storage: Box<dyn StorageBackend>,
-    cached_index: Option<ReleaseIndex>,
+    pub(super) ctx: Arc<Context>,
+    pub(super) app_id: String,
+    pub(super) current_version: String,
+    pub(super) channel: String,
+    pub(super) release_retention_limit: usize,
+    pub(super) artifact_retention_policy: InstallArtifactCachePolicy,
+    pub(super) install_dir: PathBuf,
+    pub(super) storage: Box<dyn StorageBackend>,
+    pub(super) cached_index: Option<ReleaseIndex>,
 }
 
 impl UpdateManager {
@@ -240,7 +232,10 @@ impl UpdateManager {
         }
 
         let progress = progress.map(Arc::new);
-        match self.download_and_apply_inner(info, progress).await {
+        match self
+            .download_and_apply_inner(info, progress, in_progress_record.clone())
+            .await
+        {
             Ok(restart_outcome) => {
                 let completed_at_utc = status::now_utc_rfc3339();
                 let record = match restart_outcome {
@@ -296,11 +291,17 @@ impl UpdateManager {
         &self,
         info: &UpdateInfo,
         progress: Option<Arc<F>>,
+        in_progress_template: UpdateStatusRecord,
     ) -> Result<SupervisorRestartOutcome>
     where
         F: Fn(ProgressInfo) + Send + Sync,
     {
         self.ctx.check_cancelled()?;
+        let progress_emitter = PhaseProgressEmitter {
+            progress: progress.as_ref(),
+            install_dir: &self.install_dir,
+            in_progress_template: &in_progress_template,
+        };
 
         // Phase 1: Check
         info!(version = %info.latest_version, "Starting update");
@@ -358,206 +359,15 @@ impl UpdateManager {
         .await?;
 
         // Phase 6: Finalize
-        emit_progress(
-            progress.as_ref(),
-            ProgressInfo {
-                phase: 6,
-                total_percent: 90,
-                ..ProgressInfo::default()
-            },
-        );
-        let latest = info
-            .apply_releases
-            .last()
-            .ok_or_else(|| SurgeError::Update("No latest release".to_string()))?;
-        let active_app_dir = self.install_dir.join("app");
-        let next_app_dir = self.install_dir.join(".surge-app-next");
-        let previous_swap_dir = self.install_dir.join(".surge-app-prev");
-        let supervisor_was_running = !latest.supervisor_id.trim().is_empty()
-            && supervisor_pid_file(&self.install_dir, &latest.supervisor_id).is_file();
-
-        lifecycle::request_supervisor_shutdown(&self.install_dir, &latest.supervisor_id).await?;
-
-        if next_app_dir.exists() {
-            tokio::fs::remove_dir_all(&next_app_dir).await?;
-        }
-        if previous_swap_dir.exists() {
-            tokio::fs::remove_dir_all(&previous_swap_dir).await?;
-        }
-
-        // Legacy installs may still be on `app-{version}` layout.
-        let fallback_previous_app_dir = if active_app_dir.is_dir() {
-            None
-        } else {
-            apply::find_previous_app_dir(&self.install_dir, &self.current_version)
-        };
-
-        atomic_rename(&extracted_final_dir, &next_app_dir)?;
-
-        if active_app_dir.is_dir() {
-            atomic_rename(&active_app_dir, &previous_swap_dir)?;
-        }
-        if let Err(err) = atomic_rename(&next_app_dir, &active_app_dir) {
-            // Best effort rollback to previous active content.
-            if previous_swap_dir.is_dir() && !active_app_dir.exists() {
-                let _ = atomic_rename(&previous_swap_dir, &active_app_dir);
-            }
-            return Err(err);
-        }
-
-        let previous_app_dir_for_assets = if previous_swap_dir.is_dir() {
-            Some(previous_swap_dir.as_path())
-        } else {
-            fallback_previous_app_dir.as_deref()
-        };
-
-        if !latest.persistent_assets.is_empty() {
-            if let Some(previous) = previous_app_dir_for_assets {
-                copy_persistent_assets(previous, &active_app_dir, &latest.persistent_assets)?;
-            } else {
-                debug!(
-                    version = %latest.version,
-                    "No previous app directory found; skipping persistent asset carry-over"
-                );
-            }
-        }
-
-        let storage_cfg = self.ctx.storage_config();
-        let runtime_manifest_profile = InstallProfile::new(
-            &self.app_id,
-            latest.display_name(&self.app_id),
-            &latest.main_exe,
-            &latest.install_directory,
-            &latest.supervisor_id,
-            &latest.icon,
-            &latest.shortcuts,
-            &latest.persistent_assets,
-            &latest.environment,
-        );
-        let runtime_manifest_metadata = RuntimeManifestMetadata::new(
-            &latest.version,
-            &self.channel,
-            storage_provider_manifest_name(storage_cfg.provider),
-            &storage_cfg.bucket,
-            &storage_cfg.region,
-            &storage_cfg.endpoint,
-        );
-        write_runtime_manifest(&active_app_dir, &runtime_manifest_profile, &runtime_manifest_metadata)?;
-
-        if !latest.shortcuts.is_empty() {
-            match install_shortcuts(
-                &self.app_id,
-                latest.display_name(&self.app_id),
-                &active_app_dir,
-                &latest.main_exe,
-                &latest.supervisor_id,
-                &latest.icon,
-                &latest.shortcuts,
-                &latest.environment,
-            ) {
-                Ok(()) => {
-                    debug!(version = %latest.version, "Installed shortcuts");
-                }
-                Err(e) => {
-                    warn!(
-                        version = %latest.version,
-                        error = %e,
-                        "Failed to install shortcuts (continuing)"
-                    );
-                }
-            }
-        }
-
-        if previous_swap_dir.is_dir() {
-            let previous_version_dir = self.install_dir.join(format!("app-{}", self.current_version));
-            if !self.current_version.trim().is_empty()
-                && previous_version_dir != active_app_dir
-                && !previous_version_dir.exists()
-            {
-                if let Err(e) = atomic_rename(&previous_swap_dir, &previous_version_dir) {
-                    warn!(
-                        previous = %previous_swap_dir.display(),
-                        target = %previous_version_dir.display(),
-                        error = %e,
-                        "Failed to preserve previous active directory snapshot"
-                    );
-                    let _ = tokio::fs::remove_dir_all(&previous_swap_dir).await;
-                }
-            } else {
-                let _ = tokio::fs::remove_dir_all(&previous_swap_dir).await;
-            }
-        }
-        match prune_version_snapshots(&self.install_dir, self.release_retention_limit) {
-            Ok(0) => {}
-            Ok(pruned) => {
-                debug!(
-                    pruned,
-                    retained = self.release_retention_limit,
-                    "Pruned stale installed app version snapshots"
-                );
-            }
-            Err(e) => {
-                warn!(error = %e, "Failed to prune installed app version snapshots");
-            }
-        }
-
-        // Clean up staging directory
-        if staging_dir.exists() {
-            let _ = tokio::fs::remove_dir_all(&staging_dir).await;
-        }
-
-        let prune_index = if let Some(cached) = &self.cached_index {
-            Some(cached.clone())
-        } else {
-            match self.storage.get_object(RELEASES_FILE_COMPRESSED).await {
-                Ok(data) => Some(decompress_release_index(&data)?),
-                Err(SurgeError::NotFound(_)) => None,
-                Err(e) => return Err(e),
-            }
-        };
-        let retained_artifacts = if let Some(index) = prune_index {
-            Some(retained_artifacts_for_cache_policy(
-                &index,
-                self.artifact_retention_policy,
-                &latest.full_filename,
-                RELEASE_GRAPH_CHECKPOINT_FULLS,
-            ))
-        } else {
-            retained_artifacts_for_cache_policy_without_index(self.artifact_retention_policy, &latest.full_filename)
-        };
-        if let Some(retained_artifacts) = retained_artifacts {
-            match prune_cached_artifacts(&artifact_cache_dir, &retained_artifacts) {
-                Ok(0) => {}
-                Ok(pruned) => {
-                    debug!(
-                        pruned,
-                        retained = retained_artifacts.len(),
-                        "Pruned stale local artifact cache entries"
-                    );
-                }
-                Err(e) => {
-                    warn!(error = %e, "Failed to prune local artifact cache");
-                }
-            }
-        }
-
-        lifecycle::invoke_post_update_hook(&self.install_dir, &active_app_dir, latest);
-
-        let restart_outcome = if supervisor_was_running {
-            lifecycle::restart_supervisor_after_update(&self.install_dir, &active_app_dir, latest)
-        } else {
-            SupervisorRestartOutcome::NotApplicable
-        };
-
-        emit_progress(
-            progress.as_ref(),
-            ProgressInfo {
-                phase: 6,
-                phase_percent: 100,
-                total_percent: 100,
-                ..ProgressInfo::default()
-            },
-        );
+        let restart_outcome = finalize_update(
+            self,
+            info,
+            &extracted_final_dir,
+            &staging_dir,
+            &artifact_cache_dir,
+            &progress_emitter,
+        )
+        .await?;
 
         info!(
             version = %info.latest_version,
@@ -576,9 +386,10 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
 
+    use super::progress_substep::labels as finalize_phase;
     use super::*;
     use crate::archive::packer::ArchivePacker;
-    use crate::config::constants::DEFAULT_ZSTD_LEVEL;
+    use crate::config::constants::{DEFAULT_ZSTD_LEVEL, RELEASES_FILE_COMPRESSED};
     #[cfg(target_os = "linux")]
     use crate::config::manifest::ShortcutLocation;
     use crate::context::StorageProvider;
@@ -1706,6 +1517,158 @@ mod tests {
         let final_progress = observed.last().expect("expected final progress");
         assert_eq!(final_progress.phase, 6);
         assert_eq!(final_progress.total_percent, 100);
+
+        let finalize_labels: Vec<&'static str> = observed
+            .iter()
+            .filter(|progress| progress.phase == 6 && !progress.phase_label.is_empty())
+            .map(|progress| progress.phase_label)
+            .collect();
+        assert!(
+            finalize_labels.contains(&finalize_phase::PREPARING_SWAP),
+            "expected finalize substep '{}' in {:?}",
+            finalize_phase::PREPARING_SWAP,
+            finalize_labels
+        );
+        assert!(
+            finalize_labels.contains(&finalize_phase::SWAPPING_APP_DIRECTORY),
+            "expected finalize substep '{}' in {:?}",
+            finalize_phase::SWAPPING_APP_DIRECTORY,
+            finalize_labels
+        );
+        assert!(
+            finalize_labels.contains(&finalize_phase::WRITING_RUNTIME_MANIFEST),
+            "expected finalize substep '{}' in {:?}",
+            finalize_phase::WRITING_RUNTIME_MANIFEST,
+            finalize_labels
+        );
+        assert!(
+            finalize_labels.contains(&finalize_phase::PRUNING_OLD_VERSIONS),
+            "expected finalize substep '{}' in {:?}",
+            finalize_phase::PRUNING_OLD_VERSIONS,
+            finalize_labels
+        );
+        assert!(
+            finalize_labels.contains(&finalize_phase::POST_UPDATE_HOOK),
+            "expected finalize substep '{}' in {:?}",
+            finalize_phase::POST_UPDATE_HOOK,
+            finalize_labels
+        );
+    }
+
+    #[tokio::test]
+    async fn test_download_and_apply_persists_current_phase_for_finalize_substeps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("store");
+        let install_root = tmp.path().join("install");
+        let app_id = "test-app";
+        std::fs::create_dir_all(&store_root).unwrap();
+        std::fs::create_dir_all(&install_root).unwrap();
+        let app_store = app_scoped_store_root(&store_root, app_id);
+
+        let rid = current_rid();
+        let full_filename = format!("{app_id}-1.1.0-{rid}-full.tar.zst");
+        let full_path = app_store.join(&full_filename);
+
+        let mut packer = ArchivePacker::new(3).unwrap();
+        packer.add_buffer("payload.txt", b"new payload", 0o644).unwrap();
+        packer.finalize_to_file(&full_path).unwrap();
+
+        let full_size = std::fs::metadata(&full_path).unwrap().len() as i64;
+        let full_sha256 = sha256_hex_file(&full_path).unwrap();
+
+        let index = ReleaseIndex {
+            app_id: app_id.to_string(),
+            releases: vec![ReleaseEntry {
+                version: "1.1.0".to_string(),
+                channels: vec!["stable".to_string()],
+                os: current_os_label_for_tests(),
+                rid: rid.clone(),
+                is_genesis: true,
+                full_filename: full_filename.clone(),
+                full_size,
+                full_sha256,
+                full_compression_level: 0,
+                full_zstd_workers: 0,
+                deltas: Vec::new(),
+                preferred_delta_id: String::new(),
+                created_utc: chrono::Utc::now().to_rfc3339(),
+                release_notes: String::new(),
+                name: String::new(),
+                main_exe: app_id.to_string(),
+                install_directory: app_id.to_string(),
+                supervisor_id: String::new(),
+                icon: String::new(),
+                shortcuts: Vec::new(),
+                persistent_assets: Vec::new(),
+                installers: Vec::new(),
+                environment: std::collections::BTreeMap::new(),
+            }],
+            ..ReleaseIndex::default()
+        };
+        write_app_scoped_release_index(&store_root, app_id, &index);
+
+        let ctx = Arc::new(Context::new());
+        ctx.set_storage(
+            StorageProvider::Filesystem,
+            store_root.to_str().unwrap(),
+            "",
+            "",
+            "",
+            "",
+        );
+
+        let observed_phases = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+        let observed_phases_for_progress = Arc::clone(&observed_phases);
+        let status_path = status::update_status_path(&install_root);
+
+        let mut manager = UpdateManager::new(ctx, app_id, "1.0.0", "stable", install_root.to_str().unwrap()).unwrap();
+        let info = manager.check_for_updates().await.unwrap().unwrap();
+
+        manager
+            .download_and_apply(
+                &info,
+                Some(move |progress: ProgressInfo| {
+                    if progress.phase == 6
+                        && !progress.phase_label.is_empty()
+                        && let Ok(bytes) = std::fs::read(&status_path)
+                        && let Ok(record) = serde_json::from_slice::<status::UpdateStatusRecord>(&bytes)
+                    {
+                        observed_phases_for_progress
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(record.current_phase);
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+
+        let observed_phases = observed_phases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+
+        assert!(
+            observed_phases
+                .iter()
+                .any(|phase| phase.as_deref() == Some(finalize_phase::PREPARING_SWAP)),
+            "expected current_phase to include '{}' in {:?}",
+            finalize_phase::PREPARING_SWAP,
+            observed_phases,
+        );
+        assert!(
+            observed_phases
+                .iter()
+                .any(|phase| phase.as_deref() == Some(finalize_phase::SWAPPING_APP_DIRECTORY)),
+            "expected current_phase to include '{}' in {:?}",
+            finalize_phase::SWAPPING_APP_DIRECTORY,
+            observed_phases,
+        );
+
+        // Final converged record clears current_phase.
+        let final_record = status::read_update_status(&install_root).unwrap().unwrap();
+        assert_eq!(final_record.state, status::UpdateConvergenceState::Converged);
+        assert!(final_record.current_phase.is_none());
     }
 
     #[tokio::test]

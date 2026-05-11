@@ -281,6 +281,31 @@ SURGE_API surge_result SURGE_CALL surge_update_download_and_apply(surge_update_m
                                                                   const surge_releases_info* info,
                                                                   surge_progress_callback progress_cb, void* user_data);
 
+/**
+ * Read the persisted update convergence record from @p install_dir as a JSON
+ * string. The record is written by surge_update_download_and_apply() so
+ * dashboards and repair tooling can distinguish "in progress", "applied but
+ * pending supervisor restart", "fully converged", and "failed" without having
+ * to infer the state from version drift alone.
+ *
+ * @param install_dir Root install directory containing
+ *                    `.surge-update-status.json`.
+ * @param json_out    [out] Receives a malloc()-allocated NUL-terminated JSON
+ *                    string on SURGE_OK, or NULL on SURGE_NOT_FOUND /
+ *                    SURGE_ERROR. Caller must free with free().
+ * @return SURGE_OK when a record exists; SURGE_NOT_FOUND when no record has
+ *         been written yet; SURGE_ERROR on read/decode failure.
+ */
+SURGE_API surge_result SURGE_CALL surge_update_status_read_json(const char* install_dir, char** json_out);
+
+/**
+ * Free a NUL-terminated string returned by a Surge FFI call that documents its
+ * output as `free()`-owned (for example surge_update_status_read_json). Safe
+ * to call with NULL. Use this rather than the host's free() to ensure the
+ * matching allocator is used across libraries.
+ */
+SURGE_API void SURGE_CALL surge_free_cstring(char* ptr);
+
 /* -------------------------------------------------------------------------- */
 /*  Release-info accessors                                                    */
 /* -------------------------------------------------------------------------- */

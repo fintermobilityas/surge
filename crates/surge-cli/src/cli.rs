@@ -269,6 +269,17 @@ pub(crate) enum Commands {
         file: PathBuf,
     },
 
+    /// Print the persisted update convergence record for a Surge-managed install
+    Status {
+        /// Root install directory (containing .surge-update-status.json)
+        #[arg(value_name = "INSTALL_DIR")]
+        install_dir: PathBuf,
+
+        /// Emit the record as JSON instead of a human-readable summary
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Install packages using a selected transport method
     Install {
         /// Install method (defaults to backend)

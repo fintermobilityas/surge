@@ -354,6 +354,73 @@ pub unsafe extern "C" fn surge_update_download_and_apply(
     }))
 }
 
+/// Read the persisted update convergence record from `install_dir` as JSON.
+///
+/// On `SURGE_OK`, `*json_out` is set to a `malloc()`-allocated, NUL-terminated
+/// UTF-8 JSON string that the caller must free with `free()`. On
+/// `SURGE_NOT_FOUND` no status record has been written for this install yet
+/// (clean install, or no update has been attempted) and `*json_out` is set to
+/// NULL. On `SURGE_ERROR` reading or decoding failed; `*json_out` is NULL.
+///
+/// The JSON schema matches [`surge_core::update::status::UpdateStatusRecord`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn surge_update_status_read_json(install_dir: *const c_char, json_out: *mut *mut c_char) -> i32 {
+    if json_out.is_null() {
+        return SURGE_ERROR;
+    }
+    // SAFETY: `json_out` is checked non-null above; clear it before any work.
+    unsafe {
+        *json_out = ptr::null_mut();
+    }
+
+    if install_dir.is_null() {
+        return SURGE_ERROR;
+    }
+
+    catch_ffi(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: `install_dir` follows the nullable C string contract; the
+        // out pointer was cleared above.
+        let install_dir_s = unsafe { cstr_to_string(install_dir) };
+        if install_dir_s.trim().is_empty() {
+            return SURGE_ERROR;
+        }
+
+        let install_path = std::path::Path::new(&install_dir_s);
+        let record = match surge_core::update::status::read_update_status(install_path) {
+            Ok(Some(record)) => record,
+            Ok(None) => return SURGE_NOT_FOUND,
+            Err(e) => {
+                tracing::error!("surge_update_status_read_json failed: {e}");
+                return SURGE_ERROR;
+            }
+        };
+
+        let json = match serde_json::to_string(&record) {
+            Ok(json) => json,
+            Err(e) => {
+                tracing::error!("surge_update_status_read_json encode failed: {e}");
+                return SURGE_ERROR;
+            }
+        };
+
+        let c_json = match std::ffi::CString::new(json) {
+            Ok(cs) => cs,
+            Err(_) => return SURGE_ERROR,
+        };
+        let bytes = c_json.as_bytes_with_nul();
+        let buf = crate::shared::libc_malloc(bytes.len()).cast::<c_char>();
+        if buf.is_null() {
+            return SURGE_ERROR;
+        }
+        // SAFETY: `buf` points to `bytes.len()` writable bytes from malloc.
+        unsafe {
+            ptr::copy_nonoverlapping(bytes.as_ptr().cast::<c_char>(), buf, bytes.len());
+            *json_out = buf;
+        }
+        SURGE_OK
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::{CStr, CString};

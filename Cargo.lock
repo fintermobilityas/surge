@@ -3206,6 +3206,7 @@ dependencies = [
 name = "surge-ffi"
 version = "1.0.0"
 dependencies = [
+ "serde_json",
  "surge-core",
  "tokio",
  "tracing",

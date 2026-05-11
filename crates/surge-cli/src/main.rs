@@ -268,6 +268,8 @@ async fn run(cli: Cli) -> surge_core::error::Result<()> {
             Ok(())
         }
 
+        Commands::Status { install_dir, json } => commands::status::execute(&install_dir, json),
+
         Commands::Install {
             method,
             target,

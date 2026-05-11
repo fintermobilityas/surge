@@ -2,39 +2,31 @@
 
 mod apply;
 mod artifacts;
+mod finalize;
 mod lifecycle;
 mod progress;
+mod progress_substep;
 mod release_index;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
-use crate::config::constants::RELEASES_FILE_COMPRESSED;
 use crate::config::manifest::{InstallArtifactCachePolicy, InstallArtifactCacheRetention};
 use crate::context::Context;
 use crate::error::{Result, SurgeError};
-use crate::install::{
-    InstallProfile, RuntimeManifestMetadata, copy_persistent_assets, prune_version_snapshots,
-    storage_provider_manifest_name, write_runtime_manifest,
-};
-use crate::platform::fs::atomic_rename;
-use crate::platform::shortcuts::install_shortcuts;
-use crate::releases::artifact_cache::prune_cached_artifacts;
-use crate::releases::manifest::{ReleaseEntry, ReleaseIndex, decompress_release_index};
-use crate::releases::restore::{
-    retained_artifacts_for_cache_policy, retained_artifacts_for_cache_policy_without_index,
-};
+use crate::releases::manifest::{ReleaseEntry, ReleaseIndex};
 use crate::storage::{StorageBackend, create_storage_backend};
-use crate::supervisor::state::supervisor_pid_file;
 use crate::update::status::{self, UpdateStatusRecord};
 
 use self::apply::materialize_update_payload;
 use self::artifacts::prepare_update_artifacts;
+use self::finalize::finalize_update;
 use self::lifecycle::SupervisorRestartOutcome;
 pub use self::progress::ProgressInfo;
 use self::progress::emit_progress;
+use self::progress_substep::PhaseProgressEmitter;
 pub use self::release_index::plan_update_from_index;
 use self::release_index::{load_release_index as load_release_index_impl, resolve_update_info};
 
@@ -65,117 +57,19 @@ pub struct UpdateInfo {
 }
 
 const DEFAULT_RELEASE_RETENTION_LIMIT: usize = 1;
-const RELEASE_GRAPH_CHECKPOINT_FULLS: usize = 3;
-/// Bound the post-finalize storage read used to pick which artifacts to keep
-/// in the local cache. Pruning is best-effort, so an unreachable storage
-/// backend must not stall the rest of finalize indefinitely.
-const PRUNE_INDEX_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-/// Periodic re-emit interval for finalize substeps whose underlying work
-/// can block silently for many seconds (supervisor shutdown, post-update
-/// hook). Operators watching CLI output use this to distinguish "stuck"
-/// from "still running".
-const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// Substep labels for the finalize phase. These appear in `ProgressInfo`
-/// events and on the persisted `current_phase` field of in-progress update
-/// status records so operators can tell a stuck "swapping app directory"
-/// apart from a stuck "starting supervisor".
-pub(crate) mod finalize_phase {
-    pub const STOPPING_SUPERVISOR: &str = "stopping supervisor";
-    pub const PREPARING_SWAP: &str = "preparing app swap";
-    pub const SWAPPING_APP_DIRECTORY: &str = "swapping app directory";
-    pub const COPYING_PERSISTENT_ASSETS: &str = "copying persistent assets";
-    pub const WRITING_RUNTIME_MANIFEST: &str = "writing runtime metadata";
-    pub const INSTALLING_SHORTCUTS: &str = "installing shortcuts";
-    pub const PRUNING_OLD_VERSIONS: &str = "pruning old versions and caches";
-    pub const POST_UPDATE_HOOK: &str = "running post-update hook";
-    pub const RESTARTING_SUPERVISOR: &str = "restarting supervisor";
-}
-
-/// Bundle of state used to emit phase progress and persist the current
-/// substep label to the update status record.
-struct PhaseProgressEmitter<'a, F>
-where
-    F: Fn(ProgressInfo) + Send + Sync,
-{
-    progress: Option<&'a Arc<F>>,
-    install_dir: &'a std::path::Path,
-    in_progress_template: &'a UpdateStatusRecord,
-}
-
-impl<F> PhaseProgressEmitter<'_, F>
-where
-    F: Fn(ProgressInfo) + Send + Sync,
-{
-    /// Run a future while periodically re-emitting the substep label so
-    /// observers see "still working" beats during long-running phases that
-    /// don't themselves report progress (supervisor shutdown, post-update
-    /// hook, supervisor restart). The label is emitted once up front, then
-    /// every `interval` until the future resolves.
-    async fn run_with_heartbeat<Fut, T>(
-        &self,
-        phase: i32,
-        label: &'static str,
-        total_percent: i32,
-        interval: std::time::Duration,
-        future: Fut,
-    ) -> T
-    where
-        Fut: std::future::Future<Output = T>,
-    {
-        self.emit_substep(phase, label, total_percent);
-        tokio::pin!(future);
-        let mut ticker = tokio::time::interval(interval);
-        // Skip the immediate tick; we already emitted once via emit_substep above.
-        ticker.tick().await;
-        loop {
-            tokio::select! {
-                result = &mut future => return result,
-                _ = ticker.tick() => {
-                    emit_progress(
-                        self.progress,
-                        ProgressInfo {
-                            phase,
-                            phase_label: label,
-                            total_percent,
-                            ..ProgressInfo::default()
-                        },
-                    );
-                }
-            }
-        }
-    }
-
-    /// Emit a progress event and best-effort persist the current substep
-    /// label to the in-progress status record.
-    fn emit_substep(&self, phase: i32, label: &'static str, total_percent: i32) {
-        emit_progress(
-            self.progress,
-            ProgressInfo {
-                phase,
-                phase_label: label,
-                total_percent,
-                ..ProgressInfo::default()
-            },
-        );
-        let record = self.in_progress_template.clone().with_current_phase(label);
-        if let Err(e) = status::write_update_status(self.install_dir, &record) {
-            warn!(error = %e, phase = label, "Failed to persist in-progress substep status (continuing)");
-        }
-    }
-}
+pub(super) const RELEASE_GRAPH_CHECKPOINT_FULLS: usize = 3;
 
 /// Manages checking for and applying application updates.
 pub struct UpdateManager {
-    ctx: Arc<Context>,
-    app_id: String,
-    current_version: String,
-    channel: String,
-    release_retention_limit: usize,
-    artifact_retention_policy: InstallArtifactCachePolicy,
-    install_dir: PathBuf,
-    storage: Box<dyn StorageBackend>,
-    cached_index: Option<ReleaseIndex>,
+    pub(super) ctx: Arc<Context>,
+    pub(super) app_id: String,
+    pub(super) current_version: String,
+    pub(super) channel: String,
+    pub(super) release_retention_limit: usize,
+    pub(super) artifact_retention_policy: InstallArtifactCachePolicy,
+    pub(super) install_dir: PathBuf,
+    pub(super) storage: Box<dyn StorageBackend>,
+    pub(super) cached_index: Option<ReleaseIndex>,
 }
 
 impl UpdateManager {
@@ -465,238 +359,15 @@ impl UpdateManager {
         .await?;
 
         // Phase 6: Finalize
-        emit_progress(
-            progress.as_ref(),
-            ProgressInfo {
-                phase: 6,
-                total_percent: 90,
-                ..ProgressInfo::default()
-            },
-        );
-        let latest = info
-            .apply_releases
-            .last()
-            .ok_or_else(|| SurgeError::Update("No latest release".to_string()))?;
-        let active_app_dir = self.install_dir.join("app");
-        let next_app_dir = self.install_dir.join(".surge-app-next");
-        let previous_swap_dir = self.install_dir.join(".surge-app-prev");
-        let supervisor_was_running = !latest.supervisor_id.trim().is_empty()
-            && supervisor_pid_file(&self.install_dir, &latest.supervisor_id).is_file();
-
-        if supervisor_was_running {
-            progress_emitter
-                .run_with_heartbeat(
-                    6,
-                    finalize_phase::STOPPING_SUPERVISOR,
-                    91,
-                    HEARTBEAT_INTERVAL,
-                    lifecycle::request_supervisor_shutdown(&self.install_dir, &latest.supervisor_id),
-                )
-                .await?;
-        } else {
-            lifecycle::request_supervisor_shutdown(&self.install_dir, &latest.supervisor_id).await?;
-        }
-
-        progress_emitter.emit_substep(6, finalize_phase::PREPARING_SWAP, 92);
-        if next_app_dir.exists() {
-            tokio::fs::remove_dir_all(&next_app_dir).await?;
-        }
-        if previous_swap_dir.exists() {
-            tokio::fs::remove_dir_all(&previous_swap_dir).await?;
-        }
-
-        // Legacy installs may still be on `app-{version}` layout.
-        let fallback_previous_app_dir = if active_app_dir.is_dir() {
-            None
-        } else {
-            apply::find_previous_app_dir(&self.install_dir, &self.current_version)
-        };
-
-        progress_emitter.emit_substep(6, finalize_phase::SWAPPING_APP_DIRECTORY, 93);
-        atomic_rename(&extracted_final_dir, &next_app_dir)?;
-
-        if active_app_dir.is_dir() {
-            atomic_rename(&active_app_dir, &previous_swap_dir)?;
-        }
-        if let Err(err) = atomic_rename(&next_app_dir, &active_app_dir) {
-            // Best effort rollback to previous active content.
-            if previous_swap_dir.is_dir() && !active_app_dir.exists() {
-                let _ = atomic_rename(&previous_swap_dir, &active_app_dir);
-            }
-            return Err(err);
-        }
-
-        let previous_app_dir_for_assets = if previous_swap_dir.is_dir() {
-            Some(previous_swap_dir.as_path())
-        } else {
-            fallback_previous_app_dir.as_deref()
-        };
-
-        if !latest.persistent_assets.is_empty() && previous_app_dir_for_assets.is_some() {
-            progress_emitter.emit_substep(6, finalize_phase::COPYING_PERSISTENT_ASSETS, 94);
-            if let Some(previous) = previous_app_dir_for_assets {
-                copy_persistent_assets(previous, &active_app_dir, &latest.persistent_assets)?;
-            }
-        } else if !latest.persistent_assets.is_empty() {
-            debug!(
-                version = %latest.version,
-                "No previous app directory found; skipping persistent asset carry-over"
-            );
-        }
-
-        progress_emitter.emit_substep(6, finalize_phase::WRITING_RUNTIME_MANIFEST, 95);
-        let storage_cfg = self.ctx.storage_config();
-        let runtime_manifest_profile = InstallProfile::new(
-            &self.app_id,
-            latest.display_name(&self.app_id),
-            &latest.main_exe,
-            &latest.install_directory,
-            &latest.supervisor_id,
-            &latest.icon,
-            &latest.shortcuts,
-            &latest.persistent_assets,
-            &latest.environment,
-        );
-        let runtime_manifest_metadata = RuntimeManifestMetadata::new(
-            &latest.version,
-            &self.channel,
-            storage_provider_manifest_name(storage_cfg.provider),
-            &storage_cfg.bucket,
-            &storage_cfg.region,
-            &storage_cfg.endpoint,
-        );
-        write_runtime_manifest(&active_app_dir, &runtime_manifest_profile, &runtime_manifest_metadata)?;
-
-        if !latest.shortcuts.is_empty() {
-            progress_emitter.emit_substep(6, finalize_phase::INSTALLING_SHORTCUTS, 96);
-            match install_shortcuts(
-                &self.app_id,
-                latest.display_name(&self.app_id),
-                &active_app_dir,
-                &latest.main_exe,
-                &latest.supervisor_id,
-                &latest.icon,
-                &latest.shortcuts,
-                &latest.environment,
-            ) {
-                Ok(()) => {
-                    debug!(version = %latest.version, "Installed shortcuts");
-                }
-                Err(e) => {
-                    warn!(
-                        version = %latest.version,
-                        error = %e,
-                        "Failed to install shortcuts (continuing)"
-                    );
-                }
-            }
-        }
-
-        progress_emitter.emit_substep(6, finalize_phase::PRUNING_OLD_VERSIONS, 97);
-        if previous_swap_dir.is_dir() {
-            let previous_version_dir = self.install_dir.join(format!("app-{}", self.current_version));
-            if !self.current_version.trim().is_empty()
-                && previous_version_dir != active_app_dir
-                && !previous_version_dir.exists()
-            {
-                if let Err(e) = atomic_rename(&previous_swap_dir, &previous_version_dir) {
-                    warn!(
-                        previous = %previous_swap_dir.display(),
-                        target = %previous_version_dir.display(),
-                        error = %e,
-                        "Failed to preserve previous active directory snapshot"
-                    );
-                    let _ = tokio::fs::remove_dir_all(&previous_swap_dir).await;
-                }
-            } else {
-                let _ = tokio::fs::remove_dir_all(&previous_swap_dir).await;
-            }
-        }
-        match prune_version_snapshots(&self.install_dir, self.release_retention_limit) {
-            Ok(0) => {}
-            Ok(pruned) => {
-                debug!(
-                    pruned,
-                    retained = self.release_retention_limit,
-                    "Pruned stale installed app version snapshots"
-                );
-            }
-            Err(e) => {
-                warn!(error = %e, "Failed to prune installed app version snapshots");
-            }
-        }
-
-        // Clean up staging directory
-        if staging_dir.exists() {
-            let _ = tokio::fs::remove_dir_all(&staging_dir).await;
-        }
-
-        let prune_index = if let Some(cached) = &self.cached_index {
-            Some(cached.clone())
-        } else {
-            match tokio::time::timeout(
-                PRUNE_INDEX_FETCH_TIMEOUT,
-                self.storage.get_object(RELEASES_FILE_COMPRESSED),
-            )
-            .await
-            {
-                Ok(Ok(data)) => Some(decompress_release_index(&data)?),
-                Ok(Err(SurgeError::NotFound(_))) => None,
-                Ok(Err(e)) => return Err(e),
-                Err(_) => {
-                    warn!(
-                        timeout_secs = PRUNE_INDEX_FETCH_TIMEOUT.as_secs(),
-                        "Timed out fetching release index for artifact pruning; skipping prune step"
-                    );
-                    None
-                }
-            }
-        };
-        let retained_artifacts = if let Some(index) = prune_index {
-            Some(retained_artifacts_for_cache_policy(
-                &index,
-                self.artifact_retention_policy,
-                &latest.full_filename,
-                RELEASE_GRAPH_CHECKPOINT_FULLS,
-            ))
-        } else {
-            retained_artifacts_for_cache_policy_without_index(self.artifact_retention_policy, &latest.full_filename)
-        };
-        if let Some(retained_artifacts) = retained_artifacts {
-            match prune_cached_artifacts(&artifact_cache_dir, &retained_artifacts) {
-                Ok(0) => {}
-                Ok(pruned) => {
-                    debug!(
-                        pruned,
-                        retained = retained_artifacts.len(),
-                        "Pruned stale local artifact cache entries"
-                    );
-                }
-                Err(e) => {
-                    warn!(error = %e, "Failed to prune local artifact cache");
-                }
-            }
-        }
-
-        progress_emitter.emit_substep(6, finalize_phase::POST_UPDATE_HOOK, 98);
-        lifecycle::invoke_post_update_hook(&self.install_dir, &active_app_dir, latest);
-
-        let restart_outcome = if supervisor_was_running {
-            progress_emitter.emit_substep(6, finalize_phase::RESTARTING_SUPERVISOR, 99);
-            lifecycle::restart_supervisor_after_update(&self.install_dir, &active_app_dir, latest)
-        } else {
-            SupervisorRestartOutcome::NotApplicable
-        };
-
-        emit_progress(
-            progress.as_ref(),
-            ProgressInfo {
-                phase: 6,
-                phase_percent: 100,
-                total_percent: 100,
-                ..ProgressInfo::default()
-            },
-        );
+        let restart_outcome = finalize_update(
+            self,
+            info,
+            &extracted_final_dir,
+            &staging_dir,
+            &artifact_cache_dir,
+            &progress_emitter,
+        )
+        .await?;
 
         info!(
             version = %info.latest_version,
@@ -715,9 +386,10 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
 
+    use super::progress_substep::labels as finalize_phase;
     use super::*;
     use crate::archive::packer::ArchivePacker;
-    use crate::config::constants::DEFAULT_ZSTD_LEVEL;
+    use crate::config::constants::{DEFAULT_ZSTD_LEVEL, RELEASES_FILE_COMPRESSED};
     #[cfg(target_os = "linux")]
     use crate::config::manifest::ShortcutLocation;
     use crate::context::StorageProvider;

@@ -6,6 +6,7 @@ use super::{
     AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, Command, Instant, Path, Result, Stdio,
     SurgeError, logline, make_progress_bar, make_spinner, shell_single_quote,
 };
+use tokio::io::AsyncSeekExt;
 
 const REMOTE_COPY_CONFIRMATION_TIMEOUT: Duration = Duration::from_mins(10);
 const TAILSCALE_STREAM_COMMAND_TIMEOUT: Duration = Duration::from_mins(30);
@@ -19,7 +20,8 @@ pub(crate) const REMOTE_INSTALLER_PARTIAL_PATH: &str = "/tmp/.surge-installer.pa
 /// The script writes to a `.partial` file, verifies size and hash, then renames
 /// to the final path. On any failure the partial file is cleaned up and the
 /// stderr contains an actionable reason that callers can surface to the user.
-pub(crate) fn build_remote_installer_install_command(expected_size: u64, expected_sha256: &str) -> String {
+#[cfg(test)]
+fn build_remote_installer_install_command(expected_size: u64, expected_sha256: &str) -> String {
     let partial = REMOTE_INSTALLER_PARTIAL_PATH;
     let final_path = REMOTE_INSTALLER_FINAL_PATH;
     let expected_sha256 = expected_sha256.trim();
@@ -189,10 +191,134 @@ pub(crate) async fn stream_directory_to_tailscale_node_with_command(
     Ok(())
 }
 
-pub(crate) async fn stream_file_to_tailscale_node_with_command(
+pub(crate) async fn stream_directory_entries_to_tailscale_node_with_command(
+    node: &str,
+    local_dir: &Path,
+    entries: &[String],
+    remote_command: &str,
+) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+
+    let list_file = tempfile::NamedTempFile::new()
+        .map_err(|e| SurgeError::Platform(format!("Failed to create tar entry list: {e}")))?;
+    std::fs::write(list_file.path(), entries.join("\n"))
+        .map_err(|e| SurgeError::Platform(format!("Failed to write tar entry list: {e}")))?;
+
+    let ssh_command = format!("sh -lc {}", shell_single_quote(remote_command));
+    let local_dir_str = local_dir.to_string_lossy().to_string();
+    let list_path = list_file.path().to_string_lossy().to_string();
+    let mut tar_child = Command::new("tar")
+        .args(["-C", local_dir_str.as_str(), "-cf", "-", "-T", list_path.as_str()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            SurgeError::Platform(format!(
+                "Failed to archive selected entries from '{}' for transfer: {e}",
+                local_dir.display()
+            ))
+        })?;
+    let mut remote_child = Command::new("tailscale")
+        .args(["ssh", node, ssh_command.as_str()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| SurgeError::Platform(format!("Failed to run tailscale ssh stream copy: {e}")))?;
+
+    let mut tar_stdout = tar_child
+        .stdout
+        .take()
+        .ok_or_else(|| SurgeError::Platform("Failed to capture local tar stdout".to_string()))?;
+    let mut remote_stdin = remote_child
+        .stdin
+        .take()
+        .ok_or_else(|| SurgeError::Platform("Failed to capture tailscale ssh stdin".to_string()))?;
+
+    let transfer_message = format!(
+        "Streaming {} staged entr{} to '{node}'",
+        entries.len(),
+        if entries.len() == 1 { "y" } else { "ies" }
+    );
+    let transfer_spinner = make_spinner(&transfer_message);
+    let transfer_result: Result<()> = async {
+        let mut buffer = vec![0_u8; 128 * 1024];
+        loop {
+            let read_bytes = tar_stdout.read(&mut buffer).await.map_err(|e| {
+                SurgeError::Platform(format!(
+                    "Failed to read selected staged entries from '{}': {e}",
+                    local_dir.display()
+                ))
+            })?;
+            if read_bytes == 0 {
+                break;
+            }
+            remote_stdin.write_all(&buffer[..read_bytes]).await.map_err(|e| {
+                SurgeError::Platform(format!("Failed to stream selected staged entries to '{node}': {e}"))
+            })?;
+            if let Some(spinner) = transfer_spinner.as_ref() {
+                spinner.tick();
+            }
+        }
+        remote_stdin
+            .flush()
+            .await
+            .map_err(|e| SurgeError::Platform(format!("Failed to flush selected staged entries to '{node}': {e}")))?;
+        Ok(())
+    }
+    .await;
+    drop(remote_stdin);
+
+    if let Some(spinner) = &transfer_spinner {
+        spinner.finish_and_clear();
+    }
+
+    if let Err(err) = transfer_result {
+        let _ = tar_child.kill().await;
+        let _ = remote_child.kill().await;
+        return Err(err);
+    }
+
+    let tar_output = tar_child
+        .wait_with_output()
+        .await
+        .map_err(|e| SurgeError::Platform(format!("Failed to wait for local tar process: {e}")))?;
+    if !tar_output.status.success() {
+        let stderr = String::from_utf8_lossy(&tar_output.stderr).trim().to_string();
+        return Err(SurgeError::Platform(if stderr.is_empty() {
+            format!("Command failed: tar -C '{}' -cf - -T <entry-list>", local_dir.display())
+        } else {
+            format!(
+                "Command failed: tar -C '{}' -cf - -T <entry-list>: {stderr}",
+                local_dir.display()
+            )
+        }));
+    }
+
+    let remote_output = remote_child
+        .wait_with_output()
+        .await
+        .map_err(|e| SurgeError::Platform(format!("Failed to wait for tailscale ssh stream copy: {e}")))?;
+    if !remote_output.status.success() {
+        let stderr = String::from_utf8_lossy(&remote_output.stderr).trim().to_string();
+        return Err(SurgeError::Platform(if stderr.is_empty() {
+            format!("Command failed: tailscale ssh {node} sh -lc <stream-copy>")
+        } else {
+            format!("Command failed: tailscale ssh {node} sh -lc <stream-copy>: {stderr}")
+        }));
+    }
+
+    Ok(())
+}
+
+pub(crate) async fn stream_file_to_tailscale_node_with_command_from_offset(
     node: &str,
     local_file: &Path,
     remote_command: &str,
+    offset: u64,
 ) -> Result<()> {
     let ssh_command = format!("sh -lc {}", shell_single_quote(remote_command));
     let mut child = Command::new("tailscale")
@@ -209,6 +335,20 @@ pub(crate) async fn stream_file_to_tailscale_node_with_command(
         .map_err(|e| SurgeError::Platform(format!("Failed to open '{}' for transfer: {e}", local_file.display())))?;
 
     let transfer_total_bytes = tokio::fs::metadata(local_file).await.map_or(0, |meta| meta.len());
+    if offset > transfer_total_bytes {
+        return Err(SurgeError::Platform(format!(
+            "Cannot resume '{}' from byte {offset}; file is only {transfer_total_bytes} bytes",
+            local_file.display()
+        )));
+    }
+    if offset > 0 {
+        local_reader.seek(std::io::SeekFrom::Start(offset)).await.map_err(|e| {
+            SurgeError::Platform(format!(
+                "Failed to seek '{}' to resume offset {offset}: {e}",
+                local_file.display()
+            ))
+        })?;
+    }
     let transfer_message = format!("Streaming '{}' to '{node}'", local_file.display());
     let transfer_bar = if transfer_total_bytes > 0 {
         make_progress_bar(&transfer_message, transfer_total_bytes)
@@ -222,7 +362,7 @@ pub(crate) async fn stream_file_to_tailscale_node_with_command(
         .take()
         .ok_or_else(|| SurgeError::Platform("Failed to capture tailscale ssh stdin".to_string()))?;
 
-    let mut transferred_bytes = 0_u64;
+    let mut transferred_bytes = offset;
     let mut buffer = vec![0_u8; 128 * 1024];
     loop {
         let read_bytes = local_reader.read(&mut buffer).await.map_err(|e| {

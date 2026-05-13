@@ -163,7 +163,14 @@ pub(crate) fn plan_remote_convergence(
     let installed_version = Some(remote_state.version.clone());
     let metadata_matches = remote_state.metadata_matches(channel, storage_config);
     match compare_versions(&remote_state.version, &release.version) {
-        std::cmp::Ordering::Equal if metadata_matches && !force => Ok(RemoteConvergencePlan {
+        std::cmp::Ordering::Equal if metadata_matches && force => Ok(RemoteConvergencePlan {
+            action: RemoteConvergenceAction::ConvergeRuntime,
+            installed_version,
+            target_version: release.version.clone(),
+            update_info: None,
+            reason: Some("package metadata is current; --force will verify remote runtime convergence".to_string()),
+        }),
+        std::cmp::Ordering::Equal if metadata_matches => Ok(RemoteConvergencePlan {
             action: RemoteConvergenceAction::Skip,
             installed_version,
             target_version: release.version.clone(),

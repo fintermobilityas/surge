@@ -122,6 +122,7 @@ pub(crate) enum RemoteConvergenceAction {
     CleanInstall,
     Update,
     RepairMetadata,
+    ConvergeRuntime,
     Reinstall,
     Skip,
 }

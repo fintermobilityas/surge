@@ -102,6 +102,7 @@ If the local environment cannot run a listed command, document the exact gap in 
 ## Integrating Surge Into Other App Repos
 - Treat `docs/integrating-surge.md` as the shared playbook for future app integrations. It is written for both humans and agents.
 - Default to released Surge tags for app integrations. Use local checkout or pinned-commit overrides only while validating an unmerged Surge fix.
+- When a new Surge beta is cut for downstream consumption, do not update listed app repos such as `../youpark`, `../youpayv2`, or `../accesspad` until the matching `Surge.NET` NuGet package is available from the configured feed and a restore can see it. After the package is available, bump and commit the downstream repo updates as part of the beta cut.
 - If an app repo integrates `surge-core`, treat that as a runtime dependency as well as a publishing dependency; do not reduce it to "CLI only" in smoke or release guidance.
 - App repos should expose wrapper scripts for local filesystem smoke and Windows Azure smoke. Agents should use those wrappers instead of ad hoc `surge pack` / `surge push` commands.
 - If a Rust app temporarily overrides `surge-core`, prefer a local `file://` Git source pinned to the exact Surge commit instead of a raw crate path. This preserves workspace dependency resolution in clean and cross-platform smoke runs.

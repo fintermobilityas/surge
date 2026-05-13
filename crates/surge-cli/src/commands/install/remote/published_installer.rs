@@ -1,9 +1,10 @@
 use super::types::{RemoteInstallerMode, RemoteLaunchEnvironment, RemotePublishedInstallerPlan};
 use super::{
-    BTreeMap, CacheFetchOutcome, InstallerManifest, InstallerRelease, InstallerRuntime, InstallerStorage, InstallerUi,
-    Path, PathBuf, RELEASES_FILE_COMPRESSED, ReleaseEntry, Result, StorageBackend, SurgeError, SurgeManifest,
+    CacheFetchOutcome, InstallerManifest, InstallerRelease, InstallerRuntime, InstallerStorage, InstallerUi, Path,
+    PathBuf, RELEASES_FILE_COMPRESSED, ReleaseEntry, Result, StorageBackend, SurgeError, SurgeManifest,
     cache_path_for_key, core_install, fetch_or_reuse_file, logline, pack,
 };
+use std::collections::BTreeMap;
 use surge_core::config::manifest::CacheManifestConfig;
 
 fn remote_installer_extension_for_rid(rid: &str) -> &'static str {

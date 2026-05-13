@@ -1,4 +1,6 @@
-use super::{BTreeMap, Path, PathBuf, Result, core_install, shell_single_quote};
+use std::collections::BTreeMap;
+
+use super::{Path, PathBuf, Result, core_install, shell_single_quote};
 
 pub(super) fn remote_linux_shortcut_icon_path(
     staged_app_dir: &Path,
@@ -55,7 +57,7 @@ pub(super) fn stage_remote_linux_shortcuts(
     Ok(())
 }
 
-fn shell_export_lines(environment: &BTreeMap<String, String>) -> String {
+pub(super) fn shell_export_lines(environment: &BTreeMap<String, String>) -> String {
     let mut lines = String::new();
     for (key, value) in environment {
         lines.push_str("export ");

@@ -268,7 +268,11 @@ pub(crate) async fn cleanup_remote_staged_payload(ssh_node: &str, app_id: &str, 
     run_tailscale_streaming(&["ssh", ssh_node, ssh_command.as_str()], "remote").await
 }
 
-async fn stop_remote_supervisor_if_running(ssh_node: &str, install_root: &Path, supervisor_id: &str) -> Result<()> {
+pub(crate) async fn stop_remote_supervisor_if_running(
+    ssh_node: &str,
+    install_root: &Path,
+    supervisor_id: &str,
+) -> Result<()> {
     let Some(stop_command) = build_remote_stop_supervisor_command(install_root, supervisor_id) else {
         return Ok(());
     };

@@ -3,18 +3,18 @@
 mod activation;
 mod execution;
 mod published_installer;
+mod runtime;
 mod staging;
 mod state;
 mod types;
 
 use super::{
-    ArchiveAcquisition, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BTreeMap, BufReader,
-    CacheFetchOutcome, Command, InstallBehavior, InstallerManifest, InstallerRelease, InstallerRuntime,
-    InstallerStorage, InstallerUi, Instant, Path, PathBuf, RELEASES_FILE_COMPRESSED, ReleaseEntry, ReleaseIndex,
-    Result, Serialize, Stdio, StorageBackend, SurgeError, SurgeManifest, cache_path_for_key, compare_versions,
-    core_install, download_release_archive, fetch_or_reuse_file, host_can_build_installer_locally, infer_os_from_rid,
-    logline, make_progress_bar, make_spinner, release_install_profile, release_runtime_manifest_metadata,
-    shell_single_quote,
+    ArchiveAcquisition, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, CacheFetchOutcome, Command,
+    InstallBehavior, InstallerManifest, InstallerRelease, InstallerRuntime, InstallerStorage, InstallerUi, Instant,
+    Path, PathBuf, RELEASES_FILE_COMPRESSED, ReleaseEntry, ReleaseIndex, Result, Serialize, Stdio, StorageBackend,
+    SurgeError, SurgeManifest, cache_path_for_key, compare_versions, core_install, download_release_archive,
+    fetch_or_reuse_file, host_can_build_installer_locally, infer_os_from_rid, logline, make_progress_bar, make_spinner,
+    release_install_profile, release_runtime_manifest_metadata, shell_single_quote,
 };
 use crate::commands::pack;
 use serde::Deserialize;
@@ -28,6 +28,7 @@ pub(crate) use self::published_installer::{
     build_installer_for_tailscale, missing_remote_installer_error, plan_remote_published_installer,
     plan_remote_published_installer_without_manifest, try_prepare_published_installer_for_tailscale,
 };
+use self::runtime::{converge_current_remote_runtime, verify_remote_runtime_after_install};
 pub(crate) use self::staging::{
     deploy_remote_app_copy_for_tailscale, run_remote_staged_installer_setup, warn_if_remote_stage_cleanup_fails,
 };
@@ -46,6 +47,8 @@ pub(crate) use self::types::{
 pub(crate) use self::activation::build_remote_app_copy_activation_script;
 #[cfg(test)]
 pub(crate) use self::published_installer::{build_remote_installer_manifest, published_installer_public_url};
+#[cfg(test)]
+pub(crate) use self::runtime::{build_remote_process_verification_probe, build_remote_runtime_start_command};
 #[cfg(test)]
 pub(crate) use self::staging::{
     build_remote_paths_exist_probe, build_remote_stage_cleanup_command, build_remote_staged_installer_setup_command,
@@ -102,6 +105,22 @@ pub(super) async fn install_release_via_tailscale(
             "'{app_id}' v{} ({channel}) is already installed on '{file_target}', skipping.",
             release.version
         ));
+        return Ok(());
+    }
+
+    if convergence_plan.action == RemoteConvergenceAction::ConvergeRuntime {
+        if behavior.plan_only {
+            return Ok(());
+        }
+        if behavior.no_start {
+            logline::success(&format!(
+                "'{app_id}' v{} ({channel}) is package-current on '{file_target}'; runtime convergence was skipped because --no-start was supplied.",
+                release.version
+            ));
+            return Ok(());
+        }
+        let launch_env = detect_remote_launch_environment(ssh_target).await;
+        converge_current_remote_runtime(ssh_target, file_target, app_id, release, &launch_env).await?;
         return Ok(());
     }
 
@@ -453,6 +472,14 @@ fn log_remote_convergence_plan(
         RemoteConvergenceAction::RepairMetadata => {
             logline::info("Selected action only repairs runtime metadata; no package artifact should be downloaded.");
         }
+        RemoteConvergenceAction::ConvergeRuntime => {
+            if let Some(reason) = &plan.reason {
+                logline::info(&format!("Plan reason: {reason}"));
+            }
+            logline::info(
+                "Selected action verifies runtime state and restarts the supervisor only if runtime proof is missing.",
+            );
+        }
         RemoteConvergenceAction::Skip => {}
     }
 }
@@ -491,6 +518,7 @@ fn remote_action_label(action: RemoteConvergenceAction) -> &'static str {
         RemoteConvergenceAction::CleanInstall => "clean install",
         RemoteConvergenceAction::Update => "update existing install",
         RemoteConvergenceAction::RepairMetadata => "repair runtime metadata",
+        RemoteConvergenceAction::ConvergeRuntime => "converge runtime",
         RemoteConvergenceAction::Reinstall => "reinstall",
         RemoteConvergenceAction::Skip => "skip",
     }
@@ -501,100 +529,4 @@ fn update_strategy_label(strategy: ApplyStrategy) -> &'static str {
         ApplyStrategy::Full => "full package",
         ApplyStrategy::Delta => "delta",
     }
-}
-
-async fn verify_remote_runtime_after_install(
-    ssh_target: &str,
-    file_target: &str,
-    install_dir: &str,
-    app_id: &str,
-    release: &ReleaseEntry,
-    channel: &str,
-    storage_config: &surge_core::context::StorageConfig,
-    verify_started_process: bool,
-) -> Result<()> {
-    let state = check_remote_install_state(ssh_target, install_dir)
-        .await?
-        .ok_or_else(|| {
-            SurgeError::Update(format!(
-                "Remote runtime verification failed on '{file_target}': no runtime metadata found"
-            ))
-        })?;
-    if state.version.trim() == release.version.trim() && state.metadata_matches(channel, storage_config) {
-        logline::success(&format!(
-            "Verified remote runtime on '{file_target}': v{} ({channel}).",
-            release.version
-        ));
-        if verify_started_process {
-            verify_remote_started_process(ssh_target, file_target, app_id, release).await?;
-        }
-        return Ok(());
-    }
-
-    Err(SurgeError::Update(format!(
-        "Remote runtime verification failed on '{file_target}': found v{} channel {:?}, expected v{} channel '{}'.",
-        state.version, state.channel, release.version, channel
-    )))
-}
-
-async fn verify_remote_started_process(
-    ssh_target: &str,
-    file_target: &str,
-    app_id: &str,
-    release: &ReleaseEntry,
-) -> Result<()> {
-    let remote_home = execution::detect_remote_home_directory(ssh_target).await?;
-    let install_root = staging::remote_install_root(&remote_home, app_id, &release.install_directory)?;
-    let main_exe = if release.main_exe.trim().is_empty() {
-        app_id
-    } else {
-        release.main_exe.trim()
-    };
-    let probe =
-        build_remote_process_verification_probe(&install_root, main_exe, &release.supervisor_id, &release.version);
-    let command = format!("sh -c {}", shell_single_quote(&probe));
-    let output = execution::run_tailscale_capture(&["ssh", ssh_target, command.as_str()]).await?;
-    let result = output.trim();
-    if result == "ready" {
-        logline::success(&format!(
-            "Verified remote process on '{file_target}' for v{}.",
-            release.version
-        ));
-        return Ok(());
-    }
-
-    Err(SurgeError::Update(format!(
-        "Remote process verification failed on '{file_target}': {result}"
-    )))
-}
-
-pub(crate) fn build_remote_process_verification_probe(
-    install_root: &Path,
-    main_exe: &str,
-    supervisor_id: &str,
-    version: &str,
-) -> String {
-    format!(
-        "install_root={}; main_exe={}; supervisor_id={}; version={}; \
-active_exe=\"$install_root/app/$main_exe\"; app_seen=0; version_seen=0; supervisor_seen=0; \
-for cmdline in /proc/[0-9]*/cmdline; do \
-  [ -r \"$cmdline\" ] || continue; \
-  pid=\"${{cmdline%/cmdline}}\"; pid=\"${{pid##*/}}\"; \
-  case \"$pid\" in \"$$\"|\"$PPID\") continue ;; esac; \
-  cmd=\"$(tr '\\0' ' ' < \"$cmdline\" 2>/dev/null || true)\"; \
-  [ -n \"$cmd\" ] || continue; \
-  case \"$cmd\" in *\"$active_exe\"*) app_seen=1; case \"$cmd\" in *\"--surge-first-run $version\"*) version_seen=1 ;; esac ;; esac; \
-  if [ -n \"$supervisor_id\" ]; then \
-    case \"$cmd\" in *\"surge-supervisor\"*\"--id $supervisor_id\"*) supervisor_seen=1 ;; esac; \
-  fi; \
-done; \
-if [ \"$app_seen\" -ne 1 ]; then echo \"app process for $active_exe was not found\"; exit 0; fi; \
-if [ -n \"$version\" ] && [ \"$version_seen\" -ne 1 ]; then echo \"app process for $active_exe is running without --surge-first-run $version\"; exit 0; fi; \
-if [ -n \"$supervisor_id\" ] && [ \"$supervisor_seen\" -ne 1 ]; then echo \"supervisor process '$supervisor_id' was not found\"; exit 0; fi; \
-echo ready",
-        shell_single_quote(&install_root.to_string_lossy()),
-        shell_single_quote(main_exe),
-        shell_single_quote(supervisor_id.trim()),
-        shell_single_quote(version.trim())
-    )
 }

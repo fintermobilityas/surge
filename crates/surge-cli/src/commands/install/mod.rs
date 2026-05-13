@@ -9,7 +9,6 @@ mod resolution;
 mod runtime;
 mod selection;
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Instant;
@@ -457,13 +456,13 @@ mod tests {
         RemoteLaunchEnvironment, RemotePublishedInstallerPlan, RemoteTailscaleCachedState, RemoteTailscaleOperation,
         RemoteTailscaleTransferInputs, RemoteTailscaleTransferStrategy, build_remote_app_copy_activation_script,
         build_remote_installer_manifest, build_remote_paths_exist_probe, build_remote_process_verification_probe,
-        build_remote_stage_cleanup_command, build_remote_staged_installer_setup_command,
-        build_remote_stop_supervisor_command, missing_remote_installer_error, parse_remote_install_state,
-        parse_remote_launch_environment, parse_remote_staged_payload_identity, plan_remote_convergence,
-        plan_remote_published_installer, plan_remote_published_installer_without_manifest,
-        published_installer_public_url, remote_install_matches, remote_launch_environment_probe,
-        remote_staged_payload_identity, select_latest_remote_legacy_app_dir, select_remote_installer_mode,
-        select_remote_tailscale_transfer_strategy, should_skip_remote_install,
+        build_remote_runtime_start_command, build_remote_stage_cleanup_command,
+        build_remote_staged_installer_setup_command, build_remote_stop_supervisor_command,
+        missing_remote_installer_error, parse_remote_install_state, parse_remote_launch_environment,
+        parse_remote_staged_payload_identity, plan_remote_convergence, plan_remote_published_installer,
+        plan_remote_published_installer_without_manifest, published_installer_public_url, remote_install_matches,
+        remote_launch_environment_probe, remote_staged_payload_identity, select_latest_remote_legacy_app_dir,
+        select_remote_installer_mode, select_remote_tailscale_transfer_strategy, should_skip_remote_install,
         try_prepare_published_installer_for_tailscale,
     };
     use super::resolution::{
@@ -2258,7 +2257,51 @@ apps:
             true,
         )
         .expect("forced plan should resolve");
-        assert_eq!(forced.action, RemoteConvergenceAction::Reinstall);
+        assert_eq!(forced.action, RemoteConvergenceAction::ConvergeRuntime);
+        assert!(
+            forced
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("verify remote runtime convergence"))
+        );
+    }
+
+    #[test]
+    fn build_remote_runtime_start_command_restarts_through_supervisor() {
+        let mut environment = BTreeMap::new();
+        environment.insert("DISPLAY".to_string(), ":0".to_string());
+
+        let command = build_remote_runtime_start_command(
+            Path::new("/home/demo/.local/share/demo app"),
+            "demo",
+            "demo-supervisor",
+            "1.2.0",
+            &environment,
+        );
+
+        assert!(command.contains("export DISPLAY=':0'"));
+        assert!(command.contains("kill_matching \"$active_exe\""));
+        assert!(command.contains("kill_matching \"$install_root/app-\""));
+        assert!(command.contains("kill_matching \"surge-supervisor.*--id $supervisor_id\""));
+        assert!(command.contains("supervisor_bin=\"$active_app_dir/surge-supervisor\""));
+        assert!(command.contains("nohup \"$supervisor_bin\" run --id \"$supervisor_id\""));
+        assert!(command.contains("-- --surge-first-run \"$version\""));
+        assert!(command.contains("supervisor restart confirmed"));
+    }
+
+    #[test]
+    fn build_remote_runtime_start_command_restarts_direct_app_without_supervisor() {
+        let command = build_remote_runtime_start_command(
+            Path::new("/home/demo/.local/share/demo"),
+            "demo",
+            "",
+            "1.2.0",
+            &BTreeMap::new(),
+        );
+
+        assert!(command.contains("nohup \"$active_exe\" --surge-first-run \"$version\""));
+        assert!(command.contains("application restart requested"));
+        assert!(command.contains("supervisor_id=''"));
     }
 
     #[test]

@@ -3,9 +3,13 @@ use super::activation::{
 };
 use super::execution::{
     detect_remote_home_directory, run_tailscale_capture, run_tailscale_streaming,
-    run_tailscale_streaming_with_status_watchdog, stream_directory_to_tailscale_node_with_command,
+    run_tailscale_streaming_with_status_watchdog, stream_directory_entries_to_tailscale_node_with_command,
+    stream_directory_to_tailscale_node_with_command,
 };
 use super::published_installer::build_remote_runtime_environment;
+use super::stage_manifest::{
+    RemoteStageManifest, build_remote_stage_prepare_command, build_remote_stage_verify_command,
+};
 use super::state::{check_remote_staged_payload_identity, remote_staged_payload_identity};
 use super::types::RemoteLaunchEnvironment;
 use super::{
@@ -206,16 +210,18 @@ pub(crate) async fn deploy_remote_app_copy_for_tailscale(
         stage_remote_linux_shortcuts(&stage_root, &rendered)?;
     }
 
-    let transfer_command = format!(
-        "command -v tar >/dev/null 2>&1 || {{ echo 'Remote host is missing tar' >&2; exit 1; }}; \
-install_root={}; stage_dir=\"$install_root/.surge-transfer-stage\"; \
-mkdir -p \"$install_root\"; rm -rf \"$stage_dir\"; mkdir -p \"$stage_dir\"; tar -C \"$stage_dir\" -xf -",
-        shell_single_quote(&install_root.to_string_lossy())
-    );
-    logline::info(&format!(
-        "Streaming extracted app payload to '{file_target}' for host-mismatch remote deployment..."
-    ));
-    stream_directory_to_tailscale_node_with_command(ssh_target, &stage_root, &transfer_command).await?;
+    let stage_manifest = RemoteStageManifest::build(&stage_root)?;
+    let stage_manifest_path = stage_manifest.write_to_stage_root(&stage_root)?;
+    let stage_manifest_sha256 = surge_core::crypto::sha256::sha256_hex_file(&stage_manifest_path)?;
+    sync_remote_app_copy_stage(
+        ssh_target,
+        file_target,
+        &install_root,
+        &stage_root,
+        &stage_manifest,
+        &stage_manifest_sha256,
+    )
+    .await?;
 
     if stage {
         return Ok(());
@@ -253,6 +259,114 @@ pub(crate) async fn run_remote_staged_installer_setup(
     ));
     let watchdog = RemoteSetupWatchdog::new(ssh_node, &install_root);
     run_tailscale_streaming_with_status_watchdog(&["ssh", ssh_node, ssh_command.as_str()], "remote", watchdog).await
+}
+
+async fn sync_remote_app_copy_stage(
+    ssh_target: &str,
+    file_target: &str,
+    install_root: &Path,
+    stage_root: &Path,
+    manifest: &RemoteStageManifest,
+    manifest_sha256: &str,
+) -> Result<()> {
+    let verify_command = format!(
+        "sh -c {}",
+        shell_single_quote(&build_remote_stage_verify_command(install_root, manifest_sha256))
+    );
+    let verify_output = run_tailscale_capture(&["ssh", ssh_target, verify_command.as_str()]).await?;
+    let action = parse_stage_verify_output(&verify_output)?;
+
+    match action {
+        RemoteStageSyncAction::Ready => {
+            logline::success(&format!(
+                "Verified resumable remote app stage on '{file_target}'; skipping payload upload."
+            ));
+            Ok(())
+        }
+        RemoteStageSyncAction::Create => {
+            logline::info(&format!(
+                "Creating resumable remote app stage on '{file_target}' for host-mismatch deployment..."
+            ));
+            let transfer_command = build_remote_stage_prepare_command(install_root, true);
+            stream_directory_to_tailscale_node_with_command(ssh_target, stage_root, &transfer_command).await?;
+            verify_remote_app_copy_stage(ssh_target, install_root, manifest_sha256).await
+        }
+        RemoteStageSyncAction::Resume(mut entries) => {
+            entries.push(super::stage_manifest::REMOTE_STAGE_MANIFEST_FILE.to_string());
+            entries.sort();
+            entries.dedup();
+            let known: std::collections::BTreeSet<&str> =
+                manifest.entries().iter().map(|entry| entry.path.as_str()).collect();
+            let filtered: Vec<String> = entries
+                .into_iter()
+                .filter(|entry| {
+                    entry == super::stage_manifest::REMOTE_STAGE_MANIFEST_FILE || known.contains(entry.as_str())
+                })
+                .collect();
+            logline::info(&format!(
+                "Resuming remote app stage on '{file_target}' with {} missing or invalid entr{}.",
+                filtered.len(),
+                if filtered.len() == 1 { "y" } else { "ies" }
+            ));
+            let transfer_command = build_remote_stage_prepare_command(install_root, false);
+            stream_directory_entries_to_tailscale_node_with_command(
+                ssh_target,
+                stage_root,
+                &filtered,
+                &transfer_command,
+            )
+            .await?;
+            verify_remote_app_copy_stage(ssh_target, install_root, manifest_sha256).await
+        }
+    }
+}
+
+async fn verify_remote_app_copy_stage(ssh_target: &str, install_root: &Path, manifest_sha256: &str) -> Result<()> {
+    let verify_command = format!(
+        "sh -c {}",
+        shell_single_quote(&build_remote_stage_verify_command(install_root, manifest_sha256))
+    );
+    let verify_output = run_tailscale_capture(&["ssh", ssh_target, verify_command.as_str()]).await?;
+    match parse_stage_verify_output(&verify_output)? {
+        RemoteStageSyncAction::Ready => Ok(()),
+        other => Err(SurgeError::Platform(format!(
+            "Remote app stage verification failed after transfer: {other:?}"
+        ))),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RemoteStageSyncAction {
+    Ready,
+    Create,
+    Resume(Vec<String>),
+}
+
+fn parse_stage_verify_output(output: &str) -> Result<RemoteStageSyncAction> {
+    let mut entries = Vec::new();
+    for line in output.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        match line {
+            "STAGE_READY" => return Ok(RemoteStageSyncAction::Ready),
+            "STAGE_MISSING" | "STAGE_UNVERIFIABLE" => return Ok(RemoteStageSyncAction::Create),
+            _ => {
+                if let Some((kind, path)) = line.split_once('\t')
+                    && (kind == "MISSING" || kind == "INVALID")
+                    && !path.trim().is_empty()
+                {
+                    entries.push(path.trim().to_string());
+                    continue;
+                }
+                return Err(SurgeError::Platform(format!(
+                    "Remote app stage verification returned unexpected output: {line}"
+                )));
+            }
+        }
+    }
+    if entries.is_empty() {
+        Ok(RemoteStageSyncAction::Create)
+    } else {
+        Ok(RemoteStageSyncAction::Resume(entries))
+    }
 }
 
 pub(crate) async fn warn_if_remote_stage_cleanup_fails(ssh_node: &str, app_id: &str, release: &ReleaseEntry) {

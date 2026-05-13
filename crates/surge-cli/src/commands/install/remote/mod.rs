@@ -2,13 +2,16 @@
 
 mod activation;
 mod execution;
+mod installer_stage;
 mod published_installer;
 mod runtime;
+mod stage_manifest;
 mod staging;
 mod state;
 mod types;
 mod watchdog;
 
+use self::installer_stage::stage_installer_file_for_tailscale;
 use super::{
     ArchiveAcquisition, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, CacheFetchOutcome, Command,
     InstallBehavior, InstallerManifest, InstallerRelease, InstallerRuntime, InstallerStorage, InstallerUi, Instant,
@@ -22,8 +25,8 @@ use serde::Deserialize;
 use surge_core::update::manager::ApplyStrategy;
 
 pub(crate) use self::execution::{
-    REMOTE_INSTALLER_FINAL_PATH, build_remote_installer_install_command, resolve_tailscale_targets,
-    run_tailscale_streaming, run_tailscale_streaming_with_status_watchdog, stream_file_to_tailscale_node_with_command,
+    REMOTE_INSTALLER_FINAL_PATH, resolve_tailscale_targets, run_tailscale_streaming,
+    run_tailscale_streaming_with_status_watchdog,
 };
 pub(crate) use self::published_installer::{
     build_installer_for_tailscale, missing_remote_installer_error, plan_remote_published_installer,
@@ -373,12 +376,18 @@ pub(super) async fn install_release_via_tailscale(
         .len();
     let installer_sha256 = surge_core::crypto::sha256::sha256_hex_file(&installer_path)?;
     logline::info(&format!(
-        "Transferring installer to '{file_target}' ({}, sha256 {})...",
+        "Preparing installer stage on '{file_target}' ({}, sha256 {})...",
         crate::formatters::format_bytes(installer_size),
         &installer_sha256[..installer_sha256.len().min(12)],
     ));
-    let install_command = build_remote_installer_install_command(installer_size, &installer_sha256);
-    stream_file_to_tailscale_node_with_command(ssh_target, &installer_path, &install_command).await?;
+    stage_installer_file_for_tailscale(
+        ssh_target,
+        file_target,
+        &installer_path,
+        installer_size,
+        &installer_sha256,
+    )
+    .await?;
 
     let no_start_flag = if behavior.no_start { " --no-start" } else { "" };
     let stage_flag = if behavior.mode.is_stage() { " --stage" } else { "" };

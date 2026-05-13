@@ -82,12 +82,25 @@ pub struct UpdateStatusRecord {
     pub completed_at_utc: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Last time the active updater wrote progress for this transaction.
+    /// Observers use this as a durable heartbeat for remote setup watchdogs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_progress_at_utc: Option<String>,
     /// Coarse-grained label for the substep currently in progress (for
     /// example "downloading artifacts" or "swapping app directory"). Only
     /// meaningful for `InProgress` records; observers can use it to tell
     /// "stuck in finalize" apart from "stuck in download".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_phase: Option<String>,
+    /// Most recent phase that completed before the current or terminal state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_completed_phase: Option<String>,
+    /// Phase active when a terminal failure was recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_phase: Option<String>,
+    /// Whether retrying the same setup/update command is expected to be safe.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_safe: Option<bool>,
 }
 
 impl UpdateStatusRecord {
@@ -103,7 +116,11 @@ impl UpdateStatusRecord {
             attempted_at_utc: None,
             completed_at_utc: None,
             reason: None,
+            last_progress_at_utc: None,
             current_phase: None,
+            last_completed_phase: None,
+            failure_phase: None,
+            retry_safe: None,
         }
     }
 
@@ -125,17 +142,43 @@ impl UpdateStatusRecord {
             attempted_at_utc: Some(attempted_at_utc),
             completed_at_utc: None,
             reason: None,
+            last_progress_at_utc: None,
             current_phase: None,
+            last_completed_phase: None,
+            failure_phase: None,
+            retry_safe: None,
         }
     }
 
     /// Set the current substep label on an [`UpdateConvergenceState::InProgress`]
     /// record. No-op for any other state.
     #[must_use]
-    pub fn with_current_phase(mut self, phase: impl Into<String>) -> Self {
+    pub fn with_current_phase(self, phase: impl Into<String>) -> Self {
+        self.with_current_phase_at(phase, now_utc_rfc3339())
+    }
+
+    #[must_use]
+    pub fn with_current_phase_at(mut self, phase: impl Into<String>, progress_at_utc: String) -> Self {
         let label = phase.into();
         if matches!(self.state, UpdateConvergenceState::InProgress) {
             self.current_phase = Some(label);
+            self.last_progress_at_utc = Some(progress_at_utc);
+        }
+        self
+    }
+
+    #[must_use]
+    pub fn with_completed_phase(self, phase: impl Into<String>) -> Self {
+        self.with_completed_phase_at(phase, now_utc_rfc3339())
+    }
+
+    #[must_use]
+    pub fn with_completed_phase_at(mut self, phase: impl Into<String>, progress_at_utc: String) -> Self {
+        let label = phase.into();
+        if matches!(self.state, UpdateConvergenceState::InProgress) {
+            self.last_completed_phase = Some(label);
+            self.current_phase = None;
+            self.last_progress_at_utc = Some(progress_at_utc);
         }
         self
     }
@@ -159,7 +202,11 @@ impl UpdateStatusRecord {
             attempted_at_utc,
             completed_at_utc: Some(completed_at_utc),
             reason: None,
+            last_progress_at_utc: None,
             current_phase: None,
+            last_completed_phase: None,
+            failure_phase: None,
+            retry_safe: None,
         }
     }
 
@@ -183,7 +230,11 @@ impl UpdateStatusRecord {
             attempted_at_utc: Some(attempted_at_utc),
             completed_at_utc: Some(completed_at_utc),
             reason: Some(reason.to_string()),
+            last_progress_at_utc: None,
             current_phase: None,
+            last_completed_phase: None,
+            failure_phase: Some("supervisor restart requested".to_string()),
+            retry_safe: Some(true),
         }
     }
 
@@ -206,7 +257,65 @@ impl UpdateStatusRecord {
             attempted_at_utc: Some(attempted_at_utc),
             completed_at_utc: None,
             reason: Some(reason.to_string()),
+            last_progress_at_utc: None,
             current_phase: None,
+            last_completed_phase: None,
+            failure_phase: None,
+            retry_safe: Some(true),
+        }
+    }
+
+    #[must_use]
+    pub fn failed_with_context(
+        app_id: &str,
+        installed_version: &str,
+        target_version: &str,
+        channel: &str,
+        attempted_at_utc: String,
+        reason: &str,
+        context: FailureContext,
+    ) -> Self {
+        Self {
+            state: UpdateConvergenceState::Failed,
+            installed_version: installed_version.to_string(),
+            target_version: target_version.to_string(),
+            channel: channel.to_string(),
+            app_id: app_id.to_string(),
+            supervisor_restart_confirmed: false,
+            attempted_at_utc: Some(attempted_at_utc),
+            completed_at_utc: Some(now_utc_rfc3339()),
+            reason: Some(reason.to_string()),
+            last_progress_at_utc: context.last_progress_at_utc,
+            current_phase: None,
+            last_completed_phase: context.last_completed_phase,
+            failure_phase: context.failure_phase,
+            retry_safe: Some(context.retry_safe),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FailureContext {
+    pub failure_phase: Option<String>,
+    pub last_completed_phase: Option<String>,
+    pub last_progress_at_utc: Option<String>,
+    pub retry_safe: bool,
+}
+
+impl FailureContext {
+    #[must_use]
+    pub fn from_record(record: Option<&UpdateStatusRecord>, retry_safe: bool) -> Self {
+        let Some(record) = record else {
+            return Self {
+                retry_safe,
+                ..Self::default()
+            };
+        };
+        Self {
+            failure_phase: record.current_phase.clone().or_else(|| record.failure_phase.clone()),
+            last_completed_phase: record.last_completed_phase.clone(),
+            last_progress_at_utc: record.last_progress_at_utc.clone(),
+            retry_safe,
         }
     }
 }

@@ -3,14 +3,14 @@ use super::activation::{
 };
 use super::execution::{
     detect_remote_home_directory, run_tailscale_capture, run_tailscale_streaming,
-    stream_directory_to_tailscale_node_with_command,
+    run_tailscale_streaming_with_status_watchdog, stream_directory_to_tailscale_node_with_command,
 };
 use super::published_installer::build_remote_runtime_environment;
 use super::state::{check_remote_staged_payload_identity, remote_staged_payload_identity};
 use super::types::RemoteLaunchEnvironment;
 use super::{
-    ArchiveAcquisition, Path, PathBuf, ReleaseEntry, ReleaseIndex, Result, StorageBackend, SurgeError,
-    cache_path_for_key, core_install, download_release_archive, logline, release_install_profile,
+    ArchiveAcquisition, Path, PathBuf, ReleaseEntry, ReleaseIndex, RemoteSetupWatchdog, Result, StorageBackend,
+    SurgeError, cache_path_for_key, core_install, download_release_archive, logline, release_install_profile,
     release_runtime_manifest_metadata, shell_single_quote,
 };
 
@@ -251,7 +251,8 @@ pub(crate) async fn run_remote_staged_installer_setup(
         "Using pre-staged installer cache for '{app_id}' v{} on '{file_target}'.",
         release.version
     ));
-    run_tailscale_streaming(&["ssh", ssh_node, ssh_command.as_str()], "remote").await
+    let watchdog = RemoteSetupWatchdog::new(ssh_node, &install_root);
+    run_tailscale_streaming_with_status_watchdog(&["ssh", ssh_node, ssh_command.as_str()], "remote", watchdog).await
 }
 
 pub(crate) async fn warn_if_remote_stage_cleanup_fails(ssh_node: &str, app_id: &str, release: &ReleaseEntry) {

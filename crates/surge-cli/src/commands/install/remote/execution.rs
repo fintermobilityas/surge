@@ -1,6 +1,7 @@
 use std::process::ExitStatus;
 use std::time::Duration;
 
+use super::watchdog::{RemoteSetupWatchdog, wait_for_tailscale_command_with_status_watchdog};
 use super::{
     AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, Command, Instant, Path, Result, Stdio,
     SurgeError, logline, make_progress_bar, make_spinner, shell_single_quote,
@@ -329,6 +330,22 @@ pub(crate) async fn run_tailscale_capture(args: &[&str]) -> Result<String> {
 }
 
 pub(crate) async fn run_tailscale_streaming(args: &[&str], prefix: &str) -> Result<()> {
+    run_tailscale_streaming_inner(args, prefix, None).await
+}
+
+pub(crate) async fn run_tailscale_streaming_with_status_watchdog(
+    args: &[&str],
+    prefix: &str,
+    watchdog: RemoteSetupWatchdog,
+) -> Result<()> {
+    run_tailscale_streaming_inner(args, prefix, Some(watchdog)).await
+}
+
+async fn run_tailscale_streaming_inner(
+    args: &[&str],
+    prefix: &str,
+    watchdog: Option<RemoteSetupWatchdog>,
+) -> Result<()> {
     let mut child = Command::new("tailscale")
         .args(args)
         .stdout(Stdio::piped())
@@ -346,11 +363,25 @@ pub(crate) async fn run_tailscale_streaming(args: &[&str], prefix: &str) -> Resu
         .take()
         .ok_or_else(|| SurgeError::Platform("Failed to capture tailscale stderr".to_string()))?;
 
-    let stdout_task = tokio::spawn(relay_tailscale_output(stdout, prefix.to_string()));
-    let stderr_task = tokio::spawn(relay_tailscale_output(stderr, prefix.to_string()));
+    let (progress_tx, progress_rx) = tokio::sync::mpsc::unbounded_channel();
+    let stdout_task = tokio::spawn(relay_tailscale_output(
+        stdout,
+        prefix.to_string(),
+        watchdog.as_ref().map(|_| progress_tx.clone()),
+    ));
+    let stderr_task = tokio::spawn(relay_tailscale_output(
+        stderr,
+        prefix.to_string(),
+        watchdog.as_ref().map(|_| progress_tx.clone()),
+    ));
+    drop(progress_tx);
 
     let cmd = format!("tailscale {}", args.join(" "));
-    let status = wait_for_tailscale_command(&mut child, &cmd).await?;
+    let status = if let Some(watchdog) = watchdog {
+        wait_for_tailscale_command_with_status_watchdog(&mut child, &cmd, &watchdog, progress_rx).await?
+    } else {
+        wait_for_tailscale_command(&mut child, &cmd).await?
+    };
     let stdout = stdout_task
         .await
         .map_err(|e| SurgeError::Platform(format!("Failed to read tailscale stdout: {e}")))?
@@ -389,7 +420,11 @@ async fn wait_for_tailscale_command(child: &mut tokio::process::Child, cmd: &str
     )))
 }
 
-async fn relay_tailscale_output<R>(reader: R, prefix: String) -> std::io::Result<String>
+async fn relay_tailscale_output<R>(
+    reader: R,
+    prefix: String,
+    progress_tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+) -> std::io::Result<String>
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
@@ -408,6 +443,9 @@ where
         let trimmed = chunk.trim();
         if !trimmed.is_empty() {
             logline::subtle(&format!("{prefix}: {trimmed}"));
+            if let Some(progress_tx) = &progress_tx {
+                let _ = progress_tx.send(());
+            }
         }
         captured.push_str(&chunk);
     }

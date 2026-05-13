@@ -18,7 +18,7 @@ use crate::context::Context;
 use crate::error::{Result, SurgeError};
 use crate::releases::manifest::{ReleaseEntry, ReleaseIndex};
 use crate::storage::{StorageBackend, create_storage_backend};
-use crate::update::status::{self, UpdateStatusRecord};
+use crate::update::status::{self, FailureContext, UpdateStatusRecord};
 
 use self::apply::materialize_update_payload;
 use self::artifacts::prepare_update_artifacts;
@@ -26,7 +26,7 @@ use self::finalize::finalize_update;
 use self::lifecycle::SupervisorRestartOutcome;
 pub use self::progress::ProgressInfo;
 use self::progress::emit_progress;
-use self::progress_substep::PhaseProgressEmitter;
+use self::progress_substep::{PhaseProgressEmitter, labels as update_phase};
 pub use self::release_index::plan_update_from_index;
 use self::release_index::{load_release_index as load_release_index_impl, resolve_update_info};
 
@@ -271,13 +271,15 @@ impl UpdateManager {
                 Ok(())
             }
             Err(e) => {
-                let record = UpdateStatusRecord::failed(
+                let status_context = status::read_update_status(&self.install_dir).ok().flatten();
+                let record = UpdateStatusRecord::failed_with_context(
                     &self.app_id,
                     &pre_attempt_version,
                     &target_version,
                     &self.channel,
                     attempted_at_utc,
                     &e.to_string(),
+                    FailureContext::from_record(status_context.as_ref(), true),
                 );
                 if let Err(write_err) = status::write_update_status(&self.install_dir, &record) {
                     warn!(error = %write_err, "Failed to persist failed-update status (continuing)");
@@ -312,6 +314,7 @@ impl UpdateManager {
                 ..ProgressInfo::default()
             },
         );
+        progress_emitter.emit_substep(1, update_phase::RELEASE_RESOLVED, 1);
 
         if info.apply_releases.is_empty() {
             return Err(SurgeError::Update("No releases to apply".to_string()));
@@ -329,6 +332,7 @@ impl UpdateManager {
                 ..ProgressInfo::default()
             },
         );
+        progress_emitter.emit_completed_phase(update_phase::RELEASE_RESOLVED);
 
         // Phase 2: Download
         emit_progress(
@@ -341,13 +345,16 @@ impl UpdateManager {
                 ..ProgressInfo::default()
             },
         );
+        progress_emitter.emit_substep(2, update_phase::PACKAGE_DOWNLOAD_STARTED, 10);
 
         let artifact_cache_dir = self.install_dir.join(".surge-cache").join("artifacts");
         tokio::fs::create_dir_all(&artifact_cache_dir).await?;
         prepare_update_artifacts(self, info, &staging_dir, &artifact_cache_dir, progress.as_ref()).await?;
+        progress_emitter.emit_completed_phase(update_phase::PACKAGE_DOWNLOADED);
 
         let extract_dir = staging_dir.join("extracted");
         tokio::fs::create_dir_all(&extract_dir).await?;
+        progress_emitter.emit_substep(5, update_phase::PACKAGE_APPLY_STARTED, 60);
         let extracted_final_dir = materialize_update_payload(
             self,
             info,
@@ -357,6 +364,7 @@ impl UpdateManager {
             progress.as_ref(),
         )
         .await?;
+        progress_emitter.emit_completed_phase(update_phase::PACKAGE_APPLY_COMPLETED);
 
         // Phase 6: Finalize
         let restart_outcome = finalize_update(
@@ -1289,7 +1297,13 @@ mod tests {
             "failed record preserves pre-attempt version"
         );
         assert_eq!(status_record.target_version, "1.1.0");
-        assert!(status_record.completed_at_utc.is_none());
+        assert!(status_record.completed_at_utc.is_some());
+        assert_eq!(
+            status_record.failure_phase.as_deref(),
+            Some(finalize_phase::PACKAGE_DOWNLOAD_STARTED)
+        );
+        assert_eq!(status_record.retry_safe, Some(true));
+        assert!(status_record.last_progress_at_utc.is_some());
         let reason = status_record
             .reason
             .as_deref()

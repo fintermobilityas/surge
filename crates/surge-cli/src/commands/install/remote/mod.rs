@@ -7,6 +7,7 @@ mod runtime;
 mod staging;
 mod state;
 mod types;
+mod watchdog;
 
 use super::{
     ArchiveAcquisition, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, CacheFetchOutcome, Command,
@@ -22,7 +23,7 @@ use surge_core::update::manager::ApplyStrategy;
 
 pub(crate) use self::execution::{
     REMOTE_INSTALLER_FINAL_PATH, build_remote_installer_install_command, resolve_tailscale_targets,
-    run_tailscale_streaming, stream_file_to_tailscale_node_with_command,
+    run_tailscale_streaming, run_tailscale_streaming_with_status_watchdog, stream_file_to_tailscale_node_with_command,
 };
 pub(crate) use self::published_installer::{
     build_installer_for_tailscale, missing_remote_installer_error, plan_remote_published_installer,
@@ -42,6 +43,7 @@ pub(crate) use self::types::{
     RemoteTailscaleCachedState, RemoteTailscaleOperation, RemoteTailscaleTransferInputs,
     RemoteTailscaleTransferStrategy, ensure_supported_tailscale_rid,
 };
+pub(crate) use self::watchdog::RemoteSetupWatchdog;
 
 #[cfg(test)]
 pub(crate) use self::activation::build_remote_app_copy_activation_script;
@@ -394,7 +396,11 @@ pub(super) async fn install_release_via_tailscale(
     } else {
         logline::info(&format!("Running installer on '{file_target}'..."));
     }
-    run_tailscale_streaming(&["ssh", ssh_target, ssh_command.as_str()], "remote").await?;
+    let remote_home = execution::detect_remote_home_directory(ssh_target).await?;
+    let install_root_for_watchdog = staging::remote_install_root(&remote_home, app_id, &release.install_directory)?;
+    let watchdog = RemoteSetupWatchdog::new(ssh_target, &install_root_for_watchdog);
+    run_tailscale_streaming_with_status_watchdog(&["ssh", ssh_target, ssh_command.as_str()], "remote", watchdog)
+        .await?;
     if !behavior.mode.is_stage() {
         warn_if_remote_stage_cleanup_fails(ssh_target, app_id, release).await;
         verify_remote_runtime_after_install(

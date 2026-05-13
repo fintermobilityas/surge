@@ -26,6 +26,11 @@ use crate::update::status::{self, UpdateStatusRecord};
 /// status records so operators can tell a stuck "swapping app directory"
 /// apart from a stuck "starting supervisor".
 pub(crate) mod labels {
+    pub const RELEASE_RESOLVED: &str = "release or delta resolved";
+    pub const PACKAGE_DOWNLOAD_STARTED: &str = "package download started";
+    pub const PACKAGE_DOWNLOADED: &str = "package downloaded";
+    pub const PACKAGE_APPLY_STARTED: &str = "package apply started";
+    pub const PACKAGE_APPLY_COMPLETED: &str = "package apply completed";
     pub const STOPPING_SUPERVISOR: &str = "stopping supervisor";
     pub const PREPARING_SWAP: &str = "preparing app swap";
     pub const SWAPPING_APP_DIRECTORY: &str = "swapping app directory";
@@ -91,6 +96,7 @@ where
                             ..ProgressInfo::default()
                         },
                     );
+                    self.persist_current_phase(label);
                 }
             }
         }
@@ -108,7 +114,24 @@ where
                 ..ProgressInfo::default()
             },
         );
-        let record = self.in_progress_template.clone().with_current_phase(label);
+        self.persist_current_phase(label);
+    }
+
+    pub(super) fn emit_completed_phase(&self, label: &'static str) {
+        let record = self
+            .in_progress_template
+            .clone()
+            .with_completed_phase_at(label, status::now_utc_rfc3339());
+        if let Err(e) = status::write_update_status(self.install_dir, &record) {
+            warn!(error = %e, phase = label, "Failed to persist completed phase status (continuing)");
+        }
+    }
+
+    fn persist_current_phase(&self, label: &'static str) {
+        let record = self
+            .in_progress_template
+            .clone()
+            .with_current_phase_at(label, status::now_utc_rfc3339());
         if let Err(e) = status::write_update_status(self.install_dir, &record) {
             warn!(error = %e, phase = label, "Failed to persist in-progress substep status (continuing)");
         }

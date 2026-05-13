@@ -17,6 +17,7 @@ use surge_core::releases::restore::RestoreProgress;
 use surge_core::update::manager::ProgressInfo;
 
 mod convergence;
+mod status;
 
 const PACKAGE_PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(10);
 const PACKAGE_PROGRESS_PERCENT_STEP: u64 = 10;
@@ -187,7 +188,7 @@ pub async fn execute(dir: &Path, no_start: bool, stage: bool, reinstall: bool) -
     let install_root = default_install_root(&manifest.app_id, &manifest.runtime.install_directory)?;
 
     if stage {
-        let package = resolve_package(dir, &manifest, &install_root).await?;
+        let package = resolve_package(dir, &manifest, &install_root, None).await?;
         ensure_stage_cache_entry(&package, &manifest, &install_root)?;
         prune_setup_artifact_cache(&install_root, &package, &manifest);
         persist_staged_installer_cache(dir, &manifest, &install_root)?;
@@ -204,49 +205,75 @@ pub async fn execute(dir: &Path, no_start: bool, stage: bool, reinstall: bool) -
         return Ok(());
     }
 
-    if let Err(e) = super::stop_supervisor(&install_root, &manifest.runtime.supervisor_id).await {
-        logline::warn(&format!("Could not stop supervisor: {e}"));
-    }
-    stop_running_app(&install_root, &manifest.runtime.main_exe)?;
+    let setup_status = status::SetupStatus::new(&manifest, &install_root);
+    let setup_result: Result<()> = async {
+        setup_status.record_phase(status::PHASE_STAGE_RECEIVED);
+        setup_status.record_completed_phase(status::PHASE_STAGE_RECEIVED);
+        setup_status.record_phase(status::PHASE_SUPERVISOR_STOP_REQUESTED);
+        if let Err(e) = super::stop_supervisor(&install_root, &manifest.runtime.supervisor_id).await {
+            logline::warn(&format!("Could not stop supervisor: {e}"));
+        }
+        stop_running_app(&install_root, &manifest.runtime.main_exe)?;
+        setup_status.record_completed_phase(status::PHASE_SUPERVISOR_STOP_REQUESTED);
 
-    let package = resolve_package(dir, &manifest, &install_root).await?;
+        setup_status.record_phase(status::PHASE_RELEASE_RESOLVED);
+        let package = resolve_package(dir, &manifest, &install_root, Some(&setup_status)).await?;
+        setup_status.record_completed_phase(status::PHASE_PACKAGE_DOWNLOADED);
 
-    let profile = InstallProfile::from_installer_manifest(&manifest, &manifest.runtime.shortcuts);
+        let profile = InstallProfile::from_installer_manifest(&manifest, &manifest.runtime.shortcuts);
 
-    core_install::install_package_locally_at_root(&profile, package.path(), &install_root)?;
-    let active_app_dir = install_root.join("app");
-    let runtime_manifest = core_install::RuntimeManifestMetadata::new(
-        &manifest.version,
-        &manifest.channel,
-        &manifest.storage.provider,
-        &manifest.storage.bucket,
-        &manifest.storage.region,
-        &manifest.storage.endpoint,
-    );
-    core_install::write_runtime_manifest(&active_app_dir, &profile, &runtime_manifest)?;
-
-    prune_setup_artifact_cache(&install_root, &package, &manifest);
-
-    logline::success(&format!(
-        "Installed '{}' to '{}'",
-        manifest.app_id,
-        install_root.display()
-    ));
-
-    if !no_start {
-        match core_install::auto_start_after_install_sequence(
-            &profile,
-            &install_root,
-            &active_app_dir,
+        setup_status.record_phase(status::PHASE_APP_SWAP_STARTED);
+        core_install::install_package_locally_at_root(&profile, package.path(), &install_root)?;
+        let active_app_dir = install_root.join("app");
+        setup_status.record_completed_phase(status::PHASE_PERSISTENT_ASSETS_COPIED);
+        let runtime_manifest = core_install::RuntimeManifestMetadata::new(
             &manifest.version,
-        ) {
-            Ok(pid) => {
-                logline::success(&format!("Started '{}' (pid {pid})", manifest.runtime.name));
-            }
-            Err(e) => {
-                logline::warn(&format!("Auto-start failed: {e}"));
+            &manifest.channel,
+            &manifest.storage.provider,
+            &manifest.storage.bucket,
+            &manifest.storage.region,
+            &manifest.storage.endpoint,
+        );
+        core_install::write_runtime_manifest(&active_app_dir, &profile, &runtime_manifest)?;
+
+        prune_setup_artifact_cache(&install_root, &package, &manifest);
+
+        logline::success(&format!(
+            "Installed '{}' to '{}'",
+            manifest.app_id,
+            install_root.display()
+        ));
+
+        if no_start {
+            setup_status.record_converged(false);
+        } else {
+            setup_status.record_phase(status::PHASE_SUPERVISOR_RESTART_REQUESTED);
+            match core_install::auto_start_after_install_sequence(
+                &profile,
+                &install_root,
+                &active_app_dir,
+                &manifest.version,
+            ) {
+                Ok(pid) => {
+                    logline::success(&format!("Started '{}' (pid {pid})", manifest.runtime.name));
+                    setup_status.record_completed_phase(status::PHASE_SUPERVISOR_RESTART_CONFIRMED);
+                    setup_status.record_converged(!manifest.runtime.supervisor_id.trim().is_empty());
+                }
+                Err(e) => {
+                    let reason = format!("Auto-start failed: {e}");
+                    logline::warn(&reason);
+                    setup_status.record_pending_restart(&reason);
+                }
             }
         }
+
+        Ok(())
+    }
+    .await;
+
+    if let Err(e) = setup_result {
+        setup_status.record_failed(&e.to_string());
+        return Err(e);
     }
 
     Ok(())
@@ -254,7 +281,12 @@ pub async fn execute(dir: &Path, no_start: bool, stage: bool, reinstall: bool) -
 
 /// Resolve the full package: prefer bundled payload, then the persistent
 /// artifact cache, then release-graph reconstruction/download into that cache.
-async fn resolve_package(dir: &Path, manifest: &InstallerManifest, install_root: &Path) -> Result<ResolvedPackage> {
+async fn resolve_package(
+    dir: &Path,
+    manifest: &InstallerManifest,
+    install_root: &Path,
+    setup_status: Option<&status::SetupStatus>,
+) -> Result<ResolvedPackage> {
     let full_filename = manifest.release.full_filename.trim();
     let download_progress = Mutex::new(ProgressReporter::new("Downloading package..."));
     let restore_progress = Mutex::new(ProgressReporter::new("Preparing package..."));
@@ -269,6 +301,9 @@ async fn resolve_package(dir: &Path, manifest: &InstallerManifest, install_root:
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if let Some(message) = reporter.observe_bytes(done, total) {
+                    if let Some(setup_status) = setup_status {
+                        setup_status.record_phase(status::PHASE_PACKAGE_DOWNLOADING);
+                    }
                     logline::subtle(&message);
                 }
             }),
@@ -277,6 +312,9 @@ async fn resolve_package(dir: &Path, manifest: &InstallerManifest, install_root:
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if let Some(message) = reporter.observe_restore(update) {
+                    if let Some(setup_status) = setup_status {
+                        setup_status.record_phase(status::PHASE_PACKAGE_DOWNLOADING);
+                    }
                     logline::subtle(&message);
                 }
             }),
@@ -777,6 +815,58 @@ mod tests {
         assert!(runtime_yaml.contains("id: demo-app"));
         assert!(runtime_yaml.contains("version: 1.2.3"));
         assert!(runtime_yaml.contains("channel: stable"));
+
+        let status_record = surge_core::update::status::read_update_status(&install_root)
+            .expect("read update status")
+            .expect("status record");
+        assert_eq!(
+            status_record.state,
+            surge_core::update::status::UpdateConvergenceState::Converged
+        );
+        assert_eq!(status_record.app_id, "demo-app");
+        assert_eq!(status_record.target_version, "1.2.3");
+        assert_eq!(status_record.installed_version, "1.2.3");
+        assert!(status_record.completed_at_utc.is_some());
+    }
+
+    #[tokio::test]
+    async fn execute_records_failed_status_with_phase_context() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let installer_dir = temp_dir.path().join("installer");
+        let install_root = temp_dir.path().join("installed-app");
+        let store_root = temp_dir.path().join("store");
+        let full_filename = "demo-app-1.2.3-full.tar.zst";
+
+        std::fs::create_dir_all(&installer_dir).expect("installer dir");
+        std::fs::create_dir_all(&store_root).expect("store dir");
+
+        let manifest = make_manifest(&install_root, &store_root, full_filename, "offline");
+        let installer_yaml = serde_yaml::to_string(&manifest).expect("installer yaml");
+        std::fs::write(installer_dir.join("installer.yml"), installer_yaml).expect("installer manifest");
+
+        let err = execute(&installer_dir, true, false, false)
+            .await
+            .expect_err("setup should fail without bundled payload");
+        let status_record = surge_core::update::status::read_update_status(&install_root)
+            .expect("read update status")
+            .expect("status record");
+
+        assert_eq!(
+            status_record.state,
+            surge_core::update::status::UpdateConvergenceState::Failed
+        );
+        assert_eq!(
+            status_record.failure_phase.as_deref(),
+            Some(status::PHASE_RELEASE_RESOLVED)
+        );
+        assert_eq!(status_record.retry_safe, Some(true));
+        assert!(
+            status_record
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains(&err.to_string())
+        );
     }
 
     #[tokio::test]
@@ -865,7 +955,7 @@ mod tests {
 
         let manifest = make_manifest(&install_root, &store_root, full_filename, "online");
         write_release_index(&store_root, &manifest, &stored_archive);
-        let package = resolve_package(&installer_dir, &manifest, &install_root)
+        let package = resolve_package(&installer_dir, &manifest, &install_root, None)
             .await
             .expect("downloaded package");
 

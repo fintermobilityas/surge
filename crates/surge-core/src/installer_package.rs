@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use crate::config::constants::RELEASES_FILE_COMPRESSED;
 use crate::config::installer::InstallerManifest;
 use crate::error::{Result, SurgeError};
-use crate::releases::artifact_cache::{cache_path_for_key, cached_artifact_matches, prune_cached_artifacts};
+use crate::releases::artifact_cache::{
+    cache_path_for_key, cached_artifact_matches, fetch_or_reuse_file, prune_cached_artifacts,
+};
 use crate::releases::manifest::{ReleaseEntry, ReleaseIndex, decompress_release_index};
 use crate::releases::restore::{
     RestoreOptions, RestoreProgressCallback, restore_full_archive_for_version_with_options,
@@ -149,9 +151,14 @@ pub async fn resolve_installer_package(
     }
 
     notify_stage(options.stage, InstallerPackageStage::DownloadingPackage);
-    backend
-        .download_to_file(full_filename, &cached_package_path, options.download_progress)
-        .await?;
+    fetch_or_reuse_file(
+        &*backend,
+        full_filename,
+        &cached_package_path,
+        &manifest.release.full_sha256,
+        options.download_progress,
+    )
+    .await?;
 
     Ok(ResolvedInstallerPackage {
         path: cached_package_path,

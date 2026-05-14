@@ -36,6 +36,10 @@ pub(crate) fn select_remote_tailscale_transfer_strategy(
         return RemoteTailscaleTransferStrategy::StagedInstallerCache;
     }
 
+    if inputs.operation == RemoteTailscaleOperation::Install && inputs.installer_mode == RemoteInstallerMode::Online {
+        return RemoteTailscaleTransferStrategy::Installer { prefer_published: true };
+    }
+
     if inputs.host_installer_availability == RemoteHostInstallerAvailability::Unavailable
         || matches!(inputs.installer_mode, RemoteInstallerMode::Offline)
             && (inputs.operation == RemoteTailscaleOperation::Stage
@@ -56,7 +60,7 @@ pub(crate) fn select_remote_tailscale_transfer_strategy_for_convergence(
     if inputs.operation == RemoteTailscaleOperation::Install
         && matches!(convergence_action, RemoteConvergenceAction::Reinstall)
     {
-        return RemoteTailscaleTransferStrategy::AppCopy;
+        return select_remote_tailscale_transfer_strategy(inputs);
     }
 
     select_remote_tailscale_transfer_strategy(inputs)

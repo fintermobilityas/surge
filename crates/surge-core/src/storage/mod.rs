@@ -74,9 +74,73 @@ pub(crate) async fn download_response_to_file(
     Ok(())
 }
 
+pub(crate) async fn download_response_to_file_from_offset(
+    response: Response,
+    dest: &std::path::Path,
+    offset: u64,
+    progress: Option<&TransferProgress<'_>>,
+) -> Result<()> {
+    if offset == 0 {
+        return download_response_to_file(response, dest, progress).await;
+    }
+
+    let existing_len = tokio::fs::metadata(dest).await.map_or(0, |metadata| metadata.len());
+    if existing_len != offset {
+        return Err(SurgeError::Storage(format!(
+            "Cannot resume download into '{}': expected {offset} bytes, found {existing_len}",
+            dest.display()
+        )));
+    }
+
+    let remaining_total = response.content_length().unwrap_or(0);
+    let total = offset.saturating_add(remaining_total);
+
+    if let Some(parent) = dest.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dest)
+        .await?;
+    let mut done = offset;
+    let mut reported = false;
+    let mut stream = response.bytes_stream();
+
+    if let Some(cb) = progress {
+        cb(done, total.max(done));
+        reported = true;
+    }
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        file.write_all(&chunk).await?;
+        done = done.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+        if let Some(cb) = progress {
+            cb(done, total.max(done));
+            reported = true;
+        }
+    }
+
+    file.flush().await?;
+
+    if let Some(cb) = progress
+        && (!reported || done < total)
+    {
+        cb(done, total.max(done));
+    }
+
+    Ok(())
+}
+
 /// Abstract storage backend interface.
 #[async_trait]
 pub trait StorageBackend: Send + Sync {
+    fn supports_resumable_downloads(&self) -> bool {
+        false
+    }
+
     /// Upload an object from bytes.
     async fn put_object(&self, key: &str, data: &[u8], content_type: &str) -> Result<()>;
 
@@ -99,6 +163,21 @@ pub trait StorageBackend: Send + Sync {
         dest: &std::path::Path,
         progress: Option<&TransferProgress<'_>>,
     ) -> Result<()>;
+
+    async fn download_to_file_from_offset(
+        &self,
+        key: &str,
+        dest: &std::path::Path,
+        offset: u64,
+        progress: Option<&TransferProgress<'_>>,
+    ) -> Result<()> {
+        if offset == 0 {
+            return self.download_to_file(key, dest, progress).await;
+        }
+        Err(SurgeError::Storage(
+            "Storage backend does not support resumable downloads".to_string(),
+        ))
+    }
 
     /// Upload a file to storage.
     async fn upload_from_file(

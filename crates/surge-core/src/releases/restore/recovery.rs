@@ -1,4 +1,9 @@
+use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicI64, Ordering},
+};
 
 use crate::crypto::sha256::sha256_hex;
 use crate::error::{Result, SurgeError};
@@ -6,7 +11,7 @@ use crate::platform::fs::write_file_atomic;
 use crate::releases::artifact_cache::{cache_path_for_key, fetch_or_reuse_file};
 use crate::releases::delta::{apply_delta_patch, decode_delta_patch};
 use crate::releases::manifest::{ReleaseEntry, ReleaseIndex};
-use crate::storage::StorageBackend;
+use crate::storage::{StorageBackend, TransferProgress};
 use futures_util::stream::{self, StreamExt};
 
 use super::candidate::select_restore_candidate;
@@ -182,20 +187,57 @@ async fn prefetch_artifacts_to_cache(
 ) -> Result<()> {
     const PREFETCH_CONCURRENCY: usize = 4;
 
-    let mut items_done = 0i64;
-    let mut bytes_done = 0i64;
+    let completed_items = Arc::new(AtomicI64::new(0));
+    let downloaded_bytes_by_key = Arc::new(Mutex::new(BTreeMap::<String, i64>::new()));
     let mut prefetch_stream = stream::iter(specs.iter().cloned())
-        .map(|spec| async move {
-            let cache_path = cache_path_for_key(cache_root, &spec.key)?;
-            fetch_or_reuse_file(storage, &spec.key, &cache_path, &spec.sha256, None).await?;
-            Ok::<i64, SurgeError>(spec.size.max(0))
+        .map(|spec| {
+            let completed_items = Arc::clone(&completed_items);
+            let downloaded_bytes_by_key = Arc::clone(&downloaded_bytes_by_key);
+            async move {
+                let cache_path = cache_path_for_key(cache_root, &spec.key)?;
+                let progress_callback: Option<Box<TransferProgress<'_>>> = progress.map(|callback| {
+                    let completed_items = Arc::clone(&completed_items);
+                    let downloaded_bytes_by_key = Arc::clone(&downloaded_bytes_by_key);
+                    let key = spec.key.clone();
+                    Box::new(move |done: u64, _total: u64| {
+                        let bytes_done = {
+                            let mut state = downloaded_bytes_by_key
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            state.insert(key.clone(), i64::try_from(done).unwrap_or(i64::MAX));
+                            state.values().copied().fold(0i64, i64::saturating_add)
+                        };
+                        callback(RestoreProgress {
+                            items_done: completed_items.load(Ordering::SeqCst),
+                            items_total,
+                            bytes_done,
+                            bytes_total,
+                        });
+                    }) as Box<TransferProgress<'_>>
+                });
+                fetch_or_reuse_file(
+                    storage,
+                    &spec.key,
+                    &cache_path,
+                    &spec.sha256,
+                    progress_callback.as_deref(),
+                )
+                .await?;
+                Ok::<(String, i64), SurgeError>((spec.key, spec.size.max(0)))
+            }
         })
         .buffer_unordered(PREFETCH_CONCURRENCY);
 
     while let Some(result) = prefetch_stream.next().await {
-        let size = result?;
-        items_done = items_done.saturating_add(1);
-        bytes_done = bytes_done.saturating_add(size);
+        let (key, size) = result?;
+        let items_done = completed_items.fetch_add(1, Ordering::SeqCst).saturating_add(1);
+        let bytes_done = {
+            let mut state = downloaded_bytes_by_key
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.insert(key, size);
+            state.values().copied().fold(0i64, i64::saturating_add)
+        };
         if let Some(callback) = progress {
             callback(RestoreProgress {
                 items_done,

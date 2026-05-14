@@ -9,7 +9,6 @@ use super::{
 };
 use tokio::io::AsyncSeekExt;
 
-const REMOTE_COPY_CONFIRMATION_TIMEOUT: Duration = Duration::from_mins(10);
 const REMOTE_STREAM_PROGRESS_TIMEOUT: Duration = Duration::from_mins(3);
 const TAILSCALE_STREAM_COMMAND_TIMEOUT: Duration = Duration::from_mins(30);
 
@@ -216,11 +215,12 @@ pub(crate) async fn stream_directory_entries_to_tailscale_node_with_command(
     Ok(())
 }
 
-pub(crate) async fn stream_file_to_tailscale_node_with_command_from_offset(
+pub(crate) async fn stream_file_to_tailscale_node_with_command_from_offset_timeout(
     node: &str,
     local_file: &Path,
     remote_command: &str,
     offset: u64,
+    confirmation_timeout: Duration,
 ) -> Result<()> {
     let ssh_command = format!("sh -lc {}", shell_single_quote(remote_command));
     let mut child = Command::new("tailscale")
@@ -324,7 +324,7 @@ pub(crate) async fn stream_file_to_tailscale_node_with_command_from_offset(
         logline::subtle("Waiting for remote copy confirmation...");
     }
 
-    let output = tokio::time::timeout(REMOTE_COPY_CONFIRMATION_TIMEOUT, child.wait_with_output()).await;
+    let output = tokio::time::timeout(confirmation_timeout, child.wait_with_output()).await;
     if let Some(spinner) = finalize_spinner {
         spinner.finish_and_clear();
     }
@@ -335,7 +335,7 @@ pub(crate) async fn stream_file_to_tailscale_node_with_command_from_offset(
         Err(_) => {
             return Err(SurgeError::Platform(format!(
                 "Timed out after {}s waiting for remote copy confirmation to '{node}'",
-                REMOTE_COPY_CONFIRMATION_TIMEOUT.as_secs()
+                confirmation_timeout.as_secs()
             )));
         }
     };

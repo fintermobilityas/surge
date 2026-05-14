@@ -58,6 +58,7 @@ impl AzureBlobBackend {
         query_params: &[(String, String)],
         content_length: Option<usize>,
         content_type: &str,
+        range_header: Option<&str>,
         extra_headers: &[(String, String)],
     ) -> Vec<(String, String)> {
         let now = Utc::now();
@@ -97,6 +98,7 @@ impl AzureBlobBackend {
             Some(n) if n > 0 => n.to_string(),
             _ => String::new(),
         };
+        let range_header = range_header.unwrap_or_default();
 
         let string_to_sign = format!(
             "{method}\n\
@@ -110,7 +112,7 @@ impl AzureBlobBackend {
              \n\
              \n\
              \n\
-             \n\
+             {range_header}\n\
              {canonicalized_headers}\n\
              {canonicalized_resource}"
         );

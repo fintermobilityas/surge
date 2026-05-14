@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::process::ExitStatus;
 use std::time::Duration;
 
@@ -9,6 +10,7 @@ use super::{
 use tokio::io::AsyncSeekExt;
 
 const REMOTE_COPY_CONFIRMATION_TIMEOUT: Duration = Duration::from_mins(10);
+const REMOTE_STREAM_PROGRESS_TIMEOUT: Duration = Duration::from_mins(3);
 const TAILSCALE_STREAM_COMMAND_TIMEOUT: Duration = Duration::from_mins(30);
 
 pub(crate) const REMOTE_INSTALLER_FINAL_PATH: &str = "/tmp/.surge-installer";
@@ -89,108 +91,6 @@ pub(crate) async fn detect_remote_home_directory(ssh_node: &str) -> Result<std::
     Ok(std::path::PathBuf::from(home))
 }
 
-pub(crate) async fn stream_directory_to_tailscale_node_with_command(
-    node: &str,
-    local_dir: &Path,
-    remote_command: &str,
-) -> Result<()> {
-    let ssh_command = format!("sh -lc {}", shell_single_quote(remote_command));
-    let local_dir_str = local_dir.to_string_lossy().to_string();
-    let mut tar_child = Command::new("tar")
-        .args(["-C", local_dir_str.as_str(), "-cf", "-", "."])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| SurgeError::Platform(format!("Failed to archive '{}' for transfer: {e}", local_dir.display())))?;
-    let mut remote_child = Command::new("tailscale")
-        .args(["ssh", node, ssh_command.as_str()])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| SurgeError::Platform(format!("Failed to run tailscale ssh stream copy: {e}")))?;
-
-    let mut tar_stdout = tar_child
-        .stdout
-        .take()
-        .ok_or_else(|| SurgeError::Platform("Failed to capture local tar stdout".to_string()))?;
-    let mut remote_stdin = remote_child
-        .stdin
-        .take()
-        .ok_or_else(|| SurgeError::Platform("Failed to capture tailscale ssh stdin".to_string()))?;
-
-    let transfer_message = format!("Streaming '{}' to '{node}'", local_dir.display());
-    let transfer_spinner = make_spinner(&transfer_message);
-    let transfer_result: Result<()> = async {
-        let mut buffer = vec![0_u8; 128 * 1024];
-        loop {
-            let read_bytes = tar_stdout.read(&mut buffer).await.map_err(|e| {
-                SurgeError::Platform(format!(
-                    "Failed to read archived directory '{}' for transfer: {e}",
-                    local_dir.display()
-                ))
-            })?;
-            if read_bytes == 0 {
-                break;
-            }
-            remote_stdin.write_all(&buffer[..read_bytes]).await.map_err(|e| {
-                SurgeError::Platform(format!("Failed to stream '{}' to '{node}': {e}", local_dir.display()))
-            })?;
-            if let Some(spinner) = transfer_spinner.as_ref() {
-                spinner.tick();
-            }
-        }
-        remote_stdin.flush().await.map_err(|e| {
-            SurgeError::Platform(format!(
-                "Failed to flush transfer stream to '{node}' for '{}': {e}",
-                local_dir.display()
-            ))
-        })?;
-        Ok(())
-    }
-    .await;
-    drop(remote_stdin);
-
-    if let Some(spinner) = &transfer_spinner {
-        spinner.finish_and_clear();
-    }
-
-    if let Err(err) = transfer_result {
-        let _ = tar_child.kill().await;
-        let _ = remote_child.kill().await;
-        return Err(err);
-    }
-
-    let tar_output = tar_child
-        .wait_with_output()
-        .await
-        .map_err(|e| SurgeError::Platform(format!("Failed to wait for local tar process: {e}")))?;
-    if !tar_output.status.success() {
-        let stderr = String::from_utf8_lossy(&tar_output.stderr).trim().to_string();
-        return Err(SurgeError::Platform(if stderr.is_empty() {
-            format!("Command failed: tar -C '{}' -cf - .", local_dir.display())
-        } else {
-            format!("Command failed: tar -C '{}' -cf - .: {stderr}", local_dir.display())
-        }));
-    }
-
-    let remote_output = remote_child
-        .wait_with_output()
-        .await
-        .map_err(|e| SurgeError::Platform(format!("Failed to wait for tailscale ssh stream copy: {e}")))?;
-    if !remote_output.status.success() {
-        let stderr = String::from_utf8_lossy(&remote_output.stderr).trim().to_string();
-        return Err(SurgeError::Platform(if stderr.is_empty() {
-            format!("Command failed: tailscale ssh {node} sh -lc <stream-copy>")
-        } else {
-            format!("Command failed: tailscale ssh {node} sh -lc <stream-copy>: {stderr}")
-        }));
-    }
-
-    Ok(())
-}
-
 pub(crate) async fn stream_directory_entries_to_tailscale_node_with_command(
     node: &str,
     local_dir: &Path,
@@ -247,26 +147,28 @@ pub(crate) async fn stream_directory_entries_to_tailscale_node_with_command(
     let transfer_result: Result<()> = async {
         let mut buffer = vec![0_u8; 128 * 1024];
         loop {
-            let read_bytes = tar_stdout.read(&mut buffer).await.map_err(|e| {
-                SurgeError::Platform(format!(
-                    "Failed to read selected staged entries from '{}': {e}",
-                    local_dir.display()
-                ))
-            })?;
+            let read_bytes = await_transfer_progress(
+                tar_stdout.read(&mut buffer),
+                format!("reading selected staged entries from '{}'", local_dir.display()),
+            )
+            .await?;
             if read_bytes == 0 {
                 break;
             }
-            remote_stdin.write_all(&buffer[..read_bytes]).await.map_err(|e| {
-                SurgeError::Platform(format!("Failed to stream selected staged entries to '{node}': {e}"))
-            })?;
+            await_transfer_progress(
+                remote_stdin.write_all(&buffer[..read_bytes]),
+                format!("streaming selected staged entries to '{node}'"),
+            )
+            .await?;
             if let Some(spinner) = transfer_spinner.as_ref() {
                 spinner.tick();
             }
         }
-        remote_stdin
-            .flush()
-            .await
-            .map_err(|e| SurgeError::Platform(format!("Failed to flush selected staged entries to '{node}': {e}")))?;
+        await_transfer_progress(
+            remote_stdin.flush(),
+            format!("flushing selected staged entries to '{node}'"),
+        )
+        .await?;
         Ok(())
     }
     .await;
@@ -365,15 +267,19 @@ pub(crate) async fn stream_file_to_tailscale_node_with_command_from_offset(
     let mut transferred_bytes = offset;
     let mut buffer = vec![0_u8; 128 * 1024];
     loop {
-        let read_bytes = local_reader.read(&mut buffer).await.map_err(|e| {
-            SurgeError::Platform(format!("Failed to read '{}' for transfer: {e}", local_file.display()))
-        })?;
+        let read_bytes = await_transfer_progress(
+            local_reader.read(&mut buffer),
+            format!("reading '{}'", local_file.display()),
+        )
+        .await?;
         if read_bytes == 0 {
             break;
         }
-        child_stdin.write_all(&buffer[..read_bytes]).await.map_err(|e| {
-            SurgeError::Platform(format!("Failed to stream '{}' to '{node}': {e}", local_file.display()))
-        })?;
+        await_transfer_progress(
+            child_stdin.write_all(&buffer[..read_bytes]),
+            format!("streaming '{}' to '{node}'", local_file.display()),
+        )
+        .await?;
         transferred_bytes = transferred_bytes.saturating_add(u64::try_from(read_bytes).unwrap_or(0));
 
         if let Some(bar) = transfer_bar.as_ref() {
@@ -398,12 +304,11 @@ pub(crate) async fn stream_file_to_tailscale_node_with_command_from_offset(
         }
     }
 
-    child_stdin.flush().await.map_err(|e| {
-        SurgeError::Platform(format!(
-            "Failed to flush transfer stream to '{node}' for '{}': {e}",
-            local_file.display()
-        ))
-    })?;
+    await_transfer_progress(
+        child_stdin.flush(),
+        format!("flushing transfer stream to '{node}' for '{}'", local_file.display()),
+    )
+    .await?;
     drop(child_stdin);
 
     if let Some(bar) = &transfer_bar {
@@ -446,6 +351,20 @@ pub(crate) async fn stream_file_to_tailscale_node_with_command_from_offset(
     }
 
     Ok(())
+}
+
+async fn await_transfer_progress<T, Fut>(future: Fut, operation: String) -> Result<T>
+where
+    Fut: Future<Output = std::io::Result<T>>,
+{
+    match tokio::time::timeout(REMOTE_STREAM_PROGRESS_TIMEOUT, future).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(SurgeError::Platform(format!("Failed while {operation}: {error}"))),
+        Err(_) => Err(SurgeError::Platform(format!(
+            "Timed out after {}s without transfer progress while {operation}; rerun to resume the staged transfer",
+            REMOTE_STREAM_PROGRESS_TIMEOUT.as_secs()
+        ))),
+    }
 }
 
 pub(crate) async fn run_tailscale_capture(args: &[&str]) -> Result<String> {

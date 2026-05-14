@@ -39,7 +39,7 @@ pub(crate) use self::staging::{
 pub(crate) use self::state::{
     check_remote_install_state, detect_remote_launch_environment, remote_install_matches,
     remote_staged_installer_matches_release, remote_staged_payload_matches_release, select_remote_installer_mode,
-    select_remote_tailscale_transfer_strategy, verify_remote_stage_readiness,
+    select_remote_tailscale_transfer_strategy_for_convergence, verify_remote_stage_readiness,
 };
 pub(crate) use self::types::{
     RemoteConvergenceAction, RemoteConvergencePlan, RemoteHostInstallerAvailability, RemoteInstallerMode,
@@ -63,7 +63,7 @@ pub(crate) use self::staging::{
 pub(crate) use self::state::{
     parse_remote_install_state, parse_remote_launch_environment, parse_remote_staged_payload_identity,
     plan_remote_convergence, remote_launch_environment_probe, remote_staged_payload_identity,
-    should_skip_remote_install,
+    select_remote_tailscale_transfer_strategy, should_skip_remote_install,
 };
 #[cfg(test)]
 pub(crate) use self::types::{RemoteInstallState, RemoteLaunchEnvironment, RemotePublishedInstallerPlan};
@@ -91,7 +91,12 @@ pub(super) async fn install_release_via_tailscale(
     } else {
         release.install_directory.trim()
     };
-    let remote_state = check_remote_install_state(ssh_target, install_dir).await?;
+    let main_exe_name = if release.main_exe.trim().is_empty() {
+        app_id
+    } else {
+        release.main_exe.trim()
+    };
+    let remote_state = check_remote_install_state(ssh_target, install_dir, main_exe_name).await?;
     let convergence_plan = state::plan_remote_convergence(
         remote_state.as_ref(),
         index,
@@ -187,26 +192,29 @@ pub(super) async fn install_release_via_tailscale(
     let transfer_strategy = if prefer_update_setup {
         RemoteTailscaleTransferStrategy::Installer { prefer_published: true }
     } else {
-        select_remote_tailscale_transfer_strategy(RemoteTailscaleTransferInputs {
-            host_installer_availability: if host_can_build_installer {
-                RemoteHostInstallerAvailability::Available
-            } else {
-                RemoteHostInstallerAvailability::Unavailable
+        select_remote_tailscale_transfer_strategy_for_convergence(
+            RemoteTailscaleTransferInputs {
+                host_installer_availability: if host_can_build_installer {
+                    RemoteHostInstallerAvailability::Available
+                } else {
+                    RemoteHostInstallerAvailability::Unavailable
+                },
+                installer_mode,
+                operation: if behavior.mode.is_stage() {
+                    RemoteTailscaleOperation::Stage
+                } else {
+                    RemoteTailscaleOperation::Install
+                },
+                cached_state: if has_matching_pre_staged_installer_cache {
+                    RemoteTailscaleCachedState::InstallerCache
+                } else if has_matching_pre_staged_app_copy_payload {
+                    RemoteTailscaleCachedState::AppCopyPayload
+                } else {
+                    RemoteTailscaleCachedState::None
+                },
             },
-            installer_mode,
-            operation: if behavior.mode.is_stage() {
-                RemoteTailscaleOperation::Stage
-            } else {
-                RemoteTailscaleOperation::Install
-            },
-            cached_state: if has_matching_pre_staged_installer_cache {
-                RemoteTailscaleCachedState::InstallerCache
-            } else if has_matching_pre_staged_app_copy_payload {
-                RemoteTailscaleCachedState::AppCopyPayload
-            } else {
-                RemoteTailscaleCachedState::None
-            },
-        })
+            convergence_plan.action,
+        )
     };
     if matches!(transfer_strategy, RemoteTailscaleTransferStrategy::AppCopy) {
         deploy_remote_app_copy_for_tailscale(

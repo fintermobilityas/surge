@@ -92,6 +92,7 @@ pub(crate) struct RemoteTailscaleTransferInputs {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RemoteInstallState {
     pub(crate) version: String,
+    pub(crate) active_executable_exists: bool,
     pub(crate) channel: Option<String>,
     pub(crate) storage_provider: Option<String>,
     pub(crate) storage_bucket: Option<String>,

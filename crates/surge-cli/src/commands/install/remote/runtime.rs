@@ -164,7 +164,12 @@ pub(crate) async fn verify_remote_runtime_after_install(
     storage_config: &surge_core::context::StorageConfig,
     verify_started_process: bool,
 ) -> Result<()> {
-    let state = check_remote_install_state(ssh_target, install_dir)
+    let main_exe_name = if release.main_exe.trim().is_empty() {
+        app_id
+    } else {
+        release.main_exe.trim()
+    };
+    let state = check_remote_install_state(ssh_target, install_dir, main_exe_name)
         .await?
         .ok_or_else(|| {
             SurgeError::Update(format!(

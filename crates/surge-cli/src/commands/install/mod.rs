@@ -917,7 +917,7 @@ mod tests {
                 operation: RemoteTailscaleOperation::Install,
                 cached_state: RemoteTailscaleCachedState::None,
             }),
-            RemoteTailscaleTransferStrategy::AppCopy
+            RemoteTailscaleTransferStrategy::Installer { prefer_published: true }
         );
     }
 
@@ -959,7 +959,7 @@ mod tests {
     }
 
     #[test]
-    fn select_remote_tailscale_transfer_strategy_uses_resumable_app_copy_for_reinstall_repairs() {
+    fn select_remote_tailscale_transfer_strategy_uses_online_installer_for_online_reinstall_repairs() {
         assert_eq!(
             select_remote_tailscale_transfer_strategy_for_convergence(
                 RemoteTailscaleTransferInputs {
@@ -970,7 +970,43 @@ mod tests {
                 },
                 RemoteConvergenceAction::Reinstall
             ),
-            RemoteTailscaleTransferStrategy::AppCopy
+            RemoteTailscaleTransferStrategy::Installer { prefer_published: true }
+        );
+        assert_eq!(
+            select_remote_tailscale_transfer_strategy_for_convergence(
+                RemoteTailscaleTransferInputs {
+                    host_installer_availability: RemoteHostInstallerAvailability::Available,
+                    installer_mode: RemoteInstallerMode::Online,
+                    operation: RemoteTailscaleOperation::Install,
+                    cached_state: RemoteTailscaleCachedState::InstallerCache,
+                },
+                RemoteConvergenceAction::Reinstall
+            ),
+            RemoteTailscaleTransferStrategy::StagedInstallerCache
+        );
+        assert_eq!(
+            select_remote_tailscale_transfer_strategy_for_convergence(
+                RemoteTailscaleTransferInputs {
+                    host_installer_availability: RemoteHostInstallerAvailability::Available,
+                    installer_mode: RemoteInstallerMode::Offline,
+                    operation: RemoteTailscaleOperation::Install,
+                    cached_state: RemoteTailscaleCachedState::None,
+                },
+                RemoteConvergenceAction::Reinstall
+            ),
+            RemoteTailscaleTransferStrategy::Installer { prefer_published: true }
+        );
+        assert_eq!(
+            select_remote_tailscale_transfer_strategy_for_convergence(
+                RemoteTailscaleTransferInputs {
+                    host_installer_availability: RemoteHostInstallerAvailability::Unavailable,
+                    installer_mode: RemoteInstallerMode::Online,
+                    operation: RemoteTailscaleOperation::Install,
+                    cached_state: RemoteTailscaleCachedState::None,
+                },
+                RemoteConvergenceAction::Reinstall
+            ),
+            RemoteTailscaleTransferStrategy::Installer { prefer_published: true }
         );
     }
 

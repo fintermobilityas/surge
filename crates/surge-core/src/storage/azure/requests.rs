@@ -6,7 +6,10 @@ use tracing::debug;
 
 use crate::context::StorageConfig;
 use crate::error::{Result, SurgeError};
-use crate::storage::{ListResult, ObjectInfo, StorageBackend, TransferProgress, download_response_to_file};
+use crate::storage::{
+    ListResult, ObjectInfo, StorageBackend, TransferProgress, download_response_to_file,
+    download_response_to_file_from_offset,
+};
 
 use super::AzureBlobBackend;
 use super::auth::decode_account_key;
@@ -124,6 +127,7 @@ impl StorageBackend for AzureBlobBackend {
             &[],
             Some(data.len()),
             content_type,
+            None,
             &extra_headers,
         );
 
@@ -149,7 +153,7 @@ impl StorageBackend for AzureBlobBackend {
         let mut req = self.client.get(&url);
         if self.has_credentials() {
             let resource_path = format!("/{}/{}", self.container, full_key);
-            let headers = self.sign_request("GET", &resource_path, &[], None, "", &[]);
+            let headers = self.sign_request("GET", &resource_path, &[], None, "", None, &[]);
             for (name, value) in &headers {
                 req = req.header(name.as_str(), value.as_str());
             }
@@ -174,7 +178,7 @@ impl StorageBackend for AzureBlobBackend {
         let mut req = self.client.head(&url);
         if self.has_credentials() {
             let resource_path = format!("/{}/{}", self.container, full_key);
-            let headers = self.sign_request("HEAD", &resource_path, &[], None, "", &[]);
+            let headers = self.sign_request("HEAD", &resource_path, &[], None, "", None, &[]);
             for (name, value) in &headers {
                 req = req.header(name.as_str(), value.as_str());
             }
@@ -225,7 +229,7 @@ impl StorageBackend for AzureBlobBackend {
         let url = self.blob_url(&full_key);
         let resource_path = format!("/{}/{}", self.container, full_key);
 
-        let headers = self.sign_request("DELETE", &resource_path, &[], None, "", &[]);
+        let headers = self.sign_request("DELETE", &resource_path, &[], None, "", None, &[]);
 
         let mut req = self.client.delete(&url);
         for (name, value) in &headers {
@@ -267,7 +271,7 @@ impl StorageBackend for AzureBlobBackend {
         let mut req = self.client.get(&url);
         if self.has_credentials() {
             let resource_path = format!("/{}", self.container);
-            let headers = self.sign_request("GET", &resource_path, &query_params, None, "", &[]);
+            let headers = self.sign_request("GET", &resource_path, &query_params, None, "", None, &[]);
             for (name, value) in &headers {
                 req = req.header(name.as_str(), value.as_str());
             }
@@ -288,7 +292,7 @@ impl StorageBackend for AzureBlobBackend {
         let mut req = self.client.get(&url);
         if self.has_credentials() {
             let resource_path = format!("/{}/{}", self.container, full_key);
-            let headers = self.sign_request("GET", &resource_path, &[], None, "", &[]);
+            let headers = self.sign_request("GET", &resource_path, &[], None, "", None, &[]);
             for (name, value) in &headers {
                 req = req.header(name.as_str(), value.as_str());
             }
@@ -307,6 +311,60 @@ impl StorageBackend for AzureBlobBackend {
         Ok(())
     }
 
+    fn supports_resumable_downloads(&self) -> bool {
+        true
+    }
+
+    async fn download_to_file_from_offset(
+        &self,
+        key: &str,
+        dest: &Path,
+        offset: u64,
+        progress: Option<&TransferProgress<'_>>,
+    ) -> Result<()> {
+        if offset == 0 {
+            return self.download_to_file(key, dest, progress).await;
+        }
+
+        let full_key = self.full_key(key);
+        let url = self.blob_url(&full_key);
+        let range_header = format!("bytes={offset}-");
+
+        let mut req = self
+            .client
+            .get(&url)
+            .header(reqwest::header::RANGE, range_header.as_str());
+        if self.has_credentials() {
+            let resource_path = format!("/{}/{}", self.container, full_key);
+            let headers = self.sign_request("GET", &resource_path, &[], None, "", Some(&range_header), &[]);
+            for (name, value) in &headers {
+                req = req.header(name.as_str(), value.as_str());
+            }
+        }
+
+        let resp = req.send().await?;
+        let status = resp.status();
+        if status != reqwest::StatusCode::PARTIAL_CONTENT {
+            let body = resp.text().await.unwrap_or_default();
+            if !status.is_success() {
+                return Self::check_response_status(status, &full_key, &body);
+            }
+            return Err(SurgeError::Storage(format!(
+                "Azure blob '{full_key}' did not honor resumable range request from byte {offset} (HTTP {status})"
+            )));
+        }
+
+        download_response_to_file_from_offset(resp, dest, offset, progress).await?;
+
+        debug!(
+            key = %full_key,
+            dest = %dest.display(),
+            offset,
+            "Azure resumable download completed"
+        );
+        Ok(())
+    }
+
     async fn upload_from_file(&self, key: &str, src: &Path, progress: Option<&TransferProgress<'_>>) -> Result<()> {
         self.require_credentials("upload")?;
         let data = tokio::fs::read(src).await?;
@@ -322,6 +380,7 @@ impl StorageBackend for AzureBlobBackend {
             &[],
             Some(data.len()),
             "application/octet-stream",
+            None,
             &extra_headers,
         );
 

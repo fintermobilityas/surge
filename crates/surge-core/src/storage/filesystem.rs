@@ -1,6 +1,7 @@
 //! Filesystem storage backend for local/testing deployments.
 
 use async_trait::async_trait;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::error::{Result, SurgeError};
@@ -44,6 +45,10 @@ fn i64_size_from_u64(size: u64) -> Result<i64> {
 
 #[async_trait]
 impl StorageBackend for FilesystemBackend {
+    fn supports_resumable_downloads(&self) -> bool {
+        true
+    }
+
     async fn put_object(&self, key: &str, data: &[u8], _content_type: &str) -> Result<()> {
         let path = self.resolve_key(key);
         if let Some(parent) = path.parent() {
@@ -125,6 +130,63 @@ impl StorageBackend for FilesystemBackend {
             return Err(SurgeError::NotFound(format!("Object not found: {key}")));
         }
         copy_file_with_progress(&source, dest, progress)?;
+        Ok(())
+    }
+
+    async fn download_to_file_from_offset(
+        &self,
+        key: &str,
+        dest: &Path,
+        offset: u64,
+        progress: Option<&TransferProgress<'_>>,
+    ) -> Result<()> {
+        if offset == 0 {
+            return self.download_to_file(key, dest, progress).await;
+        }
+
+        let source = self.resolve_key(key);
+        if !source.exists() {
+            return Err(SurgeError::NotFound(format!("Object not found: {key}")));
+        }
+
+        let total = std::fs::metadata(&source)?.len();
+        if offset > total {
+            return Err(SurgeError::Storage(format!(
+                "Cannot resume object '{key}' from byte {offset}; object is only {total} bytes"
+            )));
+        }
+
+        let existing_len = std::fs::metadata(dest).map_or(0, |metadata| metadata.len());
+        if existing_len != offset {
+            return Err(SurgeError::Storage(format!(
+                "Cannot resume download into '{}': expected {offset} bytes, found {existing_len}",
+                dest.display()
+            )));
+        }
+
+        let mut input = std::fs::File::open(&source)?;
+        input.seek(SeekFrom::Start(offset))?;
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut output = std::fs::OpenOptions::new().create(true).append(true).open(dest)?;
+        let mut done = offset;
+        let mut buffer = vec![0_u8; 128 * 1024];
+        if let Some(cb) = progress {
+            cb(done, total.max(done));
+        }
+        loop {
+            let read = input.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            output.write_all(&buffer[..read])?;
+            done = done.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+            if let Some(cb) = progress {
+                cb(done, total.max(done));
+            }
+        }
+        output.flush()?;
         Ok(())
     }
 

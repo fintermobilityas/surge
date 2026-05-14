@@ -9,7 +9,7 @@ use surge_core::error::{Result, SurgeError};
 use surge_core::install::{self as core_install, InstallProfile};
 use surge_core::releases::version::compare_versions;
 use surge_core::storage_config::build_storage_config_from_installer_manifest;
-use surge_core::update::manager::{ApplyStrategy, ProgressInfo, UpdateManager};
+use surge_core::update::manager::{ApplyStrategy, ProgressInfo, UpdateInfo, UpdateManager};
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -88,7 +88,7 @@ async fn update_existing_install(
     )?;
     manager.set_artifact_retention_policy(manifest.effective_install_artifact_cache_policy())?;
 
-    let Some(update) = manager.check_for_updates().await? else {
+    let Some(mut update) = manager.check_for_updates().await? else {
         repair_runtime_metadata(manifest, install_root)?;
         logline::success(&format!(
             "Repaired runtime metadata for '{}' v{} ({}).",
@@ -116,6 +116,8 @@ async fn update_existing_install(
     if let Some(reason) = &update.fallback_reason {
         logline::warn(&format!("Delta update unavailable; using full package: {reason}"));
     }
+
+    apply_installer_runtime_environment(&mut update, manifest);
 
     let update_progress = Mutex::new(ProgressReporter::new("Applying update..."));
     manager
@@ -195,4 +197,202 @@ fn context_from_installer_manifest(manifest: &InstallerManifest) -> Result<Conte
     );
     ctx.set_storage_prefix(&storage.prefix);
     Ok(ctx)
+}
+
+fn apply_installer_runtime_environment(update: &mut UpdateInfo, manifest: &InstallerManifest) {
+    for release in &mut update.apply_releases {
+        release.environment.extend(manifest.runtime.environment.clone());
+    }
+    for release in &mut update.available_releases {
+        if release.version == update.latest_version {
+            release.environment.extend(manifest.runtime.environment.clone());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use surge_core::config::installer::{
+        InstallerManifest, InstallerRelease, InstallerRuntime, InstallerStorage, InstallerUi,
+    };
+    use surge_core::config::manifest::CacheManifestConfig;
+    use surge_core::releases::manifest::ReleaseEntry;
+    use surge_core::update::manager::{ApplyStrategy, UpdateInfo};
+
+    use super::apply_installer_runtime_environment;
+
+    #[test]
+    fn installer_runtime_environment_merges_into_update_release_environment() {
+        let mut manifest = minimal_manifest();
+        manifest
+            .runtime
+            .environment
+            .insert("DISPLAY".to_string(), ":0".to_string());
+        manifest
+            .runtime
+            .environment
+            .insert("XAUTHORITY".to_string(), "/run/user/1000/gdm/Xauthority".to_string());
+        manifest.runtime.environment.insert(
+            "DBUS_SESSION_BUS_ADDRESS".to_string(),
+            "unix:path=/run/user/1000/bus".to_string(),
+        );
+
+        let mut update = UpdateInfo {
+            available_releases: vec![release("1.0.5"), release("1.1.0")],
+            latest_version: "1.1.0".to_string(),
+            delta_available: true,
+            download_size: 42,
+            apply_releases: vec![release("1.0.5"), release("1.1.0")],
+            apply_strategy: ApplyStrategy::Delta,
+            fallback_reason: None,
+        };
+        update.apply_releases[0]
+            .environment
+            .insert("APP_SETTING".to_string(), "base".to_string());
+        update.apply_releases[1]
+            .environment
+            .insert("DISPLAY".to_string(), ":99".to_string());
+        update.apply_releases[1]
+            .environment
+            .insert("APP_SETTING".to_string(), "latest".to_string());
+        update.available_releases[0]
+            .environment
+            .insert("APP_SETTING".to_string(), "older".to_string());
+        update.available_releases[1]
+            .environment
+            .insert("DISPLAY".to_string(), ":99".to_string());
+        update.available_releases[1]
+            .environment
+            .insert("APP_SETTING".to_string(), "available-latest".to_string());
+
+        apply_installer_runtime_environment(&mut update, &manifest);
+
+        assert_eq!(
+            update.apply_releases[0]
+                .environment
+                .get("APP_SETTING")
+                .map(String::as_str),
+            Some("base")
+        );
+        assert_eq!(
+            update.apply_releases[0]
+                .environment
+                .get("DBUS_SESSION_BUS_ADDRESS")
+                .map(String::as_str),
+            Some("unix:path=/run/user/1000/bus")
+        );
+        assert_eq!(
+            update.apply_releases[1].environment.get("DISPLAY").map(String::as_str),
+            Some(":0")
+        );
+        assert_eq!(
+            update.apply_releases[1]
+                .environment
+                .get("APP_SETTING")
+                .map(String::as_str),
+            Some("latest")
+        );
+        assert_eq!(
+            update.apply_releases[1]
+                .environment
+                .get("XAUTHORITY")
+                .map(String::as_str),
+            Some("/run/user/1000/gdm/Xauthority")
+        );
+        assert_eq!(
+            update.available_releases[0]
+                .environment
+                .get("APP_SETTING")
+                .map(String::as_str),
+            Some("older")
+        );
+        assert_eq!(update.available_releases[0].environment.get("DISPLAY"), None);
+        assert_eq!(
+            update.available_releases[1]
+                .environment
+                .get("DISPLAY")
+                .map(String::as_str),
+            Some(":0")
+        );
+        assert_eq!(
+            update.available_releases[1]
+                .environment
+                .get("APP_SETTING")
+                .map(String::as_str),
+            Some("available-latest")
+        );
+    }
+
+    fn minimal_manifest() -> InstallerManifest {
+        InstallerManifest {
+            schema: 1,
+            format: "surge-installer-v1".to_string(),
+            ui: InstallerUi::Console,
+            installer_type: "online".to_string(),
+            app_id: "demo".to_string(),
+            rid: "linux-x64".to_string(),
+            version: "1.1.0".to_string(),
+            channel: "test".to_string(),
+            generated_utc: "2026-05-14T10:00:00Z".to_string(),
+            headless_default_if_no_display: true,
+            release_index_key: "releases.yml.zst".to_string(),
+            storage: InstallerStorage {
+                provider: "filesystem".to_string(),
+                bucket: String::new(),
+                region: String::new(),
+                endpoint: String::new(),
+                prefix: String::new(),
+            },
+            release: InstallerRelease {
+                full_filename: "demo-1.1.0-linux-x64-full.tar.zst".to_string(),
+                full_sha256: String::new(),
+                delta_filename: String::new(),
+                delta_algorithm: String::new(),
+                delta_patch_format: String::new(),
+                delta_compression: String::new(),
+            },
+            runtime: InstallerRuntime {
+                name: "Demo".to_string(),
+                main_exe: "demo".to_string(),
+                install_directory: "demo".to_string(),
+                supervisor_id: "demo-supervisor".to_string(),
+                icon: String::new(),
+                shortcuts: Vec::new(),
+                persistent_assets: Vec::new(),
+                installers: Vec::new(),
+                environment: BTreeMap::new(),
+            },
+            cache: CacheManifestConfig::default(),
+        }
+    }
+
+    fn release(version: &str) -> ReleaseEntry {
+        ReleaseEntry {
+            version: version.to_string(),
+            channels: vec!["test".to_string()],
+            os: "linux".to_string(),
+            rid: "linux-x64".to_string(),
+            is_genesis: false,
+            full_filename: format!("demo-{version}-linux-x64-full.tar.zst"),
+            full_size: 1,
+            full_sha256: "sha".to_string(),
+            full_compression_level: 3,
+            full_zstd_workers: 1,
+            deltas: Vec::new(),
+            preferred_delta_id: String::new(),
+            created_utc: "2026-05-14T10:00:00Z".to_string(),
+            release_notes: String::new(),
+            name: "Demo".to_string(),
+            main_exe: "demo".to_string(),
+            install_directory: "demo".to_string(),
+            supervisor_id: "demo-supervisor".to_string(),
+            icon: String::new(),
+            shortcuts: Vec::new(),
+            persistent_assets: Vec::new(),
+            installers: Vec::new(),
+            environment: BTreeMap::new(),
+        }
+    }
 }

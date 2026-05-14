@@ -4,13 +4,12 @@ use super::activation::{
 use super::execution::{
     detect_remote_home_directory, run_tailscale_capture, run_tailscale_streaming,
     run_tailscale_streaming_with_status_watchdog, stream_directory_entries_to_tailscale_node_with_command,
-    stream_directory_to_tailscale_node_with_command,
 };
 use super::published_installer::build_remote_runtime_environment;
 use super::stage_manifest::{
     RemoteStageManifest, build_remote_stage_prepare_command, build_remote_stage_verify_command,
 };
-use super::state::{check_remote_staged_payload_identity, remote_staged_payload_identity};
+use super::state::remote_staged_payload_identity;
 use super::types::RemoteLaunchEnvironment;
 use super::{
     ArchiveAcquisition, Path, PathBuf, ReleaseEntry, ReleaseIndex, RemoteSetupWatchdog, Result, StorageBackend,
@@ -118,34 +117,6 @@ pub(crate) async fn deploy_remote_app_copy_for_tailscale(
     } else {
         release.main_exe.trim()
     };
-
-    if !stage
-        && let Some(remote_staged_payload) = check_remote_staged_payload_identity(ssh_target, &install_root).await
-        && remote_staged_payload == staged_payload_identity
-    {
-        logline::success(&format!(
-            "Using pre-staged payload for '{app_id}' v{} on '{file_target}'.",
-            release.version
-        ));
-        stop_remote_supervisor_if_running(ssh_target, &install_root, &release.supervisor_id).await?;
-        let legacy_app_dir = if release.persistent_assets.is_empty() {
-            None
-        } else {
-            detect_remote_legacy_app_dir(ssh_target, &install_root).await?
-        };
-        let activation_script = build_remote_app_copy_activation_script(
-            &install_root,
-            main_exe_name,
-            &release.version,
-            &runtime_environment,
-            &release.persistent_assets,
-            legacy_app_dir.as_deref(),
-            no_start,
-        )?;
-        let ssh_command = format!("sh -lc {}", shell_single_quote(&activation_script));
-        logline::info(&format!("Activating pre-staged install on '{file_target}'..."));
-        return run_tailscale_streaming(&["ssh", ssh_target, ssh_command.as_str()], "remote").await;
-    }
 
     std::fs::create_dir_all(download_dir)?;
     let local_package = download_dir.join(Path::new(full_filename).file_name().unwrap_or_default());
@@ -288,7 +259,23 @@ async fn sync_remote_app_copy_stage(
                 "Creating resumable remote app stage on '{file_target}' for host-mismatch deployment..."
             ));
             let transfer_command = build_remote_stage_prepare_command(install_root, true);
-            stream_directory_to_tailscale_node_with_command(ssh_target, stage_root, &transfer_command).await?;
+            stream_directory_entries_to_tailscale_node_with_command(
+                ssh_target,
+                stage_root,
+                &[super::stage_manifest::REMOTE_STAGE_MANIFEST_FILE.to_string()],
+                &transfer_command,
+            )
+            .await?;
+
+            let transfer_command = build_remote_stage_prepare_command(install_root, false);
+            let entries: Vec<String> = manifest.entries().iter().map(|entry| entry.path.clone()).collect();
+            stream_directory_entries_to_tailscale_node_with_command(
+                ssh_target,
+                stage_root,
+                &entries,
+                &transfer_command,
+            )
+            .await?;
             verify_remote_app_copy_stage(ssh_target, install_root, manifest_sha256).await
         }
         RemoteStageSyncAction::Resume(mut entries) => {

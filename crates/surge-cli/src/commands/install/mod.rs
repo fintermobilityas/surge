@@ -462,7 +462,8 @@ mod tests {
         parse_remote_staged_payload_identity, plan_remote_convergence, plan_remote_published_installer,
         plan_remote_published_installer_without_manifest, published_installer_public_url, remote_install_matches,
         remote_launch_environment_probe, remote_staged_payload_identity, select_latest_remote_legacy_app_dir,
-        select_remote_installer_mode, select_remote_tailscale_transfer_strategy, should_skip_remote_install,
+        select_remote_installer_mode, select_remote_tailscale_transfer_strategy,
+        select_remote_tailscale_transfer_strategy_for_convergence, should_skip_remote_install,
         try_prepare_published_installer_for_tailscale,
     };
     use super::resolution::{
@@ -527,6 +528,7 @@ mod tests {
     fn remote_state(version: &str, channel: &str, storage: &surge_core::context::StorageConfig) -> RemoteInstallState {
         RemoteInstallState {
             version: version.to_string(),
+            active_executable_exists: true,
             channel: Some(channel.to_string()),
             storage_provider: Some(core_install::storage_provider_manifest_name(storage.provider).to_string()),
             storage_bucket: Some(storage.bucket.clone()),
@@ -953,6 +955,22 @@ mod tests {
                 cached_state: RemoteTailscaleCachedState::InstallerCache,
             }),
             RemoteTailscaleTransferStrategy::StagedInstallerCache
+        );
+    }
+
+    #[test]
+    fn select_remote_tailscale_transfer_strategy_uses_resumable_app_copy_for_reinstall_repairs() {
+        assert_eq!(
+            select_remote_tailscale_transfer_strategy_for_convergence(
+                RemoteTailscaleTransferInputs {
+                    host_installer_availability: RemoteHostInstallerAvailability::Available,
+                    installer_mode: RemoteInstallerMode::Online,
+                    operation: RemoteTailscaleOperation::Install,
+                    cached_state: RemoteTailscaleCachedState::None,
+                },
+                RemoteConvergenceAction::Reinstall
+            ),
+            RemoteTailscaleTransferStrategy::AppCopy
         );
     }
 
@@ -2125,10 +2143,11 @@ apps:
     #[test]
     fn parse_remote_install_state_extracts_version_and_channel() {
         let state = parse_remote_install_state(
-            "version=1.2.3\nchannel=production\nprovider=filesystem\nbucket=/srv/releases\nregion=\nendpoint=\n",
+            "version=1.2.3\nactive_executable_exists=true\nchannel=production\nprovider=filesystem\nbucket=/srv/releases\nregion=\nendpoint=\n",
         )
         .expect("remote install state should parse");
         assert_eq!(state.version, "1.2.3");
+        assert!(state.active_executable_exists);
         assert_eq!(state.channel.as_deref(), Some("production"));
         assert_eq!(state.storage_provider.as_deref(), Some("filesystem"));
         assert_eq!(state.storage_bucket.as_deref(), Some("/srv/releases"));
@@ -2143,6 +2162,7 @@ apps:
     fn remote_install_matches_requires_matching_channel_and_version() {
         let production = RemoteInstallState {
             version: "1.2.3".to_string(),
+            active_executable_exists: true,
             channel: Some("production".to_string()),
             storage_provider: None,
             storage_bucket: None,
@@ -2151,6 +2171,7 @@ apps:
         };
         let test = RemoteInstallState {
             version: "1.2.3".to_string(),
+            active_executable_exists: true,
             channel: Some("test".to_string()),
             storage_provider: None,
             storage_bucket: None,
@@ -2168,6 +2189,7 @@ apps:
     fn force_flag_bypasses_remote_install_skip() {
         let remote_state = RemoteInstallState {
             version: "1.2.3".to_string(),
+            active_executable_exists: true,
             channel: Some("test".to_string()),
             storage_provider: None,
             storage_bucket: None,
@@ -2263,6 +2285,39 @@ apps:
                 .reason
                 .as_deref()
                 .is_some_and(|reason| reason.contains("verify remote runtime convergence"))
+        );
+    }
+
+    #[test]
+    fn remote_convergence_plan_reinstalls_current_install_when_active_executable_is_missing() {
+        let storage = storage_config("/srv/releases");
+        let target = release("1.2.0", "test", "linux-x64", "demo-1.2.0-linux-x64-full.tar.zst");
+        let index = ReleaseIndex {
+            app_id: "demo".to_string(),
+            releases: vec![target.clone()],
+            ..ReleaseIndex::default()
+        };
+        let mut state = remote_state("1.2.0", "test", &storage);
+        state.active_executable_exists = false;
+
+        let plan = plan_remote_convergence(
+            Some(&state),
+            &index,
+            "demo",
+            "linux-x64",
+            &target,
+            "test",
+            &storage,
+            RemoteInstallerMode::Online,
+            false,
+        )
+        .expect("plan should resolve");
+
+        assert_eq!(plan.action, RemoteConvergenceAction::Reinstall);
+        assert!(
+            plan.reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("active executable is missing"))
         );
     }
 

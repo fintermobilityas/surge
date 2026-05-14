@@ -49,12 +49,28 @@ pub(crate) fn select_remote_tailscale_transfer_strategy(
     }
 }
 
+pub(crate) fn select_remote_tailscale_transfer_strategy_for_convergence(
+    inputs: RemoteTailscaleTransferInputs,
+    convergence_action: RemoteConvergenceAction,
+) -> RemoteTailscaleTransferStrategy {
+    if inputs.operation == RemoteTailscaleOperation::Install
+        && matches!(convergence_action, RemoteConvergenceAction::Reinstall)
+    {
+        return RemoteTailscaleTransferStrategy::AppCopy;
+    }
+
+    select_remote_tailscale_transfer_strategy(inputs)
+}
+
 pub(crate) async fn check_remote_install_state(
     ssh_node: &str,
     install_dir: &str,
+    main_exe: &str,
 ) -> Result<Option<RemoteInstallState>> {
     let probe = format!(
-        r#"manifest="$HOME/.local/share/{}/app/.surge/runtime.yml";
+        r#"app_dir="$HOME/.local/share/{}/app";
+main_exe="{}";
+manifest="$app_dir/.surge/runtime.yml";
 if [ ! -f "$manifest" ]; then
   exit 0
 fi
@@ -64,8 +80,13 @@ provider="$(sed -n 's/^provider:[[:space:]]*//p' "$manifest" | head -n1)"
 bucket="$(sed -n 's/^bucket:[[:space:]]*//p' "$manifest" | head -n1)"
 region="$(sed -n 's/^region:[[:space:]]*//p' "$manifest" | head -n1)"
 endpoint="$(sed -n 's/^endpoint:[[:space:]]*//p' "$manifest" | head -n1)"
-printf 'version=%s\nchannel=%s\nprovider=%s\nbucket=%s\nregion=%s\nendpoint=%s\n' "$version" "$channel" "$provider" "$bucket" "$region" "$endpoint""#,
+active_executable_exists=false
+if [ -n "$main_exe" ] && [ -f "$app_dir/$main_exe" ]; then
+  active_executable_exists=true
+fi
+printf 'version=%s\nactive_executable_exists=%s\nchannel=%s\nprovider=%s\nbucket=%s\nregion=%s\nendpoint=%s\n' "$version" "$active_executable_exists" "$channel" "$provider" "$bucket" "$region" "$endpoint""#,
         install_dir.replace('\'', ""),
+        main_exe.replace('\'', ""),
     );
     let command = format!("sh -c {}", shell_single_quote(&probe));
     run_tailscale_capture(&["ssh", ssh_node, command.as_str()])
@@ -80,6 +101,7 @@ printf 'version=%s\nchannel=%s\nprovider=%s\nbucket=%s\nregion=%s\nendpoint=%s\n
 
 pub(crate) fn parse_remote_install_state(output: &str) -> Option<RemoteInstallState> {
     let mut version = None;
+    let mut active_executable_exists = false;
     let mut channel = None;
     let mut storage_provider = None;
     let mut storage_bucket = None;
@@ -100,6 +122,11 @@ pub(crate) fn parse_remote_install_state(output: &str) -> Option<RemoteInstallSt
             if !value.is_empty() {
                 channel = Some(value.to_string());
             }
+            continue;
+        }
+
+        if let Some(value) = line.strip_prefix("active_executable_exists=") {
+            active_executable_exists = matches!(value.trim(), "true" | "1" | "yes");
             continue;
         }
 
@@ -137,6 +164,7 @@ pub(crate) fn parse_remote_install_state(output: &str) -> Option<RemoteInstallSt
 
     version.map(|version| RemoteInstallState {
         version,
+        active_executable_exists,
         channel,
         storage_provider,
         storage_bucket,
@@ -163,6 +191,15 @@ pub(crate) fn plan_remote_convergence(
     let installed_version = Some(remote_state.version.clone());
     let metadata_matches = remote_state.metadata_matches(channel, storage_config);
     match compare_versions(&remote_state.version, &release.version) {
+        std::cmp::Ordering::Equal if metadata_matches && !remote_state.active_executable_exists => {
+            Ok(RemoteConvergencePlan {
+                action: RemoteConvergenceAction::Reinstall,
+                installed_version,
+                target_version: release.version.clone(),
+                update_info: None,
+                reason: Some("package metadata is current but the active executable is missing".to_string()),
+            })
+        }
         std::cmp::Ordering::Equal if metadata_matches && force => Ok(RemoteConvergencePlan {
             action: RemoteConvergenceAction::ConvergeRuntime,
             installed_version,

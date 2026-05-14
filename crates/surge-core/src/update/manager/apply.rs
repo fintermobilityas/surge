@@ -13,7 +13,7 @@ use crate::error::{Result, SurgeError};
 use crate::pack::builder::build_canonical_archive_from_directory;
 use crate::platform::detect::current_rid;
 use crate::platform::fs::write_file_atomic;
-use crate::releases::artifact_cache::cache_path_for_key;
+use crate::releases::artifact_cache::{cache_path_for_key, fetch_or_reuse_file};
 use crate::releases::delta::{
     DeltaApplyProgress, apply_delta_patch_with_progress, decode_delta_patch, is_supported_delta,
 };
@@ -41,7 +41,22 @@ where
     F: Fn(ProgressInfo) + Send + Sync,
 {
     if matches!(info.apply_strategy, ApplyStrategy::Delta) {
-        materialize_delta_payload(manager, info, staging_dir, artifact_cache_dir, extract_dir, progress).await
+        match materialize_delta_payload(manager, info, staging_dir, artifact_cache_dir, extract_dir, progress).await {
+            Ok(path) => Ok(path),
+            Err(SurgeError::Cancelled) => Err(SurgeError::Cancelled),
+            Err(delta_error) => {
+                materialize_full_payload_after_delta_failure(
+                    manager,
+                    info,
+                    staging_dir,
+                    artifact_cache_dir,
+                    extract_dir,
+                    progress,
+                    delta_error,
+                )
+                .await
+            }
+        }
     } else {
         materialize_full_payload(info, staging_dir, extract_dir, progress)
     }
@@ -56,18 +71,40 @@ fn materialize_full_payload<F>(
 where
     F: Fn(ProgressInfo) + Send + Sync,
 {
+    materialize_full_payload_with_progress_range(info, staging_dir, extract_dir, progress, 60, 75, 80, 85)
+}
+
+fn materialize_full_payload_with_progress_range<F>(
+    info: &UpdateInfo,
+    staging_dir: &Path,
+    extract_dir: &Path,
+    progress: Option<&Arc<F>>,
+    extract_total_percent_start: i32,
+    extract_total_percent_end: i32,
+    apply_total_percent_start: i32,
+    apply_total_percent_end: i32,
+) -> Result<PathBuf>
+where
+    F: Fn(ProgressInfo) + Send + Sync,
+{
     let latest = info
         .apply_releases
         .last()
         .ok_or_else(|| SurgeError::Update("No latest release".to_string()))?;
     let archive_path = staging_dir.join(&latest.full_filename);
-    extract_archive_with_progress(&archive_path, extract_dir, progress, 60, 75)?;
+    extract_archive_with_progress(
+        &archive_path,
+        extract_dir,
+        progress,
+        extract_total_percent_start,
+        extract_total_percent_end,
+    )?;
 
     emit_progress(
         progress,
         ProgressInfo {
             phase: 5,
-            total_percent: 80,
+            total_percent: apply_total_percent_start,
             ..ProgressInfo::default()
         },
     );
@@ -76,12 +113,96 @@ where
         ProgressInfo {
             phase: 5,
             phase_percent: 100,
-            total_percent: 85,
+            total_percent: apply_total_percent_end,
             ..ProgressInfo::default()
         },
     );
 
     Ok(extract_dir.to_path_buf())
+}
+
+async fn materialize_full_payload_after_delta_failure<F>(
+    manager: &UpdateManager,
+    info: &UpdateInfo,
+    staging_dir: &Path,
+    artifact_cache_dir: &Path,
+    extract_dir: &Path,
+    progress: Option<&Arc<F>>,
+    delta_error: SurgeError,
+) -> Result<PathBuf>
+where
+    F: Fn(ProgressInfo) + Send + Sync,
+{
+    let latest = info
+        .apply_releases
+        .last()
+        .ok_or_else(|| SurgeError::Update("No latest release".to_string()))?;
+
+    warn!(
+        version = %latest.version,
+        error = %delta_error,
+        "Delta materialization failed; falling back to the full package"
+    );
+
+    let cache_path = cache_path_for_key(artifact_cache_dir, &latest.full_filename)?;
+    let download_started_at = Instant::now();
+    let full_size = u64::try_from(latest.full_size.max(0)).unwrap_or(u64::MAX);
+    emit_progress(
+        progress,
+        ProgressInfo {
+            phase: 2,
+            phase_label: "download full package fallback",
+            total_percent: 60,
+            bytes_total: saturating_i64_from_u64(full_size),
+            items_total: 1,
+            ..ProgressInfo::default()
+        },
+    );
+    let progress_for_download = progress.cloned();
+    let download_progress = move |done: u64, total: u64| {
+        let total = total.max(done).max(full_size);
+        let phase_percent = clamp_progress_percent_u64(done, total);
+        emit_progress(
+            progress_for_download.as_ref(),
+            ProgressInfo {
+                phase: 2,
+                phase_label: "download full package fallback",
+                phase_percent,
+                total_percent: phase_total_percent(60, 15, phase_percent),
+                bytes_done: saturating_i64_from_u64(done),
+                bytes_total: saturating_i64_from_u64(total),
+                items_done: i64::from(phase_percent == 100),
+                items_total: 1,
+                speed_bytes_per_sec: average_speed_bytes_per_sec(done, download_started_at),
+            },
+        );
+    };
+
+    fetch_or_reuse_file(
+        manager.storage.as_ref(),
+        &latest.full_filename,
+        &cache_path,
+        &latest.full_sha256,
+        Some(&download_progress),
+    )
+    .await
+    .map_err(|fallback_error| {
+        SurgeError::Update(format!(
+            "Delta materialization failed: {delta_error}; full package fallback failed: {fallback_error}"
+        ))
+    })?;
+
+    let stage_path = staging_dir.join(&latest.full_filename);
+    if let Some(parent) = stage_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::copy(&cache_path, &stage_path).await?;
+    if extract_dir.exists() {
+        tokio::fs::remove_dir_all(extract_dir).await?;
+    }
+    tokio::fs::create_dir_all(extract_dir).await?;
+
+    materialize_full_payload_with_progress_range(info, staging_dir, extract_dir, progress, 75, 90, 90, 90)
 }
 
 async fn materialize_delta_payload<F>(

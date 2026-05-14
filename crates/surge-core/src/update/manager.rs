@@ -2236,6 +2236,142 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_download_and_apply_delta_falls_back_to_full_when_rebuilt_archive_hash_mismatches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("store");
+        let install_root = tmp.path().join("install");
+        let app_id = "test-app";
+        std::fs::create_dir_all(&store_root).unwrap();
+        std::fs::create_dir_all(&install_root).unwrap();
+        let app_store = app_scoped_store_root(&store_root, app_id);
+
+        let rid = current_rid();
+        let os = current_os_label_for_tests();
+
+        let mut packer_v1 = ArchivePacker::new(3).unwrap();
+        packer_v1.add_buffer("payload.txt", b"v1 payload", 0o644).unwrap();
+        let full_v1 = packer_v1.finalize().unwrap();
+
+        let mut packer_v2 = ArchivePacker::new(3).unwrap();
+        packer_v2.add_buffer("payload.txt", b"v2 payload", 0o644).unwrap();
+        let full_v2 = packer_v2.finalize().unwrap();
+
+        let mut packer_wrong_v2 = ArchivePacker::new(3).unwrap();
+        packer_wrong_v2
+            .add_buffer("payload.txt", b"wrong v2 payload", 0o644)
+            .unwrap();
+        let wrong_full_v2 = packer_wrong_v2.finalize().unwrap();
+
+        let patch_wrong_v2 = bsdiff_buffers(&full_v1, &wrong_full_v2).unwrap();
+        let delta_wrong_v2 = zstd::encode_all(patch_wrong_v2.as_slice(), 3).unwrap();
+
+        let full_v1_name = format!("{app_id}-1.0.0-{rid}-full.tar.zst");
+        let full_v2_name = format!("{app_id}-1.1.0-{rid}-full.tar.zst");
+        let delta_v2_name = format!("{app_id}-1.1.0-{rid}-delta.tar.zst");
+
+        std::fs::write(app_store.join(&full_v1_name), &full_v1).unwrap();
+        std::fs::write(app_store.join(&full_v2_name), &full_v2).unwrap();
+        std::fs::write(app_store.join(&delta_v2_name), &delta_wrong_v2).unwrap();
+
+        let index = ReleaseIndex {
+            app_id: app_id.to_string(),
+            releases: vec![
+                ReleaseEntry {
+                    version: "1.0.0".to_string(),
+                    channels: vec!["stable".to_string()],
+                    os: os.clone(),
+                    rid: rid.clone(),
+                    is_genesis: true,
+                    full_filename: full_v1_name.clone(),
+                    full_size: full_v1.len() as i64,
+                    full_sha256: sha256_hex(&full_v1),
+                    full_compression_level: 0,
+                    full_zstd_workers: 0,
+                    deltas: Vec::new(),
+                    preferred_delta_id: String::new(),
+                    created_utc: chrono::Utc::now().to_rfc3339(),
+                    release_notes: String::new(),
+                    name: String::new(),
+                    main_exe: app_id.to_string(),
+                    install_directory: app_id.to_string(),
+                    supervisor_id: String::new(),
+                    icon: String::new(),
+                    shortcuts: Vec::new(),
+                    persistent_assets: Vec::new(),
+                    installers: Vec::new(),
+                    environment: std::collections::BTreeMap::new(),
+                },
+                ReleaseEntry {
+                    version: "1.1.0".to_string(),
+                    channels: vec!["stable".to_string()],
+                    os,
+                    rid: rid.clone(),
+                    is_genesis: false,
+                    full_filename: full_v2_name.clone(),
+                    full_size: full_v2.len() as i64,
+                    full_sha256: sha256_hex(&full_v2),
+                    full_compression_level: 0,
+                    full_zstd_workers: 0,
+                    deltas: vec![DeltaArtifact::bsdiff_zstd(
+                        "primary",
+                        "1.0.0",
+                        &delta_v2_name,
+                        delta_wrong_v2.len() as i64,
+                        &sha256_hex(&delta_wrong_v2),
+                    )],
+                    preferred_delta_id: "primary".to_string(),
+                    created_utc: chrono::Utc::now().to_rfc3339(),
+                    release_notes: String::new(),
+                    name: String::new(),
+                    main_exe: app_id.to_string(),
+                    install_directory: app_id.to_string(),
+                    supervisor_id: String::new(),
+                    icon: String::new(),
+                    shortcuts: Vec::new(),
+                    persistent_assets: Vec::new(),
+                    installers: Vec::new(),
+                    environment: std::collections::BTreeMap::new(),
+                },
+            ],
+            ..ReleaseIndex::default()
+        };
+
+        write_app_scoped_release_index(&store_root, app_id, &index);
+
+        let ctx = Arc::new(Context::new());
+        ctx.set_storage(
+            StorageProvider::Filesystem,
+            store_root.to_str().unwrap(),
+            "",
+            "",
+            "",
+            "",
+        );
+
+        let mut manager = UpdateManager::new(ctx, app_id, "1.0.0", "stable", install_root.to_str().unwrap()).unwrap();
+        let info = manager.check_for_updates().await.unwrap().unwrap();
+        assert_eq!(info.apply_strategy, ApplyStrategy::Delta);
+        manager
+            .download_and_apply(&info, None::<fn(ProgressInfo)>)
+            .await
+            .unwrap();
+
+        let installed = std::fs::read_to_string(install_root.join("app").join("payload.txt")).unwrap();
+        assert_eq!(installed, "v2 payload");
+        assert!(
+            install_root
+                .join(".surge-cache")
+                .join("artifacts")
+                .join(&full_v2_name)
+                .is_file()
+        );
+
+        let status = status::read_update_status(&install_root).unwrap().unwrap();
+        assert_eq!(status.state, status::UpdateConvergenceState::Converged);
+        assert_eq!(status.installed_version, "1.1.0");
+    }
+
+    #[tokio::test]
     async fn test_download_and_apply_delta_rebuilds_current_full_from_installed_app_when_cache_chain_is_missing() {
         let tmp = tempfile::tempdir().unwrap();
         let store_root = tmp.path().join("store");

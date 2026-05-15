@@ -596,6 +596,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetch_or_reuse_file_accepts_resumable_backend_restart_after_range_http_200() {
+        struct RestartingResumeBackend {
+            payload: Vec<u8>,
+            range_downloads: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl StorageBackend for RestartingResumeBackend {
+            fn supports_resumable_downloads(&self) -> bool {
+                true
+            }
+
+            async fn put_object(&self, _key: &str, _data: &[u8], _content_type: &str) -> Result<()> {
+                unimplemented!("test backend is read-only")
+            }
+
+            async fn get_object(&self, _key: &str) -> Result<Vec<u8>> {
+                unimplemented!("test backend only supports file downloads")
+            }
+
+            async fn head_object(&self, _key: &str) -> Result<ObjectInfo> {
+                Ok(ObjectInfo {
+                    size: i64::try_from(self.payload.len()).expect("payload length should fit i64"),
+                    ..ObjectInfo::default()
+                })
+            }
+
+            async fn delete_object(&self, _key: &str) -> Result<()> {
+                unimplemented!("test backend is read-only")
+            }
+
+            async fn list_objects(&self, _prefix: &str, _marker: Option<&str>, _max_keys: i32) -> Result<ListResult> {
+                Ok(ListResult::default())
+            }
+
+            async fn download_to_file(
+                &self,
+                _key: &str,
+                dest: &Path,
+                _progress: Option<&TransferProgress<'_>>,
+            ) -> Result<()> {
+                tokio::fs::write(dest, &self.payload).await?;
+                Ok(())
+            }
+
+            async fn download_to_file_from_offset(
+                &self,
+                _key: &str,
+                dest: &Path,
+                _offset: u64,
+                _progress: Option<&TransferProgress<'_>>,
+            ) -> Result<()> {
+                self.range_downloads.fetch_add(1, Ordering::SeqCst);
+                tokio::fs::write(dest, &self.payload).await?;
+                Ok(())
+            }
+
+            async fn upload_from_file(
+                &self,
+                _key: &str,
+                _src: &Path,
+                _progress: Option<&TransferProgress<'_>>,
+            ) -> Result<()> {
+                unimplemented!("test backend is read-only")
+            }
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let destination = tmp.path().join("artifact.bin");
+        let payload = b"remote-payload".to_vec();
+        let partial_path = partial_download_path(&destination).expect("partial path");
+        std::fs::write(&partial_path, b"remote-").expect("write partial");
+
+        let backend = RestartingResumeBackend {
+            payload: payload.clone(),
+            range_downloads: AtomicUsize::new(0),
+        };
+
+        let outcome = fetch_or_reuse_file(&backend, "artifact.bin", &destination, &sha256_hex(&payload), None)
+            .await
+            .expect("fetch should accept restarted full response");
+
+        assert_eq!(outcome, CacheFetchOutcome::DownloadedFresh);
+        assert_eq!(backend.range_downloads.load(Ordering::SeqCst), 1);
+        assert_eq!(std::fs::read(&destination).expect("cache file should exist"), payload);
+        assert!(!partial_path.exists());
+    }
+
+    #[tokio::test]
     async fn fetch_or_reuse_file_keeps_resumable_partial_after_download_error() {
         struct FailingResumeBackend;
 

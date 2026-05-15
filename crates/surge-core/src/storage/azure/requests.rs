@@ -111,6 +111,23 @@ impl AzureBlobBackend {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumableDownloadResponseAction {
+    AppendFromOffset,
+    RestartFromZero,
+    Error,
+}
+
+fn resumable_download_response_action(status: reqwest::StatusCode) -> ResumableDownloadResponseAction {
+    if status == reqwest::StatusCode::PARTIAL_CONTENT {
+        ResumableDownloadResponseAction::AppendFromOffset
+    } else if status.is_success() {
+        ResumableDownloadResponseAction::RestartFromZero
+    } else {
+        ResumableDownloadResponseAction::Error
+    }
+}
+
 #[async_trait]
 impl StorageBackend for AzureBlobBackend {
     async fn put_object(&self, key: &str, data: &[u8], content_type: &str) -> Result<()> {
@@ -344,17 +361,25 @@ impl StorageBackend for AzureBlobBackend {
 
         let resp = req.send().await?;
         let status = resp.status();
-        if status != reqwest::StatusCode::PARTIAL_CONTENT {
-            let body = resp.text().await.unwrap_or_default();
-            if !status.is_success() {
+        match resumable_download_response_action(status) {
+            ResumableDownloadResponseAction::AppendFromOffset => {
+                download_response_to_file_from_offset(resp, dest, offset, progress).await?;
+            }
+            ResumableDownloadResponseAction::RestartFromZero => {
+                debug!(
+                    key = %full_key,
+                    dest = %dest.display(),
+                    offset,
+                    status = %status,
+                    "Azure blob ignored resumable range request; restarting download from byte zero"
+                );
+                download_response_to_file(resp, dest, progress).await?;
+            }
+            ResumableDownloadResponseAction::Error => {
+                let body = resp.text().await.unwrap_or_default();
                 return Self::check_response_status(status, &full_key, &body);
             }
-            return Err(SurgeError::Storage(format!(
-                "Azure blob '{full_key}' did not honor resumable range request from byte {offset} (HTTP {status})"
-            )));
         }
-
-        download_response_to_file_from_offset(resp, dest, offset, progress).await?;
 
         debug!(
             key = %full_key,
@@ -399,5 +424,26 @@ impl StorageBackend for AzureBlobBackend {
             cb(total, total);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn azure_resume_http_200_restarts_from_zero_instead_of_reusing_partial() {
+        assert_eq!(
+            resumable_download_response_action(reqwest::StatusCode::OK),
+            ResumableDownloadResponseAction::RestartFromZero
+        );
+        assert_eq!(
+            resumable_download_response_action(reqwest::StatusCode::PARTIAL_CONTENT),
+            ResumableDownloadResponseAction::AppendFromOffset
+        );
+        assert_eq!(
+            resumable_download_response_action(reqwest::StatusCode::RANGE_NOT_SATISFIABLE),
+            ResumableDownloadResponseAction::Error
+        );
     }
 }

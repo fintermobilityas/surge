@@ -143,6 +143,15 @@ pub(super) fn restart_supervisor_after_update(
     active_app_dir: &Path,
     latest: &ReleaseEntry,
 ) -> SupervisorRestartOutcome {
+    restart_supervisor_after_update_with_pid(install_dir, active_app_dir, latest, current_pid())
+}
+
+pub(super) fn restart_supervisor_after_update_with_pid(
+    install_dir: &Path,
+    active_app_dir: &Path,
+    latest: &ReleaseEntry,
+    watched_pid: u32,
+) -> SupervisorRestartOutcome {
     let supervisor_id = latest.supervisor_id.trim();
     if supervisor_id.is_empty() {
         return SupervisorRestartOutcome::NotApplicable;
@@ -183,7 +192,7 @@ pub(super) fn restart_supervisor_after_update(
     };
 
     let install_dir_str = install_dir.to_string_lossy();
-    let pid_str = current_pid().to_string();
+    let pid_str = watched_pid.to_string();
     let exe_path_str = exe_path.to_string_lossy();
     let mut args: Vec<&str> = vec![
         "watch",

@@ -143,7 +143,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         if: matrix.build_strategy != 'ubuntu18-container'
         with:
+          cache-bin: false
           key: ${{ matrix.cache_key }}
+          prefix-key: v1-rust-no-bin
       - run: cargo build --release
         if: matrix.build_strategy != 'ubuntu18-container'
       - name: Build Linux arm64 artifacts in Ubuntu 18.04
@@ -201,6 +203,9 @@ jobs:
           ref: ${{ github.event.release.tag_name }}
           submodules: true
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+          prefix-key: v1-rust-no-bin
       - name: Validate crates.io API token
         run: |
           if [ -z "${CARGO_REGISTRY_TOKEN}" ]; then

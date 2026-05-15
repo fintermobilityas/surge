@@ -66,6 +66,9 @@ jobs:
         with:
           submodules: true
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+          prefix-key: v1-rust-no-bin
       - run: rustup component add clippy
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
@@ -77,6 +80,9 @@ jobs:
         with:
           submodules: true
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+          prefix-key: v1-rust-no-bin
       - run: rustup component add clippy
       - run: cargo clippy --workspace --lib --bins --examples -- -D warnings -D clippy::unwrap_used -D clippy::expect_used
 
@@ -88,6 +94,9 @@ jobs:
         with:
           submodules: true
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+          prefix-key: v1-rust-no-bin
       - run: rustup component add clippy
       - name: Run pedantic audit (non-blocking)
         run: |
@@ -117,7 +126,9 @@ jobs:
           submodules: true
       - uses: Swatinem/rust-cache@v2
         with:
+          cache-bin: false
           key: ${{ matrix.cache_key }}
+          prefix-key: v1-rust-no-bin
       - run: cargo test --release
 
   rust-artifacts:
@@ -186,7 +197,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         if: matrix.build_strategy != 'ubuntu18-container'
         with:
+          cache-bin: false
           key: ${{ matrix.cache_key }}
+          prefix-key: v1-rust-no-bin
       - run: cargo build --release
         if: matrix.build_strategy != 'ubuntu18-container'
       - name: Build Linux arm64 artifacts in Ubuntu 18.04

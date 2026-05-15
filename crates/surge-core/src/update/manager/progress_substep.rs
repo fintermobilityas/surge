@@ -128,10 +128,16 @@ where
     }
 
     fn persist_current_phase(&self, label: &'static str) {
-        let record = self
+        let mut record = self
             .in_progress_template
             .clone()
             .with_current_phase_at(label, status::now_utc_rfc3339());
+        if let Ok(Some(existing)) = status::read_update_status(self.install_dir)
+            && existing.app_id == record.app_id
+            && existing.target_version == record.target_version
+        {
+            record.last_completed_phase = existing.last_completed_phase;
+        }
         if let Err(e) = status::write_update_status(self.install_dir, &record) {
             warn!(error = %e, phase = label, "Failed to persist in-progress substep status (continuing)");
         }

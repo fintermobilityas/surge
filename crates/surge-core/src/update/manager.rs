@@ -10,6 +10,7 @@ mod release_index;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tracing::{info, warn};
 
@@ -18,7 +19,7 @@ use crate::context::Context;
 use crate::error::{Result, SurgeError};
 use crate::releases::manifest::{ReleaseEntry, ReleaseIndex};
 use crate::storage::{StorageBackend, create_storage_backend};
-use crate::update::status::{self, FailureContext, UpdateStatusRecord};
+use crate::update::status::{self, FailureContext, UpdateStatusRecord, UpdateWorkerGuard};
 
 use self::apply::materialize_update_payload;
 use self::artifacts::prepare_update_artifacts;
@@ -58,6 +59,7 @@ pub struct UpdateInfo {
 
 const DEFAULT_RELEASE_RETENTION_LIMIT: usize = 1;
 pub(super) const RELEASE_GRAPH_CHECKPOINT_FULLS: usize = 3;
+const ABANDONED_IN_PROGRESS_TIMEOUT: Duration = Duration::from_mins(5);
 
 /// Manages checking for and applying application updates.
 pub struct UpdateManager {
@@ -220,6 +222,27 @@ impl UpdateManager {
         let pre_attempt_version = self.current_version.clone();
         let target_version = info.latest_version.clone();
 
+        if let Some(failed) = status::fail_abandoned_in_progress_update(
+            &self.install_dir,
+            &self.app_id,
+            &target_version,
+            &self.channel,
+            ABANDONED_IN_PROGRESS_TIMEOUT,
+        )? {
+            let phase = failed.failure_phase.as_deref().unwrap_or("unknown");
+            return Err(SurgeError::Update(format!(
+                "Previous update attempt stalled at phase '{phase}'; retry is safe"
+            )));
+        }
+
+        let _worker_guard = match UpdateWorkerGuard::record(&self.install_dir, &self.app_id, &target_version) {
+            Ok(guard) => Some(guard),
+            Err(e) => {
+                warn!(error = %e, "Failed to persist update worker marker (continuing)");
+                None
+            }
+        };
+
         let in_progress_record = UpdateStatusRecord::in_progress(
             &self.app_id,
             &pre_attempt_version,
@@ -255,15 +278,18 @@ impl UpdateManager {
                         completed_at_utc,
                         true,
                     ),
-                    SupervisorRestartOutcome::Unconfirmed { reason } => UpdateStatusRecord::pending_restart(
-                        &self.app_id,
-                        &target_version,
-                        &target_version,
-                        &self.channel,
-                        attempted_at_utc,
-                        completed_at_utc,
-                        &reason,
-                    ),
+                    SupervisorRestartOutcome::Unconfirmed { reason } => {
+                        UpdateStatusRecord::pending_restart_with_failure_phase(
+                            &self.app_id,
+                            &target_version,
+                            &target_version,
+                            &self.channel,
+                            attempted_at_utc,
+                            completed_at_utc,
+                            &reason,
+                            status::RESTART_HANDOFF_FAILED_PHASE,
+                        )
+                    }
                 };
                 if let Err(e) = status::write_update_status(&self.install_dir, &record) {
                     warn!(error = %e, "Failed to persist post-update convergence status (continuing)");
@@ -354,16 +380,22 @@ impl UpdateManager {
 
         let extract_dir = staging_dir.join("extracted");
         tokio::fs::create_dir_all(&extract_dir).await?;
-        progress_emitter.emit_substep(5, update_phase::PACKAGE_APPLY_STARTED, 60);
-        let extracted_final_dir = materialize_update_payload(
-            self,
-            info,
-            &staging_dir,
-            &artifact_cache_dir,
-            &extract_dir,
-            progress.as_ref(),
-        )
-        .await?;
+        let extracted_final_dir = progress_emitter
+            .run_with_heartbeat(
+                5,
+                update_phase::PACKAGE_APPLY_STARTED,
+                60,
+                progress_substep::HEARTBEAT_INTERVAL,
+                materialize_update_payload(
+                    self,
+                    info,
+                    &staging_dir,
+                    &artifact_cache_dir,
+                    &extract_dir,
+                    progress.as_ref(),
+                ),
+            )
+            .await?;
         progress_emitter.emit_completed_phase(update_phase::PACKAGE_APPLY_COMPLETED);
 
         // Phase 6: Finalize
@@ -669,6 +701,93 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("Timed out waiting for supervisor"));
         assert!(stop_file.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_restart_supervisor_handoff_starts_new_child_after_watched_process_exits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let install_dir = tmp.path();
+        let active_app_dir = install_dir.join("app");
+        std::fs::create_dir_all(&active_app_dir).unwrap();
+
+        let supervisor_path = active_app_dir.join(crate::platform::process::supervisor_binary_name());
+        std::fs::write(
+            &supervisor_path,
+            r#"#!/bin/sh
+id=""
+dir=""
+pid=""
+exe=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    watch) shift ;;
+    --id) id="$2"; shift 2 ;;
+    --dir) dir="$2"; shift 2 ;;
+    --pid) pid="$2"; shift 2 ;;
+    --exe) exe="$2"; shift 2 ;;
+    --) shift; break ;;
+    *) shift ;;
+  esac
+done
+echo $$ > "$dir/.surge-supervisor-$id.pid"
+while kill -0 "$pid" 2>/dev/null; do
+  sleep 0.05
+done
+"$exe" "$@" &
+wait $!
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&supervisor_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&supervisor_path, permissions).unwrap();
+
+        let app_path = active_app_dir.join("demo-app");
+        std::fs::write(
+            &app_path,
+            r"#!/bin/sh
+echo started > new-child-started
+",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&app_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&app_path, permissions).unwrap();
+
+        let mut watched_child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("while true; do sleep 1; done")
+            .spawn()
+            .unwrap();
+
+        let mut latest = make_entry("1.1.0", "stable", &current_os_label_for_tests(), &current_rid());
+        latest.main_exe = "demo-app".to_string();
+        latest.supervisor_id = "demo-supervisor".to_string();
+
+        let outcome = lifecycle::restart_supervisor_after_update_with_pid(
+            install_dir,
+            &active_app_dir,
+            &latest,
+            watched_child.id(),
+        );
+        let confirmed = matches!(outcome, SupervisorRestartOutcome::Confirmed);
+
+        watched_child.kill().unwrap();
+        watched_child.wait().unwrap();
+        assert!(confirmed);
+
+        let started_path = install_dir.join("new-child-started");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !started_path.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            started_path.exists(),
+            "new child should start after watched process exits"
+        );
     }
 
     #[tokio::test]

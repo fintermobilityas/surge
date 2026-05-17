@@ -249,13 +249,13 @@ for cmdline in /proc/[0-9]*/cmdline; do \
   case \"$pid\" in \"$$\"|\"$PPID\") continue ;; esac; \
   cmd=\"$(tr '\\0' ' ' < \"$cmdline\" 2>/dev/null || true)\"; \
   [ -n \"$cmd\" ] || continue; \
-  case \"$cmd\" in *\"$active_exe\"*) app_seen=1; case \"$cmd\" in *\"--surge-first-run $version\"*) version_seen=1 ;; esac ;; esac; \
+  case \"$cmd\" in *\"$active_exe\"*) app_seen=1; cmd_tokens=\" $cmd \"; case \"$cmd_tokens\" in *\" --surge-first-run $version \"*|*\" $version --surge-first-run \"*) version_seen=1 ;; esac ;; esac; \
   if [ -n \"$supervisor_id\" ]; then \
     case \"$cmd\" in *\"surge-supervisor\"*\"--id $supervisor_id\"*) supervisor_seen=1 ;; esac; \
   fi; \
 done; \
 if [ \"$app_seen\" -ne 1 ]; then echo \"app process for $active_exe was not found\"; exit 0; fi; \
-if [ -n \"$version\" ] && [ \"$version_seen\" -ne 1 ]; then echo \"app process for $active_exe is running without --surge-first-run $version\"; exit 0; fi; \
+if [ -n \"$version\" ] && [ \"$version_seen\" -ne 1 ]; then echo \"app process for $active_exe is running without --surge-first-run proof for $version\"; exit 0; fi; \
 if [ -n \"$supervisor_id\" ] && [ \"$supervisor_seen\" -ne 1 ]; then echo \"supervisor process '$supervisor_id' was not found\"; exit 0; fi; \
 echo ready",
         shell_single_quote(&install_root.to_string_lossy()),

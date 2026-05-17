@@ -1101,10 +1101,12 @@ mod tests {
         );
 
         assert!(probe.contains("active_exe=\"$install_root/app/$main_exe\""));
-        assert!(probe.contains("--surge-first-run $version"));
+        assert!(probe.contains("cmd_tokens=\" $cmd \""));
+        assert!(probe.contains("*\" --surge-first-run $version \"*|*\" $version --surge-first-run \"*"));
         assert!(probe.contains("surge-supervisor"));
         assert!(probe.contains("--id $supervisor_id"));
         assert!(probe.contains("app process for $active_exe was not found"));
+        assert!(probe.contains("app process for $active_exe is running without --surge-first-run proof for $version"));
         assert!(probe.contains("supervisor process '$supervisor_id' was not found"));
     }
 

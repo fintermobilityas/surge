@@ -1101,13 +1101,43 @@ mod tests {
         );
 
         assert!(probe.contains("active_exe=\"$install_root/app/$main_exe\""));
-        assert!(probe.contains("cmd_tokens=\" $cmd \""));
+        assert!(probe.contains("contains_target_first_run()"));
+        assert!(probe.contains("watched_pid_is_running()"));
         assert!(probe.contains("*\" --surge-first-run $version \"*|*\" $version --surge-first-run \"*"));
         assert!(probe.contains("surge-supervisor"));
         assert!(probe.contains("--id $supervisor_id"));
         assert!(probe.contains("app process for $active_exe was not found"));
         assert!(probe.contains("app process for $active_exe is running without --surge-first-run proof for $version"));
+        assert!(probe.contains("stale app process for $active_exe is still running without target proof for $version"));
+        assert!(probe.contains("supervisor process '$supervisor_id' is still waiting for the previous child"));
+        assert!(probe.contains("supervisor process '$supervisor_id' is running with stale first-run proof"));
         assert!(probe.contains("supervisor process '$supervisor_id' was not found"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_remote_process_verification_probe_is_valid_shell_syntax() {
+        use std::io::Write;
+
+        let probe = build_remote_process_verification_probe(
+            Path::new("/home/demo/apps/demo-app"),
+            "demoapp",
+            "demo-supervisor",
+            "1.2.3",
+        );
+        let mut child = std::process::Command::new("sh")
+            .arg("-n")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("shell syntax checker should start");
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin should be piped")
+            .write_all(probe.as_bytes())
+            .expect("probe should be written to shell");
+        let status = child.wait().expect("shell syntax checker should exit");
+        assert!(status.success(), "probe failed shell syntax check with {status}");
     }
 
     #[test]

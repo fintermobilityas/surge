@@ -241,23 +241,34 @@ pub(crate) fn build_remote_process_verification_probe(
     version: &str,
 ) -> String {
     format!(
-        "install_root={}; main_exe={}; supervisor_id={}; version={}; \
-active_exe=\"$install_root/app/$main_exe\"; app_seen=0; version_seen=0; supervisor_seen=0; \
-for cmdline in /proc/[0-9]*/cmdline; do \
-  [ -r \"$cmdline\" ] || continue; \
-  pid=\"${{cmdline%/cmdline}}\"; pid=\"${{pid##*/}}\"; \
-  case \"$pid\" in \"$$\"|\"$PPID\") continue ;; esac; \
-  cmd=\"$(tr '\\0' ' ' < \"$cmdline\" 2>/dev/null || true)\"; \
-  [ -n \"$cmd\" ] || continue; \
-  case \"$cmd\" in *\"$active_exe\"*) app_seen=1; cmd_tokens=\" $cmd \"; case \"$cmd_tokens\" in *\" --surge-first-run $version \"*|*\" $version --surge-first-run \"*) version_seen=1 ;; esac ;; esac; \
-  if [ -n \"$supervisor_id\" ]; then \
-    case \"$cmd\" in *\"surge-supervisor\"*\"--id $supervisor_id\"*) supervisor_seen=1 ;; esac; \
-  fi; \
-done; \
-if [ \"$app_seen\" -ne 1 ]; then echo \"app process for $active_exe was not found\"; exit 0; fi; \
-if [ -n \"$version\" ] && [ \"$version_seen\" -ne 1 ]; then echo \"app process for $active_exe is running without --surge-first-run proof for $version\"; exit 0; fi; \
-if [ -n \"$supervisor_id\" ] && [ \"$supervisor_seen\" -ne 1 ]; then echo \"supervisor process '$supervisor_id' was not found\"; exit 0; fi; \
-echo ready",
+        r#"install_root={}; main_exe={}; supervisor_id={}; version={};
+active_exe="$install_root/app/$main_exe"; app_seen=0; target_app_seen=0; stale_app_seen=0; supervisor_seen=0; stale_supervisor_seen=0; waiting_supervisor_seen=0;
+contains_target_first_run() {{ cmd_tokens=" $1 "; case "$cmd_tokens" in *" --surge-first-run $version "*|*" $version --surge-first-run "*) return 0 ;; esac; return 1; }}
+watched_pid_is_running() {{ case "$1" in *" watch "*" --pid "*) rest="${{1#* --pid }}"; watched_pid="${{rest%% *}}"; case "$watched_pid" in ""|*[!0-9]*) return 1 ;; esac; kill -0 "$watched_pid" 2>/dev/null ;; esac; return 1; }}
+for cmdline in /proc/[0-9]*/cmdline; do
+  [ -r "$cmdline" ] || continue;
+  pid="${{cmdline%/cmdline}}"; pid="${{pid##*/}}";
+  case "$pid" in "$$"|"$PPID") continue ;; esac;
+  cmd="$(tr '\0' ' ' < "$cmdline" 2>/dev/null || true)";
+  [ -n "$cmd" ] || continue;
+  case "$cmd" in *"surge-supervisor"*) ;; *"$active_exe"*) app_seen=1; if contains_target_first_run "$cmd"; then target_app_seen=1; else stale_app_seen=1; fi ;; esac;
+  if [ -n "$supervisor_id" ]; then
+    case "$cmd" in *"surge-supervisor"*"--id $supervisor_id"*)
+      supervisor_seen=1;
+      if watched_pid_is_running "$cmd"; then waiting_supervisor_seen=1; fi;
+      case " $cmd " in *" --surge-first-run "*) if ! contains_target_first_run "$cmd"; then stale_supervisor_seen=1; fi ;; esac
+    ;; esac;
+  fi;
+done;
+if [ "$target_app_seen" -ne 1 ]; then
+  if [ "$app_seen" -eq 1 ]; then echo "app process for $active_exe is running without --surge-first-run proof for $version"; else echo "app process for $active_exe was not found"; fi;
+  exit 0;
+fi;
+if [ "$stale_app_seen" -eq 1 ]; then echo "stale app process for $active_exe is still running without target proof for $version"; exit 0; fi;
+if [ -n "$supervisor_id" ] && [ "$waiting_supervisor_seen" -eq 1 ]; then echo "supervisor process '$supervisor_id' is still waiting for the previous child"; exit 0; fi;
+if [ -n "$supervisor_id" ] && [ "$stale_supervisor_seen" -eq 1 ]; then echo "supervisor process '$supervisor_id' is running with stale first-run proof"; exit 0; fi;
+if [ -n "$supervisor_id" ] && [ "$supervisor_seen" -ne 1 ]; then echo "supervisor process '$supervisor_id' was not found"; exit 0; fi;
+echo ready"#,
         shell_single_quote(&install_root.to_string_lossy()),
         shell_single_quote(main_exe),
         shell_single_quote(supervisor_id.trim()),

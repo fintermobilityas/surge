@@ -7,7 +7,9 @@ use crate::error::{Result, SurgeError};
 use crate::platform::process::{ProcessHandle, current_pid, spawn_detached, spawn_process, supervisor_binary_name};
 use crate::releases::manifest::ReleaseEntry;
 use crate::supervisor::state::{read_restart_args, supervisor_pid_file, supervisor_stop_file};
-use crate::update::status::confirm_supervisor_restart;
+use crate::update::status::{
+    RESTART_HANDOFF_FAILED_PHASE, RESTART_HANDOFF_WAITING_FOR_OLD_CHILD_PHASE, confirm_supervisor_restart,
+};
 
 const SUPERVISOR_RESTART_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -16,12 +18,13 @@ pub(super) enum SupervisorRestartOutcome {
     /// No supervisor was configured for this release (or wasn't running before
     /// the update) so there is no post-update restart to confirm.
     NotApplicable,
-    /// Supervisor restart was confirmed by observing the supervisor pid file
-    /// within `SUPERVISOR_RESTART_CONFIRM_TIMEOUT` after the spawn.
-    Confirmed,
-    /// Supervisor restart could not be confirmed within the timeout window.
-    /// The reason describes why (spawn failure, missing binary, no pid file).
-    Unconfirmed { reason: String },
+    /// The target package is installed, but restart handoff is still pending.
+    /// The supervisor writes the converged record only after the old child exits
+    /// and a replacement target child stays active.
+    PendingRestart {
+        reason: String,
+        failure_phase: &'static str,
+    },
 }
 
 pub(super) async fn request_supervisor_shutdown(install_dir: &Path, supervisor_id: &str) -> Result<()> {
@@ -163,8 +166,9 @@ pub(super) fn restart_supervisor_after_update_with_pid(
             supervisor = %supervisor_path.display(),
             "Cannot restart supervisor after update because the bundled binary is missing"
         );
-        return SupervisorRestartOutcome::Unconfirmed {
+        return SupervisorRestartOutcome::PendingRestart {
             reason: format!("supervisor binary missing at {}", supervisor_path.display()),
+            failure_phase: RESTART_HANDOFF_FAILED_PHASE,
         };
     }
 
@@ -174,8 +178,9 @@ pub(super) fn restart_supervisor_after_update_with_pid(
             exe = %exe_path.display(),
             "Cannot restart supervisor after update because the application executable is missing"
         );
-        return SupervisorRestartOutcome::Unconfirmed {
+        return SupervisorRestartOutcome::PendingRestart {
             reason: format!("application executable missing at {}", exe_path.display()),
+            failure_phase: RESTART_HANDOFF_FAILED_PHASE,
         };
     }
 
@@ -220,22 +225,30 @@ pub(super) fn restart_supervisor_after_update_with_pid(
                 error = %e,
                 "Failed to restart supervisor after update (continuing)"
             );
-            return SupervisorRestartOutcome::Unconfirmed {
+            return SupervisorRestartOutcome::PendingRestart {
                 reason: format!("spawn failed: {e}"),
+                failure_phase: RESTART_HANDOFF_FAILED_PHASE,
             };
         }
     }
 
     if confirm_supervisor_restart(install_dir, supervisor_id, SUPERVISOR_RESTART_CONFIRM_TIMEOUT) {
-        SupervisorRestartOutcome::Confirmed
+        SupervisorRestartOutcome::PendingRestart {
+            reason: format!(
+                "supervisor handoff accepted; waiting for previous child pid {watched_pid} to exit and target version {} to start",
+                latest.version
+            ),
+            failure_phase: RESTART_HANDOFF_WAITING_FOR_OLD_CHILD_PHASE,
+        }
     } else {
         let timeout_ms = u64::try_from(SUPERVISOR_RESTART_CONFIRM_TIMEOUT.as_millis()).unwrap_or(u64::MAX);
         warn!(
             supervisor_id,
             timeout_ms, "Supervisor pid file did not appear after restart within timeout window"
         );
-        SupervisorRestartOutcome::Unconfirmed {
+        SupervisorRestartOutcome::PendingRestart {
             reason: format!("supervisor pid file did not appear within {timeout_ms}ms after restart"),
+            failure_phase: RESTART_HANDOFF_FAILED_PHASE,
         }
     }
 }

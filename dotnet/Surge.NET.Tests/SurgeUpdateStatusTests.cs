@@ -46,7 +46,8 @@ namespace Surge.Tests
                   "supervisor_restart_confirmed": false,
                   "attempted_at_utc": "2026-05-11T14:00:00Z",
                   "completed_at_utc": "2026-05-11T14:05:00Z",
-                  "reason": "supervisor pid file did not appear within 5000ms after restart"
+                  "reason": "supervisor handoff accepted; waiting for previous child pid 1234 to exit",
+                  "failure_phase": "restart handoff waiting for old child"
                 }
                 """;
 
@@ -54,7 +55,8 @@ namespace Surge.Tests
             Assert.NotNull(status);
             Assert.Equal(SurgeUpdateConvergenceState.PendingRestart, status!.State);
             Assert.False(status.SupervisorRestartConfirmed);
-            Assert.Contains("supervisor pid file did not appear", status.Reason);
+            Assert.Contains("waiting for previous child", status.Reason);
+            Assert.Equal("restart handoff waiting for old child", status.FailurePhase);
         }
 
         [Fact]

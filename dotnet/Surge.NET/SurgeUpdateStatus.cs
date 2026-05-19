@@ -21,8 +21,8 @@ namespace Surge
         /// <summary>An update is currently being applied.</summary>
         InProgress,
         /// <summary>
-        /// Latest update applied to disk and the supervisor restart was confirmed
-        /// by observing the supervisor pid file.
+        /// Latest update applied to disk and the supervisor handoff proved a
+        /// replacement runtime is active.
         /// </summary>
         Converged,
         /// <summary>
@@ -73,9 +73,9 @@ namespace Surge
         public string Channel { get; init; } = "";
 
         /// <summary>
-        /// True when a supervisor was configured for this release and its pid
-        /// file was observed after the post-update restart. When no supervisor
-        /// was configured this is false and carries no signal — read
+        /// True when a supervisor was configured for this release and the
+        /// post-update handoff proved a target-version child is active. When no
+        /// supervisor was configured this is false and carries no signal — read
         /// <see cref="State"/> for convergence.
         /// </summary>
         public bool SupervisorRestartConfirmed { get; init; }
@@ -91,6 +91,13 @@ namespace Surge
         /// and <see cref="SurgeUpdateConvergenceState.PendingRestart"/> records.
         /// </summary>
         public string? Reason { get; init; }
+
+        /// <summary>
+        /// Phase active when a terminal failure or pending restart state was
+        /// recorded. For restart handoff records this distinguishes cases such
+        /// as waiting for the previous child from target child exit.
+        /// </summary>
+        public string? FailurePhase { get; init; }
 
         /// <summary>
         /// Read the persisted update convergence record from <paramref name="installDirectory"/>.
@@ -142,6 +149,7 @@ namespace Surge
                 AttemptedAtUtc = NullIfEmpty(GetString(fields, "attempted_at_utc")),
                 CompletedAtUtc = NullIfEmpty(GetString(fields, "completed_at_utc")),
                 Reason = NullIfEmpty(GetString(fields, "reason")),
+                FailurePhase = NullIfEmpty(GetString(fields, "failure_phase")),
             };
         }
 

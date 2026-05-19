@@ -3,9 +3,8 @@
 //! After a channel promotion, operators need a reliable signal that distinguishes:
 //! - **`Idle`** — the install completed but no update has been attempted since.
 //! - **`InProgress`** — an update is currently being applied.
-//! - **`Converged`** — the latest update applied to disk and the supervisor restart
-//!   (or the install-time auto-start) was confirmed by observing the supervisor pid
-//!   file.
+//! - **`Converged`** — the latest update applied to disk and the supervisor handoff
+//!   (or the install-time auto-start) proved a replacement runtime is active.
 //! - **`PendingRestart`** — the latest update applied to disk but the supervisor
 //!   restart could not be confirmed within the post-update window. The runtime
 //!   process may still be running an older binary even though `installed_version`
@@ -25,8 +24,14 @@ use crate::error::{Result, SurgeError};
 use crate::platform::fs::write_file_atomic;
 use crate::supervisor::state::supervisor_pid_file;
 
+mod handoff;
+
+pub use handoff::{
+    RESTART_HANDOFF_FAILED_PHASE, RESTART_HANDOFF_TARGET_CHILD_EXITED_PHASE,
+    RESTART_HANDOFF_WAITING_FOR_OLD_CHILD_PHASE, mark_restart_handoff_converged, mark_restart_handoff_pending,
+};
+
 pub const UPDATE_STATUS_FILE_NAME: &str = ".surge-update-status.json";
-pub const RESTART_HANDOFF_FAILED_PHASE: &str = "restart handoff failed";
 const UPDATE_WORKER_FILE_NAME: &str = ".surge-update-worker.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,10 +78,10 @@ pub struct UpdateStatusRecord {
     pub target_version: String,
     pub channel: String,
     pub app_id: String,
-    /// True when a supervisor was configured for this release and its pid file
-    /// was observed after the post-update restart, or when no supervisor was
-    /// configured (in which case there is nothing to restart and the field
-    /// carries no signal).
+    /// True when a supervisor was configured for this release and the post-update
+    /// handoff proved a target-version child is active. When no supervisor was
+    /// configured this is false and carries no signal; read `state` for
+    /// convergence.
     pub supervisor_restart_confirmed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attempted_at_utc: Option<String>,

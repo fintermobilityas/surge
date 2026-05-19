@@ -2,13 +2,18 @@
 #![allow(clippy::cast_possible_wrap)]
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitCode};
+use std::process::{Child, Command, ExitCode, ExitStatus};
 
 use clap::{Parser, Subcommand};
 use surge_core::supervisor::state::{supervisor_pid_file, supervisor_stop_file};
+use surge_core::update::status::{
+    RESTART_HANDOFF_TARGET_CHILD_EXITED_PHASE, mark_restart_handoff_converged, mark_restart_handoff_pending,
+};
 #[cfg(windows)]
 use sysinfo::{Pid, ProcessesToUpdate, System};
 use thiserror::Error;
+
+const RESTART_HANDOFF_STABILITY_WINDOW: std::time::Duration = std::time::Duration::from_secs(4);
 
 #[derive(Parser)]
 #[command(
@@ -178,6 +183,7 @@ fn run_supervisor(
     // args are drained so crash-restarts don't re-fire lifecycle callbacks.
     let mut lifecycle_args: Vec<String> = args.iter().filter(|a| a.starts_with("--surge-")).cloned().collect();
     let regular_args: Vec<String> = args.iter().filter(|a| !a.starts_with("--surge-")).cloned().collect();
+    let mut pending_handoff_version = watched_pid.and_then(|_| first_run_version(args));
     let mut watched_pid = watched_pid;
 
     loop {
@@ -216,17 +222,15 @@ fn run_supervisor(
 
         tracing::info!("Child process started with PID {}", child.id());
 
-        let status = match wait_for_child_or_stop(&mut child, &shutdown, &stop_file)? {
-            WaitOutcome::Exited(status) => status,
-            WaitOutcome::ObservedProcessExited => unreachable!(),
-            WaitOutcome::StopRequested => {
-                tracing::info!("Stop requested, exiting supervisor loop and leaving child running");
-                break;
-            }
-            WaitOutcome::ShutdownRequested => {
-                tracing::info!("Shutdown signal received, child terminated and supervisor loop is exiting");
-                break;
-            }
+        let Some(status) = wait_for_supervised_child(
+            &mut child,
+            &shutdown,
+            &stop_file,
+            install_dir,
+            &mut pending_handoff_version,
+        )?
+        else {
+            break;
         };
 
         if shutdown.load(std::sync::atomic::Ordering::Acquire) || stop_file.exists() {
@@ -254,6 +258,100 @@ fn run_supervisor(
     Ok(())
 }
 
+fn first_run_version(args: &[String]) -> Option<String> {
+    args.iter().enumerate().find_map(|(index, arg)| {
+        if arg != "--surge-first-run" {
+            return None;
+        }
+        args.get(index + 1)
+            .filter(|candidate| !candidate.starts_with("--"))
+            .or_else(|| {
+                index
+                    .checked_sub(1)
+                    .and_then(|prev| args.get(prev))
+                    .filter(|candidate| !candidate.starts_with("--"))
+            })
+            .map(|version| version.trim().to_string())
+            .filter(|version| !version.is_empty())
+    })
+}
+
+fn record_restart_handoff_converged(install_dir: &Path, version: &str) {
+    match mark_restart_handoff_converged(install_dir, version) {
+        Ok(Some(_)) => {
+            tracing::info!(version, "Restart handoff converged after target child startup");
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(version, error = %e, "Failed to record restart handoff convergence");
+        }
+    }
+}
+
+fn record_restart_handoff_child_exited(install_dir: &Path, version: &str, status: ExitStatus) {
+    let reason = format!("target child exited with {status} before restart handoff completed");
+    match mark_restart_handoff_pending(install_dir, version, &reason, RESTART_HANDOFF_TARGET_CHILD_EXITED_PHASE) {
+        Ok(Some(_)) => {
+            tracing::warn!(version, %status, "Restart handoff target child exited before startup proof completed");
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(version, error = %e, "Failed to record restart handoff child exit");
+        }
+    }
+}
+
+fn wait_for_supervised_child(
+    child: &mut Child,
+    shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    stop_file: &Path,
+    install_dir: &Path,
+    pending_handoff_version: &mut Option<String>,
+) -> Result<Option<ExitStatus>, SupervisorError> {
+    let Some(version) = pending_handoff_version.clone() else {
+        return wait_for_child_exit_status(child, shutdown, stop_file);
+    };
+
+    match wait_for_child_startup_or_stop(child, shutdown, stop_file, RESTART_HANDOFF_STABILITY_WINDOW)? {
+        StartupOutcome::Running => {
+            record_restart_handoff_converged(install_dir, &version);
+            *pending_handoff_version = None;
+            wait_for_child_exit_status(child, shutdown, stop_file)
+        }
+        StartupOutcome::Exited(status) => {
+            record_restart_handoff_child_exited(install_dir, &version, status);
+            Ok(Some(status))
+        }
+        StartupOutcome::StopRequested => {
+            tracing::info!("Stop requested, exiting supervisor loop and leaving child running");
+            Ok(None)
+        }
+        StartupOutcome::ShutdownRequested => {
+            tracing::info!("Shutdown signal received, child terminated and supervisor loop is exiting");
+            Ok(None)
+        }
+    }
+}
+
+fn wait_for_child_exit_status(
+    child: &mut Child,
+    shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    stop_file: &Path,
+) -> Result<Option<ExitStatus>, SupervisorError> {
+    match wait_for_child_or_stop(child, shutdown, stop_file)? {
+        WaitOutcome::Exited(status) => Ok(Some(status)),
+        WaitOutcome::ObservedProcessExited => unreachable!(),
+        WaitOutcome::StopRequested => {
+            tracing::info!("Stop requested, exiting supervisor loop and leaving child running");
+            Ok(None)
+        }
+        WaitOutcome::ShutdownRequested => {
+            tracing::info!("Shutdown signal received, child terminated and supervisor loop is exiting");
+            Ok(None)
+        }
+    }
+}
+
 fn write_pid_file(path: &Path) -> Result<(), SupervisorError> {
     let pid = std::process::id();
     std::fs::write(path, pid.to_string())?;
@@ -266,6 +364,42 @@ enum WaitOutcome {
     ObservedProcessExited,
     StopRequested,
     ShutdownRequested,
+}
+
+enum StartupOutcome {
+    Running,
+    Exited(std::process::ExitStatus),
+    StopRequested,
+    ShutdownRequested,
+}
+
+fn wait_for_child_startup_or_stop(
+    child: &mut Child,
+    shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    stop_file: &Path,
+    stable_for: std::time::Duration,
+) -> Result<StartupOutcome, SupervisorError> {
+    let deadline = std::time::Instant::now() + stable_for;
+    loop {
+        if shutdown.load(std::sync::atomic::Ordering::Acquire) {
+            terminate_child_process(child)?;
+            return Ok(StartupOutcome::ShutdownRequested);
+        }
+
+        if stop_file.exists() {
+            return Ok(StartupOutcome::StopRequested);
+        }
+
+        if let Some(status) = child.try_wait()? {
+            return Ok(StartupOutcome::Exited(status));
+        }
+
+        if std::time::Instant::now() >= deadline {
+            return Ok(StartupOutcome::Running);
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 fn wait_for_pid_or_stop(

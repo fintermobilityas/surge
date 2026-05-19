@@ -270,15 +270,7 @@ impl UpdateManager {
                         completed_at_utc,
                         false,
                     ),
-                    SupervisorRestartOutcome::Confirmed => UpdateStatusRecord::converged(
-                        &self.app_id,
-                        &target_version,
-                        &self.channel,
-                        Some(attempted_at_utc),
-                        completed_at_utc,
-                        true,
-                    ),
-                    SupervisorRestartOutcome::Unconfirmed { reason } => {
+                    SupervisorRestartOutcome::PendingRestart { reason, failure_phase } => {
                         UpdateStatusRecord::pending_restart_with_failure_phase(
                             &self.app_id,
                             &target_version,
@@ -287,7 +279,7 @@ impl UpdateManager {
                             attempted_at_utc,
                             completed_at_utc,
                             &reason,
-                            status::RESTART_HANDOFF_FAILED_PHASE,
+                            failure_phase,
                         )
                     }
                 };
@@ -773,13 +765,23 @@ echo started > new-child-started
             &latest,
             watched_child.id(),
         );
-        let confirmed = matches!(outcome, SupervisorRestartOutcome::Confirmed);
+        assert!(matches!(
+            outcome,
+            SupervisorRestartOutcome::PendingRestart {
+                failure_phase: status::RESTART_HANDOFF_WAITING_FOR_OLD_CHILD_PHASE,
+                ..
+            }
+        ));
+
+        let started_path = install_dir.join("new-child-started");
+        assert!(
+            !started_path.exists(),
+            "new child should not start while watched process is still running"
+        );
 
         watched_child.kill().unwrap();
         watched_child.wait().unwrap();
-        assert!(confirmed);
 
-        let started_path = install_dir.join("new-child-started");
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while !started_path.exists() && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));

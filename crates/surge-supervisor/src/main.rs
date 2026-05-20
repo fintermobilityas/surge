@@ -300,9 +300,21 @@ fn record_restart_handoff_converged(install_dir: &Path, version: &str) {
         Ok(Some(_)) => {
             tracing::info!(version, "Restart handoff converged after target child startup");
         }
-        Ok(None) => {}
+        Ok(None) => {
+            tracing::warn!(
+                install_root = %install_dir.display(),
+                version,
+                reason = "no matching pending restart handoff status record",
+                "Failed to record restart handoff convergence"
+            );
+        }
         Err(e) => {
-            tracing::warn!(version, error = %e, "Failed to record restart handoff convergence");
+            tracing::warn!(
+                install_root = %install_dir.display(),
+                version,
+                reason = %e,
+                "Failed to record restart handoff convergence"
+            );
         }
     }
 }
@@ -313,9 +325,21 @@ fn record_restart_handoff_child_exited(install_dir: &Path, version: &str, status
         Ok(Some(_)) => {
             tracing::warn!(version, %status, "Restart handoff target child exited before startup proof completed");
         }
-        Ok(None) => {}
+        Ok(None) => {
+            tracing::warn!(
+                install_root = %install_dir.display(),
+                version,
+                reason = "no matching pending restart handoff status record",
+                "Failed to record restart handoff child exit"
+            );
+        }
         Err(e) => {
-            tracing::warn!(version, error = %e, "Failed to record restart handoff child exit");
+            tracing::warn!(
+                install_root = %install_dir.display(),
+                version,
+                reason = %e,
+                "Failed to record restart handoff child exit"
+            );
         }
     }
 }
@@ -559,7 +583,39 @@ fn ctrlc_handler(shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>) {
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+
     use super::*;
+
+    struct TestInstallDir {
+        path: PathBuf,
+    }
+
+    impl TestInstallDir {
+        fn new(name: &str) -> Self {
+            let unique = format!(
+                "{name}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            );
+            let path = std::env::temp_dir().join(unique);
+            std::fs::create_dir(&path).unwrap();
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestInstallDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
 
     #[test]
     fn pending_handoff_version_uses_explicit_watch_target() {
@@ -617,5 +673,68 @@ mod tests {
 
         assert_eq!(handoff_version.as_deref(), Some("2.0.0"));
         assert_eq!(args, vec!["--app-mode"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watched_handoff_converges_when_target_child_survives_stability_window() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TestInstallDir::new("surge-supervisor-handoff-converges");
+        let install_dir = tmp.path();
+        let child_started = install_dir.join("target-child-started");
+        let exe_path = install_dir.join("target-child");
+        std::fs::write(
+            &exe_path,
+            format!(
+                "#!/bin/sh\n\
+                 echo started > '{}'\n\
+                 sleep 5\n",
+                child_started.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&exe_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&exe_path, permissions).unwrap();
+
+        let pending = surge_core::update::status::UpdateStatusRecord::pending_restart_with_failure_phase(
+            "demo-app",
+            "2.0.0",
+            "2.0.0",
+            "stable",
+            "2026-05-20T10:00:00Z".to_string(),
+            "2026-05-20T10:00:01Z".to_string(),
+            "waiting for old child",
+            surge_core::update::status::RESTART_HANDOFF_WAITING_FOR_OLD_CHILD_PHASE,
+        );
+        surge_core::update::status::write_update_status(install_dir, &pending).unwrap();
+
+        let mut watched_child = Command::new("sh").arg("-c").arg("sleep 0.1").spawn().unwrap();
+        let watched_pid = watched_child.id();
+        watched_child.wait().unwrap();
+        run_supervisor(
+            "demo-supervisor",
+            install_dir,
+            &exe_path,
+            &[],
+            Some(watched_pid),
+            Some("2.0.0"),
+        )
+        .unwrap();
+
+        assert!(child_started.exists(), "replacement child should have started");
+        let status = surge_core::update::status::read_update_status(install_dir)
+            .unwrap()
+            .expect("status record should remain present");
+        assert_eq!(
+            status.state,
+            surge_core::update::status::UpdateConvergenceState::Converged
+        );
+        assert_eq!(status.target_version, "2.0.0");
+        assert_eq!(status.installed_version, "2.0.0");
+        assert!(status.supervisor_restart_confirmed);
+        assert_eq!(status.failure_phase, None);
+        assert_eq!(status.reason, None);
     }
 }

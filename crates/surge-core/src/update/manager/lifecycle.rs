@@ -196,26 +196,17 @@ pub(super) fn restart_supervisor_after_update_with_pid(
         }
     };
 
-    let install_dir_str = install_dir.to_string_lossy();
-    let pid_str = watched_pid.to_string();
-    let exe_path_str = exe_path.to_string_lossy();
-    let mut args: Vec<&str> = vec![
-        "watch",
-        "--id",
+    let args = supervisor_watch_args(
         supervisor_id,
-        "--dir",
-        &install_dir_str,
-        "--pid",
-        &pid_str,
-        "--exe",
-        &exe_path_str,
-    ];
-    if !restart_args.is_empty() {
-        args.push("--");
-        args.extend(restart_args.iter().map(String::as_str));
-    }
+        install_dir,
+        watched_pid,
+        &latest.version,
+        &exe_path,
+        &restart_args,
+    );
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
 
-    match spawn_detached(&supervisor_path, &args, Some(install_dir), &latest.environment) {
+    match spawn_detached(&supervisor_path, &arg_refs, Some(install_dir), &latest.environment) {
         Ok(handle) => {
             info!(pid = handle.pid(), supervisor_id, "Restarted supervisor after update");
         }
@@ -250,5 +241,74 @@ pub(super) fn restart_supervisor_after_update_with_pid(
             reason: format!("supervisor pid file did not appear within {timeout_ms}ms after restart"),
             failure_phase: RESTART_HANDOFF_FAILED_PHASE,
         }
+    }
+}
+
+fn supervisor_watch_args(
+    supervisor_id: &str,
+    install_dir: &Path,
+    watched_pid: u32,
+    handoff_version: &str,
+    exe_path: &Path,
+    restart_args: &[String],
+) -> Vec<String> {
+    let mut args = vec![
+        "watch".to_string(),
+        "--id".to_string(),
+        supervisor_id.to_string(),
+        "--dir".to_string(),
+        install_dir.to_string_lossy().into_owned(),
+        "--pid".to_string(),
+        watched_pid.to_string(),
+        "--handoff-version".to_string(),
+        handoff_version.to_string(),
+        "--exe".to_string(),
+        exe_path.to_string_lossy().into_owned(),
+    ];
+    if !restart_args.is_empty() {
+        args.push("--".to_string());
+        args.extend(restart_args.iter().cloned());
+    }
+    args
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::*;
+
+    #[test]
+    fn supervisor_watch_args_include_handoff_version_before_child_args() {
+        let restart_args = vec!["--app-mode".to_string(), "service".to_string()];
+
+        let args = supervisor_watch_args(
+            "demo-supervisor",
+            Path::new("/opt/demo"),
+            42,
+            "2.0.0",
+            Path::new("/opt/demo/app/demo"),
+            &restart_args,
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                "watch",
+                "--id",
+                "demo-supervisor",
+                "--dir",
+                "/opt/demo",
+                "--pid",
+                "42",
+                "--handoff-version",
+                "2.0.0",
+                "--exe",
+                "/opt/demo/app/demo",
+                "--",
+                "--app-mode",
+                "service",
+            ]
+        );
     }
 }

@@ -65,6 +65,10 @@ enum Commands {
         #[arg(long)]
         pid: u32,
 
+        /// Target version whose update handoff should converge after replacement child startup
+        #[arg(long)]
+        handoff_version: Option<String>,
+
         /// Path to the application executable
         #[arg(long)]
         exe: PathBuf,
@@ -118,7 +122,7 @@ fn main() -> ExitCode {
             verbose,
         } => {
             init_tracing(verbose);
-            if let Err(e) = run_supervisor(&id, &dir, &exe, &args, None) {
+            if let Err(e) = run_supervisor(&id, &dir, &exe, &args, None, None) {
                 tracing::error!("{e}");
                 return ExitCode::FAILURE;
             }
@@ -128,12 +132,13 @@ fn main() -> ExitCode {
             id,
             dir,
             pid,
+            handoff_version,
             exe,
             args,
             verbose,
         } => {
             init_tracing(verbose);
-            if let Err(e) = run_supervisor(&id, &dir, &exe, &args, Some(pid)) {
+            if let Err(e) = run_supervisor(&id, &dir, &exe, &args, Some(pid), handoff_version.as_deref()) {
                 tracing::error!("{e}");
                 return ExitCode::FAILURE;
             }
@@ -158,6 +163,7 @@ fn run_supervisor(
     exe_path: &Path,
     args: &[String],
     watched_pid: Option<u32>,
+    handoff_version: Option<&str>,
 ) -> Result<(), SupervisorError> {
     tracing::info!(
         "Surge supervisor '{supervisor_id}' starting, exe: {}",
@@ -183,7 +189,7 @@ fn run_supervisor(
     // args are drained so crash-restarts don't re-fire lifecycle callbacks.
     let mut lifecycle_args: Vec<String> = args.iter().filter(|a| a.starts_with("--surge-")).cloned().collect();
     let regular_args: Vec<String> = args.iter().filter(|a| !a.starts_with("--surge-")).cloned().collect();
-    let mut pending_handoff_version = watched_pid.and_then(|_| first_run_version(args));
+    let mut pending_handoff_version = pending_restart_handoff_version(watched_pid, handoff_version, args);
     let mut watched_pid = watched_pid;
 
     loop {
@@ -256,6 +262,19 @@ fn run_supervisor(
 
     tracing::info!("Supervisor '{supervisor_id}' exiting");
     Ok(())
+}
+
+fn pending_restart_handoff_version(
+    watched_pid: Option<u32>,
+    handoff_version: Option<&str>,
+    args: &[String],
+) -> Option<String> {
+    watched_pid?;
+    handoff_version
+        .map(str::trim)
+        .filter(|version| !version.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| first_run_version(args))
 }
 
 fn first_run_version(args: &[String]) -> Option<String> {
@@ -536,4 +555,67 @@ fn ctrlc_handler(shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pending_handoff_version_uses_explicit_watch_target() {
+        let args = vec!["--app-mode".to_string()];
+
+        let version = pending_restart_handoff_version(Some(42), Some(" 2.0.0 "), &args);
+
+        assert_eq!(version.as_deref(), Some("2.0.0"));
+    }
+
+    #[test]
+    fn pending_handoff_version_falls_back_to_first_run_arg() {
+        let args = vec!["--surge-first-run".to_string(), "2.0.0".to_string()];
+
+        let version = pending_restart_handoff_version(Some(42), None, &args);
+
+        assert_eq!(version.as_deref(), Some("2.0.0"));
+    }
+
+    #[test]
+    fn pending_handoff_version_requires_watched_pid() {
+        let args = vec!["--surge-first-run".to_string(), "2.0.0".to_string()];
+
+        let version = pending_restart_handoff_version(None, Some("2.0.0"), &args);
+
+        assert_eq!(version, None);
+    }
+
+    #[test]
+    fn watch_command_accepts_handoff_version_before_trailing_args() {
+        let cli = Cli::try_parse_from([
+            "surge-supervisor",
+            "watch",
+            "--id",
+            "demo-supervisor",
+            "--dir",
+            "/tmp/demo",
+            "--pid",
+            "42",
+            "--handoff-version",
+            "2.0.0",
+            "--exe",
+            "/tmp/demo/demo-app",
+            "--",
+            "--app-mode",
+        ])
+        .unwrap();
+
+        let Commands::Watch {
+            handoff_version, args, ..
+        } = cli.command
+        else {
+            panic!("expected watch command");
+        };
+
+        assert_eq!(handoff_version.as_deref(), Some("2.0.0"));
+        assert_eq!(args, vec!["--app-mode"]);
+    }
 }

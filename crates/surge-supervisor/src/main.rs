@@ -583,14 +583,17 @@ fn ctrlc_handler(shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::path::{Path, PathBuf};
 
     use super::*;
 
+    #[cfg(unix)]
     struct TestInstallDir {
         path: PathBuf,
     }
 
+    #[cfg(unix)]
     impl TestInstallDir {
         fn new(name: &str) -> Self {
             let unique = format!(
@@ -611,6 +614,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     impl Drop for TestInstallDir {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);

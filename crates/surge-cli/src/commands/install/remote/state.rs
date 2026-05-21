@@ -78,6 +78,7 @@ manifest="$app_dir/.surge/runtime.yml";
 if [ ! -f "$manifest" ]; then
   exit 0
 fi
+id="$(sed -n 's/^id:[[:space:]]*//p' "$manifest" | head -n1)"
 version="$(sed -n 's/^version:[[:space:]]*//p' "$manifest" | head -n1)"
 channel="$(sed -n 's/^channel:[[:space:]]*//p' "$manifest" | head -n1)"
 provider="$(sed -n 's/^provider:[[:space:]]*//p' "$manifest" | head -n1)"
@@ -88,7 +89,7 @@ active_executable_exists=false
 if [ -n "$main_exe" ] && [ -f "$app_dir/$main_exe" ]; then
   active_executable_exists=true
 fi
-printf 'version=%s\nactive_executable_exists=%s\nchannel=%s\nprovider=%s\nbucket=%s\nregion=%s\nendpoint=%s\n' "$version" "$active_executable_exists" "$channel" "$provider" "$bucket" "$region" "$endpoint""#,
+printf 'id=%s\nversion=%s\nactive_executable_exists=%s\nchannel=%s\nprovider=%s\nbucket=%s\nregion=%s\nendpoint=%s\n' "$id" "$version" "$active_executable_exists" "$channel" "$provider" "$bucket" "$region" "$endpoint""#,
         install_dir.replace('\'', ""),
         main_exe.replace('\'', ""),
     );
@@ -104,6 +105,7 @@ printf 'version=%s\nactive_executable_exists=%s\nchannel=%s\nprovider=%s\nbucket
 }
 
 pub(crate) fn parse_remote_install_state(output: &str) -> Option<RemoteInstallState> {
+    let mut app_id = None;
     let mut version = None;
     let mut active_executable_exists = false;
     let mut channel = None;
@@ -113,6 +115,14 @@ pub(crate) fn parse_remote_install_state(output: &str) -> Option<RemoteInstallSt
     let mut storage_endpoint = None;
 
     for line in output.lines() {
+        if let Some(value) = line.strip_prefix("id=") {
+            let value = value.trim();
+            if !value.is_empty() {
+                app_id = Some(value.to_string());
+            }
+            continue;
+        }
+
         if let Some(value) = line.strip_prefix("version=") {
             let value = value.trim();
             if !value.is_empty() {
@@ -167,6 +177,7 @@ pub(crate) fn parse_remote_install_state(output: &str) -> Option<RemoteInstallSt
     }
 
     version.map(|version| RemoteInstallState {
+        app_id,
         version,
         active_executable_exists,
         channel,
@@ -193,6 +204,16 @@ pub(crate) fn plan_remote_convergence(
     };
 
     let installed_version = Some(remote_state.version.clone());
+    if !remote_state.app_identity_matches(app_id) {
+        return Ok(RemoteConvergencePlan {
+            action: RemoteConvergenceAction::Reinstall,
+            installed_version,
+            target_version: release.version.clone(),
+            update_info: None,
+            reason: Some(remote_state.app_identity_reinstall_reason(app_id)),
+        });
+    }
+
     let metadata_matches = remote_state.metadata_matches(channel, storage_config);
     match compare_versions(&remote_state.version, &release.version) {
         std::cmp::Ordering::Equal if metadata_matches && !remote_state.active_executable_exists => {
@@ -454,11 +475,13 @@ pub(crate) fn parse_remote_launch_environment(output: &str) -> RemoteLaunchEnvir
 
 pub(crate) fn remote_install_matches(
     remote_state: Option<&RemoteInstallState>,
+    expected_app_id: &str,
     expected_version: &str,
     expected_channel: &str,
 ) -> bool {
     remote_state.is_some_and(|state| {
-        state.version.trim() == expected_version
+        state.app_identity_matches(expected_app_id)
+            && state.version.trim() == expected_version
             && state
                 .channel
                 .as_deref()

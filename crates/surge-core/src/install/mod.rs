@@ -16,7 +16,7 @@ pub use self::launch::{auto_start_after_install, auto_start_after_install_sequen
 pub use self::persistent_assets::{copy_persistent_assets, validate_relative_persistent_asset_path};
 pub use self::runtime_manifest::{
     LEGACY_RUNTIME_MANIFEST_RELATIVE_PATH, RUNTIME_MANIFEST_RELATIVE_PATH, RuntimeManifestMetadata,
-    storage_provider_manifest_name, write_runtime_manifest,
+    read_runtime_manifest_version, storage_provider_manifest_name, write_runtime_manifest,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,7 +111,8 @@ mod tests {
 
     use super::{
         InstallProfile, LEGACY_RUNTIME_MANIFEST_RELATIVE_PATH, RUNTIME_MANIFEST_RELATIVE_PATH, RuntimeManifestMetadata,
-        install_package_locally_at_root, storage_provider_manifest_name, write_runtime_manifest,
+        install_package_locally_at_root, read_runtime_manifest_version, storage_provider_manifest_name,
+        write_runtime_manifest,
     };
 
     #[test]
@@ -167,6 +168,20 @@ mod tests {
         assert!(raw.contains("endpoint: https://example.invalid"));
         assert!(!raw.contains("region:"));
         assert_eq!(raw, legacy_raw);
+    }
+
+    #[test]
+    fn read_runtime_manifest_version_prefers_current_manifest() {
+        let tmp = tempfile::tempdir().expect("temp dir should exist");
+        let current_path = tmp.path().join(RUNTIME_MANIFEST_RELATIVE_PATH);
+        let legacy_path = tmp.path().join(LEGACY_RUNTIME_MANIFEST_RELATIVE_PATH);
+        std::fs::create_dir_all(current_path.parent().unwrap()).unwrap();
+        std::fs::write(&current_path, "id: demo\nversion: 2.0.0\nchannel: test\n").unwrap();
+        std::fs::write(&legacy_path, "id: demo\nversion: 1.0.0\nchannel: test\n").unwrap();
+
+        let version = read_runtime_manifest_version(tmp.path()).unwrap();
+
+        assert_eq!(version.as_deref(), Some("2.0.0"));
     }
 
     #[test]

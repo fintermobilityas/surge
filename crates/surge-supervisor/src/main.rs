@@ -184,11 +184,12 @@ fn run_supervisor(
 
     let shutdown = install_signal_handlers();
 
-    // Separate one-shot lifecycle args (--surge-*) from regular args.
-    // On the first child start, all args are passed. After that, lifecycle
-    // args are drained so crash-restarts don't re-fire lifecycle callbacks.
-    let mut lifecycle_args: Vec<String> = args.iter().filter(|a| a.starts_with("--surge-")).cloned().collect();
-    let regular_args: Vec<String> = args.iter().filter(|a| !a.starts_with("--surge-")).cloned().collect();
+    // On the first child start, all args are passed in their original order.
+    // After that, one-shot lifecycle args are drained so crash-restarts don't
+    // re-fire lifecycle callbacks.
+    let first_child_args = args.to_vec();
+    let restart_args = without_lifecycle_args(args);
+    let mut next_child_args = Some(first_child_args);
     let mut pending_handoff_version = pending_restart_handoff_version(watched_pid, handoff_version, args);
     let mut watched_pid = watched_pid;
 
@@ -216,8 +217,7 @@ fn run_supervisor(
             }
         }
 
-        let mut child_args = regular_args.clone();
-        child_args.append(&mut lifecycle_args);
+        let child_args = next_child_args.take().unwrap_or_else(|| restart_args.clone());
 
         tracing::info!("Starting child process: {}", exe_path.display());
 
@@ -265,11 +265,10 @@ fn run_supervisor(
 }
 
 fn pending_restart_handoff_version(
-    watched_pid: Option<u32>,
+    _watched_pid: Option<u32>,
     handoff_version: Option<&str>,
     args: &[String],
 ) -> Option<String> {
-    watched_pid?;
     handoff_version
         .map(str::trim)
         .filter(|version| !version.is_empty())
@@ -293,6 +292,34 @@ fn first_run_version(args: &[String]) -> Option<String> {
             .map(|version| version.trim().to_string())
             .filter(|version| !version.is_empty())
     })
+}
+
+fn without_lifecycle_args(args: &[String]) -> Vec<String> {
+    let mut retained = Vec::with_capacity(args.len());
+    let mut index = 0usize;
+    while index < args.len() {
+        let arg = &args[index];
+        if is_lifecycle_arg(arg) {
+            index += 1;
+            if lifecycle_arg_takes_value(arg) && args.get(index).is_some_and(|candidate| !candidate.starts_with("--")) {
+                index += 1;
+            }
+            continue;
+        }
+
+        retained.push(arg.clone());
+        index += 1;
+    }
+
+    retained
+}
+
+fn is_lifecycle_arg(arg: &str) -> bool {
+    matches!(arg, "--surge-first-run" | "--surge-installed" | "--surge-updated") || arg.starts_with("--surge-updated=")
+}
+
+fn lifecycle_arg_takes_value(arg: &str) -> bool {
+    matches!(arg, "--surge-first-run" | "--surge-installed" | "--surge-updated")
 }
 
 fn record_restart_handoff_converged(install_dir: &Path, version: &str) {
@@ -640,12 +667,28 @@ mod tests {
     }
 
     #[test]
-    fn pending_handoff_version_requires_watched_pid() {
+    fn pending_handoff_version_accepts_first_run_without_watched_pid() {
         let args = vec!["--surge-first-run".to_string(), "2.0.0".to_string()];
 
-        let version = pending_restart_handoff_version(None, Some("2.0.0"), &args);
+        let version = pending_restart_handoff_version(None, None, &args);
 
-        assert_eq!(version, None);
+        assert_eq!(version.as_deref(), Some("2.0.0"));
+    }
+
+    #[test]
+    fn restart_args_drop_lifecycle_flag_value_pairs() {
+        let args = vec![
+            "--app-mode".to_string(),
+            "service".to_string(),
+            "--surge-first-run".to_string(),
+            "2.0.0".to_string(),
+            "--surge-updated=2.0.0".to_string(),
+            "--tail".to_string(),
+        ];
+
+        let retained = without_lifecycle_args(&args);
+
+        assert_eq!(retained, vec!["--app-mode", "service", "--tail"]);
     }
 
     #[test]
@@ -677,6 +720,47 @@ mod tests {
 
         assert_eq!(handoff_version.as_deref(), Some("2.0.0"));
         assert_eq!(args, vec!["--app-mode"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_supervisor_preserves_first_run_flag_value_order() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TestInstallDir::new("surge-supervisor-first-run-order");
+        let install_dir = tmp.path();
+        let args_path = install_dir.join("args.txt");
+        let exe_path = install_dir.join("target-child");
+        std::fs::write(
+            &exe_path,
+            format!(
+                "#!/bin/sh\n\
+                 printf '%s\\n' \"$@\" > '{}'\n",
+                args_path.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&exe_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&exe_path, permissions).unwrap();
+
+        run_supervisor(
+            "demo-supervisor",
+            install_dir,
+            &exe_path,
+            &[
+                "--app-mode".to_string(),
+                "service".to_string(),
+                "--surge-first-run".to_string(),
+                "2.0.0".to_string(),
+            ],
+            None,
+            None,
+        )
+        .unwrap();
+
+        let args = std::fs::read_to_string(args_path).unwrap();
+        assert_eq!(args, "--app-mode\nservice\n--surge-first-run\n2.0.0\n");
     }
 
     #[cfg(unix)]

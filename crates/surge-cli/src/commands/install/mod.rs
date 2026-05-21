@@ -1149,16 +1149,20 @@ mod tests {
 
         assert!(probe.contains("active_exe=\"$install_root/app/$main_exe\""));
         assert!(probe.contains("contains_target_first_run()"));
-        assert!(probe.contains("watched_pid_is_running()"));
+        assert!(probe.contains("contains_target_version_arg()"));
+        assert!(probe.contains("extract_watched_pid()"));
         assert!(probe.contains("*\" --surge-first-run $version \"*|*\" $version --surge-first-run \"*"));
+        assert!(probe.contains("target_app_pids"));
+        assert!(probe.contains("target_supervisor_seen"));
         assert!(probe.contains("surge-supervisor"));
         assert!(probe.contains("--id $supervisor_id"));
         assert!(probe.contains("app process for $active_exe was not found"));
-        assert!(probe.contains("app process for $active_exe is running without --surge-first-run proof for $version"));
+        assert!(probe.contains("app process for $active_exe is running without target proof for $version"));
         assert!(probe.contains("stale app process for $active_exe is still running without target proof for $version"));
         assert!(probe.contains("supervisor process '$supervisor_id' is still waiting for the previous child"));
         assert!(probe.contains("supervisor process '$supervisor_id' is running with stale first-run proof"));
         assert!(probe.contains("supervisor process '$supervisor_id' was not found"));
+        assert!(probe.contains("supervisor process '$supervisor_id' is not watching target app process for $version"));
     }
 
     #[cfg(unix)]

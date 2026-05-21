@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::context::StorageProvider;
 use crate::error::{Result, SurgeError};
@@ -56,6 +56,11 @@ struct RuntimeManifestFile<'a> {
     region: &'a str,
     #[serde(skip_serializing_if = "str::is_empty")]
     endpoint: &'a str,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RuntimeManifestVersion {
+    version: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -175,4 +180,23 @@ pub fn write_runtime_manifest(
     std::fs::write(&runtime_manifest_path, &yaml)?;
     std::fs::write(&legacy_manifest_path, yaml)?;
     Ok(runtime_manifest_path)
+}
+
+pub fn read_runtime_manifest_version(active_app_dir: &Path) -> Result<Option<String>> {
+    for relative_path in [RUNTIME_MANIFEST_RELATIVE_PATH, LEGACY_RUNTIME_MANIFEST_RELATIVE_PATH] {
+        let path = active_app_dir.join(relative_path);
+        if !path.is_file() {
+            continue;
+        }
+
+        let raw = std::fs::read(&path)?;
+        let manifest: RuntimeManifestVersion = serde_yaml::from_slice(&raw)
+            .map_err(|e| SurgeError::Config(format!("Failed to parse runtime manifest '{}': {e}", path.display())))?;
+        let version = manifest.version.trim();
+        if !version.is_empty() {
+            return Ok(Some(version.to_string()));
+        }
+    }
+
+    Ok(None)
 }

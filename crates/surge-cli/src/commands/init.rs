@@ -103,6 +103,7 @@ pub async fn execute(
                 persistent_assets: vec![],
                 installers: vec![],
                 environment: BTreeMap::new(),
+                compatibility: None,
             }],
             target: None,
         }],

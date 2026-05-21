@@ -1,5 +1,6 @@
 #![allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 
+mod compatibility;
 mod local;
 mod profile;
 mod progress;
@@ -25,6 +26,7 @@ pub(crate) use self::runtime::{
     release_runtime_manifest_metadata, stop_running_supervisor,
 };
 
+use self::compatibility::{CompatibilityInstallTarget, run_platform_compatibility_preflight};
 use self::local::install_selected_release_locally;
 use self::profile::{
     build_rid_candidates, derive_base_rid, detect_local_profile, warn_if_local_rid_looks_incompatible,
@@ -69,7 +71,21 @@ pub struct InstallBehavior {
     pub plan_only: bool,
     pub no_start: bool,
     pub force: bool,
+    pub platform_mismatch: PlatformMismatchPolicy,
     pub mode: InstallMode,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PlatformMismatchPolicy {
+    #[default]
+    Reject,
+    Allow,
+}
+
+impl PlatformMismatchPolicy {
+    fn allows_mismatch(self) -> bool {
+        matches!(self, Self::Allow)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -327,6 +343,36 @@ pub async fn execute(
             "Release {} ({selected_rid}) has no full package filename",
             release.version
         )));
+    }
+
+    let compatibility_rid = if release.rid.trim().is_empty() {
+        rid_candidates.first().map(String::as_str).unwrap_or_default()
+    } else {
+        release.rid.as_str()
+    };
+    if let Some(compatibility) = manifest
+        .as_ref()
+        .and_then(|manifest| manifest.find_target(&app_id, compatibility_rid))
+        .and_then(|target| target.compatibility)
+        .filter(|compatibility| !compatibility.is_empty())
+    {
+        let compatibility_target = match &install_target {
+            InstallTarget::Local => CompatibilityInstallTarget::Local,
+            InstallTarget::Tailscale {
+                ssh_target,
+                file_target,
+            } => CompatibilityInstallTarget::Tailscale {
+                ssh_target,
+                file_target,
+            },
+        };
+        run_platform_compatibility_preflight(
+            compatibility_target,
+            compatibility_rid,
+            &compatibility,
+            behavior.platform_mismatch.allows_mismatch(),
+        )
+        .await?;
     }
 
     if behavior.mode.is_verify_stage() {
@@ -1547,6 +1593,7 @@ apps:
                 plan_only: false,
                 no_start: true,
                 force: false,
+                platform_mismatch: PlatformMismatchPolicy::Reject,
                 mode: InstallMode::Install,
             },
             &download_dir,

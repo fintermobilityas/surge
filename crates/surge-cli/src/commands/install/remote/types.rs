@@ -91,6 +91,7 @@ pub(crate) struct RemoteTailscaleTransferInputs {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RemoteInstallState {
+    pub(crate) app_id: Option<String>,
     pub(crate) version: String,
     pub(crate) active_executable_exists: bool,
     pub(crate) channel: Option<String>,
@@ -101,6 +102,23 @@ pub(crate) struct RemoteInstallState {
 }
 
 impl RemoteInstallState {
+    pub(crate) fn app_identity_matches(&self, expected_app_id: &str) -> bool {
+        self.app_id
+            .as_deref()
+            .is_some_and(|value| value.trim() == expected_app_id.trim())
+    }
+
+    pub(crate) fn app_identity_reinstall_reason(&self, expected_app_id: &str) -> String {
+        match self.app_id.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+            Some(installed_app_id) => format!(
+                "installed app id '{installed_app_id}' differs from selected app id '{expected_app_id}'; full reinstall is required"
+            ),
+            None => format!(
+                "installed runtime metadata does not expose app id '{expected_app_id}'; full reinstall is required"
+            ),
+        }
+    }
+
     pub(crate) fn metadata_matches(&self, expected_channel: &str, storage_config: &StorageConfig) -> bool {
         self.channel
             .as_deref()

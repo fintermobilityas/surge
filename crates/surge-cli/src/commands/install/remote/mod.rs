@@ -134,7 +134,7 @@ pub(super) async fn install_release_via_tailscale(
         return Ok(());
     }
 
-    let install_matches = remote_install_matches(remote_state.as_ref(), &release.version, channel);
+    let install_matches = remote_install_matches(remote_state.as_ref(), app_id, &release.version, channel);
     if install_matches && behavior.force {
         logline::info(&format!(
             "'{app_id}' v{} ({channel}) is already installed on '{file_target}'; reinstalling due to --force.",

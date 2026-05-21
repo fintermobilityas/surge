@@ -176,10 +176,13 @@ pub(crate) async fn verify_remote_runtime_after_install(
                 "Remote runtime verification failed on '{file_target}': no runtime metadata found"
             ))
         })?;
-    if state.version.trim() == release.version.trim() && state.metadata_matches(channel, storage_config) {
+    if state.app_identity_matches(app_id)
+        && state.version.trim() == release.version.trim()
+        && state.metadata_matches(channel, storage_config)
+    {
         logline::success(&format!(
-            "Verified remote runtime on '{file_target}': v{} ({channel}).",
-            release.version
+            "Verified remote runtime on '{file_target}': '{app_id}' v{} ({channel}).",
+            release.version,
         ));
         if verify_started_process {
             verify_remote_started_process(ssh_target, file_target, app_id, release).await?;
@@ -188,8 +191,8 @@ pub(crate) async fn verify_remote_runtime_after_install(
     }
 
     Err(SurgeError::Update(format!(
-        "Remote runtime verification failed on '{file_target}': found v{} channel {:?}, expected v{} channel '{}'.",
-        state.version, state.channel, release.version, channel
+        "Remote runtime verification failed on '{file_target}': found app id {:?} v{} channel {:?}, expected '{app_id}' v{} channel '{}'.",
+        state.app_id, state.version, state.channel, release.version, channel
     )))
 }
 

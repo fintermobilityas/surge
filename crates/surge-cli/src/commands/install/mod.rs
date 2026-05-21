@@ -573,6 +573,7 @@ mod tests {
 
     fn remote_state(version: &str, channel: &str, storage: &surge_core::context::StorageConfig) -> RemoteInstallState {
         RemoteInstallState {
+            app_id: Some("demo".to_string()),
             version: version.to_string(),
             active_executable_exists: true,
             channel: Some(channel.to_string()),
@@ -2258,9 +2259,10 @@ apps:
     #[test]
     fn parse_remote_install_state_extracts_version_and_channel() {
         let state = parse_remote_install_state(
-            "version=1.2.3\nactive_executable_exists=true\nchannel=production\nprovider=filesystem\nbucket=/srv/releases\nregion=\nendpoint=\n",
+            "id=demo\nversion=1.2.3\nactive_executable_exists=true\nchannel=production\nprovider=filesystem\nbucket=/srv/releases\nregion=\nendpoint=\n",
         )
         .expect("remote install state should parse");
+        assert_eq!(state.app_id.as_deref(), Some("demo"));
         assert_eq!(state.version, "1.2.3");
         assert!(state.active_executable_exists);
         assert_eq!(state.channel.as_deref(), Some("production"));
@@ -2274,8 +2276,9 @@ apps:
     }
 
     #[test]
-    fn remote_install_matches_requires_matching_channel_and_version() {
+    fn remote_install_matches_requires_matching_app_channel_and_version() {
         let production = RemoteInstallState {
+            app_id: Some("demo".to_string()),
             version: "1.2.3".to_string(),
             active_executable_exists: true,
             channel: Some("production".to_string()),
@@ -2285,6 +2288,7 @@ apps:
             storage_endpoint: None,
         };
         let test = RemoteInstallState {
+            app_id: Some("demo".to_string()),
             version: "1.2.3".to_string(),
             active_executable_exists: true,
             channel: Some("test".to_string()),
@@ -2294,15 +2298,27 @@ apps:
             storage_endpoint: None,
         };
 
-        assert!(remote_install_matches(Some(&production), "1.2.3", "production"));
-        assert!(!remote_install_matches(Some(&production), "1.2.4", "production"));
-        assert!(!remote_install_matches(Some(&test), "1.2.3", "production"));
-        assert!(!remote_install_matches(None, "1.2.3", "production"));
+        assert!(remote_install_matches(Some(&production), "demo", "1.2.3", "production"));
+        assert!(!remote_install_matches(
+            Some(&production),
+            "other",
+            "1.2.3",
+            "production"
+        ));
+        assert!(!remote_install_matches(
+            Some(&production),
+            "demo",
+            "1.2.4",
+            "production"
+        ));
+        assert!(!remote_install_matches(Some(&test), "demo", "1.2.3", "production"));
+        assert!(!remote_install_matches(None, "demo", "1.2.3", "production"));
     }
 
     #[test]
     fn force_flag_bypasses_remote_install_skip() {
         let remote_state = RemoteInstallState {
+            app_id: Some("demo".to_string()),
             version: "1.2.3".to_string(),
             active_executable_exists: true,
             channel: Some("test".to_string()),
@@ -2312,7 +2328,7 @@ apps:
             storage_endpoint: None,
         };
 
-        let install_matches = remote_install_matches(Some(&remote_state), "1.2.3", "test");
+        let install_matches = remote_install_matches(Some(&remote_state), "demo", "1.2.3", "test");
 
         assert!(should_skip_remote_install(install_matches, false));
         assert!(!should_skip_remote_install(install_matches, true));
@@ -2400,6 +2416,39 @@ apps:
                 .reason
                 .as_deref()
                 .is_some_and(|reason| reason.contains("verify remote runtime convergence"))
+        );
+    }
+
+    #[test]
+    fn remote_convergence_plan_reinstalls_same_version_when_app_id_differs() {
+        let storage = storage_config("/srv/releases");
+        let target = release("1.2.0", "test", "linux-x64", "target-1.2.0-linux-x64-full.tar.zst");
+        let index = ReleaseIndex {
+            app_id: "target".to_string(),
+            releases: vec![target.clone()],
+            ..ReleaseIndex::default()
+        };
+        let mut state = remote_state("1.2.0", "test", &storage);
+        state.app_id = Some("previous".to_string());
+
+        let plan = plan_remote_convergence(
+            Some(&state),
+            &index,
+            "target",
+            "linux-x64",
+            &target,
+            "test",
+            &storage,
+            RemoteInstallerMode::Online,
+            true,
+        )
+        .expect("forced app swap plan should resolve");
+
+        assert_eq!(plan.action, RemoteConvergenceAction::Reinstall);
+        assert!(
+            plan.reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("installed app id 'previous' differs"))
         );
     }
 

@@ -408,6 +408,9 @@ pub(crate) struct InstallOptions {
     #[arg(long)]
     pub(crate) force: bool,
 
+    #[command(flatten)]
+    pub(crate) compatibility_options: InstallCompatibilityOptions,
+
     /// Local cache directory for downloaded packages
     #[arg(long, default_value = ".surge/install-cache")]
     pub(crate) download_dir: PathBuf,
@@ -442,6 +445,13 @@ pub(crate) struct InstallStageOptions {
     /// Verify that the selected release is already staged and ready for the next tailscale install
     #[arg(long, conflicts_with = "stage")]
     pub(crate) verify_stage: bool,
+}
+
+#[derive(Args, Clone)]
+pub(crate) struct InstallCompatibilityOptions {
+    /// Continue an install even when explicit target compatibility metadata does not match the host
+    #[arg(long)]
+    pub(crate) allow_platform_mismatch: bool,
 }
 
 #[cfg(test)]
@@ -519,6 +529,18 @@ mod tests {
         };
 
         assert!(options.force);
+    }
+
+    #[test]
+    fn install_platform_mismatch_flag_parses() {
+        let cli = Cli::try_parse_from(["surge", "install", "tailscale", "my-node", "--allow-platform-mismatch"])
+            .expect("install command with --allow-platform-mismatch should parse");
+
+        let Commands::Install { options, .. } = cli.command else {
+            panic!("expected install command");
+        };
+
+        assert!(options.compatibility_options.allow_platform_mismatch);
     }
 
     #[test]

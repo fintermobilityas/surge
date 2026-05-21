@@ -176,6 +176,58 @@ pub struct TargetConfig {
     pub installers: Vec<String>,
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compatibility: Option<TargetCompatibilityConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TargetCompatibilityConfig {
+    #[serde(
+        default,
+        rename = "os-release",
+        alias = "os_release",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub os_release: Option<OsReleaseCompatibilityConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu: Option<GpuCompatibilityConfig>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub files: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub packages: BTreeMap<String, String>,
+}
+
+impl TargetCompatibilityConfig {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.os_release.is_none() && self.gpu.is_none() && self.files.is_empty() && self.packages.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OsReleaseCompatibilityConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(
+        default,
+        rename = "version-id",
+        alias = "version_id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub version_id: Option<String>,
+    #[serde(
+        default,
+        rename = "id-like",
+        alias = "id_like",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub id_like: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GpuCompatibilityConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vendor: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

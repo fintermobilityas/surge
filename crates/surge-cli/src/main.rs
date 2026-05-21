@@ -317,6 +317,11 @@ async fn run(cli: Cli) -> surge_core::error::Result<()> {
                     plan_only: options.plan_only,
                     no_start: options.no_start,
                     force: options.force,
+                    platform_mismatch: if options.compatibility_options.allow_platform_mismatch {
+                        commands::install::PlatformMismatchPolicy::Allow
+                    } else {
+                        commands::install::PlatformMismatchPolicy::Reject
+                    },
                     mode: if options.stage_options.verify_stage {
                         commands::install::InstallMode::VerifyStage
                     } else if options.stage_options.stage {

@@ -10,11 +10,11 @@ use serde_yaml::Value;
 use crate::error::{Result, SurgeError};
 
 pub use self::types::{
-    AppConfig, CacheManifestConfig, ChannelManifestConfig, InstallArtifactCacheManifestConfig,
+    AppConfig, CacheManifestConfig, ChannelManifestConfig, GpuCompatibilityConfig, InstallArtifactCacheManifestConfig,
     InstallArtifactCachePolicy, InstallArtifactCacheRetention, InstallerType, LockManifestConfig,
-    PackCompressionFormat, PackCompressionManifestConfig, PackDeltaManifestConfig, PackDeltaStrategy,
-    PackManifestConfig, PackPolicy, PackRetentionManifestConfig, ShortcutLocation, StorageManifestConfig,
-    SurgeManifest, TargetConfig,
+    OsReleaseCompatibilityConfig, PackCompressionFormat, PackCompressionManifestConfig, PackDeltaManifestConfig,
+    PackDeltaStrategy, PackManifestConfig, PackPolicy, PackRetentionManifestConfig, ShortcutLocation,
+    StorageManifestConfig, SurgeManifest, TargetCompatibilityConfig, TargetConfig,
 };
 
 impl SurgeManifest {
@@ -83,6 +83,54 @@ apps:
         let manifest = SurgeManifest::parse(yaml).expect("manifest should parse");
         assert_eq!(manifest.apps.len(), 1);
         assert_eq!(manifest.apps[0].id, "explicit-id");
+    }
+
+    #[test]
+    fn parse_target_compatibility_rules() {
+        let yaml = br#"schema: 1
+storage:
+  provider: filesystem
+  bucket: /tmp/store
+apps:
+  - id: demo
+    target:
+      rid: linux-x64
+      compatibility:
+        os-release:
+          id: ubuntu
+          version-id: "24.04"
+        gpu:
+          vendor: nvidia
+        files:
+          /etc/example_runtime_release: "R35.*"
+        packages:
+          example-dnn-runtime: "8.4.*"
+"#;
+
+        let manifest = SurgeManifest::parse(yaml).expect("manifest should parse");
+        let target = manifest
+            .find_target("demo", "linux-x64")
+            .expect("target should resolve");
+        let compatibility = target.compatibility.expect("compatibility should parse");
+
+        assert_eq!(
+            compatibility
+                .os_release
+                .as_ref()
+                .and_then(|os_release| os_release.id.as_deref()),
+            Some("ubuntu")
+        );
+        assert_eq!(
+            compatibility
+                .files
+                .get("/etc/example_runtime_release")
+                .map(String::as_str),
+            Some("R35.*")
+        );
+        assert_eq!(
+            compatibility.packages.get("example-dnn-runtime").map(String::as_str),
+            Some("8.4.*")
+        );
     }
 
     #[test]

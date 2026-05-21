@@ -25,7 +25,7 @@ use serde::Deserialize;
 use surge_core::update::manager::ApplyStrategy;
 
 pub(crate) use self::execution::{
-    REMOTE_INSTALLER_FINAL_PATH, resolve_tailscale_targets, run_tailscale_streaming,
+    REMOTE_INSTALLER_FINAL_PATH, resolve_tailscale_targets, run_tailscale_capture, run_tailscale_streaming,
     run_tailscale_streaming_with_status_watchdog,
 };
 pub(crate) use self::published_installer::{

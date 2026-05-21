@@ -245,10 +245,19 @@ pub(crate) fn build_remote_process_verification_probe(
 ) -> String {
     format!(
         r#"install_root={}; main_exe={}; supervisor_id={}; version={};
-active_exe="$install_root/app/$main_exe"; app_seen=0; target_app_seen=0; stale_app_seen=0; supervisor_seen=0; stale_supervisor_seen=0; waiting_supervisor_seen=0; target_supervisor_seen=0; target_app_pids=""; watched_pids="";
+active_exe="$install_root/app/$main_exe"; status_file="$install_root/.surge-update-status.json"; app_seen=0; target_app_seen=0; stale_app_seen=0; supervisor_seen=0; stale_supervisor_seen=0; waiting_supervisor_seen=0; target_supervisor_seen=0; target_app_pids=""; watched_pids=""; status_converged=0;
+if [ -r "$status_file" ]; then
+  status_compact="$(tr -d '[:space:]' < "$status_file" 2>/dev/null || true)";
+  status_has_state=0; status_has_installed=0; status_has_target=0;
+  case "$status_compact" in *'"state":"converged"'*) status_has_state=1 ;; esac;
+  case "$status_compact" in *'"installed_version":"'"$version"'"'*) status_has_installed=1 ;; esac;
+  case "$status_compact" in *'"target_version":"'"$version"'"'*) status_has_target=1 ;; esac;
+  if [ "$status_has_state" -eq 1 ] && [ "$status_has_installed" -eq 1 ] && [ "$status_has_target" -eq 1 ]; then status_converged=1; fi;
+fi;
 contains_target_first_run() {{ cmd_tokens=" $1 "; case "$cmd_tokens" in *" --surge-first-run $version "*|*" $version --surge-first-run "*) return 0 ;; esac; return 1; }}
 contains_target_version_arg() {{ cmd_tokens=" $1 "; case "$cmd_tokens" in *" $version "*) return 0 ;; esac; return 1; }}
 contains_target_proof() {{ contains_target_first_run "$1" || contains_target_version_arg "$1"; }}
+process_exe_matches_active() {{ actual="$(readlink "/proc/$1/exe" 2>/dev/null || true)"; [ "$actual" = "$active_exe" ]; }}
 extract_watched_pid() {{ case "$1" in *" watch "*" --pid "*) rest="${{1#* --pid }}"; watched_pid="${{rest%% *}}"; case "$watched_pid" in ""|*[!0-9]*) return 1 ;; esac; printf '%s\n' "$watched_pid"; return 0 ;; esac; return 1; }}
 for cmdline in /proc/[0-9]*/cmdline; do
   [ -r "$cmdline" ] || continue;
@@ -256,7 +265,7 @@ for cmdline in /proc/[0-9]*/cmdline; do
   case "$pid" in "$$"|"$PPID") continue ;; esac;
   cmd="$(tr '\0' ' ' < "$cmdline" 2>/dev/null || true)";
   [ -n "$cmd" ] || continue;
-  case "$cmd" in *"surge-supervisor"*) ;; *"$active_exe"*) app_seen=1; if contains_target_proof "$cmd"; then target_app_seen=1; target_app_pids="${{target_app_pids}}${{pid}} "; else stale_app_seen=1; fi ;; esac;
+  case "$cmd" in *"surge-supervisor"*) ;; *"$active_exe"*) app_seen=1; if contains_target_proof "$cmd" || {{ [ "$status_converged" -eq 1 ] && process_exe_matches_active "$pid"; }}; then target_app_seen=1; target_app_pids="${{target_app_pids}}${{pid}} "; else stale_app_seen=1; fi ;; esac;
   if [ -n "$supervisor_id" ]; then
     case "$cmd" in *"surge-supervisor"*"--id $supervisor_id"*)
       supervisor_seen=1;

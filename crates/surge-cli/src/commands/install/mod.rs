@@ -1146,10 +1146,16 @@ mod tests {
         );
 
         assert!(probe.contains("active_exe=\"$install_root/app/$main_exe\""));
+        assert!(probe.contains("status_file=\"$install_root/.surge-update-status.json\""));
+        assert!(probe.contains("status_converged=0"));
         assert!(probe.contains("contains_target_first_run()"));
         assert!(probe.contains("contains_target_version_arg()"));
+        assert!(probe.contains("process_exe_matches_active()"));
         assert!(probe.contains("extract_watched_pid()"));
         assert!(probe.contains("*\" --surge-first-run $version \"*|*\" $version --surge-first-run \"*"));
+        assert!(probe.contains("*'\"state\":\"converged\"'*"));
+        assert!(probe.contains("*'\"installed_version\":\"'\"$version\"'\"'*"));
+        assert!(probe.contains("[ \"$status_converged\" -eq 1 ] && process_exe_matches_active \"$pid\""));
         assert!(probe.contains("target_app_pids"));
         assert!(probe.contains("target_supervisor_seen"));
         assert!(probe.contains("surge-supervisor"));

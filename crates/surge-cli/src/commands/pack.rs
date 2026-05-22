@@ -343,6 +343,7 @@ pub async fn execute_installers_only(
                 RestoreOptions {
                     cache_dir: Some(output_dir),
                     progress: None,
+                    ..RestoreOptions::default()
                 },
             )
             .await?;

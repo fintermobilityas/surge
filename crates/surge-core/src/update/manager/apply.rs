@@ -19,7 +19,7 @@ use crate::releases::delta::{
 };
 use crate::releases::manifest::{ReleaseEntry, decompress_release_index};
 use crate::releases::restore::{
-    RestoreOptions, find_release_for_version_rid, restore_full_archive_for_version_with_options,
+    RebuiltFullCachePolicy, RestoreOptions, find_release_for_version_rid, restore_full_archive_for_version_with_options,
 };
 use crate::supervisor::stub::find_latest_app_dir;
 
@@ -406,6 +406,7 @@ async fn restore_base_full_archive(manager: &UpdateManager, artifact_cache_dir: 
         RestoreOptions {
             cache_dir: Some(artifact_cache_dir),
             progress: None,
+            rebuilt_full_cache_policy: RebuiltFullCachePolicy::TargetOnly,
         },
     )
     .await

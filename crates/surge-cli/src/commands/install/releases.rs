@@ -132,6 +132,7 @@ pub(super) async fn download_release_archive(
                 RestoreOptions {
                     cache_dir: destination.parent(),
                     progress: Some(&progress),
+                    ..RestoreOptions::default()
                 },
             )
             .await?;

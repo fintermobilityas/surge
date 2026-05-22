@@ -1090,6 +1090,7 @@ apps:
             RestoreOptions {
                 cache_dir: Some(&cache_root),
                 progress: None,
+                ..RestoreOptions::default()
             },
         )
         .await

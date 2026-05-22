@@ -342,6 +342,7 @@ async fn restore_release_from_storage(
                 RestoreOptions {
                     cache_dir: Some(packages_dir),
                     progress: None,
+                    ..RestoreOptions::default()
                 },
             )
             .await?;

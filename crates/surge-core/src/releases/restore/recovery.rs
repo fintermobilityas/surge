@@ -16,7 +16,7 @@ use futures_util::stream::{self, StreamExt};
 
 use super::candidate::select_restore_candidate;
 use super::planning::sorted_releases_for_rid;
-use super::{RestoreOptions, RestoreProgress, RestoreProgressCallback};
+use super::{RebuiltFullCachePolicy, RestoreOptions, RestoreProgress, RestoreProgressCallback};
 
 #[derive(Debug, Clone)]
 struct ArtifactPrefetchSpec {
@@ -139,12 +139,22 @@ pub async fn restore_full_archive_for_version_with_options(
             &restored,
             &format!("rebuilt full archive for {}", release.version),
         )?;
-        if let Some(cache_root) = options.cache_dir {
+        if let Some(cache_root) = options.cache_dir
+            && should_cache_rebuilt_full(options.rebuilt_full_cache_policy, release, version)
+        {
             cache_restored_full_archive(cache_root, release, &restored)?;
         }
     }
 
     Ok(restored)
+}
+
+fn should_cache_rebuilt_full(policy: RebuiltFullCachePolicy, release: &ReleaseEntry, target_version: &str) -> bool {
+    match policy {
+        RebuiltFullCachePolicy::All => true,
+        RebuiltFullCachePolicy::TargetOnly => release.version == target_version,
+        RebuiltFullCachePolicy::None => false,
+    }
 }
 
 fn cache_restored_full_archive(cache_root: &Path, release: &ReleaseEntry, restored: &[u8]) -> Result<()> {

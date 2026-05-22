@@ -414,6 +414,7 @@ impl UpdateManager {
 mod tests {
     #![allow(clippy::cast_possible_wrap)]
 
+    use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
     use std::time::Duration;
@@ -2354,6 +2355,113 @@ echo started > new-child-started
 
         let installed = std::fs::read_to_string(install_root.join("app").join("payload.txt")).unwrap();
         assert_eq!(installed, "v3 payload");
+    }
+
+    #[tokio::test]
+    async fn test_download_and_apply_delta_failure_does_not_cache_intermediate_restored_fulls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("store");
+        let install_root = tmp.path().join("install");
+        let app_id = "test-app";
+        std::fs::create_dir_all(&store_root).unwrap();
+        std::fs::create_dir_all(&install_root).unwrap();
+        let app_store = app_scoped_store_root(&store_root, app_id);
+
+        let rid = current_rid();
+        let os = current_os_label_for_tests();
+        let full_payloads: Vec<Vec<u8>> = (0..=5)
+            .map(|idx| format!("full payload for 1.{idx}.0").into_bytes())
+            .collect();
+        let mut full_names = Vec::new();
+        let mut delta_names = Vec::new();
+        let mut releases = Vec::new();
+
+        for idx in 0..=5 {
+            let version = format!("1.{idx}.0");
+            let full_name = format!("{app_id}-{version}-{rid}-full.tar.zst");
+            let mut release = make_entry(&version, "stable", &os, &rid);
+            release.is_genesis = idx == 0;
+            release.full_filename = full_name.clone();
+            release.full_size = full_payloads[idx].len() as i64;
+            release.full_sha256 = sha256_hex(&full_payloads[idx]);
+
+            if idx == 0 {
+                release.deltas = Vec::new();
+                release.preferred_delta_id = String::new();
+                std::fs::write(app_store.join(&full_name), &full_payloads[idx]).unwrap();
+            } else {
+                let from_version = format!("1.{}.0", idx - 1);
+                let delta_target = if idx == 5 {
+                    b"wrong latest payload".to_vec()
+                } else {
+                    full_payloads[idx].clone()
+                };
+                let patch = bsdiff_buffers(&full_payloads[idx - 1], &delta_target).unwrap();
+                let delta = zstd::encode_all(patch.as_slice(), 3).unwrap();
+                let delta_name = format!("{app_id}-{version}-{rid}-delta.tar.zst");
+                release.set_primary_delta(Some(DeltaArtifact::bsdiff_zstd(
+                    "primary",
+                    &from_version,
+                    &delta_name,
+                    delta.len() as i64,
+                    &sha256_hex(&delta),
+                )));
+                std::fs::write(app_store.join(&delta_name), &delta).unwrap();
+                delta_names.push(delta_name);
+            }
+
+            full_names.push(full_name);
+            releases.push(release);
+        }
+
+        let index = ReleaseIndex {
+            app_id: app_id.to_string(),
+            releases,
+            ..ReleaseIndex::default()
+        };
+        write_app_scoped_release_index(&store_root, app_id, &index);
+
+        let ctx = Arc::new(Context::new());
+        ctx.set_storage(
+            StorageProvider::Filesystem,
+            store_root.to_str().unwrap(),
+            "",
+            "",
+            "",
+            "",
+        );
+
+        let mut manager = UpdateManager::new(ctx, app_id, "1.4.0", "stable", install_root.to_str().unwrap()).unwrap();
+        let info = manager.check_for_updates().await.unwrap().unwrap();
+        assert_eq!(info.apply_strategy, ApplyStrategy::Delta);
+        assert_eq!(info.apply_releases.len(), 1);
+        assert_eq!(info.apply_releases[0].version, "1.5.0");
+
+        let err = manager
+            .download_and_apply(&info, None::<fn(ProgressInfo)>)
+            .await
+            .expect_err("bad latest delta and missing full fallback should fail before finalize");
+        assert!(
+            err.to_string().contains("full package fallback failed"),
+            "unexpected error: {err}"
+        );
+
+        let artifact_cache = install_root.join(".surge-cache").join("artifacts");
+        let cached_artifacts: BTreeSet<String> = std::fs::read_dir(&artifact_cache)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| !name.starts_with('.'))
+            .collect();
+
+        assert!(cached_artifacts.contains(&full_names[4]));
+        assert!(cached_artifacts.contains(delta_names.last().unwrap()));
+        assert!(!cached_artifacts.contains(&full_names[5]));
+        for intermediate_full in &full_names[1..4] {
+            assert!(
+                !cached_artifacts.contains(intermediate_full),
+                "intermediate rebuilt full should not remain cached: {intermediate_full}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -30,6 +30,15 @@ pub struct RestoreProgress {
 pub struct RestoreOptions<'a> {
     pub cache_dir: Option<&'a Path>,
     pub progress: Option<&'a RestoreProgressCallback<'a>>,
+    pub rebuilt_full_cache_policy: RebuiltFullCachePolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RebuiltFullCachePolicy {
+    #[default]
+    All,
+    TargetOnly,
+    None,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -453,6 +462,7 @@ mod tests {
             RestoreOptions {
                 cache_dir: Some(&cache_root),
                 progress: None,
+                ..RestoreOptions::default()
             },
         )
         .await
@@ -470,6 +480,7 @@ mod tests {
             RestoreOptions {
                 cache_dir: Some(&cache_root),
                 progress: None,
+                ..RestoreOptions::default()
             },
         )
         .await
@@ -542,6 +553,7 @@ mod tests {
             RestoreOptions {
                 cache_dir: Some(&cache_root),
                 progress: None,
+                ..RestoreOptions::default()
             },
         )
         .await

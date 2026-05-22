@@ -125,6 +125,7 @@ pub async fn resolve_installer_package(
             RestoreOptions {
                 cache_dir: Some(&artifact_cache_dir),
                 progress: options.restore_progress,
+                ..RestoreOptions::default()
             },
         )
         .await?;

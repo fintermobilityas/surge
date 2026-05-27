@@ -30,6 +30,7 @@ use std::ptr;
 
 use surge_core::lock::mutex::DistributedMutex;
 use surge_core::supervisor::state::{supervisor_pid_file, supervisor_stop_file, write_restart_args};
+use surge_core::update::status::{UpdateConvergenceState, mark_restart_handoff_converged, read_update_status};
 
 pub use crate::context::{
     surge_config_set_lock_server, surge_config_set_resource_budget, surge_config_set_storage, surge_context_create,
@@ -272,13 +273,73 @@ pub unsafe extern "C" fn surge_supervisor_start(
             Some(install_dir),
             &BTreeMap::new(),
         ) {
-            Ok(_) => SURGE_OK,
+            Ok(_) => {
+                mark_self_supervised_runtime_converged(install_dir, exe.parent().unwrap_or(install_dir));
+                SURGE_OK
+            }
             Err(e) => {
                 tracing::error!("supervisor_start failed: {e}");
                 SURGE_ERROR
             }
         }
     }))
+}
+
+fn mark_self_supervised_runtime_converged(install_dir: &Path, active_app_dir: &Path) {
+    let record = match read_update_status(install_dir) {
+        Ok(Some(record)) => record,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(
+                install_root = %install_dir.display(),
+                reason = %e,
+                "Failed reading update status before self-supervisor convergence proof"
+            );
+            return;
+        }
+    };
+    if !matches!(
+        record.state,
+        UpdateConvergenceState::InProgress | UpdateConvergenceState::PendingRestart
+    ) || record.installed_version.trim() != record.target_version.trim()
+    {
+        return;
+    }
+
+    let runtime_version = match surge_core::install::read_runtime_manifest_version(active_app_dir) {
+        Ok(Some(version)) => version,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(
+                install_root = %install_dir.display(),
+                app_dir = %active_app_dir.display(),
+                reason = %e,
+                "Failed reading runtime manifest before self-supervisor convergence proof"
+            );
+            return;
+        }
+    };
+    if runtime_version.trim() != record.target_version.trim() {
+        return;
+    }
+
+    match mark_restart_handoff_converged(install_dir, &record.target_version) {
+        Ok(Some(_)) => {
+            tracing::info!(
+                version = record.target_version,
+                "Restart handoff converged after self-supervisor accepted the target runtime"
+            );
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(
+                install_root = %install_dir.display(),
+                version = record.target_version,
+                reason = %e,
+                "Failed to record self-supervisor convergence proof"
+            );
+        }
+    }
 }
 
 /// Stop a supervised process watcher.
@@ -436,4 +497,72 @@ pub unsafe extern "C" fn surge_free_cstring(ptr: *mut c_char) {
     // SAFETY: caller guarantees `ptr` was returned by a Surge FFI function
     // documented as `free()`-owned, or is null.
     unsafe { crate::shared::libc_free(ptr.cast::<c_void>()) };
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    struct TestInstallDir {
+        path: PathBuf,
+    }
+
+    impl TestInstallDir {
+        fn new(name: &str) -> Self {
+            let unique = format!(
+                "{name}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            );
+            let path = std::env::temp_dir().join(unique);
+            std::fs::create_dir(&path).unwrap();
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestInstallDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn self_supervisor_converges_pending_status_when_runtime_manifest_matches() {
+        let tmp = TestInstallDir::new("surge-ffi-self-supervisor-converges");
+        let app_dir = tmp.path().join("app");
+        let runtime_manifest = app_dir.join(surge_core::install::RUNTIME_MANIFEST_RELATIVE_PATH);
+        std::fs::create_dir_all(runtime_manifest.parent().unwrap()).unwrap();
+        std::fs::write(&runtime_manifest, "id: demo-app\nversion: 2.0.0\nchannel: test\n").unwrap();
+        let pending = surge_core::update::status::UpdateStatusRecord::pending_restart_with_failure_phase(
+            "demo-app",
+            "2.0.0",
+            "2.0.0",
+            "test",
+            "2026-05-21T10:00:00Z".to_string(),
+            "2026-05-21T10:00:01Z".to_string(),
+            "waiting for old child",
+            surge_core::update::status::RESTART_HANDOFF_WAITING_FOR_OLD_CHILD_PHASE,
+        );
+        surge_core::update::status::write_update_status(tmp.path(), &pending).unwrap();
+
+        super::mark_self_supervised_runtime_converged(tmp.path(), &app_dir);
+
+        let status = surge_core::update::status::read_update_status(tmp.path())
+            .unwrap()
+            .expect("status should remain present");
+        assert_eq!(
+            status.state,
+            surge_core::update::status::UpdateConvergenceState::Converged
+        );
+        assert!(status.supervisor_restart_confirmed);
+        assert_eq!(status.failure_phase, None);
+        assert_eq!(status.reason, None);
+    }
 }

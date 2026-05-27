@@ -6,12 +6,11 @@ use std::process::{Child, Command, ExitCode, ExitStatus};
 
 use clap::{Parser, Subcommand};
 use surge_core::supervisor::state::{supervisor_pid_file, supervisor_stop_file};
-use surge_core::update::status::{
-    RESTART_HANDOFF_TARGET_CHILD_EXITED_PHASE, mark_restart_handoff_converged, mark_restart_handoff_pending,
-};
 #[cfg(windows)]
 use sysinfo::{Pid, ProcessesToUpdate, System};
 use thiserror::Error;
+
+mod handoff;
 
 const RESTART_HANDOFF_STABILITY_WINDOW: std::time::Duration = std::time::Duration::from_secs(4);
 
@@ -184,12 +183,13 @@ fn run_supervisor(
 
     let shutdown = install_signal_handlers();
 
-    // Separate one-shot lifecycle args (--surge-*) from regular args.
-    // On the first child start, all args are passed. After that, lifecycle
-    // args are drained so crash-restarts don't re-fire lifecycle callbacks.
-    let mut lifecycle_args: Vec<String> = args.iter().filter(|a| a.starts_with("--surge-")).cloned().collect();
-    let regular_args: Vec<String> = args.iter().filter(|a| !a.starts_with("--surge-")).cloned().collect();
-    let mut pending_handoff_version = pending_restart_handoff_version(watched_pid, handoff_version, args);
+    // On the first child start, all args are passed in their original order.
+    // After that, one-shot lifecycle args are drained so crash-restarts don't
+    // re-fire lifecycle callbacks.
+    let first_child_args = args.to_vec();
+    let restart_args = handoff::without_lifecycle_args(args);
+    let mut next_child_args = Some(first_child_args);
+    let mut pending_handoff_version = handoff::pending_restart_handoff_version(watched_pid, handoff_version, args);
     let mut watched_pid = watched_pid;
 
     loop {
@@ -216,8 +216,7 @@ fn run_supervisor(
             }
         }
 
-        let mut child_args = regular_args.clone();
-        child_args.append(&mut lifecycle_args);
+        let child_args = next_child_args.take().unwrap_or_else(|| restart_args.clone());
 
         tracing::info!("Starting child process: {}", exe_path.display());
 
@@ -264,86 +263,6 @@ fn run_supervisor(
     Ok(())
 }
 
-fn pending_restart_handoff_version(
-    watched_pid: Option<u32>,
-    handoff_version: Option<&str>,
-    args: &[String],
-) -> Option<String> {
-    watched_pid?;
-    handoff_version
-        .map(str::trim)
-        .filter(|version| !version.is_empty())
-        .map(ToOwned::to_owned)
-        .or_else(|| first_run_version(args))
-}
-
-fn first_run_version(args: &[String]) -> Option<String> {
-    args.iter().enumerate().find_map(|(index, arg)| {
-        if arg != "--surge-first-run" {
-            return None;
-        }
-        args.get(index + 1)
-            .filter(|candidate| !candidate.starts_with("--"))
-            .or_else(|| {
-                index
-                    .checked_sub(1)
-                    .and_then(|prev| args.get(prev))
-                    .filter(|candidate| !candidate.starts_with("--"))
-            })
-            .map(|version| version.trim().to_string())
-            .filter(|version| !version.is_empty())
-    })
-}
-
-fn record_restart_handoff_converged(install_dir: &Path, version: &str) {
-    match mark_restart_handoff_converged(install_dir, version) {
-        Ok(Some(_)) => {
-            tracing::info!(version, "Restart handoff converged after target child startup");
-        }
-        Ok(None) => {
-            tracing::warn!(
-                install_root = %install_dir.display(),
-                version,
-                reason = "no matching pending restart handoff status record",
-                "Failed to record restart handoff convergence"
-            );
-        }
-        Err(e) => {
-            tracing::warn!(
-                install_root = %install_dir.display(),
-                version,
-                reason = %e,
-                "Failed to record restart handoff convergence"
-            );
-        }
-    }
-}
-
-fn record_restart_handoff_child_exited(install_dir: &Path, version: &str, status: ExitStatus) {
-    let reason = format!("target child exited with {status} before restart handoff completed");
-    match mark_restart_handoff_pending(install_dir, version, &reason, RESTART_HANDOFF_TARGET_CHILD_EXITED_PHASE) {
-        Ok(Some(_)) => {
-            tracing::warn!(version, %status, "Restart handoff target child exited before startup proof completed");
-        }
-        Ok(None) => {
-            tracing::warn!(
-                install_root = %install_dir.display(),
-                version,
-                reason = "no matching pending restart handoff status record",
-                "Failed to record restart handoff child exit"
-            );
-        }
-        Err(e) => {
-            tracing::warn!(
-                install_root = %install_dir.display(),
-                version,
-                reason = %e,
-                "Failed to record restart handoff child exit"
-            );
-        }
-    }
-}
-
 fn wait_for_supervised_child(
     child: &mut Child,
     shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -357,12 +276,12 @@ fn wait_for_supervised_child(
 
     match wait_for_child_startup_or_stop(child, shutdown, stop_file, RESTART_HANDOFF_STABILITY_WINDOW)? {
         StartupOutcome::Running => {
-            record_restart_handoff_converged(install_dir, &version);
+            handoff::record_restart_handoff_converged(install_dir, &version);
             *pending_handoff_version = None;
             wait_for_child_exit_status(child, shutdown, stop_file)
         }
         StartupOutcome::Exited(status) => {
-            record_restart_handoff_child_exited(install_dir, &version, status);
+            handoff::record_restart_handoff_child_exited(install_dir, &version, status);
             Ok(Some(status))
         }
         StartupOutcome::StopRequested => {
@@ -622,33 +541,6 @@ mod tests {
     }
 
     #[test]
-    fn pending_handoff_version_uses_explicit_watch_target() {
-        let args = vec!["--app-mode".to_string()];
-
-        let version = pending_restart_handoff_version(Some(42), Some(" 2.0.0 "), &args);
-
-        assert_eq!(version.as_deref(), Some("2.0.0"));
-    }
-
-    #[test]
-    fn pending_handoff_version_falls_back_to_first_run_arg() {
-        let args = vec!["--surge-first-run".to_string(), "2.0.0".to_string()];
-
-        let version = pending_restart_handoff_version(Some(42), None, &args);
-
-        assert_eq!(version.as_deref(), Some("2.0.0"));
-    }
-
-    #[test]
-    fn pending_handoff_version_requires_watched_pid() {
-        let args = vec!["--surge-first-run".to_string(), "2.0.0".to_string()];
-
-        let version = pending_restart_handoff_version(None, Some("2.0.0"), &args);
-
-        assert_eq!(version, None);
-    }
-
-    #[test]
     fn watch_command_accepts_handoff_version_before_trailing_args() {
         let cli = Cli::try_parse_from([
             "surge-supervisor",
@@ -677,6 +569,47 @@ mod tests {
 
         assert_eq!(handoff_version.as_deref(), Some("2.0.0"));
         assert_eq!(args, vec!["--app-mode"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_supervisor_preserves_first_run_flag_value_order() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TestInstallDir::new("surge-supervisor-first-run-order");
+        let install_dir = tmp.path();
+        let args_path = install_dir.join("args.txt");
+        let exe_path = install_dir.join("target-child");
+        std::fs::write(
+            &exe_path,
+            format!(
+                "#!/bin/sh\n\
+                 printf '%s\\n' \"$@\" > '{}'\n",
+                args_path.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&exe_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&exe_path, permissions).unwrap();
+
+        run_supervisor(
+            "demo-supervisor",
+            install_dir,
+            &exe_path,
+            &[
+                "--app-mode".to_string(),
+                "service".to_string(),
+                "--surge-first-run".to_string(),
+                "2.0.0".to_string(),
+            ],
+            None,
+            None,
+        )
+        .unwrap();
+
+        let args = std::fs::read_to_string(args_path).unwrap();
+        assert_eq!(args, "--app-mode\nservice\n--surge-first-run\n2.0.0\n");
     }
 
     #[cfg(unix)]

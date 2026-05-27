@@ -1,5 +1,6 @@
 pub mod compact;
 pub mod demote;
+pub mod fleet_status;
 pub mod init;
 pub mod install;
 pub mod list;

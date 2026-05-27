@@ -20,6 +20,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufRead
 use tokio::process::Command;
 
 pub(crate) use self::progress::{make_progress_bar, make_spinner, shell_single_quote};
+pub(crate) use self::remote::resolve_tailscale_targets;
 pub(crate) use self::resolution::selected_install_manifest_path;
 pub(crate) use self::runtime::{
     auto_start_after_install, host_can_build_installer_locally, install_package_locally, release_install_profile,
@@ -32,10 +33,7 @@ use self::profile::{
     build_rid_candidates, derive_base_rid, detect_local_profile, warn_if_local_rid_looks_incompatible,
 };
 use self::releases::{ArchiveAcquisition, download_release_archive, fetch_release_index, select_release};
-use self::remote::{
-    ensure_supported_tailscale_rid, install_release_via_tailscale, resolve_tailscale_targets,
-    verify_remote_stage_readiness,
-};
+use self::remote::{ensure_supported_tailscale_rid, install_release_via_tailscale, verify_remote_stage_readiness};
 use self::resolution::{
     build_storage_config_with_overrides, build_storage_config_without_manifest, load_install_manifest_if_available,
     resolve_install_app_id_without_manifest, resolve_tailscale_rid_without_manifest,

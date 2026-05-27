@@ -280,6 +280,13 @@ pub(crate) enum Commands {
         json: bool,
     },
 
+    /// Inspect read-only status for nodes in a fleet
+    #[command(name = "fleet-status")]
+    FleetStatus {
+        #[command(subcommand)]
+        action: FleetStatusAction,
+    },
+
     /// Install packages using a selected transport method
     Install {
         /// Install method (defaults to backend)
@@ -301,6 +308,55 @@ pub(crate) enum Commands {
         #[command(flatten)]
         options: InstallOptions,
     },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum FleetStatusAction {
+    /// Probe Surge runtime status over tailscale SSH
+    Tailscale(FleetStatusTailscaleOptions),
+}
+
+#[derive(Args, Clone)]
+pub(crate) struct FleetStatusTailscaleOptions {
+    /// Expected application ID
+    #[arg(long)]
+    pub(crate) app_id: String,
+
+    /// Expected runtime identifier
+    #[arg(long)]
+    pub(crate) rid: String,
+
+    /// Expected release channel
+    #[arg(long)]
+    pub(crate) channel: String,
+
+    /// Expected release version
+    #[arg(long)]
+    pub(crate) version: String,
+
+    /// Target node, repeatable (for example: operator@example-node)
+    #[arg(long)]
+    pub(crate) node: Vec<String>,
+
+    /// File containing one node per line
+    #[arg(long)]
+    pub(crate) nodes_file: Option<PathBuf>,
+
+    /// Node user account used when --node values omit a user
+    #[arg(long = "node-user", alias = "ssh-user")]
+    pub(crate) node_user: Option<String>,
+
+    /// Maximum number of concurrent node probes
+    #[arg(long, default_value_t = 16)]
+    pub(crate) concurrency: usize,
+
+    /// Per-node probe timeout in seconds
+    #[arg(long, default_value_t = 20)]
+    pub(crate) timeout_seconds: u64,
+
+    /// Emit JSON instead of a human-readable summary
+    #[arg(long)]
+    pub(crate) json: bool,
 }
 
 #[derive(Subcommand)]
@@ -458,7 +514,7 @@ pub(crate) struct InstallCompatibilityOptions {
 mod tests {
     use clap::Parser;
 
-    use super::{Cli, Commands};
+    use super::{Cli, Commands, FleetStatusAction};
 
     #[test]
     fn restore_package_file_requires_installers_flag() {
@@ -563,5 +619,44 @@ mod tests {
         };
 
         assert!(err.to_string().contains("--stage"));
+    }
+
+    #[test]
+    fn fleet_status_tailscale_parses_repeated_nodes() {
+        let cli = Cli::try_parse_from([
+            "surge",
+            "fleet-status",
+            "tailscale",
+            "--app-id",
+            "sample-app",
+            "--rid",
+            "linux-x64",
+            "--channel",
+            "sample-channel",
+            "--version",
+            "1.2.3",
+            "--node",
+            "node-a",
+            "--node",
+            "operator@example-node",
+            "--concurrency",
+            "4",
+            "--timeout-seconds",
+            "8",
+            "--json",
+        ])
+        .expect("fleet status command should parse");
+
+        let Commands::FleetStatus {
+            action: FleetStatusAction::Tailscale(options),
+        } = cli.command
+        else {
+            panic!("expected fleet status tailscale command");
+        };
+
+        assert_eq!(options.node, ["node-a", "operator@example-node"]);
+        assert_eq!(options.concurrency, 4);
+        assert_eq!(options.timeout_seconds, 8);
+        assert!(options.json);
     }
 }

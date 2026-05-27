@@ -15,7 +15,7 @@ mod logline;
 mod prompts;
 mod ui;
 
-use cli::{Cli, Commands, InstallMethod, LockAction, TuneAction};
+use cli::{Cli, Commands, FleetStatusAction, InstallMethod, LockAction, TuneAction};
 
 fn main() -> ExitCode {
     let started = Instant::now();
@@ -70,7 +70,7 @@ fn main() -> ExitCode {
     let result = rt.block_on(run(cli));
 
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(exit_code) => exit_code,
         Err(e) => {
             logline::error_chain(&e);
             ExitCode::FAILURE
@@ -78,10 +78,10 @@ fn main() -> ExitCode {
     }
 }
 
-async fn run(cli: Cli) -> surge_core::error::Result<()> {
+async fn run(cli: Cli) -> surge_core::error::Result<ExitCode> {
     let manifest_path = cli.manifest_path;
 
-    match cli.command {
+    let result = match cli.command {
         Commands::Init {
             app_id,
             name,
@@ -270,6 +270,20 @@ async fn run(cli: Cli) -> surge_core::error::Result<()> {
 
         Commands::Status { install_dir, json } => commands::status::execute(&install_dir, json),
 
+        Commands::FleetStatus { action } => {
+            return match action {
+                FleetStatusAction::Tailscale(options) => {
+                    commands::fleet_status::execute_tailscale(options).await.map(|outcome| {
+                        if outcome.all_healthy {
+                            ExitCode::SUCCESS
+                        } else {
+                            ExitCode::from(2)
+                        }
+                    })
+                }
+            };
+        }
+
         Commands::Install {
             method,
             target,
@@ -341,5 +355,7 @@ async fn run(cli: Cli) -> surge_core::error::Result<()> {
             )
             .await
         }
-    }
+    };
+
+    result.map(|()| ExitCode::SUCCESS)
 }

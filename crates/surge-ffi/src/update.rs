@@ -1,14 +1,19 @@
 use std::ffi::{c_char, c_int, c_void};
 use std::ptr;
+use std::time::Duration;
 
 use surge_core::config::manifest::{InstallArtifactCachePolicy, InstallArtifactCacheRetention};
+use surge_core::error::SurgeError;
 use surge_core::update::manager::{ProgressInfo, UpdateManager};
 
 use crate::handles::{ReleaseEntryFfi, SurgeReleasesInfoHandle, SurgeUpdateManagerHandle};
 use crate::shared::{
     ProgressBridge, SURGE_CANCELLED, SURGE_ERROR, SURGE_NOT_FOUND, SURGE_OK, SurgeProgressCallback, catch_ffi,
-    clear_shared_error, cstr_to_string, set_ctx_error, set_shared_error,
+    clear_shared_error, cstr_to_string, ffi_trace, set_ctx_error, set_shared_error,
 };
+
+const DEFAULT_UPDATE_CHECK_TIMEOUT: Duration = Duration::from_mins(1);
+const UPDATE_CHECK_TIMEOUT_ENV: &str = "SURGE_UPDATE_CHECK_TIMEOUT_SECONDS";
 /// Create an update manager bound to a specific application.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn surge_update_manager_create(
@@ -18,7 +23,9 @@ pub unsafe extern "C" fn surge_update_manager_create(
     channel: *const c_char,
     install_dir: *const c_char,
 ) -> *mut SurgeUpdateManagerHandle {
+    ffi_trace("surge_update_manager_create: enter");
     if ctx.is_null() {
+        ffi_trace("surge_update_manager_create: null context");
         return ptr::null_mut();
     }
 
@@ -43,9 +50,11 @@ pub unsafe extern "C" fn surge_update_manager_create(
             let e =
                 surge_core::error::SurgeError::Config("app_id, version, channel, and install_dir are required".into());
             set_ctx_error(handle, &e);
+            ffi_trace("surge_update_manager_create: missing required input");
             return ptr::null_mut();
         }
 
+        ffi_trace("surge_update_manager_create: creating handle");
         let mgr = Box::new(SurgeUpdateManagerHandle {
             ctx: handle.ctx.clone(),
             runtime: handle.runtime.clone(),
@@ -58,10 +67,14 @@ pub unsafe extern "C" fn surge_update_manager_create(
             install_dir: install_s,
         });
 
+        ffi_trace("surge_update_manager_create: success");
         Box::into_raw(mgr)
     }));
 
-    result.unwrap_or(ptr::null_mut())
+    result.unwrap_or_else(|_| {
+        ffi_trace("surge_update_manager_create: panic");
+        ptr::null_mut()
+    })
 }
 
 /// Destroy an update manager.
@@ -206,7 +219,9 @@ pub unsafe extern "C" fn surge_update_check(
     mgr: *mut SurgeUpdateManagerHandle,
     info: *mut *mut SurgeReleasesInfoHandle,
 ) -> i32 {
+    ffi_trace("surge_update_check: enter");
     if mgr.is_null() || info.is_null() {
+        ffi_trace("surge_update_check: null input");
         return SURGE_ERROR;
     }
 
@@ -220,9 +235,11 @@ pub unsafe extern "C" fn surge_update_check(
         clear_shared_error(&mgr_ref.ctx, &mgr_ref.last_error);
 
         if mgr_ref.ctx.is_cancelled() {
+            ffi_trace("surge_update_check: cancelled before check");
             return SURGE_CANCELLED;
         }
 
+        ffi_trace("surge_update_check: creating update manager");
         let mut update_mgr = match UpdateManager::new(
             mgr_ref.ctx.clone(),
             &mgr_ref.app_id,
@@ -238,10 +255,15 @@ pub unsafe extern "C" fn surge_update_check(
             return set_shared_error(&mgr_ref.ctx, &mgr_ref.last_error, &e);
         }
 
-        let result = mgr_ref.runtime.block_on(update_mgr.check_for_updates());
+        let timeout = update_check_timeout();
+        ffi_trace("surge_update_check: checking release index");
+        let result = mgr_ref
+            .runtime
+            .block_on(async { tokio::time::timeout(timeout, update_mgr.check_for_updates()).await });
 
         match result {
-            Ok(Some(update_info)) => {
+            Ok(Ok(Some(update_info))) => {
+                ffi_trace("surge_update_check: updates available");
                 let ffi_releases: Vec<ReleaseEntryFfi> = update_info
                     .available_releases
                     .iter()
@@ -264,7 +286,8 @@ pub unsafe extern "C" fn surge_update_check(
                 unsafe { *info = Box::into_raw(releases_handle) };
                 SURGE_OK
             }
-            Ok(None) => {
+            Ok(Ok(None)) => {
+                ffi_trace("surge_update_check: no updates available");
                 let releases_handle = Box::new(SurgeReleasesInfoHandle {
                     releases: Vec::new(),
                     cached_strings: Vec::new(),
@@ -274,9 +297,28 @@ pub unsafe extern "C" fn surge_update_check(
                 unsafe { *info = Box::into_raw(releases_handle) };
                 SURGE_NOT_FOUND
             }
-            Err(e) => set_shared_error(&mgr_ref.ctx, &mgr_ref.last_error, &e),
+            Ok(Err(e)) => {
+                ffi_trace("surge_update_check: failed");
+                set_shared_error(&mgr_ref.ctx, &mgr_ref.last_error, &e)
+            }
+            Err(_) => {
+                ffi_trace("surge_update_check: timed out");
+                let e = SurgeError::Update(format!("update check timed out after {} seconds", timeout.as_secs()));
+                set_shared_error(&mgr_ref.ctx, &mgr_ref.last_error, &e)
+            }
         }
     }))
+}
+
+fn update_check_timeout() -> Duration {
+    parse_update_check_timeout(std::env::var(UPDATE_CHECK_TIMEOUT_ENV).ok().as_deref())
+}
+
+fn parse_update_check_timeout(value: Option<&str>) -> Duration {
+    value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map_or(DEFAULT_UPDATE_CHECK_TIMEOUT, Duration::from_secs)
 }
 
 /// Download and apply an update described by `info`.
@@ -424,13 +466,15 @@ pub unsafe extern "C" fn surge_update_status_read_json(install_dir: *const c_cha
 #[cfg(test)]
 mod tests {
     use std::ffi::{CStr, CString};
+    use std::time::Duration;
 
     use crate::{surge_context_create, surge_context_destroy, surge_context_last_error};
 
     use super::{
-        SURGE_OK, SurgeReleasesInfoHandle, surge_update_check, surge_update_manager_create,
-        surge_update_manager_destroy, surge_update_manager_set_artifact_retention_policy,
-        surge_update_manager_set_channel, surge_update_manager_set_release_retention_limit,
+        DEFAULT_UPDATE_CHECK_TIMEOUT, SURGE_OK, SurgeReleasesInfoHandle, parse_update_check_timeout,
+        surge_update_check, surge_update_manager_create, surge_update_manager_destroy,
+        surge_update_manager_set_artifact_retention_policy, surge_update_manager_set_channel,
+        surge_update_manager_set_release_retention_limit,
     };
 
     #[test]
@@ -629,5 +673,18 @@ mod tests {
             surge_update_manager_destroy(mgr);
             surge_context_destroy(ctx);
         }
+    }
+
+    #[test]
+    fn update_check_timeout_uses_positive_seconds_or_default() {
+        assert_eq!(parse_update_check_timeout(Some("5")), Duration::from_secs(5));
+        assert_eq!(parse_update_check_timeout(Some(" 12 ")), Duration::from_secs(12));
+        assert_eq!(parse_update_check_timeout(Some("0")), DEFAULT_UPDATE_CHECK_TIMEOUT);
+        assert_eq!(parse_update_check_timeout(Some("-1")), DEFAULT_UPDATE_CHECK_TIMEOUT);
+        assert_eq!(
+            parse_update_check_timeout(Some("not-a-number")),
+            DEFAULT_UPDATE_CHECK_TIMEOUT
+        );
+        assert_eq!(parse_update_check_timeout(None), DEFAULT_UPDATE_CHECK_TIMEOUT);
     }
 }

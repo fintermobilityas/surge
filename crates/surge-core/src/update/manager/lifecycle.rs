@@ -1,4 +1,6 @@
 use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 use std::time::Duration;
 
 use tracing::{debug, info, warn};
@@ -244,6 +246,176 @@ pub(super) fn restart_supervisor_after_update_with_pid(
     }
 }
 
+pub(super) fn terminate_superseded_app_processes(
+    install_dir: &Path,
+    active_app_dir: &Path,
+    main_exe: &str,
+) -> Result<usize> {
+    terminate_superseded_app_processes_except(install_dir, active_app_dir, main_exe, current_pid())
+}
+
+#[cfg(unix)]
+fn terminate_superseded_app_processes_except(
+    install_dir: &Path,
+    active_app_dir: &Path,
+    main_exe: &str,
+    protected_pid: u32,
+) -> Result<usize> {
+    use nix::errno::Errno;
+    use nix::sys::signal::Signal;
+
+    let main_exe = main_exe.trim();
+    if main_exe.is_empty() {
+        return Ok(0);
+    }
+
+    let pids = superseded_app_process_pids(install_dir, active_app_dir, main_exe, protected_pid);
+    if pids.is_empty() {
+        return Ok(0);
+    }
+
+    for pid in &pids {
+        if let Err(e) = signal_pid(*pid, Signal::SIGTERM) {
+            warn!(pid, error = %e, "Failed to request stale app process termination");
+        }
+    }
+
+    if wait_until_superseded_processes_exit(
+        install_dir,
+        active_app_dir,
+        main_exe,
+        protected_pid,
+        Duration::from_secs(5),
+    ) {
+        info!(
+            count = pids.len(),
+            "Terminated stale app processes from superseded install directories"
+        );
+        return Ok(pids.len());
+    }
+
+    let remaining = superseded_app_process_pids(install_dir, active_app_dir, main_exe, protected_pid);
+    for pid in &remaining {
+        match signal_pid(*pid, Signal::SIGKILL) {
+            Ok(()) | Err(Errno::ESRCH) => {}
+            Err(e) => {
+                warn!(pid, error = %e, "Failed to force-kill stale app process");
+            }
+        }
+    }
+
+    if wait_until_superseded_processes_exit(
+        install_dir,
+        active_app_dir,
+        main_exe,
+        protected_pid,
+        Duration::from_secs(2),
+    ) {
+        info!(
+            count = pids.len(),
+            forced = remaining.len(),
+            "Force-killed stale app processes from superseded install directories"
+        );
+        return Ok(pids.len());
+    }
+
+    Err(SurgeError::Platform(format!(
+        "Timed out waiting for stale '{main_exe}' processes from superseded install directories to exit"
+    )))
+}
+
+#[cfg(unix)]
+fn signal_pid(pid: u32, signal: nix::sys::signal::Signal) -> std::result::Result<(), nix::errno::Errno> {
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+
+    let Ok(raw_pid) = i32::try_from(pid) else {
+        return Ok(());
+    };
+    kill(Pid::from_raw(raw_pid), signal)
+}
+
+#[cfg(not(unix))]
+fn terminate_superseded_app_processes_except(
+    _install_dir: &Path,
+    _active_app_dir: &Path,
+    _main_exe: &str,
+    _protected_pid: u32,
+) -> Result<usize> {
+    Ok(0)
+}
+
+#[cfg(unix)]
+fn wait_until_superseded_processes_exit(
+    install_dir: &Path,
+    active_app_dir: &Path,
+    main_exe: &str,
+    protected_pid: u32,
+    timeout: Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if superseded_app_process_pids(install_dir, active_app_dir, main_exe, protected_pid).is_empty() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(unix)]
+fn superseded_app_process_pids(
+    install_dir: &Path,
+    active_app_dir: &Path,
+    main_exe: &str,
+    protected_pid: u32,
+) -> Vec<u32> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+
+    entries
+        .filter_map(std::result::Result::ok)
+        .filter_map(|entry| entry.file_name().to_string_lossy().parse::<u32>().ok())
+        .filter(|pid| *pid != protected_pid)
+        .filter(|pid| {
+            std::fs::read_link(format!("/proc/{pid}/exe"))
+                .map(normalize_proc_exe_path)
+                .is_ok_and(|exe| is_superseded_app_exe(install_dir, active_app_dir, main_exe, &exe))
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+fn normalize_proc_exe_path(path: PathBuf) -> PathBuf {
+    let normalized = {
+        let path_text = path.to_string_lossy();
+        path_text.strip_suffix(" (deleted)").map(PathBuf::from)
+    };
+    normalized.unwrap_or(path)
+}
+
+#[cfg(unix)]
+fn is_superseded_app_exe(install_dir: &Path, active_app_dir: &Path, main_exe: &str, exe: &Path) -> bool {
+    if exe == active_app_dir.join(main_exe) || exe.file_name().and_then(|name| name.to_str()) != Some(main_exe) {
+        return false;
+    }
+
+    let Ok(relative) = exe.strip_prefix(install_dir) else {
+        return false;
+    };
+
+    let mut components = relative.components();
+    let Some(std::path::Component::Normal(first)) = components.next() else {
+        return false;
+    };
+    let first = first.to_string_lossy();
+
+    first == ".surge-app-prev" || first.starts_with("app-") || components.next().is_none()
+}
+
 fn supervisor_watch_args(
     supervisor_id: &str,
     install_dir: &Path,
@@ -309,6 +481,59 @@ mod tests {
                 "--app-mode",
                 "service",
             ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn superseded_app_exe_detection_matches_retained_directories_only() {
+        let install_dir = Path::new("/opt/demo");
+        let active_app_dir = install_dir.join("app");
+
+        assert!(is_superseded_app_exe(
+            install_dir,
+            &active_app_dir,
+            "demo",
+            Path::new("/opt/demo/app-1.0.0/demo")
+        ));
+        assert!(is_superseded_app_exe(
+            install_dir,
+            &active_app_dir,
+            "demo",
+            Path::new("/opt/demo/.surge-app-prev/demo")
+        ));
+        assert!(is_superseded_app_exe(
+            install_dir,
+            &active_app_dir,
+            "demo",
+            Path::new("/opt/demo/demo")
+        ));
+        assert!(!is_superseded_app_exe(
+            install_dir,
+            &active_app_dir,
+            "demo",
+            Path::new("/opt/demo/app/demo")
+        ));
+        assert!(!is_superseded_app_exe(
+            install_dir,
+            &active_app_dir,
+            "demo",
+            Path::new("/opt/demo/app-1.0.0/other")
+        ));
+        assert!(!is_superseded_app_exe(
+            install_dir,
+            &active_app_dir,
+            "demo",
+            Path::new("/srv/other/app-1.0.0/demo")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proc_exe_deleted_suffix_is_ignored_for_matching() {
+        assert_eq!(
+            normalize_proc_exe_path(PathBuf::from("/opt/demo/app-1.0.0/demo (deleted)")),
+            PathBuf::from("/opt/demo/app-1.0.0/demo")
         );
     }
 }

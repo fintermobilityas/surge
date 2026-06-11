@@ -155,9 +155,45 @@ kill_matching() {{\n\
   done\n\
 }}\n\
 \n\
+stale_app_pids() {{\n\
+  for exe_link in /proc/[0-9]*/exe; do\n\
+    [ -e \"$exe_link\" ] || continue\n\
+    pid=\"${{exe_link%/exe}}\"\n\
+    pid=\"${{pid##*/}}\"\n\
+    case \"$pid\" in \"$$\"|\"$PPID\") continue ;; esac\n\
+    actual=\"$(readlink \"$exe_link\" 2>/dev/null || true)\"\n\
+    case \"$actual\" in *\" (deleted)\") actual=\"${{actual% (deleted)}}\" ;; esac\n\
+    case \"$actual\" in \"$install_root\"/app-*/\"$main_exe\"|\"$install_root\"/.surge-app-prev/\"$main_exe\"|\"$install_root\"/\"$main_exe\") printf '%s ' \"$pid\" ;; esac\n\
+  done\n\
+}}\n\
+\n\
+terminate_stale_app_processes() {{\n\
+  pids=\"$(stale_app_pids)\"\n\
+  [ -n \"$pids\" ] || return 0\n\
+  kill $pids 2>/dev/null || true\n\
+  i=0\n\
+  while [ \"$i\" -lt 50 ]; do\n\
+    pids=\"$(stale_app_pids)\"\n\
+    [ -z \"$pids\" ] && return 0\n\
+    sleep 0.1\n\
+    i=$((i + 1))\n\
+  done\n\
+  kill -KILL $pids 2>/dev/null || true\n\
+  i=0\n\
+  while [ \"$i\" -lt 20 ]; do\n\
+    pids=\"$(stale_app_pids)\"\n\
+    [ -z \"$pids\" ] && return 0\n\
+    sleep 0.1\n\
+    i=$((i + 1))\n\
+  done\n\
+  echo \"stale app process for $main_exe is still running from a superseded install directory\" >&2\n\
+  return 1\n\
+}}\n\
+\n\
 kill_matching \"$install_root/$main_exe\"\n\
 kill_matching \"$install_root/app-\"\n\
 kill_matching \"$install_root/app/\"\n\
+terminate_stale_app_processes\n\
 rm -rf \"$next_app_dir\" \"$previous_app_dir\"\n\
 if [ ! -d \"$stage_dir/app\" ]; then\n\
   echo \"Remote install stage is missing app payload\" >&2\n\
@@ -168,6 +204,7 @@ if [ -d \"$active_app_dir\" ]; then\n\
   mv \"$active_app_dir\" \"$previous_app_dir\"\n\
 fi\n\
 mv \"$next_app_dir\" \"$active_app_dir\"\n\
+terminate_stale_app_processes\n\
 \n\
 if [ -n \"${{legacy_app_dir:-}}\" ] && [ -d \"$legacy_app_dir\" ] && [ ! -d \"$previous_app_dir\" ]; then\n\
   persistent_source_dir=\"$legacy_app_dir\"\n\

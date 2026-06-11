@@ -111,9 +111,45 @@ kill_matching() {{\n\
     kill \"$pid\" 2>/dev/null || true\n\
   done\n\
 }}\n\
+\n\
+stale_app_pids() {{\n\
+  for exe_link in /proc/[0-9]*/exe; do\n\
+    [ -e \"$exe_link\" ] || continue\n\
+    pid=\"${{exe_link%/exe}}\"\n\
+    pid=\"${{pid##*/}}\"\n\
+    case \"$pid\" in \"$$\"|\"$PPID\") continue ;; esac\n\
+    actual=\"$(readlink \"$exe_link\" 2>/dev/null || true)\"\n\
+    case \"$actual\" in *\" (deleted)\") actual=\"${{actual% (deleted)}}\" ;; esac\n\
+    case \"$actual\" in \"$install_root\"/app-*/\"$main_exe\"|\"$install_root\"/.surge-app-prev/\"$main_exe\"|\"$install_root\"/\"$main_exe\") printf '%s ' \"$pid\" ;; esac\n\
+  done\n\
+}}\n\
+\n\
+terminate_stale_app_processes() {{\n\
+  pids=\"$(stale_app_pids)\"\n\
+  [ -n \"$pids\" ] || return 0\n\
+  kill $pids 2>/dev/null || true\n\
+  i=0\n\
+  while [ \"$i\" -lt 50 ]; do\n\
+    pids=\"$(stale_app_pids)\"\n\
+    [ -z \"$pids\" ] && return 0\n\
+    sleep 0.1\n\
+    i=$((i + 1))\n\
+  done\n\
+  kill -KILL $pids 2>/dev/null || true\n\
+  i=0\n\
+  while [ \"$i\" -lt 20 ]; do\n\
+    pids=\"$(stale_app_pids)\"\n\
+    [ -z \"$pids\" ] && return 0\n\
+    sleep 0.1\n\
+    i=$((i + 1))\n\
+  done\n\
+  echo \"stale app process for $main_exe is still running from a superseded install directory\" >&2\n\
+  return 1\n\
+}}\n\
 kill_matching \"$active_exe\"\n\
 kill_matching \"$install_root/app-\"\n\
 kill_matching \"$install_root/app/\"\n\
+terminate_stale_app_processes\n\
 cd \"$install_root\"\n\
 if [ -n \"$supervisor_id\" ]; then\n\
   kill_matching \"surge-supervisor.*--id $supervisor_id\"\n\
@@ -245,7 +281,7 @@ pub(crate) fn build_remote_process_verification_probe(
 ) -> String {
     format!(
         r#"install_root={}; main_exe={}; supervisor_id={}; version={};
-active_exe="$install_root/app/$main_exe"; status_file="$install_root/.surge-update-status.json"; app_seen=0; target_app_seen=0; stale_app_seen=0; supervisor_seen=0; stale_supervisor_seen=0; waiting_supervisor_seen=0; target_supervisor_seen=0; target_app_pids=""; watched_pids=""; status_converged=0;
+active_exe="$install_root/app/$main_exe"; status_file="$install_root/.surge-update-status.json"; app_seen=0; target_app_seen=0; stale_app_seen=0; stale_retained_app_seen=0; supervisor_seen=0; stale_supervisor_seen=0; waiting_supervisor_seen=0; target_supervisor_seen=0; target_app_pids=""; watched_pids=""; status_converged=0;
 if [ -r "$status_file" ]; then
   status_compact="$(tr -d '[:space:]' < "$status_file" 2>/dev/null || true)";
   status_has_state=0; status_has_installed=0; status_has_target=0;
@@ -257,13 +293,16 @@ fi;
 contains_target_first_run() {{ cmd_tokens=" $1 "; case "$cmd_tokens" in *" --surge-first-run $version "*|*" $version --surge-first-run "*) return 0 ;; esac; return 1; }}
 contains_target_version_arg() {{ cmd_tokens=" $1 "; case "$cmd_tokens" in *" $version "*) return 0 ;; esac; return 1; }}
 contains_target_proof() {{ contains_target_first_run "$1" || contains_target_version_arg "$1"; }}
-process_exe_matches_active() {{ actual="$(readlink "/proc/$1/exe" 2>/dev/null || true)"; [ "$actual" = "$active_exe" ]; }}
+process_exe_path() {{ actual="$(readlink "/proc/$1/exe" 2>/dev/null || true)"; case "$actual" in *" (deleted)") actual="${{actual% (deleted)}}" ;; esac; printf '%s\n' "$actual"; }}
+process_exe_matches_active() {{ actual="$(process_exe_path "$1")"; [ "$actual" = "$active_exe" ]; }}
+process_exe_is_retained_app() {{ actual="$(process_exe_path "$1")"; case "$actual" in "$install_root"/app-*/"$main_exe"|"$install_root"/.surge-app-prev/"$main_exe"|"$install_root"/"$main_exe") return 0 ;; esac; return 1; }}
 extract_watched_pid() {{ case "$1" in *" watch "*" --pid "*) rest="${{1#* --pid }}"; watched_pid="${{rest%% *}}"; case "$watched_pid" in ""|*[!0-9]*) return 1 ;; esac; printf '%s\n' "$watched_pid"; return 0 ;; esac; return 1; }}
 for cmdline in /proc/[0-9]*/cmdline; do
   [ -r "$cmdline" ] || continue;
   pid="${{cmdline%/cmdline}}"; pid="${{pid##*/}}";
   case "$pid" in "$$"|"$PPID") continue ;; esac;
   cmd="$(tr '\0' ' ' < "$cmdline" 2>/dev/null || true)";
+  if process_exe_is_retained_app "$pid"; then stale_retained_app_seen=1; fi;
   [ -n "$cmd" ] || continue;
   case "$cmd" in *"surge-supervisor"*) ;; *"$active_exe"*) app_seen=1; if contains_target_proof "$cmd" || {{ [ "$status_converged" -eq 1 ] && process_exe_matches_active "$pid"; }}; then target_app_seen=1; target_app_pids="${{target_app_pids}}${{pid}} "; else stale_app_seen=1; fi ;; esac;
   if [ -n "$supervisor_id" ]; then
@@ -282,6 +321,7 @@ if [ "$target_app_seen" -ne 1 ]; then
   exit 0;
 fi;
 if [ "$stale_app_seen" -eq 1 ]; then echo "stale app process for $active_exe is still running without target proof for $version"; exit 0; fi;
+if [ "$stale_retained_app_seen" -eq 1 ]; then echo "stale app process for $main_exe is still running from a superseded install directory"; exit 0; fi;
 if [ -n "$supervisor_id" ] && [ "$waiting_supervisor_seen" -eq 1 ]; then echo "supervisor process '$supervisor_id' is still waiting for the previous child"; exit 0; fi;
 if [ -n "$supervisor_id" ] && [ "$stale_supervisor_seen" -eq 1 ]; then echo "supervisor process '$supervisor_id' is running with stale first-run proof"; exit 0; fi;
 if [ -n "$supervisor_id" ] && [ "$supervisor_seen" -ne 1 ]; then echo "supervisor process '$supervisor_id' was not found"; exit 0; fi;

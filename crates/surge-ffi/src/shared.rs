@@ -28,6 +28,8 @@ pub(crate) const SURGE_PHASE_FINALIZE: i32 = 5;
 pub(crate) type SurgeProgressCallback = Option<extern "C" fn(*const SurgeProgressFfi, *mut c_void)>;
 pub(crate) type SurgeEventCallback = Option<extern "C" fn(*const c_char, *mut c_void)>;
 
+const SURGE_FFI_TRACE_ENV: &str = "SURGE_FFI_TRACE";
+
 /// # Safety
 ///
 /// Only safe when the pointer is valid for the duration of the async call
@@ -90,6 +92,17 @@ pub(crate) fn catch_ffi<F: FnOnce() -> i32 + std::panic::UnwindSafe>(f: F) -> i3
         Ok(code) => code,
         Err(_) => SURGE_ERROR,
     }
+}
+
+pub(crate) fn ffi_trace(phase: &str) {
+    tracing::debug!(phase, "surge ffi phase");
+    if ffi_trace_enabled(std::env::var(SURGE_FFI_TRACE_ENV).ok().as_deref()) {
+        eprintln!("surge-ffi: {phase}");
+    }
+}
+
+fn ffi_trace_enabled(value: Option<&str>) -> bool {
+    value.is_some_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
 }
 
 pub(crate) fn set_ctx_error(handle: &SurgeContextHandle, e: &SurgeError) -> i32 {
@@ -193,7 +206,7 @@ mod tests {
     use std::ffi::CString;
     use std::ptr;
 
-    use super::{collect_argv, try_index, try_len};
+    use super::{collect_argv, ffi_trace_enabled, try_index, try_len};
     use std::ffi::c_int;
 
     #[test]
@@ -225,5 +238,16 @@ mod tests {
         // SAFETY: `argv` points to valid C strings for the duration of the call.
         let args = unsafe { collect_argv(argv.len() as c_int, argv.as_ptr()) };
         assert_eq!(args, vec!["--surge-first-run", "--surge-updated=1.2.3"]);
+    }
+
+    #[test]
+    fn ffi_trace_flag_accepts_common_truthy_values() {
+        assert!(ffi_trace_enabled(Some("1")));
+        assert!(ffi_trace_enabled(Some("true")));
+        assert!(ffi_trace_enabled(Some("YES")));
+        assert!(ffi_trace_enabled(Some(" on ")));
+        assert!(!ffi_trace_enabled(Some("0")));
+        assert!(!ffi_trace_enabled(Some("false")));
+        assert!(!ffi_trace_enabled(None));
     }
 }

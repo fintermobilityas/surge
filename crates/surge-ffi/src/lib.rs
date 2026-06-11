@@ -44,8 +44,8 @@ pub use crate::releases::{
     surge_releases_count, surge_releases_destroy,
 };
 use crate::shared::{
-    SURGE_CANCELLED, SURGE_ERROR, SURGE_OK, SurgeEventCallback, catch_ffi, collect_argv, cstr_to_string, libc_malloc,
-    set_ctx_error,
+    SURGE_CANCELLED, SURGE_ERROR, SURGE_OK, SurgeEventCallback, catch_ffi, collect_argv, cstr_to_string, ffi_trace,
+    libc_malloc, set_ctx_error,
 };
 pub use crate::update::{
     surge_update_check, surge_update_download_and_apply, surge_update_manager_create, surge_update_manager_destroy,
@@ -213,8 +213,10 @@ pub unsafe extern "C" fn surge_supervisor_start(
     argc: c_int,
     argv: *const *const c_char,
 ) -> i32 {
+    ffi_trace("surge_supervisor_start: enter");
     catch_ffi(std::panic::AssertUnwindSafe(|| {
         if exe_path.is_null() || install_dir.is_null() || supervisor_id.is_null() {
+            ffi_trace("surge_supervisor_start: null input");
             return SURGE_ERROR;
         }
 
@@ -228,6 +230,7 @@ pub unsafe extern "C" fn surge_supervisor_start(
             )
         };
         if exe_s.trim().is_empty() || install_dir_s.trim().is_empty() || sup_id.trim().is_empty() {
+            ffi_trace("surge_supervisor_start: missing required input");
             return SURGE_ERROR;
         }
 
@@ -242,11 +245,14 @@ pub unsafe extern "C" fn surge_supervisor_start(
                 "supervisor_start failed: supervisor binary not found at {}",
                 supervisor_path.display()
             );
+            ffi_trace("surge_supervisor_start: supervisor binary missing");
             return SURGE_ERROR;
         }
 
+        ffi_trace("surge_supervisor_start: writing restart args");
         if let Err(e) = write_restart_args(install_dir, &sup_id, &args_owned) {
             tracing::error!("supervisor_start failed: {e}");
+            ffi_trace("surge_supervisor_start: restart args failed");
             return SURGE_ERROR;
         }
 
@@ -267,6 +273,7 @@ pub unsafe extern "C" fn surge_supervisor_start(
             args.extend(args_owned.iter().map(String::as_str));
         }
 
+        ffi_trace("surge_supervisor_start: spawning supervisor");
         match surge_core::platform::process::spawn_detached(
             &supervisor_path,
             &args,
@@ -274,11 +281,13 @@ pub unsafe extern "C" fn surge_supervisor_start(
             &BTreeMap::new(),
         ) {
             Ok(_) => {
+                ffi_trace("surge_supervisor_start: spawned supervisor");
                 mark_self_supervised_runtime_converged(install_dir, exe.parent().unwrap_or(install_dir));
                 SURGE_OK
             }
             Err(e) => {
                 tracing::error!("supervisor_start failed: {e}");
+                ffi_trace("surge_supervisor_start: spawn failed");
                 SURGE_ERROR
             }
         }
@@ -345,29 +354,36 @@ fn mark_self_supervised_runtime_converged(install_dir: &Path, active_app_dir: &P
 /// Stop a supervised process watcher.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn surge_supervisor_stop(install_dir: *const c_char, supervisor_id: *const c_char) -> i32 {
+    ffi_trace("surge_supervisor_stop: enter");
     catch_ffi(std::panic::AssertUnwindSafe(|| {
         if install_dir.is_null() || supervisor_id.is_null() {
+            ffi_trace("surge_supervisor_stop: null input");
             return SURGE_ERROR;
         }
 
         // SAFETY: pointer inputs satisfy this API's FFI contract.
         let (install_dir_s, sup_id) = unsafe { (cstr_to_string(install_dir), cstr_to_string(supervisor_id)) };
         if install_dir_s.trim().is_empty() || sup_id.trim().is_empty() {
+            ffi_trace("surge_supervisor_stop: missing required input");
             return SURGE_ERROR;
         }
 
         let install_dir = Path::new(&install_dir_s);
         let pid_file = supervisor_pid_file(install_dir, &sup_id);
         if !pid_file.is_file() {
+            ffi_trace("surge_supervisor_stop: pid file missing");
             return SURGE_ERROR;
         }
 
+        ffi_trace("surge_supervisor_stop: writing stop file");
         let stop_file = supervisor_stop_file(install_dir, &sup_id);
         if let Err(e) = std::fs::write(&stop_file, b"surge-stop") {
             tracing::error!("supervisor_stop failed: {e}");
+            ffi_trace("surge_supervisor_stop: stop file failed");
             return SURGE_ERROR;
         }
 
+        ffi_trace("surge_supervisor_stop: waiting for supervisor exit");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         while pid_file.exists() {
             if std::time::Instant::now() >= deadline {
@@ -375,11 +391,13 @@ pub unsafe extern "C" fn surge_supervisor_stop(install_dir: *const c_char, super
                     "supervisor_stop failed: timed out waiting for supervisor '{}' to exit",
                     sup_id
                 );
+                ffi_trace("surge_supervisor_stop: timed out");
                 return SURGE_ERROR;
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         let _ = std::fs::remove_file(&stop_file);
+        ffi_trace("surge_supervisor_stop: success");
         SURGE_OK
     }))
 }

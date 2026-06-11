@@ -6,19 +6,28 @@ use surge_core::context::{Context, ResourceBudget, StorageProvider};
 
 use crate::SurgeResourceBudgetFfi;
 use crate::handles::SurgeContextHandle;
-use crate::shared::{SURGE_ERROR, SURGE_OK, catch_ffi, cstr_to_string, set_ctx_error};
+use crate::shared::{SURGE_ERROR, SURGE_OK, catch_ffi, cstr_to_string, ffi_trace, set_ctx_error};
 
 /// Create a new Surge context.
 ///
 /// Returns a new context handle, or null on allocation/runtime failure.
 #[unsafe(no_mangle)]
 pub extern "C" fn surge_context_create() -> *mut SurgeContextHandle {
+    ffi_trace("surge_context_create: enter");
     let result = std::panic::catch_unwind(|| {
+        ffi_trace("surge_context_create: creating tokio runtime");
         let runtime = match tokio::runtime::Runtime::new() {
-            Ok(rt) => Arc::new(rt),
-            Err(_) => return ptr::null_mut(),
+            Ok(rt) => {
+                ffi_trace("surge_context_create: tokio runtime ready");
+                Arc::new(rt)
+            }
+            Err(_) => {
+                ffi_trace("surge_context_create: tokio runtime failed");
+                return ptr::null_mut();
+            }
         };
 
+        ffi_trace("surge_context_create: creating context handle");
         let ctx = Arc::new(Context::new());
         let handle = Box::new(SurgeContextHandle {
             ctx,
@@ -27,10 +36,14 @@ pub extern "C" fn surge_context_create() -> *mut SurgeContextHandle {
             shared_last_error: Arc::new(std::sync::Mutex::new(None)),
         });
 
+        ffi_trace("surge_context_create: success");
         Box::into_raw(handle)
     });
 
-    result.unwrap_or(ptr::null_mut())
+    result.unwrap_or_else(|_| {
+        ffi_trace("surge_context_create: panic");
+        ptr::null_mut()
+    })
 }
 
 /// Destroy a Surge context and release all associated resources.

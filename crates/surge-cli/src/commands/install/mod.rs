@@ -807,6 +807,10 @@ mod tests {
         assert!(script.contains("--surge-first-run \"$version\""));
         assert!(script.contains("kill_matching \"$install_root/$main_exe\""));
         assert!(script.contains("kill_matching \"$install_root/app-\""));
+        assert!(script.contains("stale_app_pids()"));
+        assert!(script.contains("terminate_stale_app_processes"));
+        assert!(script.contains("\"$install_root\"/app-*/\"$main_exe\""));
+        assert!(script.contains("\"$install_root\"/.surge-app-prev/\"$main_exe\""));
     }
 
     #[cfg(unix)]
@@ -1148,9 +1152,12 @@ mod tests {
         assert!(probe.contains("active_exe=\"$install_root/app/$main_exe\""));
         assert!(probe.contains("status_file=\"$install_root/.surge-update-status.json\""));
         assert!(probe.contains("status_converged=0"));
+        assert!(probe.contains("stale_retained_app_seen=0"));
         assert!(probe.contains("contains_target_first_run()"));
         assert!(probe.contains("contains_target_version_arg()"));
         assert!(probe.contains("process_exe_matches_active()"));
+        assert!(probe.contains("process_exe_path()"));
+        assert!(probe.contains("process_exe_is_retained_app()"));
         assert!(probe.contains("extract_watched_pid()"));
         assert!(probe.contains("*\" --surge-first-run $version \"*|*\" $version --surge-first-run \"*"));
         assert!(probe.contains("*'\"state\":\"converged\"'*"));
@@ -1163,6 +1170,7 @@ mod tests {
         assert!(probe.contains("app process for $active_exe was not found"));
         assert!(probe.contains("app process for $active_exe is running without target proof for $version"));
         assert!(probe.contains("stale app process for $active_exe is still running without target proof for $version"));
+        assert!(probe.contains("stale app process for $main_exe is still running from a superseded install directory"));
         assert!(probe.contains("supervisor process '$supervisor_id' is still waiting for the previous child"));
         assert!(probe.contains("supervisor process '$supervisor_id' is running with stale first-run proof"));
         assert!(probe.contains("supervisor process '$supervisor_id' was not found"));
@@ -2509,6 +2517,9 @@ apps:
         assert!(command.contains("export DISPLAY=':0'"));
         assert!(command.contains("kill_matching \"$active_exe\""));
         assert!(command.contains("kill_matching \"$install_root/app-\""));
+        assert!(command.contains("stale_app_pids()"));
+        assert!(command.contains("terminate_stale_app_processes"));
+        assert!(command.contains("\"$install_root\"/app-*/\"$main_exe\""));
         assert!(command.contains("kill_matching \"surge-supervisor.*--id $supervisor_id\""));
         assert!(command.contains("supervisor_bin=\"$active_app_dir/surge-supervisor\""));
         assert!(command.contains("nohup \"$supervisor_bin\" run --id \"$supervisor_id\""));

@@ -271,6 +271,17 @@ where
     } else {
         SupervisorRestartOutcome::NotApplicable
     };
+    match lifecycle::terminate_superseded_app_processes(&manager.install_dir, &active_app_dir, &latest.main_exe) {
+        Ok(0) => {}
+        Ok(terminated) => {
+            debug!(
+                version = %latest.version,
+                terminated,
+                "Terminated stale app processes from superseded install directories"
+            );
+        }
+        Err(e) => return Err(e),
+    }
 
     emit_progress(
         progress_emitter.progress,

@@ -1,5 +1,9 @@
 use std::ffi::{CStr, c_char, c_int, c_void};
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use surge_core::context::Context;
 use surge_core::error::SurgeError;
@@ -29,6 +33,7 @@ pub(crate) type SurgeProgressCallback = Option<extern "C" fn(*const SurgeProgres
 pub(crate) type SurgeEventCallback = Option<extern "C" fn(*const c_char, *mut c_void)>;
 
 const SURGE_FFI_TRACE_ENV: &str = "SURGE_FFI_TRACE";
+const SURGE_FFI_TRACE_FILE_ENV: &str = "SURGE_FFI_TRACE_FILE";
 
 /// # Safety
 ///
@@ -98,11 +103,64 @@ pub(crate) fn ffi_trace(phase: &str) {
     tracing::debug!(phase, "surge ffi phase");
     if ffi_trace_enabled(std::env::var(SURGE_FFI_TRACE_ENV).ok().as_deref()) {
         eprintln!("surge-ffi: {phase}");
+        if let Some(path) = ffi_trace_file_path() {
+            append_ffi_trace(&path, phase);
+        }
     }
 }
 
 fn ffi_trace_enabled(value: Option<&str>) -> bool {
     value.is_some_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+}
+
+fn ffi_trace_file_path() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os(SURGE_FFI_TRACE_FILE_ENV).filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(path));
+    }
+
+    infer_install_root_for_trace().map(|install_root| install_root.join(".surge-cache").join("ffi-trace.log"))
+}
+
+fn infer_install_root_for_trace() -> Option<PathBuf> {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(app_dir) = exe.parent()
+        && active_app_dir_name(app_dir)
+        && let Some(install_root) = app_dir.parent()
+    {
+        return Some(install_root.to_path_buf());
+    }
+
+    std::env::current_dir()
+        .ok()
+        .filter(|path| looks_like_install_root(path))
+}
+
+fn active_app_dir_name(app_dir: &Path) -> bool {
+    let Some(name) = app_dir.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    name == "app" || name.starts_with("app-") || name == ".surge-app-prev"
+}
+
+fn looks_like_install_root(path: &Path) -> bool {
+    path.join("app").is_dir() || path.join(".surge-cache").is_dir() || path.join(".surge-update-status.json").is_file()
+}
+
+fn append_ffi_trace(path: &Path, phase: &str) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    let pid = std::process::id();
+    let thread_id = std::thread::current().id();
+
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{timestamp_ms} pid={pid} thread={thread_id:?} {phase}");
+    }
 }
 
 pub(crate) fn set_ctx_error(handle: &SurgeContextHandle, e: &SurgeError) -> i32 {
@@ -206,7 +264,10 @@ mod tests {
     use std::ffi::CString;
     use std::ptr;
 
-    use super::{collect_argv, ffi_trace_enabled, try_index, try_len};
+    use super::{
+        active_app_dir_name, append_ffi_trace, collect_argv, ffi_trace_enabled, looks_like_install_root, try_index,
+        try_len,
+    };
     use std::ffi::c_int;
 
     #[test]
@@ -249,5 +310,50 @@ mod tests {
         assert!(!ffi_trace_enabled(Some("0")));
         assert!(!ffi_trace_enabled(Some("false")));
         assert!(!ffi_trace_enabled(None));
+    }
+
+    #[test]
+    fn active_app_dir_names_match_retained_install_layouts() {
+        assert!(active_app_dir_name(std::path::Path::new("/install/app")));
+        assert!(active_app_dir_name(std::path::Path::new("/install/app-1.2.3")));
+        assert!(active_app_dir_name(std::path::Path::new("/install/.surge-app-prev")));
+        assert!(!active_app_dir_name(std::path::Path::new("/install/bin")));
+    }
+
+    #[test]
+    fn install_root_trace_fallback_requires_install_markers() {
+        let path = std::env::temp_dir().join(format!(
+            "surge-ffi-install-root-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        assert!(!looks_like_install_root(&path));
+
+        std::fs::create_dir(path.join("app")).unwrap();
+        assert!(looks_like_install_root(&path));
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn append_ffi_trace_creates_parent_and_writes_phase() {
+        let path = std::env::temp_dir().join(format!(
+            "surge-ffi-trace-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let trace_path = path.join("nested").join("ffi-trace.log");
+
+        append_ffi_trace(&trace_path, "surge_context_create: enter");
+
+        let trace = std::fs::read_to_string(&trace_path).expect("trace should be written");
+        assert!(trace.contains("surge_context_create: enter"));
+        let _ = std::fs::remove_dir_all(path);
     }
 }

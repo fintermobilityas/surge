@@ -15,8 +15,8 @@ use crate::shared::{SURGE_ERROR, SURGE_OK, catch_ffi, cstr_to_string, ffi_trace,
 pub extern "C" fn surge_context_create() -> *mut SurgeContextHandle {
     ffi_trace("surge_context_create: enter");
     let result = std::panic::catch_unwind(|| {
-        ffi_trace("surge_context_create: creating tokio runtime");
-        let runtime = match tokio::runtime::Runtime::new() {
+        ffi_trace("surge_context_create: creating tokio current-thread runtime");
+        let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
             Ok(rt) => {
                 ffi_trace("surge_context_create: tokio runtime ready");
                 Arc::new(rt)

@@ -11,6 +11,11 @@ use sysinfo::{Pid, ProcessesToUpdate, System};
 use thiserror::Error;
 
 mod handoff;
+mod ownership;
+
+#[cfg(all(test, unix))]
+use ownership::current_supervisor_owns_pid_file;
+use ownership::{remove_owned_supervisor_state, supervisor_was_superseded};
 
 const RESTART_HANDOFF_STABILITY_WINDOW: std::time::Duration = std::time::Duration::from_secs(4);
 
@@ -179,7 +184,8 @@ fn run_supervisor(
     if stop_file.exists() {
         let _ = std::fs::remove_file(&stop_file);
     }
-    write_pid_file(&pid_file)?;
+    let own_pid = std::process::id();
+    write_pid_file(&pid_file, own_pid)?;
 
     let shutdown = install_signal_handlers();
 
@@ -198,10 +204,17 @@ fn run_supervisor(
             break;
         }
 
+        if supervisor_was_superseded(&pid_file, own_pid) {
+            break;
+        }
+
         if let Some(pid) = watched_pid.take() {
             tracing::info!("Watching running process PID {pid} before relaunch");
-            match wait_for_pid_or_stop(pid, &shutdown, &stop_file) {
+            match wait_for_pid_or_stop(pid, &shutdown, &stop_file, &pid_file, own_pid) {
                 WaitOutcome::ObservedProcessExited => {
+                    if supervisor_was_superseded(&pid_file, own_pid) {
+                        break;
+                    }
                     tracing::info!("Observed process PID {pid} exited, starting replacement child");
                 }
                 WaitOutcome::StopRequested => {
@@ -212,8 +225,15 @@ fn run_supervisor(
                     tracing::info!("Shutdown signal received, supervisor loop is exiting");
                     break;
                 }
+                WaitOutcome::Superseded => {
+                    break;
+                }
                 WaitOutcome::Exited(_) => unreachable!(),
             }
+        }
+
+        if supervisor_was_superseded(&pid_file, own_pid) {
+            break;
         }
 
         let child_args = next_child_args.take().unwrap_or_else(|| restart_args.clone());
@@ -231,12 +251,18 @@ fn run_supervisor(
             &mut child,
             &shutdown,
             &stop_file,
+            &pid_file,
+            own_pid,
             install_dir,
             &mut pending_handoff_version,
         )?
         else {
             break;
         };
+
+        if supervisor_was_superseded(&pid_file, own_pid) {
+            break;
+        }
 
         if shutdown.load(std::sync::atomic::Ordering::Acquire) || stop_file.exists() {
             tracing::info!("Child exited with {status} after shutdown signal, not restarting");
@@ -249,15 +275,18 @@ fn run_supervisor(
         }
 
         tracing::warn!("Child exited with {status}, restarting in 2 seconds...");
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        if !wait_before_restart(
+            &shutdown,
+            &stop_file,
+            &pid_file,
+            own_pid,
+            std::time::Duration::from_secs(2),
+        ) {
+            break;
+        }
     }
 
-    if pid_file.exists() {
-        let _ = std::fs::remove_file(&pid_file);
-    }
-    if stop_file.exists() {
-        let _ = std::fs::remove_file(&stop_file);
-    }
+    remove_owned_supervisor_state(&pid_file, &stop_file, own_pid);
 
     tracing::info!("Supervisor '{supervisor_id}' exiting");
     Ok(())
@@ -267,18 +296,27 @@ fn wait_for_supervised_child(
     child: &mut Child,
     shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     stop_file: &Path,
+    pid_file: &Path,
+    own_pid: u32,
     install_dir: &Path,
     pending_handoff_version: &mut Option<String>,
 ) -> Result<Option<ExitStatus>, SupervisorError> {
     let Some(version) = pending_handoff_version.clone() else {
-        return wait_for_child_exit_status(child, shutdown, stop_file);
+        return wait_for_child_exit_status(child, shutdown, stop_file, pid_file, own_pid);
     };
 
-    match wait_for_child_startup_or_stop(child, shutdown, stop_file, RESTART_HANDOFF_STABILITY_WINDOW)? {
+    match wait_for_child_startup_or_stop(
+        child,
+        shutdown,
+        stop_file,
+        pid_file,
+        own_pid,
+        RESTART_HANDOFF_STABILITY_WINDOW,
+    )? {
         StartupOutcome::Running => {
             handoff::record_restart_handoff_converged(install_dir, &version);
             *pending_handoff_version = None;
-            wait_for_child_exit_status(child, shutdown, stop_file)
+            wait_for_child_exit_status(child, shutdown, stop_file, pid_file, own_pid)
         }
         StartupOutcome::Exited(status) => {
             handoff::record_restart_handoff_child_exited(install_dir, &version, status);
@@ -292,6 +330,7 @@ fn wait_for_supervised_child(
             tracing::info!("Shutdown signal received, child terminated and supervisor loop is exiting");
             Ok(None)
         }
+        StartupOutcome::Superseded => Ok(None),
     }
 }
 
@@ -299,8 +338,10 @@ fn wait_for_child_exit_status(
     child: &mut Child,
     shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     stop_file: &Path,
+    pid_file: &Path,
+    own_pid: u32,
 ) -> Result<Option<ExitStatus>, SupervisorError> {
-    match wait_for_child_or_stop(child, shutdown, stop_file)? {
+    match wait_for_child_or_stop(child, shutdown, stop_file, pid_file, own_pid)? {
         WaitOutcome::Exited(status) => Ok(Some(status)),
         WaitOutcome::ObservedProcessExited => unreachable!(),
         WaitOutcome::StopRequested => {
@@ -311,13 +352,13 @@ fn wait_for_child_exit_status(
             tracing::info!("Shutdown signal received, child terminated and supervisor loop is exiting");
             Ok(None)
         }
+        WaitOutcome::Superseded => Ok(None),
     }
 }
 
-fn write_pid_file(path: &Path) -> Result<(), SupervisorError> {
-    let pid = std::process::id();
-    std::fs::write(path, pid.to_string())?;
-    tracing::debug!("Wrote PID file: {} (pid={})", path.display(), pid);
+fn write_pid_file(path: &Path, own_pid: u32) -> Result<(), SupervisorError> {
+    std::fs::write(path, own_pid.to_string())?;
+    tracing::debug!("Wrote PID file: {} (pid={})", path.display(), own_pid);
     Ok(())
 }
 
@@ -326,6 +367,7 @@ enum WaitOutcome {
     ObservedProcessExited,
     StopRequested,
     ShutdownRequested,
+    Superseded,
 }
 
 enum StartupOutcome {
@@ -333,12 +375,15 @@ enum StartupOutcome {
     Exited(std::process::ExitStatus),
     StopRequested,
     ShutdownRequested,
+    Superseded,
 }
 
 fn wait_for_child_startup_or_stop(
     child: &mut Child,
     shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     stop_file: &Path,
+    pid_file: &Path,
+    own_pid: u32,
     stable_for: std::time::Duration,
 ) -> Result<StartupOutcome, SupervisorError> {
     let deadline = std::time::Instant::now() + stable_for;
@@ -346,6 +391,10 @@ fn wait_for_child_startup_or_stop(
         if shutdown.load(std::sync::atomic::Ordering::Acquire) {
             terminate_child_process(child)?;
             return Ok(StartupOutcome::ShutdownRequested);
+        }
+
+        if supervisor_was_superseded(pid_file, own_pid) {
+            return Ok(StartupOutcome::Superseded);
         }
 
         if stop_file.exists() {
@@ -368,10 +417,16 @@ fn wait_for_pid_or_stop(
     pid: u32,
     shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     stop_file: &Path,
+    pid_file: &Path,
+    own_pid: u32,
 ) -> WaitOutcome {
     loop {
         if shutdown.load(std::sync::atomic::Ordering::Acquire) {
             return WaitOutcome::ShutdownRequested;
+        }
+
+        if supervisor_was_superseded(pid_file, own_pid) {
+            return WaitOutcome::Superseded;
         }
 
         if stop_file.exists() {
@@ -390,11 +445,17 @@ fn wait_for_child_or_stop(
     child: &mut Child,
     shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     stop_file: &Path,
+    pid_file: &Path,
+    own_pid: u32,
 ) -> Result<WaitOutcome, SupervisorError> {
     loop {
         if shutdown.load(std::sync::atomic::Ordering::Acquire) {
             terminate_child_process(child)?;
             return Ok(WaitOutcome::ShutdownRequested);
+        }
+
+        if supervisor_was_superseded(pid_file, own_pid) {
+            return Ok(WaitOutcome::Superseded);
         }
 
         if stop_file.exists() {
@@ -403,6 +464,37 @@ fn wait_for_child_or_stop(
 
         if let Some(status) = child.try_wait()? {
             return Ok(WaitOutcome::Exited(status));
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+fn wait_before_restart(
+    shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    stop_file: &Path,
+    pid_file: &Path,
+    own_pid: u32,
+    delay: std::time::Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + delay;
+    loop {
+        if shutdown.load(std::sync::atomic::Ordering::Acquire) {
+            tracing::info!("Shutdown signal received during restart delay, not restarting");
+            return false;
+        }
+
+        if supervisor_was_superseded(pid_file, own_pid) {
+            return false;
+        }
+
+        if stop_file.exists() {
+            tracing::info!("Stop requested during restart delay, not restarting");
+            return false;
+        }
+
+        if std::time::Instant::now() >= deadline {
+            return true;
         }
 
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -540,6 +632,18 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    fn wait_until(timeout: std::time::Duration, mut predicate: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if predicate() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        predicate()
+    }
+
     #[test]
     fn watch_command_accepts_handoff_version_before_trailing_args() {
         let cli = Cli::try_parse_from([
@@ -569,6 +673,121 @@ mod tests {
 
         assert_eq!(handoff_version.as_deref(), Some("2.0.0"));
         assert_eq!(args, vec!["--app-mode"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watched_supervisor_exits_when_pid_file_is_overwritten_before_watched_pid_exits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TestInstallDir::new("surge-supervisor-superseded-watch");
+        let install_dir = tmp.path();
+        let child_started = install_dir.join("target-child-started");
+        let exe_path = install_dir.join("target-child");
+        std::fs::write(
+            &exe_path,
+            format!(
+                "#!/bin/sh\n\
+                 echo started > '{}'\n",
+                child_started.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&exe_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&exe_path, permissions).unwrap();
+
+        let mut watched_child = Command::new("sh").arg("-c").arg("sleep 5").spawn().unwrap();
+        let watched_pid = watched_child.id();
+        let pid_file = supervisor_pid_file(install_dir, "demo-supervisor");
+        let stop_file = supervisor_stop_file(install_dir, "demo-supervisor");
+        let replacement_pid = if std::process::id() == 1 { 2 } else { 1 };
+        let install_dir_for_thread = install_dir.to_path_buf();
+        let exe_path_for_thread = exe_path.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let supervisor = std::thread::spawn(move || {
+            let result = run_supervisor(
+                "demo-supervisor",
+                &install_dir_for_thread,
+                &exe_path_for_thread,
+                &[],
+                Some(watched_pid),
+                None,
+            );
+            tx.send(result).unwrap();
+        });
+
+        if !wait_until(std::time::Duration::from_secs(3), || {
+            current_supervisor_owns_pid_file(&pid_file, std::process::id())
+        }) {
+            let _ = std::fs::write(&stop_file, "stop");
+            let _ = watched_child.kill();
+            let _ = watched_child.wait();
+            supervisor.join().unwrap();
+            panic!("supervisor did not write its pid file before the test timed out");
+        }
+
+        std::fs::write(&pid_file, replacement_pid.to_string()).unwrap();
+        let Ok(supervisor_result) = rx.recv_timeout(std::time::Duration::from_secs(3)) else {
+            let _ = std::fs::write(&stop_file, "stop");
+            let _ = watched_child.kill();
+            let _ = watched_child.wait();
+            supervisor.join().unwrap();
+            panic!("superseded supervisor did not exit before the watched process exited");
+        };
+        supervisor.join().unwrap();
+        supervisor_result.unwrap();
+
+        let _ = watched_child.kill();
+        let _ = watched_child.wait();
+
+        assert!(
+            !child_started.exists(),
+            "superseded supervisor must not start a replacement child"
+        );
+        assert_eq!(
+            std::fs::read_to_string(pid_file).unwrap().trim(),
+            replacement_pid.to_string()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unowned_supervisor_cleanup_preserves_new_owner_files() {
+        let tmp = TestInstallDir::new("surge-supervisor-unowned-cleanup");
+        let install_dir = tmp.path();
+        let pid_file = supervisor_pid_file(install_dir, "demo-supervisor");
+        let stop_file = supervisor_stop_file(install_dir, "demo-supervisor");
+        let replacement_pid = if std::process::id() == 1 { 2 } else { 1 };
+
+        std::fs::write(&pid_file, replacement_pid.to_string()).unwrap();
+        std::fs::write(&stop_file, "stop").unwrap();
+
+        remove_owned_supervisor_state(&pid_file, &stop_file, std::process::id());
+
+        assert_eq!(
+            std::fs::read_to_string(pid_file).unwrap().trim(),
+            replacement_pid.to_string()
+        );
+        assert_eq!(std::fs::read_to_string(stop_file).unwrap(), "stop");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_supervisor_cleanup_removes_owned_state_files() {
+        let tmp = TestInstallDir::new("surge-supervisor-owned-cleanup");
+        let install_dir = tmp.path();
+        let pid_file = supervisor_pid_file(install_dir, "demo-supervisor");
+        let stop_file = supervisor_stop_file(install_dir, "demo-supervisor");
+
+        std::fs::write(&pid_file, format!("{}\n", std::process::id())).unwrap();
+        std::fs::write(&stop_file, "stop").unwrap();
+
+        remove_owned_supervisor_state(&pid_file, &stop_file, std::process::id());
+
+        assert!(!pid_file.exists());
+        assert!(!stop_file.exists());
     }
 
     #[cfg(unix)]

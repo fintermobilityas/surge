@@ -1,3 +1,6 @@
+use std::collections::BTreeSet;
+use std::path::Path;
+
 use crate::archive::packer::ArchivePacker;
 use crate::crypto::sha256::sha256_hex;
 use crate::error::{Result, SurgeError};
@@ -40,7 +43,12 @@ impl PackBuilder {
 
         let compression_level = budget.zstd_compression_level;
         let mut packer = ArchivePacker::with_threads(compression_level, n_workers)?;
-        packer.add_directory(pack_root, "")?;
+        let executable_paths = self.executable_archive_paths();
+        if executable_paths.is_empty() {
+            packer.add_directory(pack_root, "")?;
+        } else {
+            packer.add_directory_with_executable_overrides(pack_root, "", &executable_paths)?;
+        }
 
         let archive_bytes = packer.finalize()?;
         let sha256 = sha256_hex(&archive_bytes);
@@ -59,4 +67,34 @@ impl PackBuilder {
             bytes: archive_bytes,
         })
     }
+
+    fn executable_archive_paths(&self) -> BTreeSet<String> {
+        if !rid_uses_unix_executable_bits(&self.rid) {
+            return BTreeSet::new();
+        }
+
+        let mut paths = BTreeSet::new();
+        let main_exe = self.main_exe.trim();
+        if !main_exe.is_empty() && self.artifacts_dir.join(main_exe).is_file() {
+            paths.insert(archive_path_string(main_exe));
+        }
+
+        if !self.supervisor_id.trim().is_empty() {
+            let supervisor_name = supervisor_binary_name_for_rid(&self.rid);
+            if self.artifacts_dir.join(supervisor_name).is_file() {
+                paths.insert(archive_path_string(supervisor_name));
+            }
+        }
+
+        paths
+    }
+}
+
+fn rid_uses_unix_executable_bits(rid: &str) -> bool {
+    let rid = rid.to_ascii_lowercase();
+    rid.starts_with("linux-") || rid.starts_with("osx-") || rid.starts_with("macos-")
+}
+
+fn archive_path_string(path: &str) -> String {
+    Path::new(path).to_string_lossy().replace('\\', "/")
 }

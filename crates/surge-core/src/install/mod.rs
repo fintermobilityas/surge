@@ -264,6 +264,48 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn install_package_locally_repairs_main_executable_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("temp dir should exist");
+        let install_root = tmp.path().join("install-root");
+        let package_path = tmp.path().join("package.tar.zst");
+        let environment = BTreeMap::new();
+        let shortcuts: [ShortcutLocation; 0] = [];
+        let persistent_assets: [String; 0] = [];
+
+        let mut packer = ArchivePacker::new(3).expect("archive packer should be created");
+        packer
+            .add_buffer("demo", b"#!/bin/sh\necho demo\n", 0o644)
+            .expect("main executable should be added");
+        packer
+            .finalize_to_file(&package_path)
+            .expect("archive should be written");
+
+        let profile = InstallProfile::new(
+            "demo-app",
+            "Demo App",
+            "demo",
+            "demo-install",
+            "",
+            "",
+            &shortcuts,
+            &persistent_assets,
+            &environment,
+        );
+
+        install_package_locally_at_root(&profile, &package_path, &install_root).expect("install should succeed");
+
+        let mode = std::fs::metadata(install_root.join("app").join("demo"))
+            .expect("installed main executable should exist")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode & 0o111, 0o111);
+    }
+
+    #[test]
     fn install_package_locally_restores_runtime_manifests_when_post_copy_work_fails() {
         let tmp = tempfile::tempdir().expect("temp dir should exist");
         let install_root = tmp.path().join("install-root");

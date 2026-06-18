@@ -151,6 +151,8 @@ pub fn install_package_locally_at_root_with_progress(
             copy_persistent_assets(previous, &active_app_dir, profile.persistent_assets)?;
         }
 
+        ensure_main_executable_mode(profile, &active_app_dir)?;
+
         if !profile.shortcuts.is_empty() {
             emit_install_progress(
                 progress,
@@ -212,6 +214,26 @@ pub fn install_package_locally_at_root_with_progress(
         warn!(error = %err, "Failed to prune installed app version snapshots after install");
     }
 
+    Ok(())
+}
+
+#[cfg(unix)]
+fn ensure_main_executable_mode(profile: &InstallProfile<'_>, active_app_dir: &Path) -> Result<()> {
+    let main_exe = profile.main_exe.trim();
+    if main_exe.is_empty() {
+        return Ok(());
+    }
+
+    let exe_path = active_app_dir.join(main_exe);
+    if exe_path.is_file() {
+        crate::platform::fs::make_executable(&exe_path)?;
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_main_executable_mode(_profile: &InstallProfile<'_>, _active_app_dir: &Path) -> Result<()> {
     Ok(())
 }
 

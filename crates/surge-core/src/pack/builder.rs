@@ -1227,6 +1227,85 @@ apps:
     }
 
     #[tokio::test]
+    #[cfg(unix)]
+    async fn test_build_full_package_repairs_main_executable_mode_in_archive() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir should be created");
+        let store_root = tmp.path().join("store");
+        let artifacts_root = tmp.path().join("artifacts");
+        std::fs::create_dir_all(&store_root).expect("store dir should exist");
+        std::fs::create_dir_all(&artifacts_root).expect("artifacts dir should exist");
+
+        let app_id = "demo";
+        let rid = current_rid();
+        let manifest_path = tmp.path().join("surge.yml");
+        let manifest_yaml = format!(
+            r"schema: 1
+storage:
+  provider: filesystem
+  bucket: {bucket}
+apps:
+  - id: {app_id}
+    main: demoapp
+    target:
+      rid: {rid}
+",
+            bucket = store_root.display()
+        );
+        std::fs::write(&manifest_path, manifest_yaml).expect("manifest should be written");
+
+        let app_path = artifacts_root.join("demoapp");
+        std::fs::write(&app_path, b"#!/bin/sh\necho demo\n").expect("main executable should be written");
+        std::fs::set_permissions(&app_path, std::fs::Permissions::from_mode(0o644))
+            .expect("main executable mode should be set");
+        std::fs::write(artifacts_root.join("payload.txt"), b"payload").expect("payload should be written");
+
+        let ctx = Arc::new(Context::new());
+        ctx.set_storage(
+            StorageProvider::Filesystem,
+            store_root.to_str().expect("store root utf8"),
+            "",
+            "",
+            "",
+            "",
+        );
+
+        let mut builder = PackBuilder::new(
+            ctx,
+            manifest_path.to_str().expect("manifest path utf8"),
+            app_id,
+            &rid,
+            "1.0.0",
+            artifacts_root.to_str().expect("artifacts path utf8"),
+        )
+        .expect("builder should be created");
+
+        builder.build(None).await.expect("build should succeed");
+        let full = builder
+            .artifacts()
+            .iter()
+            .find(|artifact| !artifact.is_delta)
+            .expect("full artifact should be produced");
+
+        let extracted = tmp.path().join("extracted");
+        extract_to(full.bytes(), &extracted, None).expect("full archive should extract");
+        let archived_mode = std::fs::metadata(extracted.join("demoapp"))
+            .expect("archived main executable should exist")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(archived_mode & 0o111, 0o111);
+
+        let source_mode = std::fs::metadata(&app_path)
+            .expect("source main executable should still exist")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(source_mode, 0o644);
+    }
+
+    #[tokio::test]
     async fn test_checkpoint_threshold_keeps_direct_delta() {
         let tmp = tempfile::tempdir().expect("tempdir should be created");
         let store_root = tmp.path().join("store");

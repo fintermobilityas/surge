@@ -1,5 +1,6 @@
 //! Create tar + zstd archives.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -47,6 +48,25 @@ impl ArchivePacker {
         prefix: &str,
         progress: Option<&PackProgress<'_>>,
     ) -> Result<()> {
+        self.add_directory_with_progress_and_executables(source_dir, prefix, progress, None)
+    }
+
+    pub fn add_directory_with_executable_overrides(
+        &mut self,
+        source_dir: &Path,
+        prefix: &str,
+        executable_paths: &BTreeSet<String>,
+    ) -> Result<()> {
+        self.add_directory_with_progress_and_executables(source_dir, prefix, None, Some(executable_paths))
+    }
+
+    fn add_directory_with_progress_and_executables(
+        &mut self,
+        source_dir: &Path,
+        prefix: &str,
+        progress: Option<&PackProgress<'_>>,
+        executable_paths: Option<&BTreeSet<String>>,
+    ) -> Result<()> {
         let archive_prefix = Path::new(prefix);
         let totals = if progress.is_some() {
             count_directory_entries(source_dir, archive_prefix)?
@@ -59,7 +79,7 @@ impl ArchivePacker {
             items_done: 0,
             bytes_done: 0,
         };
-        self.add_directory_recursive(source_dir, archive_prefix, &mut progress_state)
+        self.add_directory_recursive(source_dir, archive_prefix, &mut progress_state, executable_paths)
     }
 
     pub fn add_buffer(&mut self, archive_path: &str, data: &[u8], mode: u32) -> Result<()> {
@@ -100,6 +120,7 @@ impl ArchivePacker {
         source_dir: &Path,
         archive_prefix: &Path,
         progress: &mut PackProgressState<'_>,
+        executable_paths: Option<&BTreeSet<String>>,
     ) -> Result<()> {
         if !archive_prefix.as_os_str().is_empty() {
             self.add_directory_entry(archive_prefix, source_dir)?;
@@ -120,12 +141,12 @@ impl ArchivePacker {
             let metadata = fs::symlink_metadata(&source_path)?;
 
             if metadata.is_dir() {
-                self.add_directory_recursive(&source_path, &archive_path, progress)?;
+                self.add_directory_recursive(&source_path, &archive_path, progress, executable_paths)?;
                 continue;
             }
 
             if metadata.is_file() {
-                self.add_file_entry(&source_path, &archive_path, &metadata)?;
+                self.add_file_entry(&source_path, &archive_path, &metadata, executable_paths)?;
                 progress.advance(metadata.len());
                 continue;
             }
@@ -159,11 +180,21 @@ impl ArchivePacker {
         Ok(())
     }
 
-    fn add_file_entry(&mut self, source_path: &Path, archive_path: &Path, metadata: &fs::Metadata) -> Result<()> {
+    fn add_file_entry(
+        &mut self,
+        source_path: &Path,
+        archive_path: &Path,
+        metadata: &fs::Metadata,
+        executable_paths: Option<&BTreeSet<String>>,
+    ) -> Result<()> {
         let mut header = tar::Header::new_gnu();
         header.set_entry_type(tar::EntryType::Regular);
         header.set_size(metadata.len());
-        header.set_mode(normalized_mode(metadata, false));
+        let mut mode = normalized_mode(metadata, false);
+        if executable_paths.is_some_and(|paths| paths.contains(&archive_path_to_string(archive_path))) {
+            mode |= 0o111;
+        }
+        header.set_mode(mode);
         set_normalized_header_metadata(&mut header);
         header.set_cksum();
 

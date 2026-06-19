@@ -310,8 +310,7 @@ fn mark_self_supervised_runtime_converged(install_dir: &Path, active_app_dir: &P
     if !matches!(
         record.state,
         UpdateConvergenceState::InProgress | UpdateConvergenceState::PendingRestart
-    ) || record.installed_version.trim() != record.target_version.trim()
-    {
+    ) {
         return;
     }
 
@@ -551,13 +550,21 @@ mod tests {
         }
     }
 
+    fn write_runtime_manifest(app_dir: &Path, version: &str) {
+        let runtime_manifest = app_dir.join(surge_core::install::RUNTIME_MANIFEST_RELATIVE_PATH);
+        std::fs::create_dir_all(runtime_manifest.parent().unwrap()).unwrap();
+        std::fs::write(
+            &runtime_manifest,
+            format!("id: demo-app\nversion: {version}\nchannel: test\n"),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn self_supervisor_converges_pending_status_when_runtime_manifest_matches() {
         let tmp = TestInstallDir::new("surge-ffi-self-supervisor-converges");
         let app_dir = tmp.path().join("app");
-        let runtime_manifest = app_dir.join(surge_core::install::RUNTIME_MANIFEST_RELATIVE_PATH);
-        std::fs::create_dir_all(runtime_manifest.parent().unwrap()).unwrap();
-        std::fs::write(&runtime_manifest, "id: demo-app\nversion: 2.0.0\nchannel: test\n").unwrap();
+        write_runtime_manifest(&app_dir, "2.0.0");
         let pending = surge_core::update::status::UpdateStatusRecord::pending_restart_with_failure_phase(
             "demo-app",
             "2.0.0",
@@ -580,6 +587,38 @@ mod tests {
             surge_core::update::status::UpdateConvergenceState::Converged
         );
         assert!(status.supervisor_restart_confirmed);
+        assert_eq!(status.failure_phase, None);
+        assert_eq!(status.reason, None);
+    }
+
+    #[test]
+    fn self_supervisor_converges_stale_in_progress_status_when_runtime_manifest_matches() {
+        let tmp = TestInstallDir::new("surge-ffi-self-supervisor-converges-in-progress");
+        let app_dir = tmp.path().join("app");
+        write_runtime_manifest(&app_dir, "2.0.0");
+        let in_progress = surge_core::update::status::UpdateStatusRecord::in_progress(
+            "demo-app",
+            "1.0.0",
+            "2.0.0",
+            "test",
+            "2026-05-21T10:00:00Z".to_string(),
+        )
+        .with_current_phase_at("package apply started", "2026-05-21T10:00:01Z".to_string());
+        surge_core::update::status::write_update_status(tmp.path(), &in_progress).unwrap();
+
+        super::mark_self_supervised_runtime_converged(tmp.path(), &app_dir);
+
+        let status = surge_core::update::status::read_update_status(tmp.path())
+            .unwrap()
+            .expect("status should remain present");
+        assert_eq!(
+            status.state,
+            surge_core::update::status::UpdateConvergenceState::Converged
+        );
+        assert_eq!(status.installed_version, "2.0.0");
+        assert_eq!(status.target_version, "2.0.0");
+        assert!(status.supervisor_restart_confirmed);
+        assert_eq!(status.current_phase, None);
         assert_eq!(status.failure_phase, None);
         assert_eq!(status.reason, None);
     }

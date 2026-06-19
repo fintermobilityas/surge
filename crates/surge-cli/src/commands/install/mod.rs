@@ -496,8 +496,9 @@ mod tests {
     };
     use super::releases::{ArchiveAcquisition, download_release_archive, select_release};
     use super::remote::{
-        RemoteConvergenceAction, RemoteHostInstallerAvailability, RemoteInstallState, RemoteInstallerMode,
-        RemoteLaunchEnvironment, RemotePublishedInstallerPlan, RemoteTailscaleCachedState, RemoteTailscaleOperation,
+        REMOTE_PROCESS_VERIFICATION_POLL_INTERVAL, REMOTE_PROCESS_VERIFICATION_TIMEOUT, RemoteConvergenceAction,
+        RemoteHostInstallerAvailability, RemoteInstallState, RemoteInstallerMode, RemoteLaunchEnvironment,
+        RemotePublishedInstallerPlan, RemoteTailscaleCachedState, RemoteTailscaleOperation,
         RemoteTailscaleTransferInputs, RemoteTailscaleTransferStrategy, build_remote_app_copy_activation_script,
         build_remote_installer_manifest, build_remote_paths_exist_probe, build_remote_process_verification_probe,
         build_remote_runtime_start_command, build_remote_stage_cleanup_command,
@@ -1175,6 +1176,12 @@ mod tests {
         assert!(probe.contains("supervisor process '$supervisor_id' is running with stale first-run proof"));
         assert!(probe.contains("supervisor process '$supervisor_id' was not found"));
         assert!(probe.contains("supervisor process '$supervisor_id' is not watching target app process for $version"));
+    }
+
+    #[test]
+    fn remote_process_verification_waits_for_delayed_supervisor_proof() {
+        assert!(REMOTE_PROCESS_VERIFICATION_TIMEOUT >= std::time::Duration::from_secs(30));
+        assert!(REMOTE_PROCESS_VERIFICATION_POLL_INTERVAL <= std::time::Duration::from_millis(250));
     }
 
     #[cfg(unix)]

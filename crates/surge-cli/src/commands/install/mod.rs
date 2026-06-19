@@ -1136,9 +1136,32 @@ mod tests {
         assert!(command.contains("install_root='/home/demo/apps/customer'\"'\"'s app'"));
         assert!(command.contains("supervisor_id='demo-supervisor'"));
         assert!(command.contains("pid_file=\"$install_root/.surge-supervisor-$supervisor_id.pid\""));
+        assert!(command.contains("case \"$pid\" in ''|*[!0-9]*) rm -f \"$pid_file\"; exit 0 ;; esac"));
         assert!(command.contains("clear_if_stale"));
         assert!(command.contains("rm -f \"$pid_file\""));
         assert!(command.contains("kill -KILL \"$pid\""));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_remote_stop_supervisor_command_is_valid_shell_syntax() {
+        use std::io::Write;
+
+        let command = build_remote_stop_supervisor_command(Path::new("/home/demo/apps/demo-app"), "demo-supervisor")
+            .expect("supervisor command should exist");
+        let mut child = std::process::Command::new("sh")
+            .arg("-n")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("shell syntax checker should start");
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin should be piped")
+            .write_all(command.as_bytes())
+            .expect("command should be written to shell");
+        let status = child.wait().expect("shell syntax checker should exit");
+        assert!(status.success(), "command failed shell syntax check with {status}");
     }
 
     #[test]

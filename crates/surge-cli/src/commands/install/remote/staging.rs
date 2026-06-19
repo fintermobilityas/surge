@@ -462,7 +462,7 @@ pub(crate) fn build_remote_stop_supervisor_command(install_root: &Path, supervis
         "install_root={}; supervisor_id={}; pid_file=\"$install_root/.surge-supervisor-$supervisor_id.pid\"; \
 if [ ! -d \"$install_root\" ] || [ ! -f \"$pid_file\" ]; then exit 0; fi; \
 pid=\"$(tr -d '[:space:]' < \"$pid_file\")\"; \
-case \"$pid\" in ''|*[!0-9]*) echo \"Invalid PID in supervisor PID file: $pid_file\" >&2; exit 1 ;; esac; \
+case \"$pid\" in ''|*[!0-9]*) rm -f \"$pid_file\"; exit 0 ;; esac; \
 pid_stat() {{ if command -v ps >/dev/null 2>&1; then ps -o stat= -p \"$pid\" 2>/dev/null | tr -d '[:space:]' || true; elif kill -0 \"$pid\" 2>/dev/null; then printf R; fi; }}; \
 clear_if_stale() {{ stat=\"$(pid_stat)\"; if [ -z \"$stat\" ] || [ \"${{stat#Z}}\" != \"$stat\" ]; then rm -f \"$pid_file\"; exit 0; fi; }}; \
 clear_if_stale; \

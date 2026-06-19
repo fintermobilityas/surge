@@ -172,6 +172,7 @@ For a major release (e.g. `1.0.0`), manually set `[workspace.package].version` a
 ## Commit & Pull Request Guidelines
 - Use concise imperative commit messages, optionally scoped (examples: `feat(cli): ...`, `fix(core): ...`, `ci: ...`).
 - Keep commits focused (one logical change per commit).
+- Before creating a PR, review the full diff for correctness, regressions, missing tests, anonymization leaks, and repository-policy violations. Fix all actionable findings before opening the PR. If a finding is intentionally deferred, document the rationale in the PR body.
 - PRs should include: purpose, behavior impact, test evidence (commands run), and migration notes if applicable.
 - Agent-authored or agent-managed PRs must use GitHub `Squash and merge`; do not use merge commits or rebase merge.
 - Ensure GitHub Actions are green before merge.

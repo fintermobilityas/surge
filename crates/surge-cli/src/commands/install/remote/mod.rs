@@ -53,7 +53,10 @@ pub(crate) use self::activation::build_remote_app_copy_activation_script;
 #[cfg(test)]
 pub(crate) use self::published_installer::{build_remote_installer_manifest, published_installer_public_url};
 #[cfg(test)]
-pub(crate) use self::runtime::{build_remote_process_verification_probe, build_remote_runtime_start_command};
+pub(crate) use self::runtime::{
+    REMOTE_PROCESS_VERIFICATION_POLL_INTERVAL, REMOTE_PROCESS_VERIFICATION_TIMEOUT,
+    build_remote_process_verification_probe, build_remote_runtime_start_command,
+};
 #[cfg(test)]
 pub(crate) use self::staging::{
     build_remote_paths_exist_probe, build_remote_stage_cleanup_command, build_remote_staged_installer_setup_command,

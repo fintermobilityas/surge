@@ -6,6 +6,9 @@ use super::{
     run_tailscale_streaming, shell_single_quote, staging, types,
 };
 
+pub(crate) const REMOTE_PROCESS_VERIFICATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+pub(crate) const REMOTE_PROCESS_VERIFICATION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
 pub(crate) async fn converge_current_remote_runtime(
     ssh_target: &str,
     file_target: &str,
@@ -249,7 +252,7 @@ async fn verify_remote_started_process(
         build_remote_process_verification_probe(&install_root, main_exe, &release.supervisor_id, &release.version);
     let command = format!("sh -c {}", shell_single_quote(&probe));
     let mut last_result = String::new();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + REMOTE_PROCESS_VERIFICATION_TIMEOUT;
     loop {
         let output = execution::run_tailscale_capture(&["ssh", ssh_target, command.as_str()]).await?;
         let result = output.trim();
@@ -265,11 +268,12 @@ async fn verify_remote_started_process(
         if std::time::Instant::now() >= deadline {
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        tokio::time::sleep(REMOTE_PROCESS_VERIFICATION_POLL_INTERVAL).await;
     }
 
     Err(SurgeError::Update(format!(
-        "Remote process verification failed on '{file_target}': {last_result}"
+        "Remote process verification did not converge within {}s on '{file_target}': {last_result}",
+        REMOTE_PROCESS_VERIFICATION_TIMEOUT.as_secs()
     )))
 }
 

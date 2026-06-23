@@ -22,7 +22,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Verify workspace versions are aligned
         run: ./scripts/check-version-sync.sh
       - id: version
@@ -35,7 +35,7 @@ jobs:
     name: Vendor Sync
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: true
       - name: Verify surge-core vendor snapshot
@@ -46,7 +46,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - run: rustup component add rustfmt
       - run: cargo fmt --all -- --check
 
@@ -54,7 +54,7 @@ jobs:
     name: maintainability
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Run maintainability guardrail
         run: ./scripts/check-maintainability.sh
 
@@ -62,7 +62,7 @@ jobs:
     name: clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: true
       - uses: Swatinem/rust-cache@v2
@@ -76,7 +76,7 @@ jobs:
     name: clippy strict
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: true
       - uses: Swatinem/rust-cache@v2
@@ -90,7 +90,7 @@ jobs:
     name: clippy pedantic (advisory)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: true
       - uses: Swatinem/rust-cache@v2
@@ -121,7 +121,7 @@ jobs:
             name: macOS
             cache_key: macos-test
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: true
       - uses: Swatinem/rust-cache@v2
@@ -181,7 +181,7 @@ jobs:
               target/release/surge-installer-ui
               target/release/surge-supervisor
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: true
       - uses: actions/cache@v5
@@ -228,7 +228,7 @@ jobs:
       run:
         working-directory: dotnet
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: true
       - uses: actions/setup-dotnet@v5

@@ -189,7 +189,7 @@ jobs:
       - name: Pack
         run: dotnet pack Surge.NET/Surge.NET.csproj --configuration Release -p:Version=${{ needs.validate-release.outputs.release_version }} --output ../nupkgs
       - name: Push to NuGet
-        run: dotnet nuget push ../nupkgs/*.nupkg --source nuget.org --api-key ${{ secrets.PETERSUNDE_NUGET_ORG_API_KEY }} --skip-duplicate
+        run: dotnet nuget push ../nupkgs/*.nupkg --source nuget.org --api-key ${{ secrets.FINTER_NUGET_ORG_API_KEY }} --skip-duplicate
 
   publish-cargo-crates-io:
     name: Publish Cargo (crates.io)

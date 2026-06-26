@@ -19,9 +19,9 @@ use crate::install::{
     InstallProfile, RuntimeManifestMetadata, copy_persistent_assets, prune_version_snapshots,
     storage_provider_manifest_name, write_runtime_manifest,
 };
+use crate::installer_package::prune_install_artifact_cache_dir_with_stats;
 use crate::platform::fs::atomic_rename;
 use crate::platform::shortcuts::install_shortcuts;
-use crate::releases::artifact_cache::prune_cached_artifacts;
 use crate::releases::manifest::decompress_release_index;
 use crate::releases::restore::{
     retained_artifacts_for_cache_policy, retained_artifacts_for_cache_policy_without_index,
@@ -247,12 +247,12 @@ where
         retained_artifacts_for_cache_policy_without_index(manager.artifact_retention_policy, &latest.full_filename)
     };
     if let Some(retained_artifacts) = retained_artifacts {
-        match prune_cached_artifacts(artifact_cache_dir, &retained_artifacts) {
-            Ok(0) => {}
-            Ok(pruned) => {
+        match prune_install_artifact_cache_dir_with_stats(artifact_cache_dir, &retained_artifacts) {
+            Ok(result) if result.pruned_artifact_count == 0 => {}
+            Ok(result) => {
                 debug!(
-                    pruned,
-                    retained = retained_artifacts.len(),
+                    pruned = result.pruned_artifact_count,
+                    retained = result.retained_policy_key_count,
                     "Pruned stale local artifact cache entries"
                 );
             }

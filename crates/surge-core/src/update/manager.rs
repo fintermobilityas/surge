@@ -3288,6 +3288,97 @@ echo started > new-child-started
         assert!(remaining.is_empty(), "none retention should prune all cached artifacts");
     }
 
+    #[tokio::test]
+    async fn test_download_and_apply_latest_full_artifact_retention_prunes_old_fulls_and_deltas() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("store");
+        let install_root = tmp.path().join("install");
+        let app_id = "test-app";
+        std::fs::create_dir_all(&store_root).unwrap();
+        std::fs::create_dir_all(&install_root).unwrap();
+        let app_store = app_scoped_store_root(&store_root, app_id);
+
+        let current_app_dir = install_root.join("app");
+        std::fs::create_dir_all(&current_app_dir).unwrap();
+        std::fs::write(current_app_dir.join("payload.txt"), "old payload").unwrap();
+
+        let rid = current_rid();
+        let old_full_filename = format!("{app_id}-1.0.0-{rid}-full.tar.zst");
+        let old_delta_filename = format!("{app_id}-1.0.0-{rid}-delta.tar.zst");
+        let latest_full_filename = format!("{app_id}-1.1.0-{rid}-full.tar.zst");
+        let latest_full_path = app_store.join(&latest_full_filename);
+
+        let artifact_cache = install_root.join(".surge-cache").join("artifacts");
+        std::fs::create_dir_all(&artifact_cache).unwrap();
+        std::fs::write(artifact_cache.join(&old_full_filename), b"old full").unwrap();
+        std::fs::write(artifact_cache.join(&old_delta_filename), b"old delta").unwrap();
+
+        let mut packer = ArchivePacker::new(3).unwrap();
+        packer.add_buffer("payload.txt", b"new payload", 0o644).unwrap();
+        packer.finalize_to_file(&latest_full_path).unwrap();
+
+        let latest_full_size = std::fs::metadata(&latest_full_path).unwrap().len() as i64;
+        let latest_full_sha256 = sha256_hex_file(&latest_full_path).unwrap();
+        let os = current_os_label_for_tests();
+
+        let mut old_release = make_entry("1.0.0", "stable", &os, &rid);
+        old_release.full_filename = old_full_filename.clone();
+        old_release.deltas = Vec::new();
+        old_release.preferred_delta_id.clear();
+
+        let mut latest_release = make_entry("1.1.0", "stable", &os, &rid);
+        latest_release.full_filename = latest_full_filename.clone();
+        latest_release.full_size = latest_full_size;
+        latest_release.full_sha256 = latest_full_sha256;
+        latest_release.deltas = Vec::new();
+        latest_release.preferred_delta_id.clear();
+
+        let index = ReleaseIndex {
+            app_id: app_id.to_string(),
+            releases: vec![old_release, latest_release],
+            ..ReleaseIndex::default()
+        };
+
+        write_app_scoped_release_index(&store_root, app_id, &index);
+
+        let ctx = Arc::new(Context::new());
+        ctx.set_storage(
+            StorageProvider::Filesystem,
+            store_root.to_str().unwrap(),
+            "",
+            "",
+            "",
+            "",
+        );
+
+        let mut manager = UpdateManager::new(ctx, app_id, "1.0.0", "stable", install_root.to_str().unwrap()).unwrap();
+        manager
+            .set_artifact_retention_policy(InstallArtifactCachePolicy {
+                retention: InstallArtifactCacheRetention::LatestFull,
+                keep_full_count: 1,
+            })
+            .unwrap();
+
+        let info = manager.check_for_updates().await.unwrap().unwrap();
+        manager
+            .download_and_apply(&info, None::<fn(ProgressInfo)>)
+            .await
+            .unwrap();
+
+        assert!(
+            artifact_cache.join(&latest_full_filename).is_file(),
+            "latest full should remain in the local artifact cache"
+        );
+        assert!(
+            !artifact_cache.join(&old_full_filename).exists(),
+            "old full should be pruned by latest_full retention"
+        );
+        assert!(
+            !artifact_cache.join(&old_delta_filename).exists(),
+            "old delta should be pruned by latest_full retention"
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_download_and_apply_full_installs_shortcuts() {

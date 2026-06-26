@@ -15,8 +15,8 @@ use surge_core::config::installer::InstallerManifest;
 use surge_core::config::manifest::ShortcutLocation;
 use surge_core::install::{self as core_install, InstallProfile, InstallProgress, InstallProgressStage};
 use surge_core::installer_package::{
-    InstallerPackageStage, ResolveInstallerPackageOptions, ResolvedInstallerPackage, prune_install_artifact_cache,
-    resolve_installer_package, retained_artifacts_for_install_cache_without_index,
+    InstallArtifactCachePruneResult, InstallerPackageStage, ResolveInstallerPackageOptions, ResolvedInstallerPackage,
+    prune_install_artifact_cache_with_stats, resolve_installer_package, retained_artifacts_for_resolved_install_cache,
 };
 use surge_core::platform::paths::default_install_root;
 use surge_core::releases::restore::RestoreProgress;
@@ -29,6 +29,12 @@ pub enum ProgressUpdate {
 }
 
 type ResolvedPackage = ResolvedInstallerPackage;
+
+enum ArtifactCachePruneOutcome {
+    Skipped,
+    Completed(InstallArtifactCachePruneResult),
+    Failed(String),
+}
 
 const RESOLVE_PROGRESS: f32 = 0.05;
 const DOWNLOAD_START_PROGRESS: f32 = 0.10;
@@ -170,7 +176,11 @@ fn run_install_inner(
         &manifest.storage.endpoint,
     );
     core_install::write_runtime_manifest(&install_root.join("app"), &profile, &runtime_manifest)?;
-    prune_artifact_cache_for_package(&install_root, &package, manifest);
+    send_artifact_cache_prune_outcome(
+        prune_artifact_cache_for_package(&install_root, &package, manifest),
+        progress_tx,
+        ctx,
+    );
 
     send(progress_tx, ctx, ProgressUpdate::Progress(1.0));
     send(progress_tx, ctx, ProgressUpdate::Complete(install_root));
@@ -449,25 +459,65 @@ pub fn run_headless(
         &manifest.storage.endpoint,
     );
     core_install::write_runtime_manifest(&install_root.join("app"), &profile, &runtime_manifest)?;
-    prune_artifact_cache_for_package(&install_root, &package, manifest);
+    match prune_artifact_cache_for_package(&install_root, &package, manifest) {
+        ArtifactCachePruneOutcome::Skipped => {}
+        ArtifactCachePruneOutcome::Completed(result) => {
+            eprintln!("{}", format_artifact_cache_prune_result(result));
+        }
+        ArtifactCachePruneOutcome::Failed(error) => {
+            eprintln!("Artifact cache pruning failed: {error}");
+        }
+    }
     eprintln!("Installed '{}' to '{}'", manifest.app_id, install_root.display());
 
     Ok(install_root)
 }
 
-fn prune_artifact_cache_for_package(install_root: &Path, package: &ResolvedPackage, manifest: &InstallerManifest) {
-    let owned_retained_artifacts;
-    let retained_artifacts = match package.retained_artifacts.as_ref() {
-        Some(retained_artifacts) => retained_artifacts,
-        None => match retained_artifacts_for_install_cache_without_index(manifest) {
-            Some(retained_artifacts) => {
-                owned_retained_artifacts = retained_artifacts;
-                &owned_retained_artifacts
-            }
-            None => return,
-        },
+fn prune_artifact_cache_for_package(
+    install_root: &Path,
+    package: &ResolvedPackage,
+    manifest: &InstallerManifest,
+) -> ArtifactCachePruneOutcome {
+    let Some(retained_artifacts) = retained_artifacts_for_resolved_install_cache(package, manifest) else {
+        return ArtifactCachePruneOutcome::Skipped;
     };
-    let _ = prune_install_artifact_cache(install_root, retained_artifacts);
+    match prune_install_artifact_cache_with_stats(install_root, retained_artifacts.as_ref()) {
+        Ok(result) => ArtifactCachePruneOutcome::Completed(result),
+        Err(e) => ArtifactCachePruneOutcome::Failed(e.to_string()),
+    }
+}
+
+fn send_artifact_cache_prune_outcome(
+    outcome: ArtifactCachePruneOutcome,
+    progress_tx: &Sender<ProgressUpdate>,
+    ctx: &egui::Context,
+) {
+    match outcome {
+        ArtifactCachePruneOutcome::Skipped => {}
+        ArtifactCachePruneOutcome::Completed(result) => {
+            send(
+                progress_tx,
+                ctx,
+                ProgressUpdate::Status(format_artifact_cache_prune_result(result)),
+            );
+        }
+        ArtifactCachePruneOutcome::Failed(error) => {
+            send(
+                progress_tx,
+                ctx,
+                ProgressUpdate::Status(format!("Artifact cache pruning failed: {error}")),
+            );
+        }
+    }
+}
+
+fn format_artifact_cache_prune_result(result: InstallArtifactCachePruneResult) -> String {
+    format!(
+        "Pruned {} stale artifact cache entr{}; retained policy key count: {}.",
+        result.pruned_artifact_count,
+        if result.pruned_artifact_count == 1 { "y" } else { "ies" },
+        result.retained_policy_key_count
+    )
 }
 
 #[cfg(test)]

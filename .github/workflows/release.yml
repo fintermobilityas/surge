@@ -14,6 +14,7 @@ env:
 
 permissions:
   contents: write
+  packages: write
 
 jobs:
   validate-release:
@@ -188,8 +189,8 @@ jobs:
           restore-keys: nuget-
       - name: Pack
         run: dotnet pack Surge.NET/Surge.NET.csproj --configuration Release -p:Version=${{ needs.validate-release.outputs.release_version }} --output ../nupkgs
-      - name: Push to NuGet
-        run: dotnet nuget push ../nupkgs/*.nupkg --source nuget.org --api-key ${{ secrets.PETERSUNDE_NUGET_ORG_API_KEY }} --skip-duplicate
+      - name: Push to GitHub Packages
+        run: dotnet nuget push ../nupkgs/*.nupkg --source https://nuget.pkg.github.com/fintermobilityas/index.json --api-key ${{ secrets.GITHUB_TOKEN }} --skip-duplicate
 
   publish-cargo-crates-io:
     name: Publish Cargo (crates.io)

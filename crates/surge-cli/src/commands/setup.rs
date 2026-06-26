@@ -8,7 +8,7 @@ use surge_core::error::{Result, SurgeError};
 use surge_core::install::{self as core_install, InstallProfile};
 use surge_core::installer_package::{
     InstallerPackageAcquisition, ResolveInstallerPackageOptions, ResolvedInstallerPackage, install_artifact_cache_dir,
-    prune_install_artifact_cache, resolve_installer_package, retained_artifacts_for_install_cache_without_index,
+    prune_install_artifact_cache_with_stats, resolve_installer_package, retained_artifacts_for_resolved_install_cache,
 };
 use surge_core::platform::fs::make_executable;
 use surge_core::platform::paths::default_install_root;
@@ -379,23 +379,17 @@ fn ensure_stage_cache_entry(
 }
 
 fn prune_setup_artifact_cache(install_root: &Path, package: &ResolvedPackage, manifest: &InstallerManifest) {
-    let owned_retained_artifacts;
-    let retained_artifacts = match package.retained_artifacts.as_ref() {
-        Some(retained_artifacts) => retained_artifacts,
-        None => match retained_artifacts_for_install_cache_without_index(manifest) {
-            Some(retained_artifacts) => {
-                owned_retained_artifacts = retained_artifacts;
-                &owned_retained_artifacts
-            }
-            None => return,
-        },
+    let Some(retained_artifacts) = retained_artifacts_for_resolved_install_cache(package, manifest) else {
+        return;
     };
-    match prune_install_artifact_cache(install_root, retained_artifacts) {
-        Ok(0) => {}
-        Ok(pruned) => {
+    match prune_install_artifact_cache_with_stats(install_root, retained_artifacts.as_ref()) {
+        Ok(result) if result.pruned_artifact_count == 0 => {}
+        Ok(result) => {
             logline::info(&format!(
-                "Pruned {pruned} stale artifact cache entr{}.",
-                if pruned == 1 { "y" } else { "ies" }
+                "Pruned {} stale artifact cache entr{}; retained policy key count: {}.",
+                result.pruned_artifact_count,
+                if result.pruned_artifact_count == 1 { "y" } else { "ies" },
+                result.retained_policy_key_count
             ));
         }
         Err(e) => {

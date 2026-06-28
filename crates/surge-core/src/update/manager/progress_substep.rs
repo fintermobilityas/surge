@@ -1,13 +1,10 @@
-//! Phase-substep progress emission for the finalize phase.
+//! Phase-substep progress emission for long-running update phases.
 //!
-//! The finalize phase of an update runs several substeps (supervisor
-//! shutdown, atomic directory swaps, persistent asset copy, cache pruning,
-//! post-update hook, supervisor restart) that historically reported nothing
-//! to the user once the bytes/items counter hit 100%. This module owns the
-//! helper that emits `ProgressInfo` with a `phase_label` for each substep,
-//! mirrors that label into the persisted in-progress
-//! [`UpdateStatusRecord`], and provides a heartbeat helper for substeps
-//! that can block silently for many seconds.
+//! Some update work historically reported nothing useful once the coarse
+//! bytes/items counter hit a phase boundary. This module owns the helper that
+//! emits `ProgressInfo` with a `phase_label` for each substep, mirrors that
+//! label into the persisted in-progress [`UpdateStatusRecord`], and provides a
+//! heartbeat helper for substeps that can block silently for many seconds.
 //!
 //! Substep labels live in [`labels`] so the manager and tests reference the
 //! same canonical strings.
@@ -21,15 +18,20 @@ use tracing::warn;
 use super::progress::{ProgressInfo, emit_progress};
 use crate::update::status::{self, UpdateStatusRecord};
 
-/// Substep labels for the finalize phase. These appear in `ProgressInfo`
+/// Substep labels for long-running update work. These appear in `ProgressInfo`
 /// events and on the persisted `current_phase` field of in-progress update
-/// status records so operators can tell a stuck "swapping app directory"
-/// apart from a stuck "starting supervisor".
+/// status records so operators can distinguish expensive apply/finalize
+/// substeps.
 pub(crate) mod labels {
     pub const RELEASE_RESOLVED: &str = "release or delta resolved";
     pub const PACKAGE_DOWNLOAD_STARTED: &str = "package download started";
     pub const PACKAGE_DOWNLOADED: &str = "package downloaded";
     pub const PACKAGE_APPLY_STARTED: &str = "package apply started";
+    pub const RESTORING_CURRENT_PACKAGE_FROM_INSTALLED_APP: &str = "restoring current package from installed app";
+    pub const RESTORING_CURRENT_PACKAGE_FROM_RELEASE_GRAPH: &str = "restoring current package from release graph";
+    pub const APPLYING_TARGET_DELTAS: &str = "applying target deltas";
+    pub const WRITING_REBUILT_PACKAGE: &str = "writing rebuilt package";
+    pub const EXTRACTING_REBUILT_PACKAGE: &str = "extracting rebuilt package";
     pub const PACKAGE_APPLY_COMPLETED: &str = "package apply completed";
     pub const STOPPING_SUPERVISOR: &str = "stopping supervisor";
     pub const PREPARING_SWAP: &str = "preparing app swap";
@@ -127,7 +129,7 @@ where
         }
     }
 
-    fn persist_current_phase(&self, label: &'static str) {
+    pub(super) fn persist_current_phase(&self, label: &'static str) {
         let mut record = self
             .in_progress_template
             .clone()

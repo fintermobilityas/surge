@@ -131,7 +131,7 @@ jobs:
       - name: Set release version
         shell: bash
         run: ./scripts/set-release-version.sh "${{ needs.validate-release.outputs.release_version }}"
-      - uses: actions/cache@v5
+      - uses: actions/cache@v6
         if: matrix.build_strategy == 'ubuntu18-container'
         with:
           path: |
@@ -182,7 +182,7 @@ jobs:
       - uses: actions/setup-dotnet@v5
         with:
           dotnet-version: '10.0.301'
-      - uses: actions/cache@v5
+      - uses: actions/cache@v6
         with:
           path: ~/.nuget/packages
           key: nuget-${{ hashFiles('dotnet/Directory.Packages.props') }}

@@ -44,7 +44,7 @@ tempfile = "3"
 fs2 = "0.4"
 uuid = { version = "1", features = ["v4"] }
 which = "8"
-eframe = { version = "0.34.2", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
+eframe = { version = "0.35.0", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 [workspace.lints.rust]

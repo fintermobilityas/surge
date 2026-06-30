@@ -46,7 +46,7 @@ impl InstallerApp {
     pub(super) fn render_welcome(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(BG))
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 let available_height = ui.available_height();
                 ui.vertical_centered(|ui| {
                     ui.add_space(available_height * 0.10);
@@ -116,7 +116,7 @@ impl InstallerApp {
 
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(BG))
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 let available_height = ui.available_height();
                 ui.vertical_centered(|ui| {
                     ui.add_space(available_height * 0.18);
@@ -161,7 +161,7 @@ impl InstallerApp {
 
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(BG))
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 let available_height = ui.available_height();
                 ui.vertical_centered(|ui| {
                     ui.add_space(available_height * 0.13);
@@ -233,7 +233,7 @@ impl InstallerApp {
 
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(BG))
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 let available_height = ui.available_height();
                 ui.vertical_centered(|ui| {
                     ui.add_space(available_height * 0.12);

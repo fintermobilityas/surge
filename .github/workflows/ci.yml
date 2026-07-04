@@ -243,3 +243,17 @@ jobs:
       - run: dotnet format --verify-no-changes --verbosity diagnostic
       - run: dotnet build --no-restore --configuration Release -p:Version=${{ needs.version-sync.outputs.version }}
       - run: dotnet test --no-build --configuration Release --verbosity normal
+      - name: Restore AOT/trim smoke app
+        run: dotnet restore Surge.NET.AotSmoke/Surge.NET.AotSmoke.csproj --runtime linux-x64
+      - name: Publish AOT/trim smoke app
+        run: >
+          dotnet publish Surge.NET.AotSmoke/Surge.NET.AotSmoke.csproj
+          --no-restore
+          --configuration Release
+          --runtime linux-x64
+          -p:PublishAot=true
+          -p:PublishTrimmed=true
+          -p:SelfContained=true
+          -p:InvariantGlobalization=true
+          -warnaserror
+          -m:1

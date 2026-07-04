@@ -1,4 +1,5 @@
 <Solution>
+  <Project Path="Surge.NET.AotSmoke/Surge.NET.AotSmoke.csproj" />
   <Project Path="Surge.NET.Tests/Surge.NET.Tests.csproj" />
   <Project Path="Surge.NET/Surge.NET.csproj" />
 </Solution>

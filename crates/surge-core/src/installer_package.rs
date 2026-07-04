@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -40,12 +39,6 @@ pub struct ResolvedInstallerPackage {
     path: PathBuf,
     pub retained_artifacts: Option<BTreeSet<String>>,
     pub acquisition: InstallerPackageAcquisition,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct InstallArtifactCachePruneResult {
-    pub retained_policy_key_count: usize,
-    pub pruned_artifact_count: usize,
 }
 
 impl ResolvedInstallerPackage {
@@ -181,36 +174,6 @@ pub fn install_artifact_cache_dir(install_root: &Path) -> PathBuf {
 
 pub fn prune_install_artifact_cache(install_root: &Path, retained_artifacts: &BTreeSet<String>) -> Result<usize> {
     prune_cached_artifacts(&install_artifact_cache_dir(install_root), retained_artifacts)
-}
-
-pub fn prune_install_artifact_cache_with_stats(
-    install_root: &Path,
-    retained_artifacts: &BTreeSet<String>,
-) -> Result<InstallArtifactCachePruneResult> {
-    prune_install_artifact_cache_dir_with_stats(&install_artifact_cache_dir(install_root), retained_artifacts)
-}
-
-pub fn prune_install_artifact_cache_dir_with_stats(
-    artifact_cache_dir: &Path,
-    retained_artifacts: &BTreeSet<String>,
-) -> Result<InstallArtifactCachePruneResult> {
-    let pruned_artifact_count = prune_cached_artifacts(artifact_cache_dir, retained_artifacts)?;
-    Ok(InstallArtifactCachePruneResult {
-        retained_policy_key_count: retained_artifacts.len(),
-        pruned_artifact_count,
-    })
-}
-
-#[must_use]
-pub fn retained_artifacts_for_resolved_install_cache<'a>(
-    package: &'a ResolvedInstallerPackage,
-    manifest: &InstallerManifest,
-) -> Option<Cow<'a, BTreeSet<String>>> {
-    if let Some(retained_artifacts) = &package.retained_artifacts {
-        Some(Cow::Borrowed(retained_artifacts))
-    } else {
-        retained_artifacts_for_install_cache_without_index(manifest).map(Cow::Owned)
-    }
 }
 
 #[must_use]

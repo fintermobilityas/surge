@@ -1,0 +1,7 @@
+<Project>
+  <PropertyGroup>
+    <!-- NuGet.targets consumes both knobs: the first serializes the solution graph walk, the second serializes package restore work. -->
+    <RestoreBuildInParallel>false</RestoreBuildInParallel>
+    <RestoreDisableParallel>true</RestoreDisableParallel>
+  </PropertyGroup>
+</Project>

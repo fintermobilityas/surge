@@ -372,22 +372,17 @@ impl UpdateManager {
 
         let extract_dir = staging_dir.join("extracted");
         tokio::fs::create_dir_all(&extract_dir).await?;
-        let extracted_final_dir = progress_emitter
-            .run_with_heartbeat(
-                5,
-                update_phase::PACKAGE_APPLY_STARTED,
-                60,
-                progress_substep::HEARTBEAT_INTERVAL,
-                materialize_update_payload(
-                    self,
-                    info,
-                    &staging_dir,
-                    &artifact_cache_dir,
-                    &extract_dir,
-                    progress.as_ref(),
-                ),
-            )
-            .await?;
+        progress_emitter.emit_substep(5, update_phase::PACKAGE_APPLY_STARTED, 60);
+        let extracted_final_dir = materialize_update_payload(
+            self,
+            info,
+            &staging_dir,
+            &artifact_cache_dir,
+            &extract_dir,
+            progress.as_ref(),
+            &progress_emitter,
+        )
+        .await?;
         progress_emitter.emit_completed_phase(update_phase::PACKAGE_APPLY_COMPLETED);
 
         // Phase 6: Finalize
@@ -2335,6 +2330,15 @@ echo started > new-child-started
 
         write_app_scoped_release_index(&store_root, app_id, &index);
 
+        let active_app_dir = install_root.join("app");
+        std::fs::create_dir_all(active_app_dir.join(".surge")).unwrap();
+        std::fs::write(active_app_dir.join("payload.txt"), "v2 payload").unwrap();
+        std::fs::write(
+            active_app_dir.join(crate::install::RUNTIME_MANIFEST_RELATIVE_PATH),
+            format!("id: {app_id}\nversion: 1.1.0\n"),
+        )
+        .unwrap();
+
         let ctx = Arc::new(Context::new());
         ctx.set_storage(
             StorageProvider::Filesystem,
@@ -2348,10 +2352,39 @@ echo started > new-child-started
         let mut manager = UpdateManager::new(ctx, app_id, "1.1.0", "stable", install_root.to_str().unwrap()).unwrap();
         let info = manager.check_for_updates().await.unwrap().unwrap();
         assert_eq!(info.apply_strategy, ApplyStrategy::Delta);
+
+        let observed = Arc::new(Mutex::new(Vec::<ProgressInfo>::new()));
+        let observed_for_progress = Arc::clone(&observed);
         manager
-            .download_and_apply(&info, None::<fn(ProgressInfo)>)
+            .download_and_apply(
+                &info,
+                Some(move |progress: ProgressInfo| {
+                    observed_for_progress
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(progress);
+                }),
+            )
             .await
             .unwrap();
+
+        let observed = observed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let apply_labels: Vec<&'static str> = observed
+            .iter()
+            .filter(|progress| progress.phase == 5 && !progress.phase_label.is_empty())
+            .map(|progress| progress.phase_label)
+            .collect();
+        assert!(
+            apply_labels.contains(&finalize_phase::RESTORING_CURRENT_PACKAGE_FROM_RELEASE_GRAPH),
+            "expected release-graph base restore label in {apply_labels:?}"
+        );
+        assert!(
+            !apply_labels.contains(&finalize_phase::RESTORING_CURRENT_PACKAGE_FROM_INSTALLED_APP),
+            "byte-exact deltas should not prefer installed-app synthesis: {apply_labels:?}"
+        );
 
         let installed = std::fs::read_to_string(install_root.join("app").join("payload.txt")).unwrap();
         assert_eq!(installed, "v3 payload");
@@ -2760,16 +2793,218 @@ echo started > new-child-started
         assert_eq!(info.apply_releases.len(), 1);
         assert_eq!(info.apply_releases[0].version, "1.2.0");
         assert_eq!(info.apply_releases[0].full_sha256, sha256_hex(&full_v3));
+
+        let observed = Arc::new(Mutex::new(Vec::<ProgressInfo>::new()));
+        let observed_for_progress = Arc::clone(&observed);
         manager
-            .download_and_apply(&info, None::<fn(ProgressInfo)>)
+            .download_and_apply(
+                &info,
+                Some(move |progress: ProgressInfo| {
+                    observed_for_progress
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(progress);
+                }),
+            )
             .await
             .unwrap();
+
+        let observed = observed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let apply_labels: Vec<&'static str> = observed
+            .iter()
+            .filter(|progress| progress.phase == 5 && !progress.phase_label.is_empty())
+            .map(|progress| progress.phase_label)
+            .collect();
+        assert!(
+            apply_labels.contains(&finalize_phase::RESTORING_CURRENT_PACKAGE_FROM_INSTALLED_APP),
+            "expected installed-app base restore label in {apply_labels:?}"
+        );
+        assert!(
+            !apply_labels.contains(&finalize_phase::RESTORING_CURRENT_PACKAGE_FROM_RELEASE_GRAPH),
+            "sparse deltas should not rebuild the base through the release graph first: {apply_labels:?}"
+        );
 
         let installed = std::fs::read_to_string(install_root.join("app").join("payload.txt")).unwrap();
         assert_eq!(installed, "v3 payload");
 
         let cached_current_full = install_root.join(".surge-cache").join("artifacts").join(&full_v2_name);
         assert!(!cached_current_full.exists());
+    }
+
+    #[tokio::test]
+    async fn test_download_and_apply_delta_retries_release_graph_when_installed_app_base_drifts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("store");
+        let install_root = tmp.path().join("install");
+        let app_id = "test-app";
+        std::fs::create_dir_all(&store_root).unwrap();
+        std::fs::create_dir_all(&install_root).unwrap();
+        let app_store = app_scoped_store_root(&store_root, app_id);
+
+        let rid = current_rid();
+        let os = current_os_label_for_tests();
+
+        let source_v2 = tmp.path().join("source-v2");
+        let source_v3 = tmp.path().join("source-v3");
+        std::fs::create_dir_all(&source_v2).unwrap();
+        std::fs::create_dir_all(&source_v3).unwrap();
+        std::fs::write(source_v2.join("payload.txt"), "v2 payload").unwrap();
+        std::fs::write(source_v2.join("stable.txt"), "stable payload").unwrap();
+        std::fs::write(source_v3.join("payload.txt"), "v3 payload").unwrap();
+        std::fs::write(source_v3.join("stable.txt"), "stable payload").unwrap();
+
+        let mut packer_v2 = ArchivePacker::new(3).unwrap();
+        packer_v2.add_directory(&source_v2, "").unwrap();
+        let full_v2 = packer_v2.finalize().unwrap();
+
+        let mut packer_v3 = ArchivePacker::new(3).unwrap();
+        packer_v3.add_directory(&source_v3, "").unwrap();
+        let full_v3 = packer_v3.finalize().unwrap();
+
+        let patch_v3 = build_sparse_file_patch(&full_v2, &full_v3, 3, 0, &ChunkedDiffOptions::default()).unwrap();
+        let delta_v3 = zstd::encode_all(patch_v3.as_slice(), 3).unwrap();
+
+        let full_v2_name = format!("{app_id}-1.1.0-{rid}-full.tar.zst");
+        let full_v3_name = format!("{app_id}-1.2.0-{rid}-full.tar.zst");
+        let delta_v3_name = format!("{app_id}-1.2.0-{rid}-delta.tar.zst");
+
+        std::fs::write(app_store.join(&full_v2_name), &full_v2).unwrap();
+        std::fs::write(app_store.join(&delta_v3_name), &delta_v3).unwrap();
+
+        let index = ReleaseIndex {
+            app_id: app_id.to_string(),
+            releases: vec![
+                ReleaseEntry {
+                    version: "1.1.0".to_string(),
+                    channels: vec!["stable".to_string()],
+                    os: os.clone(),
+                    rid: rid.clone(),
+                    is_genesis: true,
+                    full_filename: full_v2_name,
+                    full_size: full_v2.len() as i64,
+                    full_sha256: sha256_hex(&full_v2),
+                    full_compression_level: 0,
+                    full_zstd_workers: 0,
+                    deltas: Vec::new(),
+                    preferred_delta_id: String::new(),
+                    created_utc: chrono::Utc::now().to_rfc3339(),
+                    release_notes: String::new(),
+                    name: String::new(),
+                    main_exe: app_id.to_string(),
+                    install_directory: app_id.to_string(),
+                    supervisor_id: String::new(),
+                    icon: String::new(),
+                    shortcuts: Vec::new(),
+                    persistent_assets: Vec::new(),
+                    installers: Vec::new(),
+                    environment: std::collections::BTreeMap::new(),
+                },
+                ReleaseEntry {
+                    version: "1.2.0".to_string(),
+                    channels: vec!["stable".to_string()],
+                    os,
+                    rid: rid.clone(),
+                    is_genesis: false,
+                    full_filename: full_v3_name,
+                    full_size: full_v3.len() as i64,
+                    full_sha256: sha256_hex(&full_v3),
+                    full_compression_level: 0,
+                    full_zstd_workers: 0,
+                    deltas: vec![DeltaArtifact::sparse_file_ops_zstd(
+                        "primary",
+                        "1.1.0",
+                        &delta_v3_name,
+                        delta_v3.len() as i64,
+                        &sha256_hex(&delta_v3),
+                    )],
+                    preferred_delta_id: "primary".to_string(),
+                    created_utc: chrono::Utc::now().to_rfc3339(),
+                    release_notes: String::new(),
+                    name: String::new(),
+                    main_exe: app_id.to_string(),
+                    install_directory: app_id.to_string(),
+                    supervisor_id: String::new(),
+                    icon: String::new(),
+                    shortcuts: Vec::new(),
+                    persistent_assets: Vec::new(),
+                    installers: Vec::new(),
+                    environment: std::collections::BTreeMap::new(),
+                },
+            ],
+            ..ReleaseIndex::default()
+        };
+
+        write_app_scoped_release_index(&store_root, app_id, &index);
+
+        let active_app_dir = install_root.join("app");
+        std::fs::create_dir_all(active_app_dir.join(".surge")).unwrap();
+        std::fs::write(active_app_dir.join("payload.txt"), "v2 payload").unwrap();
+        std::fs::write(active_app_dir.join("stable.txt"), "locally drifted stable payload").unwrap();
+        std::fs::write(
+            active_app_dir.join(crate::install::RUNTIME_MANIFEST_RELATIVE_PATH),
+            format!("id: {app_id}\nversion: 1.1.0\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            active_app_dir.join(crate::install::LEGACY_RUNTIME_MANIFEST_RELATIVE_PATH),
+            format!("id: {app_id}\nversion: 1.1.0\n"),
+        )
+        .unwrap();
+
+        let ctx = Arc::new(Context::new());
+        ctx.set_storage(
+            StorageProvider::Filesystem,
+            store_root.to_str().unwrap(),
+            "",
+            "",
+            "",
+            "",
+        );
+
+        let mut manager = UpdateManager::new(ctx, app_id, "1.1.0", "stable", install_root.to_str().unwrap()).unwrap();
+        let info = manager.check_for_updates().await.unwrap().unwrap();
+        assert_eq!(info.apply_strategy, ApplyStrategy::Delta);
+
+        let observed = Arc::new(Mutex::new(Vec::<ProgressInfo>::new()));
+        let observed_for_progress = Arc::clone(&observed);
+        manager
+            .download_and_apply(
+                &info,
+                Some(move |progress: ProgressInfo| {
+                    observed_for_progress
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(progress);
+                }),
+            )
+            .await
+            .unwrap();
+
+        let observed = observed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let apply_labels: Vec<&'static str> = observed
+            .iter()
+            .filter(|progress| progress.phase == 5 && !progress.phase_label.is_empty())
+            .map(|progress| progress.phase_label)
+            .collect();
+        assert!(
+            apply_labels.contains(&finalize_phase::RESTORING_CURRENT_PACKAGE_FROM_INSTALLED_APP),
+            "expected installed-app base attempt in {apply_labels:?}"
+        );
+        assert!(
+            apply_labels.contains(&finalize_phase::RESTORING_CURRENT_PACKAGE_FROM_RELEASE_GRAPH),
+            "expected release-graph retry after installed-app drift in {apply_labels:?}"
+        );
+
+        let installed = std::fs::read_to_string(install_root.join("app").join("payload.txt")).unwrap();
+        assert_eq!(installed, "v3 payload");
+        let stable = std::fs::read_to_string(install_root.join("app").join("stable.txt")).unwrap();
+        assert_eq!(stable, "stable payload");
     }
 
     #[tokio::test]

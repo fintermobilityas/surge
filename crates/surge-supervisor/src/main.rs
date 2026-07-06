@@ -2,22 +2,27 @@
 #![allow(clippy::cast_possible_wrap)]
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitCode, ExitStatus};
+use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use surge_core::supervisor::state::{supervisor_pid_file, supervisor_stop_file};
-#[cfg(windows)]
-use sysinfo::{Pid, ProcessesToUpdate, System};
+use surge_core::supervisor::state::{read_supervisor_exe_path, supervisor_pid_file, supervisor_stop_file};
 use thiserror::Error;
 
+mod child;
 mod handoff;
 mod ownership;
 
+use child::{
+    WaitOutcome, spawn_supervised_child, wait_before_restart, wait_for_pid_or_stop, wait_for_supervised_child,
+};
 #[cfg(all(test, unix))]
 use ownership::current_supervisor_owns_pid_file;
 use ownership::{remove_owned_supervisor_state, supervisor_was_superseded};
 
-const RESTART_HANDOFF_STABILITY_WINDOW: std::time::Duration = std::time::Duration::from_secs(4);
+/// Delay before relaunching a supervised child that has exited. Applied to both
+/// crash exits and clean (code 0) exits so a child that exits immediately cannot
+/// spin the supervisor in a tight relaunch loop.
+const CHILD_RESTART_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[derive(Parser)]
 #[command(
@@ -42,9 +47,10 @@ enum Commands {
         #[arg(long)]
         dir: PathBuf,
 
-        /// Path to the application executable
+        /// Path to the application executable. Optional: when omitted it is
+        /// resolved from the supervisor exe state file written by the spawner.
         #[arg(long)]
-        exe: PathBuf,
+        exe: Option<PathBuf>,
 
         /// Arguments to pass to the child process
         #[arg(trailing_var_arg = true)]
@@ -73,9 +79,10 @@ enum Commands {
         #[arg(long)]
         handoff_version: Option<String>,
 
-        /// Path to the application executable
+        /// Path to the application executable. Optional: when omitted it is
+        /// resolved from the supervisor exe state file written by the spawner.
         #[arg(long)]
-        exe: PathBuf,
+        exe: Option<PathBuf>,
 
         /// Arguments to pass when launching the replacement child process
         #[arg(trailing_var_arg = true)]
@@ -99,8 +106,27 @@ enum SupervisorError {
     #[error("Executable not found: {0}")]
     ExecutableNotFound(String),
 
+    #[error("No executable path: pass --exe or write the supervisor exe state file for id '{0}' in {1}")]
+    MissingExecutablePath(String, String),
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+fn resolve_exe_path(
+    cli_exe: Option<&Path>,
+    install_dir: &Path,
+    supervisor_id: &str,
+) -> Result<PathBuf, SupervisorError> {
+    if let Some(exe) = cli_exe
+        && !exe.as_os_str().is_empty()
+    {
+        return Ok(exe.to_path_buf());
+    }
+
+    read_supervisor_exe_path(install_dir, supervisor_id).ok_or_else(|| {
+        SupervisorError::MissingExecutablePath(supervisor_id.to_string(), install_dir.display().to_string())
+    })
 }
 
 fn init_tracing(verbose: bool) {
@@ -126,7 +152,14 @@ fn main() -> ExitCode {
             verbose,
         } => {
             init_tracing(verbose);
-            if let Err(e) = run_supervisor(&id, &dir, &exe, &args, None, None) {
+            let exe_path = match resolve_exe_path(exe.as_deref(), &dir, &id) {
+                Ok(exe_path) => exe_path,
+                Err(e) => {
+                    tracing::error!("{e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            if let Err(e) = run_supervisor(&id, &dir, &exe_path, &args, None, None) {
                 tracing::error!("{e}");
                 return ExitCode::FAILURE;
             }
@@ -142,7 +175,14 @@ fn main() -> ExitCode {
             verbose,
         } => {
             init_tracing(verbose);
-            if let Err(e) = run_supervisor(&id, &dir, &exe, &args, Some(pid), handoff_version.as_deref()) {
+            let exe_path = match resolve_exe_path(exe.as_deref(), &dir, &id) {
+                Ok(exe_path) => exe_path,
+                Err(e) => {
+                    tracing::error!("{e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            if let Err(e) = run_supervisor(&id, &dir, &exe_path, &args, Some(pid), handoff_version.as_deref()) {
                 tracing::error!("{e}");
                 return ExitCode::FAILURE;
             }
@@ -237,15 +277,7 @@ fn run_supervisor(
         }
 
         let child_args = next_child_args.take().unwrap_or_else(|| restart_args.clone());
-
-        tracing::info!("Starting child process: {}", exe_path.display());
-
-        let mut child = Command::new(exe_path)
-            .current_dir(install_dir)
-            .args(&child_args)
-            .spawn()?;
-
-        tracing::info!("Child process started with PID {}", child.id());
+        let mut child = spawn_supervised_child(exe_path, install_dir, &child_args)?;
 
         let Some(status) = wait_for_supervised_child(
             &mut child,
@@ -270,18 +302,18 @@ fn run_supervisor(
         }
 
         if status.success() {
-            tracing::info!("Child exited successfully (code 0), not restarting");
-            break;
+            tracing::info!(
+                "Child exited successfully (code 0), restarting in {} seconds...",
+                CHILD_RESTART_BACKOFF.as_secs()
+            );
+        } else {
+            tracing::warn!(
+                "Child exited with {status}, restarting in {} seconds...",
+                CHILD_RESTART_BACKOFF.as_secs()
+            );
         }
 
-        tracing::warn!("Child exited with {status}, restarting in 2 seconds...");
-        if !wait_before_restart(
-            &shutdown,
-            &stop_file,
-            &pid_file,
-            own_pid,
-            std::time::Duration::from_secs(2),
-        ) {
+        if !wait_before_restart(&shutdown, &stop_file, &pid_file, own_pid, CHILD_RESTART_BACKOFF) {
             break;
         }
     }
@@ -292,266 +324,10 @@ fn run_supervisor(
     Ok(())
 }
 
-fn wait_for_supervised_child(
-    child: &mut Child,
-    shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-    stop_file: &Path,
-    pid_file: &Path,
-    own_pid: u32,
-    install_dir: &Path,
-    pending_handoff_version: &mut Option<String>,
-) -> Result<Option<ExitStatus>, SupervisorError> {
-    let Some(version) = pending_handoff_version.clone() else {
-        return wait_for_child_exit_status(child, shutdown, stop_file, pid_file, own_pid);
-    };
-
-    match wait_for_child_startup_or_stop(
-        child,
-        shutdown,
-        stop_file,
-        pid_file,
-        own_pid,
-        RESTART_HANDOFF_STABILITY_WINDOW,
-    )? {
-        StartupOutcome::Running => {
-            handoff::record_restart_handoff_converged(install_dir, &version);
-            *pending_handoff_version = None;
-            wait_for_child_exit_status(child, shutdown, stop_file, pid_file, own_pid)
-        }
-        StartupOutcome::Exited(status) => {
-            handoff::record_restart_handoff_child_exited(install_dir, &version, status);
-            Ok(Some(status))
-        }
-        StartupOutcome::StopRequested => {
-            tracing::info!("Stop requested, exiting supervisor loop and leaving child running");
-            Ok(None)
-        }
-        StartupOutcome::ShutdownRequested => {
-            tracing::info!("Shutdown signal received, child terminated and supervisor loop is exiting");
-            Ok(None)
-        }
-        StartupOutcome::Superseded => Ok(None),
-    }
-}
-
-fn wait_for_child_exit_status(
-    child: &mut Child,
-    shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-    stop_file: &Path,
-    pid_file: &Path,
-    own_pid: u32,
-) -> Result<Option<ExitStatus>, SupervisorError> {
-    match wait_for_child_or_stop(child, shutdown, stop_file, pid_file, own_pid)? {
-        WaitOutcome::Exited(status) => Ok(Some(status)),
-        WaitOutcome::ObservedProcessExited => unreachable!(),
-        WaitOutcome::StopRequested => {
-            tracing::info!("Stop requested, exiting supervisor loop and leaving child running");
-            Ok(None)
-        }
-        WaitOutcome::ShutdownRequested => {
-            tracing::info!("Shutdown signal received, child terminated and supervisor loop is exiting");
-            Ok(None)
-        }
-        WaitOutcome::Superseded => Ok(None),
-    }
-}
-
 fn write_pid_file(path: &Path, own_pid: u32) -> Result<(), SupervisorError> {
     std::fs::write(path, own_pid.to_string())?;
     tracing::debug!("Wrote PID file: {} (pid={})", path.display(), own_pid);
     Ok(())
-}
-
-enum WaitOutcome {
-    Exited(std::process::ExitStatus),
-    ObservedProcessExited,
-    StopRequested,
-    ShutdownRequested,
-    Superseded,
-}
-
-enum StartupOutcome {
-    Running,
-    Exited(std::process::ExitStatus),
-    StopRequested,
-    ShutdownRequested,
-    Superseded,
-}
-
-fn wait_for_child_startup_or_stop(
-    child: &mut Child,
-    shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-    stop_file: &Path,
-    pid_file: &Path,
-    own_pid: u32,
-    stable_for: std::time::Duration,
-) -> Result<StartupOutcome, SupervisorError> {
-    let deadline = std::time::Instant::now() + stable_for;
-    loop {
-        if shutdown.load(std::sync::atomic::Ordering::Acquire) {
-            terminate_child_process(child)?;
-            return Ok(StartupOutcome::ShutdownRequested);
-        }
-
-        if supervisor_was_superseded(pid_file, own_pid) {
-            return Ok(StartupOutcome::Superseded);
-        }
-
-        if stop_file.exists() {
-            return Ok(StartupOutcome::StopRequested);
-        }
-
-        if let Some(status) = child.try_wait()? {
-            return Ok(StartupOutcome::Exited(status));
-        }
-
-        if std::time::Instant::now() >= deadline {
-            return Ok(StartupOutcome::Running);
-        }
-
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-}
-
-fn wait_for_pid_or_stop(
-    pid: u32,
-    shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-    stop_file: &Path,
-    pid_file: &Path,
-    own_pid: u32,
-) -> WaitOutcome {
-    loop {
-        if shutdown.load(std::sync::atomic::Ordering::Acquire) {
-            return WaitOutcome::ShutdownRequested;
-        }
-
-        if supervisor_was_superseded(pid_file, own_pid) {
-            return WaitOutcome::Superseded;
-        }
-
-        if stop_file.exists() {
-            return WaitOutcome::StopRequested;
-        }
-
-        if !is_process_running(pid) {
-            return WaitOutcome::ObservedProcessExited;
-        }
-
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-}
-
-fn wait_for_child_or_stop(
-    child: &mut Child,
-    shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-    stop_file: &Path,
-    pid_file: &Path,
-    own_pid: u32,
-) -> Result<WaitOutcome, SupervisorError> {
-    loop {
-        if shutdown.load(std::sync::atomic::Ordering::Acquire) {
-            terminate_child_process(child)?;
-            return Ok(WaitOutcome::ShutdownRequested);
-        }
-
-        if supervisor_was_superseded(pid_file, own_pid) {
-            return Ok(WaitOutcome::Superseded);
-        }
-
-        if stop_file.exists() {
-            return Ok(WaitOutcome::StopRequested);
-        }
-
-        if let Some(status) = child.try_wait()? {
-            return Ok(WaitOutcome::Exited(status));
-        }
-
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-}
-
-fn wait_before_restart(
-    shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-    stop_file: &Path,
-    pid_file: &Path,
-    own_pid: u32,
-    delay: std::time::Duration,
-) -> bool {
-    let deadline = std::time::Instant::now() + delay;
-    loop {
-        if shutdown.load(std::sync::atomic::Ordering::Acquire) {
-            tracing::info!("Shutdown signal received during restart delay, not restarting");
-            return false;
-        }
-
-        if supervisor_was_superseded(pid_file, own_pid) {
-            return false;
-        }
-
-        if stop_file.exists() {
-            tracing::info!("Stop requested during restart delay, not restarting");
-            return false;
-        }
-
-        if std::time::Instant::now() >= deadline {
-            return true;
-        }
-
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-}
-
-fn terminate_child_process(child: &mut Child) -> Result<(), SupervisorError> {
-    if child.try_wait()?.is_some() {
-        return Ok(());
-    }
-
-    #[cfg(unix)]
-    {
-        use nix::sys::signal::{Signal, kill};
-        use nix::unistd::Pid;
-
-        let _ = kill(Pid::from_raw(child.id() as i32), Signal::SIGTERM);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            if child.try_wait()?.is_some() {
-                return Ok(());
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-    }
-
-    #[cfg(not(unix))]
-    {
-        if child.try_wait()?.is_some() {
-            return Ok(());
-        }
-    }
-
-    let _ = child.kill();
-    let _ = child.wait();
-    Ok(())
-}
-
-#[cfg(unix)]
-fn is_process_running(pid: u32) -> bool {
-    use nix::errno::Errno;
-    use nix::sys::signal::kill;
-    use nix::unistd::Pid;
-
-    let Ok(raw_pid) = i32::try_from(pid) else {
-        return false;
-    };
-
-    matches!(kill(Pid::from_raw(raw_pid), None), Ok(()) | Err(Errno::EPERM))
-}
-
-#[cfg(windows)]
-fn is_process_running(pid: u32) -> bool {
-    let watched_pid = Pid::from_u32(pid);
-    let mut system = System::new();
-    let _ = system.refresh_processes(ProcessesToUpdate::Some(&[watched_pid]), true);
-    system.process(watched_pid).is_some()
 }
 
 fn install_signal_handlers() -> std::sync::Arc<std::sync::atomic::AtomicBool> {
@@ -596,6 +372,8 @@ fn ctrlc_handler(shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>) {
 mod tests {
     #[cfg(unix)]
     use std::path::{Path, PathBuf};
+    #[cfg(unix)]
+    use std::process::Command;
 
     use super::*;
 
@@ -798,13 +576,18 @@ mod tests {
         let tmp = TestInstallDir::new("surge-supervisor-first-run-order");
         let install_dir = tmp.path();
         let args_path = install_dir.join("args.txt");
+        let first_run_marker = install_dir.join("first-run-done");
         let exe_path = install_dir.join("target-child");
         std::fs::write(
             &exe_path,
             format!(
                 "#!/bin/sh\n\
-                 printf '%s\\n' \"$@\" > '{}'\n",
-                args_path.display()
+                 if [ ! -f '{marker}' ]; then\n\
+                 printf '%s\\n' \"$@\" > '{args}'\n\
+                 touch '{marker}'\n\
+                 fi\n",
+                marker = first_run_marker.display(),
+                args = args_path.display()
             ),
         )
         .unwrap();
@@ -812,23 +595,39 @@ mod tests {
         permissions.set_mode(0o755);
         std::fs::set_permissions(&exe_path, permissions).unwrap();
 
-        run_supervisor(
-            "demo-supervisor",
-            install_dir,
-            &exe_path,
-            &[
-                "--app-mode".to_string(),
-                "service".to_string(),
-                "--surge-first-run".to_string(),
-                "2.0.0".to_string(),
-            ],
-            None,
-            None,
-        )
-        .unwrap();
+        let install_dir_for_thread = install_dir.to_path_buf();
+        let exe_path_for_thread = exe_path.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let supervisor = std::thread::spawn(move || {
+            let result = run_supervisor(
+                "demo-supervisor",
+                &install_dir_for_thread,
+                &exe_path_for_thread,
+                &[
+                    "--app-mode".to_string(),
+                    "service".to_string(),
+                    "--surge-first-run".to_string(),
+                    "2.0.0".to_string(),
+                ],
+                None,
+                None,
+            );
+            tx.send(result).unwrap();
+        });
 
-        let args = std::fs::read_to_string(args_path).unwrap();
-        assert_eq!(args, "--app-mode\nservice\n--surge-first-run\n2.0.0\n");
+        let stop_file = supervisor_stop_file(install_dir, "demo-supervisor");
+        let first_child_ran = wait_until(std::time::Duration::from_secs(5), || first_run_marker.exists());
+        let args = std::fs::read_to_string(&args_path);
+        std::fs::write(&stop_file, "stop").unwrap();
+
+        let supervisor_result = rx.recv_timeout(std::time::Duration::from_secs(5));
+        supervisor.join().unwrap();
+        supervisor_result
+            .expect("supervisor did not exit after stop file")
+            .unwrap();
+
+        assert!(first_child_ran, "first child should have recorded its argv");
+        assert_eq!(args.unwrap(), "--app-mode\nservice\n--surge-first-run\n2.0.0\n");
     }
 
     #[cfg(unix)]
@@ -869,16 +668,41 @@ mod tests {
         let mut watched_child = Command::new("sh").arg("-c").arg("sleep 0.1").spawn().unwrap();
         let watched_pid = watched_child.id();
         watched_child.wait().unwrap();
-        run_supervisor(
-            "demo-supervisor",
-            install_dir,
-            &exe_path,
-            &[],
-            Some(watched_pid),
-            Some("2.0.0"),
-        )
-        .unwrap();
 
+        let install_dir_for_thread = install_dir.to_path_buf();
+        let exe_path_for_thread = exe_path.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let supervisor = std::thread::spawn(move || {
+            let result = run_supervisor(
+                "demo-supervisor",
+                &install_dir_for_thread,
+                &exe_path_for_thread,
+                &[],
+                Some(watched_pid),
+                Some("2.0.0"),
+            );
+            tx.send(result).unwrap();
+        });
+
+        let stop_file = supervisor_stop_file(install_dir, "demo-supervisor");
+        let converged = wait_until(std::time::Duration::from_secs(15), || {
+            surge_core::update::status::read_update_status(install_dir)
+                .ok()
+                .flatten()
+                .is_some_and(|status| status.state == surge_core::update::status::UpdateConvergenceState::Converged)
+        });
+        std::fs::write(&stop_file, "stop").unwrap();
+
+        let supervisor_result = rx.recv_timeout(std::time::Duration::from_secs(10));
+        supervisor.join().unwrap();
+        supervisor_result
+            .expect("supervisor did not exit after stop file")
+            .unwrap();
+
+        assert!(
+            converged,
+            "restart handoff should converge once the target child survives the stability window"
+        );
         assert!(child_started.exists(), "replacement child should have started");
         let status = surge_core::update::status::read_update_status(install_dir)
             .unwrap()
@@ -892,5 +716,90 @@ mod tests {
         assert!(status.supervisor_restart_confirmed);
         assert_eq!(status.failure_phase, None);
         assert_eq!(status.reason, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clean_child_exit_triggers_restart_in_steady_state() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TestInstallDir::new("surge-supervisor-clean-exit-restart");
+        let install_dir = tmp.path();
+        let runs_path = install_dir.join("child-runs.log");
+        let exe_path = install_dir.join("target-child");
+        std::fs::write(
+            &exe_path,
+            format!("#!/bin/sh\necho run >> '{}'\nexit 0\n", runs_path.display()),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&exe_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&exe_path, permissions).unwrap();
+
+        let install_dir_for_thread = install_dir.to_path_buf();
+        let exe_path_for_thread = exe_path.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let supervisor = std::thread::spawn(move || {
+            let result = run_supervisor(
+                "demo-supervisor",
+                &install_dir_for_thread,
+                &exe_path_for_thread,
+                &[],
+                None,
+                None,
+            );
+            tx.send(result).unwrap();
+        });
+
+        let restarted = wait_until(std::time::Duration::from_secs(10), || {
+            std::fs::read_to_string(&runs_path).is_ok_and(|contents| contents.lines().count() >= 2)
+        });
+
+        let stop_file = supervisor_stop_file(install_dir, "demo-supervisor");
+        std::fs::write(&stop_file, "stop").unwrap();
+        let supervisor_result = rx.recv_timeout(std::time::Duration::from_secs(10));
+        supervisor.join().unwrap();
+        supervisor_result
+            .expect("supervisor did not exit after stop file")
+            .unwrap();
+
+        assert!(
+            restarted,
+            "supervisor must relaunch a child that exits cleanly (code 0) instead of stopping supervision"
+        );
+    }
+
+    #[test]
+    fn resolve_exe_path_prefers_explicit_flag() {
+        let resolved = resolve_exe_path(
+            Some(Path::new("/opt/demo/app/demo")),
+            Path::new("/opt/demo"),
+            "demo-supervisor",
+        )
+        .unwrap();
+        assert_eq!(resolved, PathBuf::from("/opt/demo/app/demo"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_exe_path_reads_state_file_when_flag_absent() {
+        let tmp = TestInstallDir::new("surge-supervisor-exe-state");
+        let install_dir = tmp.path();
+        let exe = install_dir.join("app").join("demo-app");
+        surge_core::supervisor::state::write_supervisor_exe_path(install_dir, "demo-supervisor", &exe).unwrap();
+
+        let resolved = resolve_exe_path(None, install_dir, "demo-supervisor").unwrap();
+        assert_eq!(resolved, exe);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_exe_path_errors_when_flag_and_state_file_absent() {
+        let tmp = TestInstallDir::new("surge-supervisor-exe-missing");
+        let install_dir = tmp.path();
+
+        let err = resolve_exe_path(None, install_dir, "demo-supervisor").unwrap_err();
+
+        assert!(matches!(err, SupervisorError::MissingExecutablePath(..)));
     }
 }

@@ -720,6 +720,9 @@ while [ "$#" -gt 0 ]; do
     *) shift ;;
   esac
 done
+if [ -z "$exe" ]; then
+  exe="$(cat "$dir/.surge-supervisor-$id.exe" 2>/dev/null || true)"
+fi
 echo $$ > "$dir/.surge-supervisor-$id.pid"
 while kill -0 "$pid" 2>/dev/null; do
   sleep 0.05
@@ -1800,6 +1803,101 @@ echo started > new-child-started
         let final_record = status::read_update_status(&install_root).unwrap().unwrap();
         assert_eq!(final_record.state, status::UpdateConvergenceState::Converged);
         assert!(final_record.current_phase.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_finalize_starts_supervisor_when_none_was_running() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("store");
+        let install_root = tmp.path().join("install");
+        let app_id = "test-app";
+        std::fs::create_dir_all(&store_root).unwrap();
+        std::fs::create_dir_all(&install_root).unwrap();
+        let app_store = app_scoped_store_root(&store_root, app_id);
+
+        let rid = current_rid();
+        let full_filename = format!("{app_id}-1.1.0-{rid}-full.tar.zst");
+        let full_path = app_store.join(&full_filename);
+
+        // Mock supervisor: parse --id/--dir, write the pid file so the restart is
+        // confirmed, then exit. It never watches, so nothing lingers after the test.
+        let supervisor_script = b"#!/bin/sh\nid=\"\"\ndir=\"\"\nwhile [ \"$#\" -gt 0 ]; do\n  case \"$1\" in\n    --id) id=\"$2\"; shift 2 ;;\n    --dir) dir=\"$2\"; shift 2 ;;\n    *) shift ;;\n  esac\ndone\necho $$ > \"$dir/.surge-supervisor-$id.pid\"\n";
+
+        let mut packer = ArchivePacker::new(3).unwrap();
+        packer.add_buffer(app_id, b"#!/bin/sh\nexit 0\n", 0o755).unwrap();
+        packer.add_buffer("surge-supervisor", supervisor_script, 0o755).unwrap();
+        packer.finalize_to_file(&full_path).unwrap();
+
+        let full_size = std::fs::metadata(&full_path).unwrap().len() as i64;
+        let full_sha256 = sha256_hex_file(&full_path).unwrap();
+
+        let index = ReleaseIndex {
+            app_id: app_id.to_string(),
+            releases: vec![ReleaseEntry {
+                version: "1.1.0".to_string(),
+                channels: vec!["stable".to_string()],
+                os: current_os_label_for_tests(),
+                rid: rid.clone(),
+                is_genesis: true,
+                full_filename: full_filename.clone(),
+                full_size,
+                full_sha256,
+                main_exe: app_id.to_string(),
+                install_directory: app_id.to_string(),
+                supervisor_id: "demo-supervisor".to_string(),
+                created_utc: chrono::Utc::now().to_rfc3339(),
+                ..ReleaseEntry::default()
+            }],
+            ..ReleaseIndex::default()
+        };
+        write_app_scoped_release_index(&store_root, app_id, &index);
+
+        let ctx = Arc::new(Context::new());
+        ctx.set_storage(
+            StorageProvider::Filesystem,
+            store_root.to_str().unwrap(),
+            "",
+            "",
+            "",
+            "",
+        );
+
+        let pid_file = crate::supervisor::state::supervisor_pid_file(&install_root, "demo-supervisor");
+        assert!(!pid_file.exists(), "no supervisor should be running before the update");
+
+        let mut manager = UpdateManager::new(ctx, app_id, "1.0.0", "stable", install_root.to_str().unwrap()).unwrap();
+        let info = manager.check_for_updates().await.unwrap().unwrap();
+        manager
+            .download_and_apply(&info, None::<fn(ProgressInfo)>)
+            .await
+            .unwrap();
+
+        // The finalize step must start a watch supervisor even though none was
+        // running before the update, leaving a pending restart handoff.
+        assert!(
+            pid_file.is_file(),
+            "finalize should start a watch supervisor and write its pid file"
+        );
+        let exe_state = crate::supervisor::state::read_supervisor_exe_path(&install_root, "demo-supervisor");
+        assert_eq!(exe_state, Some(install_root.join("app").join(app_id)));
+
+        let final_record = status::read_update_status(&install_root).unwrap().unwrap();
+        assert_eq!(final_record.state, status::UpdateConvergenceState::PendingRestart);
+        assert_eq!(
+            final_record.failure_phase.as_deref(),
+            Some(status::RESTART_HANDOFF_WAITING_FOR_OLD_CHILD_PHASE)
+        );
+
+        let _ = std::fs::remove_file(&pid_file);
+        let mode_probe = std::fs::metadata(install_root.join("app").join("surge-supervisor")).unwrap();
+        assert_ne!(
+            mode_probe.permissions().mode() & 0o111,
+            0,
+            "packed supervisor should remain executable"
+        );
     }
 
     #[tokio::test]

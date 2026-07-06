@@ -8,12 +8,16 @@ use tracing::{debug, info, warn};
 use crate::error::{Result, SurgeError};
 use crate::platform::process::{ProcessHandle, current_pid, spawn_detached, spawn_process, supervisor_binary_name};
 use crate::releases::manifest::ReleaseEntry;
-use crate::supervisor::state::{read_restart_args, supervisor_pid_file, supervisor_stop_file};
+use crate::supervisor::state::{
+    read_restart_args, supervisor_pid_file, supervisor_stop_file, write_supervisor_exe_path,
+};
 use crate::update::status::{
     RESTART_HANDOFF_FAILED_PHASE, RESTART_HANDOFF_WAITING_FOR_OLD_CHILD_PHASE, confirm_supervisor_restart,
 };
 
 const SUPERVISOR_RESTART_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
+const SUPERVISOR_RESTART_MAX_ATTEMPTS: u32 = 2;
+const SUPERVISOR_RESTART_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone)]
 pub(super) enum SupervisorRestartOutcome {
@@ -157,6 +161,26 @@ pub(super) fn restart_supervisor_after_update_with_pid(
     latest: &ReleaseEntry,
     watched_pid: u32,
 ) -> SupervisorRestartOutcome {
+    restart_supervisor_after_update_with_config(
+        install_dir,
+        active_app_dir,
+        latest,
+        watched_pid,
+        SUPERVISOR_RESTART_CONFIRM_TIMEOUT,
+        SUPERVISOR_RESTART_MAX_ATTEMPTS,
+        SUPERVISOR_RESTART_RETRY_DELAY,
+    )
+}
+
+fn restart_supervisor_after_update_with_config(
+    install_dir: &Path,
+    active_app_dir: &Path,
+    latest: &ReleaseEntry,
+    watched_pid: u32,
+    confirm_timeout: Duration,
+    max_attempts: u32,
+    retry_delay: Duration,
+) -> SupervisorRestartOutcome {
     let supervisor_id = latest.supervisor_id.trim();
     if supervisor_id.is_empty() {
         return SupervisorRestartOutcome::NotApplicable;
@@ -186,6 +210,18 @@ pub(super) fn restart_supervisor_after_update_with_pid(
         };
     }
 
+    if let Err(e) = write_supervisor_exe_path(install_dir, supervisor_id, &exe_path) {
+        warn!(
+            supervisor_id,
+            error = %e,
+            "Failed to persist supervisor exe state before restart"
+        );
+        return SupervisorRestartOutcome::PendingRestart {
+            reason: format!("failed to persist supervisor exe state: {e}"),
+            failure_phase: RESTART_HANDOFF_FAILED_PHASE,
+        };
+    }
+
     let restart_args = match read_restart_args(install_dir, supervisor_id) {
         Ok(args) => args,
         Err(e) => {
@@ -198,52 +234,60 @@ pub(super) fn restart_supervisor_after_update_with_pid(
         }
     };
 
-    let args = supervisor_watch_args(
-        supervisor_id,
-        install_dir,
-        watched_pid,
-        &latest.version,
-        &exe_path,
-        &restart_args,
-    );
+    let args = supervisor_watch_args(supervisor_id, install_dir, watched_pid, &latest.version, &restart_args);
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
 
-    match spawn_detached(&supervisor_path, &arg_refs, Some(install_dir), &latest.environment) {
-        Ok(handle) => {
-            info!(pid = handle.pid(), supervisor_id, "Restarted supervisor after update");
+    let mut last_failure: Option<(String, &'static str)> = None;
+    for attempt in 1..=max_attempts {
+        match spawn_detached(&supervisor_path, &arg_refs, Some(install_dir), &latest.environment) {
+            Ok(handle) => {
+                info!(
+                    pid = handle.pid(),
+                    supervisor_id, attempt, "Restarted supervisor after update"
+                );
+                if confirm_supervisor_restart(install_dir, supervisor_id, confirm_timeout) {
+                    return SupervisorRestartOutcome::PendingRestart {
+                        reason: format!(
+                            "supervisor handoff accepted; waiting for previous child pid {watched_pid} to exit and target version {} to start",
+                            latest.version
+                        ),
+                        failure_phase: RESTART_HANDOFF_WAITING_FOR_OLD_CHILD_PHASE,
+                    };
+                }
+                let timeout_ms = u64::try_from(confirm_timeout.as_millis()).unwrap_or(u64::MAX);
+                warn!(
+                    supervisor_id,
+                    timeout_ms, attempt, "Supervisor pid file did not appear after restart within timeout window"
+                );
+                last_failure = Some((
+                    format!("supervisor pid file did not appear within {timeout_ms}ms after restart"),
+                    RESTART_HANDOFF_FAILED_PHASE,
+                ));
+            }
+            Err(e) => {
+                warn!(
+                    supervisor_id,
+                    error = %e,
+                    attempt,
+                    "Failed to restart supervisor after update"
+                );
+                last_failure = Some((format!("spawn failed: {e}"), RESTART_HANDOFF_FAILED_PHASE));
+            }
         }
-        Err(e) => {
-            warn!(
-                supervisor_id,
-                error = %e,
-                "Failed to restart supervisor after update (continuing)"
-            );
-            return SupervisorRestartOutcome::PendingRestart {
-                reason: format!("spawn failed: {e}"),
-                failure_phase: RESTART_HANDOFF_FAILED_PHASE,
-            };
+
+        if attempt < max_attempts {
+            warn!(supervisor_id, attempt, "Retrying supervisor restart after short delay");
+            std::thread::sleep(retry_delay);
         }
     }
 
-    if confirm_supervisor_restart(install_dir, supervisor_id, SUPERVISOR_RESTART_CONFIRM_TIMEOUT) {
-        SupervisorRestartOutcome::PendingRestart {
-            reason: format!(
-                "supervisor handoff accepted; waiting for previous child pid {watched_pid} to exit and target version {} to start",
-                latest.version
-            ),
-            failure_phase: RESTART_HANDOFF_WAITING_FOR_OLD_CHILD_PHASE,
-        }
-    } else {
-        let timeout_ms = u64::try_from(SUPERVISOR_RESTART_CONFIRM_TIMEOUT.as_millis()).unwrap_or(u64::MAX);
-        warn!(
-            supervisor_id,
-            timeout_ms, "Supervisor pid file did not appear after restart within timeout window"
-        );
-        SupervisorRestartOutcome::PendingRestart {
-            reason: format!("supervisor pid file did not appear within {timeout_ms}ms after restart"),
-            failure_phase: RESTART_HANDOFF_FAILED_PHASE,
-        }
-    }
+    let (reason, failure_phase) = last_failure.unwrap_or_else(|| {
+        (
+            "supervisor restart did not complete".to_string(),
+            RESTART_HANDOFF_FAILED_PHASE,
+        )
+    });
+    SupervisorRestartOutcome::PendingRestart { reason, failure_phase }
 }
 
 pub(super) fn terminate_superseded_app_processes(
@@ -421,7 +465,6 @@ fn supervisor_watch_args(
     install_dir: &Path,
     watched_pid: u32,
     handoff_version: &str,
-    exe_path: &Path,
     restart_args: &[String],
 ) -> Vec<String> {
     let mut args = vec![
@@ -434,8 +477,6 @@ fn supervisor_watch_args(
         watched_pid.to_string(),
         "--handoff-version".to_string(),
         handoff_version.to_string(),
-        "--exe".to_string(),
-        exe_path.to_string_lossy().into_owned(),
     ];
     if !restart_args.is_empty() {
         args.push("--".to_string());
@@ -454,14 +495,7 @@ mod tests {
     fn supervisor_watch_args_include_handoff_version_before_child_args() {
         let restart_args = vec!["--app-mode".to_string(), "service".to_string()];
 
-        let args = supervisor_watch_args(
-            "demo-supervisor",
-            Path::new("/opt/demo"),
-            42,
-            "2.0.0",
-            Path::new("/opt/demo/app/demo"),
-            &restart_args,
-        );
+        let args = supervisor_watch_args("demo-supervisor", Path::new("/opt/demo"), 42, "2.0.0", &restart_args);
 
         assert_eq!(
             args,
@@ -475,12 +509,80 @@ mod tests {
                 "42",
                 "--handoff-version",
                 "2.0.0",
-                "--exe",
-                "/opt/demo/app/demo",
                 "--",
                 "--app-mode",
                 "service",
             ]
+        );
+        assert!(
+            !args.iter().any(|arg| arg == "--exe"),
+            "supervisor argv must not carry the app exe path so external pkill -f <app-path> cannot match it"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restart_supervisor_retries_once_when_pid_file_never_appears() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let install_dir = tmp.path();
+        let active_app_dir = install_dir.join("app");
+        std::fs::create_dir_all(&active_app_dir).unwrap();
+
+        let attempts_log = install_dir.join("supervisor-attempts.log");
+        let supervisor_path = active_app_dir.join(crate::platform::process::supervisor_binary_name());
+        std::fs::write(
+            &supervisor_path,
+            format!("#!/bin/sh\necho attempt >> '{}'\nexit 0\n", attempts_log.display()),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&supervisor_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&supervisor_path, permissions).unwrap();
+
+        let app_path = active_app_dir.join("demo-app");
+        std::fs::write(&app_path, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = std::fs::metadata(&app_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&app_path, permissions).unwrap();
+
+        let latest = ReleaseEntry {
+            version: "2.0.0".to_string(),
+            main_exe: "demo-app".to_string(),
+            supervisor_id: "demo-supervisor".to_string(),
+            ..ReleaseEntry::default()
+        };
+
+        let outcome = restart_supervisor_after_update_with_config(
+            install_dir,
+            &active_app_dir,
+            &latest,
+            std::process::id(),
+            Duration::from_millis(200),
+            2,
+            Duration::from_millis(10),
+        );
+
+        match outcome {
+            SupervisorRestartOutcome::PendingRestart { failure_phase, .. } => {
+                assert_eq!(failure_phase, RESTART_HANDOFF_FAILED_PHASE);
+            }
+            SupervisorRestartOutcome::NotApplicable => panic!("expected PendingRestart failure, got NotApplicable"),
+        }
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut attempts = 0;
+        while std::time::Instant::now() < deadline {
+            attempts = std::fs::read_to_string(&attempts_log).map_or(0, |contents| contents.lines().count());
+            if attempts >= 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            attempts, 2,
+            "restart should spawn the supervisor exactly twice (one retry)"
         );
     }
 

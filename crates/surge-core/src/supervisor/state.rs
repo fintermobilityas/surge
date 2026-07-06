@@ -28,6 +28,43 @@ pub fn supervisor_restart_args_file(install_dir: &Path, supervisor_id: &str) -> 
     supervisor_state_path(install_dir, supervisor_id, ".args.json")
 }
 
+#[must_use]
+pub fn supervisor_exe_file(install_dir: &Path, supervisor_id: &str) -> PathBuf {
+    supervisor_state_path(install_dir, supervisor_id, ".exe")
+}
+
+/// Persist the supervised executable path so the spawning side can omit it from
+/// the supervisor's argv. Keeping the app path out of argv stops an external
+/// `pkill -f <app-path>` from also matching the supervisor process.
+pub fn write_supervisor_exe_path(install_dir: &Path, supervisor_id: &str, exe_path: &Path) -> Result<()> {
+    let supervisor_id = normalized_supervisor_id(supervisor_id);
+    if supervisor_id.is_empty() {
+        return Ok(());
+    }
+
+    std::fs::write(
+        supervisor_exe_file(install_dir, supervisor_id),
+        exe_path.to_string_lossy().as_bytes(),
+    )?;
+    Ok(())
+}
+
+#[must_use]
+pub fn read_supervisor_exe_path(install_dir: &Path, supervisor_id: &str) -> Option<PathBuf> {
+    let supervisor_id = normalized_supervisor_id(supervisor_id);
+    if supervisor_id.is_empty() {
+        return None;
+    }
+
+    let exe_path = supervisor_exe_file(install_dir, supervisor_id);
+    let contents = std::fs::read_to_string(exe_path).ok()?;
+    let trimmed = contents.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(trimmed))
+}
+
 pub fn write_restart_args(install_dir: &Path, supervisor_id: &str, args: &[String]) -> Result<()> {
     let supervisor_id = normalized_supervisor_id(supervisor_id);
     if supervisor_id.is_empty() {
@@ -76,5 +113,28 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let restored = read_restart_args(dir.path(), "demo-supervisor").unwrap();
         assert!(restored.is_empty());
+    }
+
+    #[test]
+    fn supervisor_exe_path_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("app").join("demo-app");
+
+        write_supervisor_exe_path(dir.path(), "demo-supervisor", &exe).unwrap();
+
+        assert_eq!(read_supervisor_exe_path(dir.path(), "demo-supervisor"), Some(exe));
+    }
+
+    #[test]
+    fn supervisor_exe_path_missing_file_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_supervisor_exe_path(dir.path(), "demo-supervisor"), None);
+    }
+
+    #[test]
+    fn supervisor_exe_path_blank_contents_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(supervisor_exe_file(dir.path(), "demo-supervisor"), "   \n").unwrap();
+        assert_eq!(read_supervisor_exe_path(dir.path(), "demo-supervisor"), None);
     }
 }

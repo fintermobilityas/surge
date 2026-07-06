@@ -151,8 +151,23 @@ where
     );
     write_runtime_manifest(&active_app_dir, &runtime_manifest_profile, &runtime_manifest_metadata)?;
 
+    // Start the replacement watch-supervisor as soon as the swapped app is
+    // usable (directory swapped, persistent assets carried over, runtime
+    // manifest written), before the best-effort shortcut/prune/hook steps that
+    // can block for many seconds. This shrinks the window in which no
+    // supervisor is watching the app. The start no longer depends on a
+    // supervisor having been running before the update: if the release
+    // configures supervision, a fresh watch supervisor is always started so a
+    // supervisor that died before the update is recovered here.
+    let restart_outcome = if latest.supervisor_id.trim().is_empty() {
+        SupervisorRestartOutcome::NotApplicable
+    } else {
+        progress_emitter.emit_substep(6, finalize_phase::RESTARTING_SUPERVISOR, 96);
+        lifecycle::restart_supervisor_after_update(&manager.install_dir, &active_app_dir, latest)
+    };
+
     if !latest.shortcuts.is_empty() {
-        progress_emitter.emit_substep(6, finalize_phase::INSTALLING_SHORTCUTS, 96);
+        progress_emitter.emit_substep(6, finalize_phase::INSTALLING_SHORTCUTS, 97);
         match install_shortcuts(
             &manager.app_id,
             latest.display_name(&manager.app_id),
@@ -176,7 +191,7 @@ where
         }
     }
 
-    progress_emitter.emit_substep(6, finalize_phase::PRUNING_OLD_VERSIONS, 97);
+    progress_emitter.emit_substep(6, finalize_phase::PRUNING_OLD_VERSIONS, 98);
     if previous_swap_dir.is_dir() {
         let previous_version_dir = manager.install_dir.join(format!("app-{}", manager.current_version));
         if !manager.current_version.trim().is_empty()
@@ -262,15 +277,9 @@ where
         }
     }
 
-    progress_emitter.emit_substep(6, finalize_phase::POST_UPDATE_HOOK, 98);
+    progress_emitter.emit_substep(6, finalize_phase::POST_UPDATE_HOOK, 99);
     lifecycle::invoke_post_update_hook(&manager.install_dir, &active_app_dir, latest);
 
-    let restart_outcome = if supervisor_was_running {
-        progress_emitter.emit_substep(6, finalize_phase::RESTARTING_SUPERVISOR, 99);
-        lifecycle::restart_supervisor_after_update(&manager.install_dir, &active_app_dir, latest)
-    } else {
-        SupervisorRestartOutcome::NotApplicable
-    };
     match lifecycle::terminate_superseded_app_processes(&manager.install_dir, &active_app_dir, &latest.main_exe) {
         Ok(0) => {}
         Ok(terminated) => {

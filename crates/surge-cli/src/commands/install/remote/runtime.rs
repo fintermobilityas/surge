@@ -88,6 +88,13 @@ pub(crate) fn build_remote_runtime_start_command(
     let version = shell_single_quote(version.trim());
     let exports = activation::shell_export_lines(environment);
 
+    // Unlike the finalize/ffi spawn sites, this remote-install template keeps
+    // `--exe` on the supervisor argv. A newer CLI can install an older package
+    // whose bundled supervisor still requires `--exe`, so omitting it here would
+    // break that install. The supervisor keeps `--exe` as its first-choice exe
+    // source, so the app-path stays out of argv on later update/self-restart
+    // spawns (finalize/ffi) once the node runs a supervisor that reads the exe
+    // state file.
     format!(
         "set -eu\n\
 install_root={install_root}\n\

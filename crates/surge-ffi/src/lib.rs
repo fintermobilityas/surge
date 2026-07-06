@@ -29,7 +29,9 @@ use std::path::Path;
 use std::ptr;
 
 use surge_core::lock::mutex::DistributedMutex;
-use surge_core::supervisor::state::{supervisor_pid_file, supervisor_stop_file, write_restart_args};
+use surge_core::supervisor::state::{
+    supervisor_pid_file, supervisor_stop_file, write_restart_args, write_supervisor_exe_path,
+};
 use surge_core::update::status::{UpdateConvergenceState, mark_restart_handoff_converged, read_update_status};
 
 pub use crate::context::{
@@ -256,18 +258,15 @@ pub unsafe extern "C" fn surge_supervisor_start(
             return SURGE_ERROR;
         }
 
+        ffi_trace("surge_supervisor_start: writing exe state");
+        if let Err(e) = write_supervisor_exe_path(install_dir, &sup_id, exe) {
+            tracing::error!("supervisor_start failed: {e}");
+            ffi_trace("surge_supervisor_start: exe state failed");
+            return SURGE_ERROR;
+        }
+
         let pid = surge_core::platform::process::current_pid().to_string();
-        let mut args: Vec<&str> = vec![
-            "watch",
-            "--id",
-            &sup_id,
-            "--dir",
-            &install_dir_s,
-            "--pid",
-            &pid,
-            "--exe",
-            &exe_s,
-        ];
+        let mut args: Vec<&str> = vec!["watch", "--id", &sup_id, "--dir", &install_dir_s, "--pid", &pid];
         if !args_owned.is_empty() {
             args.push("--");
             args.extend(args_owned.iter().map(String::as_str));

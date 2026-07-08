@@ -1,7 +1,6 @@
 use std::path::Path;
 
 use async_trait::async_trait;
-use reqwest::Client;
 use tracing::debug;
 
 use crate::context::StorageConfig;
@@ -52,9 +51,7 @@ impl AzureBlobBackend {
             config.endpoint.clone()
         };
 
-        let client = Client::builder()
-            .build()
-            .map_err(|e| SurgeError::Storage(format!("Failed to build HTTP client: {e}")))?;
+        let client = crate::net::http_client()?;
 
         debug!(
             account = %account_name,

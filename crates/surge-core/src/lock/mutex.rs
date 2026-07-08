@@ -44,10 +44,7 @@ pub struct DistributedMutex {
 
 impl DistributedMutex {
     pub fn new(ctx: Arc<Context>, name: &str) -> Self {
-        let client = reqwest::Client::builder()
-            .user_agent(format!("surge/{}", crate::config::constants::VERSION))
-            .build()
-            .unwrap_or_default();
+        let client = crate::net::http_client_or_default();
 
         Self {
             ctx,

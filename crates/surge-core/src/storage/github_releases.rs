@@ -74,10 +74,7 @@ impl GitHubReleasesBackend {
             config.endpoint.trim().trim_end_matches('/').to_string()
         };
 
-        let client = Client::builder()
-            .user_agent("surge/0.1")
-            .build()
-            .map_err(|e| SurgeError::Storage(format!("Failed to build HTTP client: {e}")))?;
+        let client = crate::net::http_client()?;
 
         Ok(Self {
             client,

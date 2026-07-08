@@ -2,7 +2,6 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use percent_encoding::utf8_percent_encode;
-use reqwest::Client;
 use tracing::debug;
 
 use crate::context::StorageConfig;
@@ -38,9 +37,7 @@ impl GcsBackend {
             config.endpoint.clone()
         };
 
-        let client = Client::builder()
-            .build()
-            .map_err(|e| SurgeError::Storage(format!("Failed to build HTTP client: {e}")))?;
+        let client = crate::net::http_client()?;
 
         debug!(
             bucket = %config.bucket,

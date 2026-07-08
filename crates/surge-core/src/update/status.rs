@@ -85,6 +85,10 @@ pub struct UpdateStatusRecord {
     pub supervisor_restart_confirmed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attempted_at_utc: Option<String>,
+    /// When the update work (download, verify, apply, restart initiation)
+    /// finished. Deliberately not re-stamped when convergence is proven later:
+    /// `attempted_at_utc..completed_at_utc` must stay a truthful measure of the
+    /// update work even when the restart handoff takes hours to settle.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completed_at_utc: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -355,6 +359,34 @@ impl UpdateStatusRecord {
         reason: &str,
         context: FailureContext,
     ) -> Self {
+        Self::failed_with_context_at(
+            app_id,
+            installed_version,
+            target_version,
+            channel,
+            attempted_at_utc,
+            now_utc_rfc3339(),
+            reason,
+            context,
+        )
+    }
+
+    /// Like [`Self::failed_with_context`], but with an explicit
+    /// `completed_at_utc` for failures classified after the fact (for example
+    /// an abandoned attempt discovered on the next update check), where "now"
+    /// would fold the idle gap into the recorded attempt duration.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn failed_with_context_at(
+        app_id: &str,
+        installed_version: &str,
+        target_version: &str,
+        channel: &str,
+        attempted_at_utc: String,
+        completed_at_utc: String,
+        reason: &str,
+        context: FailureContext,
+    ) -> Self {
         Self {
             state: UpdateConvergenceState::Failed,
             installed_version: installed_version.to_string(),
@@ -363,7 +395,7 @@ impl UpdateStatusRecord {
             app_id: app_id.to_string(),
             supervisor_restart_confirmed: false,
             attempted_at_utc: Some(attempted_at_utc),
-            completed_at_utc: Some(now_utc_rfc3339()),
+            completed_at_utc: Some(completed_at_utc),
             reason: Some(reason.to_string()),
             last_progress_at_utc: context.last_progress_at_utc,
             current_phase: None,
@@ -482,12 +514,17 @@ fn fail_abandoned_in_progress_update_at(
         .or(record.failure_phase.as_deref())
         .unwrap_or("unknown");
     let attempted_at_utc = record.attempted_at_utc.clone().unwrap_or_else(now_utc_rfc3339);
-    let failed = UpdateStatusRecord::failed_with_context(
+    let last_activity_at_utc = record
+        .last_progress_at_utc
+        .clone()
+        .unwrap_or_else(|| attempted_at_utc.clone());
+    let failed = UpdateStatusRecord::failed_with_context_at(
         &record.app_id,
         &record.installed_version,
         &record.target_version,
         &record.channel,
         attempted_at_utc,
+        last_activity_at_utc,
         &format!(
             "previous update attempt abandoned after {}s without progress at phase '{phase}'",
             age.as_secs()
@@ -727,6 +764,8 @@ mod tests {
         assert_eq!(failed.target_version, "9999.0.0");
         assert_eq!(failed.failure_phase.as_deref(), Some("package apply started"));
         assert_eq!(failed.retry_safe, Some(true));
+        assert_eq!(failed.attempted_at_utc.as_deref(), Some("2026-05-15T20:00:00Z"));
+        assert_eq!(failed.completed_at_utc.as_deref(), Some("2026-05-15T20:01:00Z"));
         assert!(
             failed
                 .reason

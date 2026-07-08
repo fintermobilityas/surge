@@ -44,7 +44,7 @@ pub struct DistributedMutex {
 
 impl DistributedMutex {
     pub fn new(ctx: Arc<Context>, name: &str) -> Self {
-        let client = crate::net::http_client().unwrap_or_default();
+        let client = crate::net::http_client_or_default();
 
         Self {
             ctx,

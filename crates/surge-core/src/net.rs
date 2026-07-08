@@ -18,9 +18,19 @@ pub(crate) const HTTP_READ_STALL_TIMEOUT: Duration = Duration::from_secs(90);
 
 pub(crate) fn http_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
-        .user_agent(format!("surge/{}", crate::config::constants::VERSION))
+        .user_agent(concat!("surge/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(HTTP_CONNECT_TIMEOUT)
         .read_timeout(HTTP_READ_STALL_TIMEOUT)
         .build()
         .map_err(|e| SurgeError::Storage(format!("Failed to build HTTP client: {e}")))
+}
+
+/// For construction sites that cannot propagate an error. Building a client
+/// only fails when the TLS backend cannot initialize; the default-client
+/// fallback keeps pre-existing behavior for that case, minus the timeouts.
+pub(crate) fn http_client_or_default() -> reqwest::Client {
+    http_client().unwrap_or_else(|error| {
+        tracing::warn!(%error, "Falling back to default HTTP client without timeouts");
+        reqwest::Client::default()
+    })
 }

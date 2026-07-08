@@ -1,10 +1,12 @@
 //! Shared HTTP client construction for storage backends and lock clients.
 //!
-//! Every outbound HTTP client must carry connect and read timeouts. Update
+//! Outbound HTTP clients are built with connect and read timeouts. Update
 //! checks and artifact downloads run unattended on remote nodes with flaky
 //! links; a request without timeouts can pin an update attempt on a dead TCP
 //! connection indefinitely, leaving the install in `in_progress` with no
-//! failure ever surfaced.
+//! failure ever surfaced. The only exception is the last-resort default
+//! client in [`http_client_or_default`], kept for construction sites that
+//! cannot propagate an error.
 
 use std::time::Duration;
 

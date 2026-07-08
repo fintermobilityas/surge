@@ -19,7 +19,7 @@ pub fn mark_restart_handoff_pending(
     };
 
     let completed_at_utc = update_work_completed_at(&existing);
-    let attempted_at_utc = existing.attempted_at_utc.unwrap_or_else(now_utc_rfc3339);
+    let attempted_at_utc = existing.attempted_at_utc.unwrap_or_else(|| completed_at_utc.clone());
     let record = UpdateStatusRecord::pending_restart_with_failure_phase(
         &existing.app_id,
         &existing.target_version,

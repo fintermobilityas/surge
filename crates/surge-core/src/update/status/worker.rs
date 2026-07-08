@@ -117,7 +117,11 @@ fn fail_abandoned_in_progress_update_at(
         .as_deref()
         .or(record.failure_phase.as_deref())
         .unwrap_or("unknown");
-    let attempted_at_utc = record.attempted_at_utc.clone().unwrap_or_else(now_utc_rfc3339);
+    let attempted_at_utc = record
+        .attempted_at_utc
+        .clone()
+        .or_else(|| record.last_progress_at_utc.clone())
+        .unwrap_or_else(now_utc_rfc3339);
     let last_activity_at_utc = record
         .last_progress_at_utc
         .clone()

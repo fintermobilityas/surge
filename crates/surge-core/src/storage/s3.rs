@@ -61,9 +61,7 @@ impl S3Backend {
         // Custom endpoints (MinIO, LocalStack, etc.) use path-style addressing.
         let path_style = !config.endpoint.is_empty();
 
-        let client = Client::builder()
-            .build()
-            .map_err(|e| SurgeError::Storage(format!("Failed to build HTTP client: {e}")))?;
+        let client = crate::net::http_client()?;
 
         debug!(
             bucket = %config.bucket,

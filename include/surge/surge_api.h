@@ -41,6 +41,28 @@ typedef struct surge_releases_info surge_releases_info;
 typedef struct surge_pack_context surge_pack_context;
 
 /* -------------------------------------------------------------------------- */
+/*  Ownership and lifetime rules                                              */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Unless a function says otherwise, input pointers are borrowed only for the
+ * duration of the call.
+ *
+ * Opaque handles returned by Surge are owned by the caller and must be passed
+ * exactly once to their matching destroy function. Destroy functions accept
+ * NULL. Child handles such as surge_update_manager and surge_pack_context own
+ * the shared state they need and may outlive the surge_context used to create
+ * them.
+ *
+ * A `const char*` returned by an accessor or supplied to a callback is borrowed
+ * and must not be freed. Accessor lifetimes are documented by that API;
+ * callback arguments remain valid only for the callback invocation. A `char*`
+ * returned through an output parameter is Surge-owned: on success the caller
+ * must pass it exactly once to surge_free_cstring(), never to the host C
+ * runtime's free(). String output parameters are set to NULL on failure.
+ */
+
+/* -------------------------------------------------------------------------- */
 /*  Enumerations                                                              */
 /* -------------------------------------------------------------------------- */
 
@@ -207,7 +229,9 @@ SURGE_API surge_result SURGE_CALL surge_config_set_resource_budget(surge_context
 
 /**
  * Create an update manager bound to a specific application.
- * @param ctx             Context handle (must outlive the manager).
+ * @param ctx             Context handle used during creation. The returned
+ *                        manager owns the shared state it needs and may outlive
+ *                        this context.
  * @param app_id          Application identifier.
  * @param current_version Current installed version string (semver).
  * @param channel         Release channel (e.g. "stable", "beta").
@@ -263,8 +287,9 @@ SURGE_API surge_result SURGE_CALL surge_update_manager_set_artifact_retention_po
 /**
  * Check for available updates.
  * @param mgr  Manager handle.
- * @param info [out] Receives a pointer to release information.
- *             Must be freed with surge_releases_destroy().
+ * @param info [out] Receives a pointer to release information on SURGE_OK.
+ *             Must be freed exactly once with surge_releases_destroy(). Set to
+ *             NULL on SURGE_NOT_FOUND, SURGE_ERROR, or SURGE_CANCELLED.
  * @return SURGE_OK if updates are available, SURGE_NOT_FOUND if up-to-date.
  */
 SURGE_API surge_result SURGE_CALL surge_update_check(surge_update_manager* mgr, surge_releases_info** info);
@@ -290,19 +315,20 @@ SURGE_API surge_result SURGE_CALL surge_update_download_and_apply(surge_update_m
  *
  * @param install_dir Root install directory containing
  *                    `.surge-update-status.json`.
- * @param json_out    [out] Receives a malloc()-allocated NUL-terminated JSON
+ * @param json_out    [out] Receives a Surge-owned NUL-terminated JSON
  *                    string on SURGE_OK, or NULL on SURGE_NOT_FOUND /
- *                    SURGE_ERROR. Caller must free with free().
+ *                    SURGE_ERROR. Caller must free it exactly once with
+ *                    surge_free_cstring(), never with the host's free().
  * @return SURGE_OK when a record exists; SURGE_NOT_FOUND when no record has
  *         been written yet; SURGE_ERROR on read/decode failure.
  */
 SURGE_API surge_result SURGE_CALL surge_update_status_read_json(const char* install_dir, char** json_out);
 
 /**
- * Free a NUL-terminated string returned by a Surge FFI call that documents its
- * output as `free()`-owned (for example surge_update_status_read_json). Safe
- * to call with NULL. Use this rather than the host's free() to ensure the
- * matching allocator is used across libraries.
+ * Free a Surge-owned NUL-terminated string returned through a `char**` output
+ * (for example surge_update_status_read_json or surge_lock_acquire). Each
+ * non-NULL output must be passed to this function exactly once and must never
+ * be passed to the host's free(). Safe to call with NULL.
  */
 SURGE_API void SURGE_CALL surge_free_cstring(char* ptr);
 
@@ -316,10 +342,18 @@ SURGE_API int32_t SURGE_CALL surge_releases_count(const surge_releases_info* inf
 /** Free a releases-info structure returned by surge_update_check(). */
 SURGE_API void SURGE_CALL surge_releases_destroy(surge_releases_info* info);
 
-/** Return the version string for release at @p index. */
+/**
+ * Return the version string for release at @p index, or NULL for an invalid
+ * handle/index. The returned pointer is borrowed, remains valid until @p info
+ * is destroyed, and must not be freed.
+ */
 SURGE_API const char* SURGE_CALL surge_release_version(const surge_releases_info* info, int32_t index);
 
-/** Return the channel string for release at @p index. */
+/**
+ * Return the channel string for release at @p index, or NULL for an invalid
+ * handle/index. The returned pointer is borrowed, remains valid until @p info
+ * is destroyed, and must not be freed.
+ */
 SURGE_API const char* SURGE_CALL surge_release_channel(const surge_releases_info* info, int32_t index);
 
 /** Return the full-package size in bytes for release at @p index. */
@@ -348,10 +382,10 @@ SURGE_API surge_result SURGE_CALL surge_bsdiff(surge_bsdiff_ctx* ctx);
  */
 SURGE_API surge_result SURGE_CALL surge_bspatch(surge_bspatch_ctx* ctx);
 
-/** Free memory allocated by surge_bsdiff(). */
+/** Free memory allocated by surge_bsdiff() and reset patch/patch_size. */
 SURGE_API void SURGE_CALL surge_bsdiff_free(surge_bsdiff_ctx* ctx);
 
-/** Free memory allocated by surge_bspatch(). */
+/** Free memory allocated by surge_bspatch() and reset newer/newer_size. */
 SURGE_API void SURGE_CALL surge_bspatch_free(surge_bspatch_ctx* ctx);
 
 /* -------------------------------------------------------------------------- */
@@ -360,7 +394,9 @@ SURGE_API void SURGE_CALL surge_bspatch_free(surge_bspatch_ctx* ctx);
 
 /**
  * Create a new pack context for building release packages.
- * @param ctx           Surge context.
+ * @param ctx           Surge context used during creation. The returned pack
+ *                      context owns the shared state it needs and may outlive
+ *                      this context.
  * @param manifest_path Path to the surge.yml manifest file.
  * @param app_id        Application identifier.
  * @param rid           Runtime identifier (e.g. "linux-x64").
@@ -405,8 +441,10 @@ SURGE_API void SURGE_CALL surge_pack_destroy(surge_pack_context* pack_ctx);
  * @param ctx             Surge context (must have lock server configured).
  * @param name            Lock name.
  * @param timeout_seconds Maximum time to wait for the lock.
- * @param challenge_out   [out] Receives an opaque challenge string required
- *                        to release the lock. Caller must free with free().
+ * @param challenge_out   [out] Receives an opaque Surge-owned challenge string
+ *                        required to release the lock, or NULL on failure.
+ *                        After release, free it exactly once with
+ *                        surge_free_cstring(), never with the host's free().
  * @return SURGE_OK on success.
  */
 SURGE_API surge_result SURGE_CALL surge_lock_acquire(surge_context* ctx, const char* name, int32_t timeout_seconds,
@@ -476,6 +514,15 @@ SURGE_API surge_result SURGE_CALL surge_process_events(int argc, const char** ar
  * @return SURGE_OK on success.
  */
 SURGE_API surge_result SURGE_CALL surge_cancel(surge_context* ctx);
+
+/**
+ * Clear a previous cancellation so @p ctx can start another operation.
+ * The caller must ensure that no operation using this context or a child
+ * handle created from it is still running while cancellation is reset.
+ * @param ctx Context handle.
+ * @return SURGE_OK on success.
+ */
+SURGE_API surge_result SURGE_CALL surge_reset_cancel(surge_context* ctx);
 
 #ifdef __cplusplus
 } /* extern "C" */

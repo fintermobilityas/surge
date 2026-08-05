@@ -1,5 +1,14 @@
 using System;
+using System.Reflection;
 using Surge;
+
+var informationalVersion = Assembly.GetExecutingAssembly()
+    .GetCustomAttribute<AssemblyInformationalVersionAttribute>()!
+    .InformationalVersion;
+var metadataSeparator = informationalVersion.IndexOf('+');
+var expectedSurgeVersion = metadataSeparator < 0
+    ? informationalVersion
+    : informationalVersion.Substring(0, metadataSeparator);
 
 var release = new SurgeRelease
 {
@@ -12,13 +21,23 @@ var release = new SurgeRelease
 var budget = new SurgeResourceBudget { MaxThreads = 2 };
 var retention = SurgeArtifactRetentionPolicy.LatestFull(2);
 var lifecycleCallbackVersion = "";
-var lifecycleHandled = SurgeApp.ProcessEvents(
-    Array.Empty<string>(),
-    onFirstRun: version => lifecycleCallbackVersion = version,
-    onInstalled: version => lifecycleCallbackVersion = version,
-    onUpdated: version => lifecycleCallbackVersion = version);
+var lifecycleHandled = false;
+try
+{
+    lifecycleHandled = SurgeApp.ProcessEvents(
+        Array.Empty<string>(),
+        onFirstRun: version => lifecycleCallbackVersion = version,
+        onInstalled: version => lifecycleCallbackVersion = version,
+        onUpdated: version => lifecycleCallbackVersion = version);
+}
+catch (DllNotFoundException)
+{
+    // This smoke roots the P/Invoke surface without bundling a native runtime.
+}
 
-if (release.Version != "1.0.0"
+if (SurgeApp.Version != expectedSurgeVersion
+    || SurgeApp.Version.Contains('+')
+    || release.Version != "1.0.0"
     || release.Channel != "stable"
     || budget.MaxThreads != 2
     || retention.Mode != SurgeArtifactRetentionMode.LatestFull

@@ -2,6 +2,7 @@
 name = "surge-bench"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Benchmark tool for the Surge update framework"

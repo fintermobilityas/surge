@@ -250,8 +250,12 @@ if let Some(info) = mgr.check_for_updates().await? {
 ```c
 surge_update_manager* mgr = surge_update_manager_create(ctx, "my-app", "1.0.0", "stable", dir);
 surge_releases_info* info = NULL;
-if (surge_update_check(mgr, &info) == SURGE_OK)
+if (surge_update_check(mgr, &info) == SURGE_OK) {
     surge_update_download_and_apply(mgr, info, progress_cb, NULL);
+    surge_releases_destroy(info);
+}
+surge_update_manager_destroy(mgr);
+surge_context_destroy(ctx);
 ```
 
 ## CI/CD Integration
@@ -533,13 +537,16 @@ The [`Surge.NET`](dotnet/Surge.NET/) NuGet package provides the full API:
 
 - **netstandard2.0** &mdash; `[DllImport]` for .NET Framework 4.6.1+, .NET Core, Mono, Xamarin
 - **net10.0** &mdash; `[LibraryImport]` with full AOT and trimming support
-- Zero external dependencies
+- Zero external managed dependencies; ship the matching native Surge library
+  from the same version and runtime identifier with the application
 - `SurgeUpdateManager.UpdateToLatestReleaseAsync()` &mdash; one call that checks, downloads, verifies, extracts, and applies
 - Per-phase progress callbacks, cancellation tokens, pre/post-update hooks
 
 ### C / C++
 
-Include [`surge_api.h`](include/surge/surge_api.h) and link against the shared library. 31 functions, all following the same pattern: opaque handles, `surge_result` return codes, thread-safe cancellation.
+Include [`surge_api.h`](include/surge/surge_api.h) and link against the shared
+library. The API uses opaque handles, `surge_result` return codes, explicit
+ownership rules, and thread-safe cancellation.
 
 ### Rust
 
@@ -595,14 +602,14 @@ surge restore -i \
 |---|---|
 | Lifecycle | `surge_context_create`, `surge_context_destroy`, `surge_context_last_error` |
 | Configuration | `surge_config_set_storage`, `surge_config_set_lock_server`, `surge_config_set_resource_budget` |
-| Update Manager | `surge_update_manager_create`, `surge_update_manager_destroy`, `surge_update_manager_set_channel`, `surge_update_manager_set_current_version`, `surge_update_check`, `surge_update_download_and_apply` |
+| Update Manager | `surge_update_manager_create`, `surge_update_manager_destroy`, `surge_update_manager_set_channel`, `surge_update_manager_set_current_version`, `surge_update_manager_set_release_retention_limit`, `surge_update_manager_set_artifact_retention_policy`, `surge_update_check`, `surge_update_download_and_apply`, `surge_update_status_read_json`, `surge_free_cstring` |
 | Release Info | `surge_releases_count`, `surge_releases_destroy`, `surge_release_version`, `surge_release_channel`, `surge_release_full_size`, `surge_release_is_genesis` |
 | Binary Diff | `surge_bsdiff`, `surge_bspatch`, `surge_bsdiff_free`, `surge_bspatch_free` |
 | Pack Builder | `surge_pack_create`, `surge_pack_build`, `surge_pack_push`, `surge_pack_destroy` |
 | Distributed Lock | `surge_lock_acquire`, `surge_lock_release` |
-| Supervisor | `surge_supervisor_start` |
+| Supervisor | `surge_supervisor_start`, `surge_supervisor_stop` |
 | Events | `surge_process_events` |
-| Cancellation | `surge_cancel` |
+| Cancellation | `surge_cancel`, `surge_reset_cancel` |
 
 ### Manifest reference
 
@@ -672,7 +679,7 @@ Use `surge compact` after rollout convergence, or for deliberate recovery/cleanu
                           │  P/Invoke or C calls
 ┌─────────────────────────▼────────────────────────────────┐
 │                 surge-ffi  (cdylib)                       │
-│          31 exported functions · surge_api.h              │
+│                  C ABI · surge_api.h                       │
 └─────────────────────────┬────────────────────────────────┘
                           │
 ┌─────────────────────────▼────────────────────────────────┐
@@ -685,7 +692,7 @@ Use `surge compact` after rollout convergence, or for deliberate recovery/cleanu
 | Crate | Description |
 |---|---|
 | `surge-core` | Core library &mdash; config, crypto, storage backends, archive (tar+zstd), bsdiff, release index, update manager, pack builder, supervisor, platform detection |
-| `surge-ffi` | C API shared library exporting 31 functions through `surge_api.h` |
+| `surge-ffi` | C API shared library exporting the interface declared in `surge_api.h` |
 | `surge-cli` | Command-line tool for packing, pushing, and managing releases |
 | `surge-supervisor` | Standalone process supervisor binary |
 
@@ -704,7 +711,7 @@ git submodule update --init
 
 ### Requirements
 
-- **Rust 1.85+** (Edition 2024) &mdash; install via [rustup](https://rustup.rs/)
+- **Rust 1.95+** (Edition 2024) &mdash; install via [rustup](https://rustup.rs/)
 - **.NET 10 SDK** (optional, for the .NET wrapper and demo app)
 
 ### Build and test
@@ -721,6 +728,14 @@ cd dotnet
 dotnet build --configuration Release
 dotnet test --configuration Release
 ```
+
+### Release artifact trust
+
+Official archives are covered by `SHA256SUMS.txt`, including the public C
+header. The Windows and macOS binaries are currently unsigned, and the macOS
+binaries are not notarized. Verify the published checksums before use and apply
+the signing/notarization required by your product distribution before shipping
+to end users.
 
 ## License
 

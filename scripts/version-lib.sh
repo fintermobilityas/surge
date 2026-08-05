@@ -40,6 +40,47 @@ workspace_surge_core_version() {
   ' "$cargo_file"
 }
 
+dotnet_package_version() {
+  local props_file
+  props_file="$(version_repo_root)/dotnet/Directory.Build.props"
+
+  awk '
+    match($0, /<Version>[^<]+<\/Version>/) {
+      value = substr($0, RSTART, RLENGTH)
+      sub(/^<Version>/, "", value)
+      sub(/<\/Version>$/, "", value)
+      print value
+      exit
+    }
+  ' "$props_file"
+}
+
+rewrite_dotnet_version() {
+  local version="$1"
+  local repo_root props_file temp_file
+
+  repo_root="$(version_repo_root)"
+  props_file="$repo_root/dotnet/Directory.Build.props"
+  temp_file="$(mktemp)"
+
+  awk -v version="$version" '
+    !updated && /<Version>[^<]+<\/Version>/ {
+      sub(/<Version>[^<]+<\/Version>/, "<Version>" version "</Version>")
+      updated = 1
+    }
+    {
+      print
+    }
+    END {
+      if (!updated) {
+        exit 1
+      }
+    }
+  ' "$props_file" > "$temp_file"
+
+  mv "$temp_file" "$props_file"
+}
+
 rewrite_workspace_versions() {
   local version="$1"
   local repo_root cargo_file temp_file
@@ -79,4 +120,5 @@ rewrite_workspace_versions() {
   ' "$cargo_file" > "$temp_file"
 
   mv "$temp_file" "$cargo_file"
+  rewrite_dotnet_version "$version"
 }

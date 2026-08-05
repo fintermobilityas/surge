@@ -110,3 +110,97 @@ pub unsafe extern "C" fn surge_release_is_genesis(info: *const SurgeReleasesInfo
 
     result.unwrap_or(0)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::CStr;
+    use std::ptr;
+
+    use crate::handles::{ReleaseEntryFfi, SurgeReleasesInfoHandle};
+
+    use super::{
+        surge_release_channel, surge_release_full_size, surge_release_is_genesis, surge_release_version,
+        surge_releases_count, surge_releases_destroy,
+    };
+
+    fn releases_handle() -> *mut SurgeReleasesInfoHandle {
+        let mut info = Box::new(SurgeReleasesInfoHandle {
+            releases: vec![ReleaseEntryFfi {
+                version: "1.2.3".to_string(),
+                channel: "beta".to_string(),
+                full_size: 42,
+                is_genesis: true,
+            }],
+            cached_strings: Vec::new(),
+            update_info: None,
+        });
+        info.cache_strings();
+        Box::into_raw(info)
+    }
+
+    #[test]
+    fn release_string_accessors_are_borrowed_for_handle_lifetime() {
+        let info = releases_handle();
+
+        let (version, channel) = unsafe {
+            // SAFETY: `info` is a live test-owned handle and index zero exists.
+            (surge_release_version(info, 0), surge_release_channel(info, 0))
+        };
+        assert!(!version.is_null());
+        assert!(!channel.is_null());
+        unsafe {
+            // SAFETY: both non-null strings are cached in the still-live
+            // `info` handle and remain NUL-terminated for its lifetime.
+            assert_eq!(CStr::from_ptr(version).to_bytes(), b"1.2.3");
+            assert_eq!(CStr::from_ptr(channel).to_bytes(), b"beta");
+            assert_eq!(surge_releases_count(info), 1);
+            assert_eq!(surge_release_full_size(info, 0), 42);
+            assert_eq!(surge_release_is_genesis(info, 0), 1);
+        }
+
+        // Other accessors do not invalidate the borrowed string storage.
+        unsafe {
+            // SAFETY: the borrowed strings remain valid until `info` is
+            // destroyed below.
+            assert_eq!(CStr::from_ptr(version).to_bytes(), b"1.2.3");
+            assert_eq!(CStr::from_ptr(channel).to_bytes(), b"beta");
+        }
+
+        unsafe {
+            // SAFETY: `info` is a live owned handle and is destroyed once.
+            surge_releases_destroy(info);
+        }
+    }
+
+    #[test]
+    fn release_accessors_reject_null_and_invalid_indices() {
+        unsafe {
+            // SAFETY: these accessors explicitly accept null handles and
+            // return neutral values without dereferencing them.
+            assert_eq!(surge_releases_count(ptr::null()), 0);
+            assert!(surge_release_version(ptr::null(), 0).is_null());
+            assert!(surge_release_channel(ptr::null(), 0).is_null());
+            assert_eq!(surge_release_full_size(ptr::null(), 0), 0);
+            assert_eq!(surge_release_is_genesis(ptr::null(), 0), 0);
+        }
+
+        let info = releases_handle();
+        for index in [-1, 1, i32::MAX] {
+            unsafe {
+                // SAFETY: `info` is live; each invalid index is intentionally
+                // passed to accessors that validate it before indexing.
+                assert!(surge_release_version(info, index).is_null());
+                assert!(surge_release_channel(info, index).is_null());
+                assert_eq!(surge_release_full_size(info, index), 0);
+                assert_eq!(surge_release_is_genesis(info, index), 0);
+            }
+        }
+
+        unsafe {
+            // SAFETY: `info` is destroyed exactly once; null destruction is an
+            // explicitly supported no-op.
+            surge_releases_destroy(info);
+            surge_releases_destroy(ptr::null_mut());
+        }
+    }
+}

@@ -12,6 +12,9 @@ use crate::shared::{
 use crate::utils::lock_recover;
 
 /// Create a new pack context for building release packages.
+///
+/// The returned pack context clones the shared state it needs and may outlive
+/// the context used during this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn surge_pack_create(
     ctx: *mut SurgeContextHandle,

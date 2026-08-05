@@ -25,12 +25,18 @@ One call that checks for updates, downloads the smallest available patch, verifi
 
 ## Key Features
 
-- **Zero dependencies** — no external NuGet packages required
+- **Zero managed dependencies** — no external NuGet packages are required
 - **Delta patches** — binary diffs (bsdiff + zstd) mean users download only what changed, typically 5–20% of the full package
 - **Release channels** — ship to `beta` first, then promote the exact same build to `stable`
 - **Persistent assets** — config files, databases, and user content survive across updates
 - **Cross-platform** — Linux, Windows, and macOS with native shortcuts and platform-correct install directories
 - **Progress & cancellation** — per-phase progress callbacks and `CancellationToken` support
+
+`Surge.NET` is a managed wrapper around the native Surge shared library. The
+matching `libsurge.so`, `surge.dll`, or `libsurge.dylib` from the same Surge
+version and runtime identifier must be shipped with the application. Official
+release archives provide those native binaries; the NuGet package does not
+embed them.
 
 ## Storage Backends
 

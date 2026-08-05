@@ -15,6 +15,9 @@ use crate::shared::{
 const DEFAULT_UPDATE_CHECK_TIMEOUT: Duration = Duration::from_mins(1);
 const UPDATE_CHECK_TIMEOUT_ENV: &str = "SURGE_UPDATE_CHECK_TIMEOUT_SECONDS";
 /// Create an update manager bound to a specific application.
+///
+/// The returned manager clones the shared state it needs and may outlive the
+/// context used during this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn surge_update_manager_create(
     ctx: *mut crate::handles::SurgeContextHandle,
@@ -214,24 +217,31 @@ pub unsafe extern "C" fn surge_update_manager_set_artifact_retention_policy(
 /// Check for available updates.
 ///
 /// Returns `SURGE_OK` if updates are available, `SURGE_NOT_FOUND` if up-to-date.
+/// `*info` is non-null only on `SURGE_OK` and must then be destroyed exactly
+/// once with `surge_releases_destroy`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn surge_update_check(
     mgr: *mut SurgeUpdateManagerHandle,
     info: *mut *mut SurgeReleasesInfoHandle,
 ) -> i32 {
     ffi_trace("surge_update_check: enter");
-    if mgr.is_null() || info.is_null() {
+    if info.is_null() {
+        ffi_trace("surge_update_check: null input");
+        return SURGE_ERROR;
+    }
+    // SAFETY: `info` is checked non-null above. Clear it before validating any
+    // other input so every non-success path has a deterministic null output.
+    unsafe { *info = ptr::null_mut() };
+
+    if mgr.is_null() {
         ffi_trace("surge_update_check: null input");
         return SURGE_ERROR;
     }
 
     catch_ffi(std::panic::AssertUnwindSafe(|| {
-        // SAFETY: `mgr`/`info` are checked non-null above. The out pointer is
-        // cleared first to avoid leaking stale values on early exits.
-        let mgr_ref = unsafe {
-            *info = ptr::null_mut();
-            &*mgr
-        };
+        // SAFETY: `mgr` is checked non-null above and remains valid for the
+        // duration of this call. The out pointer was already cleared.
+        let mgr_ref = unsafe { &*mgr };
         clear_shared_error(&mgr_ref.ctx, &mgr_ref.last_error);
 
         if mgr_ref.ctx.is_cancelled() {
@@ -288,13 +298,6 @@ pub unsafe extern "C" fn surge_update_check(
             }
             Ok(Ok(None)) => {
                 ffi_trace("surge_update_check: no updates available");
-                let releases_handle = Box::new(SurgeReleasesInfoHandle {
-                    releases: Vec::new(),
-                    cached_strings: Vec::new(),
-                    update_info: None,
-                });
-                // SAFETY: `info` is a valid out pointer checked above.
-                unsafe { *info = Box::into_raw(releases_handle) };
                 SURGE_NOT_FOUND
             }
             Ok(Err(e)) => {
@@ -398,8 +401,9 @@ pub unsafe extern "C" fn surge_update_download_and_apply(
 
 /// Read the persisted update convergence record from `install_dir` as JSON.
 ///
-/// On `SURGE_OK`, `*json_out` is set to a `malloc()`-allocated, NUL-terminated
-/// UTF-8 JSON string that the caller must free with `free()`. On
+/// On `SURGE_OK`, `*json_out` is set to a Surge-owned, NUL-terminated UTF-8
+/// JSON string that the caller must free exactly once with
+/// `surge_free_cstring`. On
 /// `SURGE_NOT_FOUND` no status record has been written for this install yet
 /// (clean install, or no update has been attempted) and `*json_out` is set to
 /// NULL. On `SURGE_ERROR` reading or decoding failed; `*json_out` is NULL.
@@ -466,16 +470,96 @@ pub unsafe extern "C" fn surge_update_status_read_json(install_dir: *const c_cha
 #[cfg(test)]
 mod tests {
     use std::ffi::{CStr, CString};
+    use std::path::{Path, PathBuf};
+    use std::ptr;
     use std::time::Duration;
 
-    use crate::{surge_context_create, surge_context_destroy, surge_context_last_error};
+    use surge_core::config::constants::{DEFAULT_ZSTD_LEVEL, RELEASES_FILE_COMPRESSED};
+    use surge_core::releases::manifest::{ReleaseIndex, compress_release_index};
+    use surge_core::update::status::{UpdateStatusRecord, write_update_status};
+
+    use crate::{
+        surge_cancel, surge_config_set_storage, surge_context_create, surge_context_destroy, surge_context_last_error,
+        surge_free_cstring, surge_reset_cancel,
+    };
 
     use super::{
-        DEFAULT_UPDATE_CHECK_TIMEOUT, SURGE_OK, SurgeReleasesInfoHandle, parse_update_check_timeout,
-        surge_update_check, surge_update_manager_create, surge_update_manager_destroy,
+        DEFAULT_UPDATE_CHECK_TIMEOUT, SURGE_CANCELLED, SURGE_ERROR, SURGE_NOT_FOUND, SURGE_OK, SurgeReleasesInfoHandle,
+        parse_update_check_timeout, surge_update_check, surge_update_manager_create, surge_update_manager_destroy,
         surge_update_manager_set_artifact_retention_policy, surge_update_manager_set_channel,
-        surge_update_manager_set_release_retention_limit,
+        surge_update_manager_set_release_retention_limit, surge_update_status_read_json,
     };
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(name: &str) -> Self {
+            let unique = format!(
+                "{name}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            );
+            let path = std::env::temp_dir().join(unique);
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+
+        fn as_cstring(&self) -> CString {
+            CString::new(self.0.to_string_lossy().as_bytes()).unwrap()
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn configure_filesystem_storage(ctx: *mut crate::handles::SurgeContextHandle, root: &TestDir) {
+        let bucket = root.as_cstring();
+        let rc = unsafe {
+            // SAFETY: `ctx` is live, `bucket` remains valid for the call, and
+            // null optional string arguments are supported by the API.
+            surge_config_set_storage(
+                ctx,
+                3,
+                bucket.as_ptr(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+            )
+        };
+        assert_eq!(rc, SURGE_OK);
+    }
+
+    fn create_manager(
+        ctx: *mut crate::handles::SurgeContextHandle,
+        install_dir: &Path,
+    ) -> *mut crate::handles::SurgeUpdateManagerHandle {
+        let app_id = CString::new("demo").unwrap();
+        let version = CString::new("1.0.0").unwrap();
+        let channel = CString::new("stable").unwrap();
+        let install_dir = CString::new(install_dir.to_string_lossy().as_bytes()).unwrap();
+        unsafe {
+            // SAFETY: `ctx` is live and all C strings remain valid for the
+            // duration of this call.
+            surge_update_manager_create(
+                ctx,
+                app_id.as_ptr(),
+                version.as_ptr(),
+                channel.as_ptr(),
+                install_dir.as_ptr(),
+            )
+        }
+    }
 
     #[test]
     fn manager_set_channel_updates_context_last_error() {
@@ -637,41 +721,137 @@ mod tests {
     }
 
     #[test]
-    fn update_check_clears_output_pointer_on_failure() {
+    fn update_check_clears_output_pointer_before_manager_validation() {
+        let stale = Box::new(SurgeReleasesInfoHandle {
+            releases: Vec::new(),
+            cached_strings: Vec::new(),
+            update_info: None,
+        });
+        let stale_ptr = Box::into_raw(stale);
+        let mut info_ptr = stale_ptr;
+        assert!(!info_ptr.is_null());
+
+        let rc = unsafe {
+            // SAFETY: the out pointer is valid; the null manager deliberately
+            // exercises the API's guarded failure path.
+            surge_update_check(ptr::null_mut(), &mut info_ptr)
+        };
+        assert_eq!(rc, SURGE_ERROR);
+        assert!(info_ptr.is_null());
+
+        // The out parameter does not own a pre-existing sentinel value.
+        // SAFETY: `stale_ptr` came from `Box::into_raw`, and the failing API
+        // call cleared the out pointer without taking ownership of it.
+        drop(unsafe { Box::from_raw(stale_ptr) });
+    }
+
+    #[test]
+    fn update_check_can_retry_after_cancellation_reset() {
+        let storage = TestDir::new("surge-ffi-no-update-storage");
+        let install = TestDir::new("surge-ffi-no-update-install");
+        let app_storage = storage.path().join("demo");
+        std::fs::create_dir_all(&app_storage).unwrap();
+        let index = ReleaseIndex {
+            app_id: "demo".to_string(),
+            ..ReleaseIndex::default()
+        };
+        let compressed = compress_release_index(&index, DEFAULT_ZSTD_LEVEL).unwrap();
+        std::fs::write(app_storage.join(RELEASES_FILE_COMPRESSED), compressed).unwrap();
+
         let ctx = surge_context_create();
         assert!(!ctx.is_null());
-
-        let app_id = CString::new("demo").unwrap();
-        let version = CString::new("1.0.0").unwrap();
-        let channel = CString::new("stable").unwrap();
-        let install_dir = CString::new("/tmp/demo").unwrap();
-
-        let mgr = unsafe {
-            surge_update_manager_create(
-                ctx,
-                app_id.as_ptr(),
-                version.as_ptr(),
-                channel.as_ptr(),
-                install_dir.as_ptr(),
-            )
-        };
+        configure_filesystem_storage(ctx, &storage);
+        let mgr = create_manager(ctx, install.path());
         assert!(!mgr.is_null());
+
+        let mut cancelled_info = ptr::null_mut();
+        unsafe {
+            // SAFETY: both handles are live, and no other operation uses this
+            // context while cancellation is requested and then reset.
+            assert_eq!(surge_cancel(ctx), SURGE_OK);
+            assert_eq!(surge_update_check(mgr, &mut cancelled_info), SURGE_CANCELLED);
+            assert!(cancelled_info.is_null());
+            assert_eq!(surge_reset_cancel(ctx), SURGE_OK);
+        }
 
         let stale = Box::new(SurgeReleasesInfoHandle {
             releases: Vec::new(),
             cached_strings: Vec::new(),
             update_info: None,
         });
-        let mut info_ptr = Box::into_raw(stale);
-        assert!(!info_ptr.is_null());
-
-        let rc = unsafe { surge_update_check(mgr, &mut info_ptr) };
-        assert_ne!(rc, SURGE_OK);
+        let stale_ptr = Box::into_raw(stale);
+        let mut info_ptr = stale_ptr;
+        let rc = unsafe {
+            // SAFETY: `mgr` and the out pointer are live for this call.
+            surge_update_check(mgr, &mut info_ptr)
+        };
+        assert_eq!(rc, SURGE_NOT_FOUND);
         assert!(info_ptr.is_null());
 
+        // SAFETY: the no-update result did not take ownership of the sentinel
+        // allocated with `Box::into_raw`.
+        drop(unsafe { Box::from_raw(stale_ptr) });
         unsafe {
+            // SAFETY: both handles are live and each is destroyed once.
             surge_update_manager_destroy(mgr);
             surge_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn update_status_read_json_clears_outputs_on_invalid_and_missing_inputs() {
+        let stale = CString::new("stale").unwrap().into_raw();
+        let mut json = stale;
+        let rc = unsafe {
+            // SAFETY: the out pointer is valid; the null path deliberately
+            // exercises the API's guarded failure path.
+            surge_update_status_read_json(ptr::null(), &mut json)
+        };
+        assert_eq!(rc, SURGE_ERROR);
+        assert!(json.is_null());
+        // SAFETY: `stale` came from `CString::into_raw`, and the failing API
+        // call cleared the out pointer without taking ownership of it.
+        drop(unsafe { CString::from_raw(stale) });
+
+        let install = TestDir::new("surge-ffi-status-missing");
+        let install_c = install.as_cstring();
+        let stale = CString::new("stale").unwrap().into_raw();
+        let mut json = stale;
+        let rc = unsafe {
+            // SAFETY: the install path and out pointer remain valid for this call.
+            surge_update_status_read_json(install_c.as_ptr(), &mut json)
+        };
+        assert_eq!(rc, SURGE_NOT_FOUND);
+        assert!(json.is_null());
+        // SAFETY: `stale` came from `CString::into_raw`, and the no-status API
+        // call cleared the out pointer without taking ownership of it.
+        drop(unsafe { CString::from_raw(stale) });
+    }
+
+    #[test]
+    fn update_status_json_is_released_through_surge_allocator() {
+        let install = TestDir::new("surge-ffi-status-owned-string");
+        let record = UpdateStatusRecord::idle("demo", "1.0.0", "stable");
+        write_update_status(install.path(), &record).unwrap();
+        let install_c = install.as_cstring();
+        let mut json = ptr::null_mut();
+
+        let rc = unsafe {
+            // SAFETY: the install path and out pointer remain valid for this call.
+            surge_update_status_read_json(install_c.as_ptr(), &mut json)
+        };
+        assert_eq!(rc, SURGE_OK);
+        assert!(!json.is_null());
+        // SAFETY: a successful call returns a non-null, NUL-terminated Surge
+        // string that remains live until it is freed below.
+        let text = unsafe { CStr::from_ptr(json) }.to_str().unwrap();
+        assert!(text.contains("\"app_id\":\"demo\""));
+
+        unsafe {
+            // SAFETY: `json` is a live Surge-owned string freed exactly once;
+            // freeing null is an explicitly supported no-op.
+            surge_free_cstring(json);
+            surge_free_cstring(ptr::null_mut());
         }
     }
 

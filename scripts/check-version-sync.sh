@@ -6,13 +6,24 @@ source "$repo_root/scripts/version-lib.sh"
 
 workspace_version="$(workspace_base_version)"
 surge_core_version="$(workspace_surge_core_version)"
+dotnet_version="$(dotnet_package_version)"
 
-if [[ -z "$workspace_version" || -z "$surge_core_version" ]]; then
-  echo "Failed to parse version values from Cargo.toml." >&2
+if [[ -z "$workspace_version" || -z "$surge_core_version" || -z "$dotnet_version" ]]; then
+  echo "Failed to parse version values from Cargo.toml and dotnet/Directory.Build.props." >&2
   exit 1
 fi
 
 failed=0
+
+if [[ "$workspace_version" != "$dotnet_version" ]]; then
+  cat <<EOF >&2
+Version mismatch:
+  Cargo.toml [workspace.package].version: $workspace_version
+  dotnet/Directory.Build.props Version:   $dotnet_version
+Update the managed package version so it matches the Cargo workspace version.
+EOF
+  failed=1
+fi
 
 if [[ "$workspace_version" != "$surge_core_version" ]]; then
   cat <<EOF >&2
@@ -27,7 +38,7 @@ fi
 # Check Cargo.lock is in sync
 lock_file="$repo_root/Cargo.lock"
 if [[ -f "$lock_file" ]]; then
-  for crate in surge-core surge-cli surge-ffi surge-supervisor surge-installer surge-installer-ui; do
+  for crate in surge-core surge-cli surge-ffi surge-supervisor surge-bench surge-installer surge-installer-ui; do
     lock_version=$(awk -v pkg="$crate" '
       /^\[\[package\]\]/ { in_pkg = 0 }
       $0 == "name = \"" pkg "\"" { in_pkg = 1; next }

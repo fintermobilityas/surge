@@ -1,4 +1,6 @@
 using System;
+using System.Reflection;
+using System.Threading;
 using Xunit;
 
 namespace Surge.Tests
@@ -10,7 +12,25 @@ namespace Surge.Tests
         [Fact]
         public void Version_ReturnsExpectedVersion()
         {
-            Assert.Equal("0.1.0", SurgeApp.Version);
+            var informationalVersion = typeof(SurgeApp).Assembly
+                .GetCustomAttribute<AssemblyInformationalVersionAttribute>()!
+                .InformationalVersion;
+
+            Assert.Equal(
+                SurgeApp.NormalizeInformationalVersion(informationalVersion),
+                SurgeApp.Version);
+            Assert.DoesNotContain("+", SurgeApp.Version, StringComparison.Ordinal);
+        }
+
+        [Theory]
+        [InlineData("1.0.0", "1.0.0")]
+        [InlineData("1.0.0-beta.53", "1.0.0-beta.53")]
+        [InlineData("1.0.0-beta.53+0123456789abcdef", "1.0.0-beta.53")]
+        public void NormalizeInformationalVersion_RemovesBuildMetadata(
+            string informationalVersion,
+            string expected)
+        {
+            Assert.Equal(expected, SurgeApp.NormalizeInformationalVersion(informationalVersion));
         }
 
         [Fact]
@@ -159,6 +179,31 @@ namespace Surge.Tests
 
             Assert.Throws<ArgumentOutOfRangeException>(() => SurgeArtifactRetentionPolicy.LatestFull(0));
             Assert.Throws<ArgumentOutOfRangeException>(() => new SurgeArtifactRetentionPolicy((SurgeArtifactRetentionMode)99));
+        }
+
+        [Theory]
+        [InlineData(0)]
+        [InlineData(-1)]
+        [InlineData(-3)]
+        public void HandleNativeCancellation_IgnoresOtherResults(int result)
+        {
+            Assert.False(SurgeUpdateManager.HandleNativeCancellation(result, CancellationToken.None));
+        }
+
+        [Fact]
+        public void HandleNativeCancellation_ReturnsTrueWithoutCancelledToken()
+        {
+            Assert.True(SurgeUpdateManager.HandleNativeCancellation(-2, CancellationToken.None));
+        }
+
+        [Fact]
+        public void HandleNativeCancellation_ThrowsForCancelledToken()
+        {
+            using var source = new CancellationTokenSource();
+            source.Cancel();
+
+            Assert.Throws<OperationCanceledException>(
+                () => SurgeUpdateManager.HandleNativeCancellation(-2, source.Token));
         }
     }
 

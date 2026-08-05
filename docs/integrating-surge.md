@@ -41,6 +41,12 @@ If you choose this path, the app repo must treat Surge as both:
 
 Do not mix these two shapes accidentally.
 
+For C ABI and `.NET` runtime integrations, ship the native Surge library from
+the same release version and runtime identifier as the wrapper or header. The
+`Surge.NET` package contains the managed wrapper only; obtain the matching
+native binary from the official release archive or the app's pinned Surge
+toolchain bundle.
+
 ## 2. What Every App Repo Should Contain
 
 Every app repo that integrates Surge should carry these pieces explicitly.
@@ -78,6 +84,10 @@ Use the latest released Surge tag by default.
 - for publishing/toolchain work in CI, prefer the Surge release bundle or a staged toolchain artifact built from a released tag
 
 Do not point normal app development at an open Surge PR unless you are explicitly validating an unreleased Surge fix.
+
+Official Surge archives are checksum-covered but currently unsigned; macOS
+archives are also not notarized. Verify `SHA256SUMS.txt`, then apply any signing
+or notarization required by the app's distribution process.
 
 ### Fix Surge upstream first
 

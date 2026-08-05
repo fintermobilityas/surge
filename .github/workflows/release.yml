@@ -3,18 +3,23 @@ name: Release
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: Existing published release tag to recover
+        required: true
+        type: string
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.release.tag_name }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event.release.tag_name || inputs.tag_name }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 jobs:
   validate-release:
@@ -23,23 +28,85 @@ jobs:
     outputs:
       release_version: ${{ steps.validate.outputs.release_version }}
       is_prerelease: ${{ steps.validate.outputs.is_prerelease }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+      tag_commit: ${{ steps.release.outputs.tag_commit }}
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ github.event.release.tag_name || inputs.tag_name }}
           fetch-depth: 0
           submodules: true
+
+      - id: release
+        name: Resolve and guard published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ github.event.release.tag_name || inputs.tag_name }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_RELEASE_ID: ${{ github.event.release.id }}
+        run: |
+          if [ -z "${REQUESTED_TAG}" ]; then
+            echo "::error::A release tag is required."
+            exit 1
+          fi
+          if [[ ! "${REQUESTED_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta)\.[0-9]+)?$ ]]; then
+            echo "::error::Unsupported release tag: ${REQUESTED_TAG}"
+            exit 1
+          fi
+
+          if ! release_json="$(gh api \
+            "/repos/${{ github.repository }}/releases/tags/${REQUESTED_TAG}")"; then
+            echo "::error::No GitHub Release exists for ${REQUESTED_TAG}."
+            exit 1
+          fi
+
+          actual_tag="$(jq -r '.tag_name' <<< "${release_json}")"
+          release_id="$(jq -r '.id' <<< "${release_json}")"
+          draft="$(jq -r '.draft' <<< "${release_json}")"
+          prerelease="$(jq -r '.prerelease' <<< "${release_json}")"
+          published_at="$(jq -r '.published_at // empty' <<< "${release_json}")"
+
+          if [ "${actual_tag}" != "${REQUESTED_TAG}" ]; then
+            echo "::error::Requested tag ${REQUESTED_TAG} resolved to release tag ${actual_tag}."
+            exit 1
+          fi
+          if [ "${draft}" != "false" ] || [ -z "${published_at}" ]; then
+            echo "::error::Release ${REQUESTED_TAG} must already be published and non-draft."
+            exit 1
+          fi
+          if [ "${EVENT_NAME}" = "release" ] && [ "${release_id}" != "${EVENT_RELEASE_ID}" ]; then
+            echo "::error::Release event ID does not match the release resolved from ${REQUESTED_TAG}."
+            exit 1
+          fi
+          if ! git rev-parse --verify --quiet "refs/tags/${REQUESTED_TAG}^{commit}" >/dev/null; then
+            echo "::error::Release tag ${REQUESTED_TAG} does not resolve to a commit."
+            exit 1
+          fi
+
+          tag_commit="$(git rev-parse "refs/tags/${REQUESTED_TAG}^{commit}")"
+          checkout_commit="$(git rev-parse HEAD)"
+          if [ "${checkout_commit}" != "${tag_commit}" ]; then
+            echo "::error::Checked-out commit ${checkout_commit} does not match release tag commit ${tag_commit}."
+            exit 1
+          fi
+
+          echo "tag_name=${REQUESTED_TAG}" >> "$GITHUB_OUTPUT"
+          echo "tag_commit=${tag_commit}" >> "$GITHUB_OUTPUT"
+          echo "release_prerelease=${prerelease}" >> "$GITHUB_OUTPUT"
 
       - name: Verify workspace versions are aligned
         run: ./scripts/check-version-sync.sh
 
       - id: validate
         name: Validate tag and release metadata
+        env:
+          TAG_NAME: ${{ steps.release.outputs.tag_name }}
+          RELEASE_PRERELEASE: ${{ steps.release.outputs.release_prerelease }}
         run: |
           source ./scripts/version-lib.sh
 
-          tag_name="${{ github.event.release.tag_name }}"
-          release_prerelease="${{ github.event.release.prerelease }}"
+          tag_name="${TAG_NAME}"
+          release_prerelease="${RELEASE_PRERELEASE}"
 
           if [[ "$tag_name" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
             release_version="${BASH_REMATCH[1]}"
@@ -112,11 +179,24 @@ jobs:
               target/release/surge-installer.exe
               target/release/surge-installer-ui.exe
               target/release/surge-supervisor.exe
-          - os: macos-latest
-            name: macOS
-            cache_key: macos-release-artifacts
+          - os: macos-15-intel
+            name: macOS Intel
+            cache_key: macos-intel-release-artifacts
             artifact_name: osx-x64
             build_strategy: host
+            macos_arch: x86_64
+            artifact_path: |
+              target/release/libsurge.dylib
+              target/release/surge
+              target/release/surge-installer
+              target/release/surge-installer-ui
+              target/release/surge-supervisor
+          - os: macos-15
+            name: macOS Apple Silicon
+            cache_key: macos-arm64-release-artifacts
+            artifact_name: osx-arm64
+            build_strategy: host
+            macos_arch: arm64
             artifact_path: |
               target/release/libsurge.dylib
               target/release/surge
@@ -126,7 +206,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ needs.validate-release.outputs.tag_commit }}
           submodules: true
       - name: Set release version
         shell: bash
@@ -161,24 +241,34 @@ jobs:
             artifacts/linux-arm64/surge-installer \
             artifacts/linux-arm64/surge-installer-ui \
             artifacts/linux-arm64/libsurge.so
+      - name: Validate macOS architecture
+        if: startsWith(matrix.os, 'macos-')
+        run: |
+          bash ./scripts/check-macos-architecture.sh --arch "${{ matrix.macos_arch }}" \
+            target/release/libsurge.dylib \
+            target/release/surge \
+            target/release/surge-installer \
+            target/release/surge-installer-ui \
+            target/release/surge-supervisor
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact_name }}
           path: ${{ matrix.artifact_path }}
 
-  publish-nuget:
-    name: Publish NuGet
+  package-nuget:
+    name: Package NuGet
     needs: [validate-release, build-artifacts]
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: dotnet
+    permissions:
+      contents: write
+    outputs:
+      package_name: ${{ steps.package.outputs.package_name }}
+      package_sha256: ${{ steps.package.outputs.package_sha256 }}
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.release.tag_name }}
-          submodules: true
+          ref: ${{ needs.validate-release.outputs.tag_commit }}
       - uses: actions/setup-dotnet@v6
         with:
           dotnet-version: '10.0.302'
@@ -187,10 +277,194 @@ jobs:
           path: ~/.nuget/packages
           key: nuget-${{ hashFiles('dotnet/Directory.Packages.props') }}
           restore-keys: nuget-
-      - name: Pack
-        run: dotnet pack Surge.NET/Surge.NET.csproj --configuration Release -p:Version=${{ needs.validate-release.outputs.release_version }} --output ../nupkgs
+      - id: package
+        name: Reuse or create the immutable NuGet package
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.validate-release.outputs.tag_name }}
+          RELEASE_VERSION: ${{ needs.validate-release.outputs.release_version }}
+          TAG_COMMIT: ${{ needs.validate-release.outputs.tag_commit }}
+          EXPECTED_REPOSITORY_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          package_name="Surge.NET.${RELEASE_VERSION}.nupkg"
+          package_path="nupkgs/${package_name}"
+          mkdir -p nupkgs
+
+          release_json="$(gh api "/repos/${{ github.repository }}/releases/tags/${RELEASE_TAG}")"
+          asset_count="$(jq --arg name "${package_name}" \
+            '[.assets[] | select(.name == $name)] | length' <<< "${release_json}")"
+
+          case "${asset_count}" in
+            0)
+              dotnet pack dotnet/Surge.NET/Surge.NET.csproj \
+                --configuration Release \
+                -p:Version="${RELEASE_VERSION}" \
+                --output nupkgs
+              ;;
+            1)
+              asset_size="$(jq --arg name "${package_name}" -r \
+                '.assets[] | select(.name == $name) | .size' <<< "${release_json}")"
+              gh release download "${RELEASE_TAG}" \
+                --pattern "${package_name}" \
+                --dir nupkgs \
+                --repo "${{ github.repository }}"
+              downloaded_size="$(stat -c '%s' "${package_path}")"
+              if [ "${downloaded_size}" != "${asset_size}" ]; then
+                echo "::error::Downloaded ${package_name} has size ${downloaded_size}; release metadata says ${asset_size}."
+                exit 1
+              fi
+              echo "Reusing ${package_name} from the published GitHub Release."
+              ;;
+            *)
+              echo "::error::Expected at most one ${package_name} release asset, found ${asset_count}."
+              exit 1
+              ;;
+          esac
+
+          shopt -s nullglob
+          packages=(nupkgs/*.nupkg)
+          if [ "${#packages[@]}" -ne 1 ] || [ "${packages[0]}" != "${package_path}" ]; then
+            echo "::error::Expected exactly one NuGet package named ${package_name}."
+            exit 1
+          fi
+
+          python3 - "${package_path}" "${RELEASE_VERSION}" "${TAG_COMMIT}" "${EXPECTED_REPOSITORY_URL}" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+          import zipfile
+
+          package_path, expected_version, expected_commit, expected_repository_url = sys.argv[1:]
+          with zipfile.ZipFile(package_path) as package:
+              nuspecs = [name for name in package.namelist() if name.endswith(".nuspec")]
+              if len(nuspecs) != 1:
+                  raise SystemExit(
+                      f"expected exactly one nuspec in {package_path}, found {len(nuspecs)}"
+                  )
+              root = ET.fromstring(package.read(nuspecs[0]))
+
+          metadata = next(
+              (element for element in root.iter() if element.tag.rsplit("}", 1)[-1] == "metadata"),
+              None,
+          )
+          if metadata is None:
+              raise SystemExit(f"missing package metadata in {package_path}")
+
+          fields = {
+              child.tag.rsplit("}", 1)[-1]: (child.text or "")
+              for child in metadata
+          }
+          if fields.get("id") != "Surge.NET":
+              raise SystemExit(f"unexpected package id: {fields.get('id')!r}")
+          if fields.get("version") != expected_version:
+              raise SystemExit(
+                  f"unexpected package version: {fields.get('version')!r}; "
+                  f"expected {expected_version!r}"
+              )
+
+          repositories = [
+              child
+              for child in metadata
+              if child.tag.rsplit("}", 1)[-1] == "repository"
+          ]
+          if len(repositories) != 1:
+              raise SystemExit(
+                  f"expected exactly one repository element, found {len(repositories)}"
+              )
+          repository = repositories[0]
+          if repository.attrib.get("type") != "git":
+              raise SystemExit(
+                  f"unexpected repository type: {repository.attrib.get('type')!r}"
+              )
+          if repository.attrib.get("url") != expected_repository_url:
+              raise SystemExit(
+                  f"unexpected repository URL: {repository.attrib.get('url')!r}; "
+                  f"expected {expected_repository_url!r}"
+              )
+          if repository.attrib.get("commit") != expected_commit:
+              raise SystemExit(
+                  f"unexpected repository commit: {repository.attrib.get('commit')!r}; "
+                  f"expected {expected_commit!r}"
+              )
+          PY
+
+          if [ "${asset_count}" = "0" ]; then
+            gh release upload "${RELEASE_TAG}" "${package_path}" \
+              --repo "${{ github.repository }}"
+
+            release_json="$(gh api "/repos/${{ github.repository }}/releases/tags/${RELEASE_TAG}")"
+            attached_count="$(jq --arg name "${package_name}" \
+              '[.assets[] | select(.name == $name)] | length' <<< "${release_json}")"
+            attached_size="$(jq --arg name "${package_name}" -r \
+              '.assets[] | select(.name == $name) | .size' <<< "${release_json}")"
+            local_size="$(stat -c '%s' "${package_path}")"
+            if [ "${attached_count}" != "1" ] || [ "${attached_size}" != "${local_size}" ]; then
+              echo "::error::The attached ${package_name} asset does not match the packaged file."
+              exit 1
+            fi
+            echo "Attached immutable ${package_name} to ${RELEASE_TAG}."
+          fi
+
+          package_sha256="$(sha256sum "${package_path}" | cut -d ' ' -f 1)"
+          echo "package_name=${package_name}" >> "$GITHUB_OUTPUT"
+          echo "package_sha256=${package_sha256}" >> "$GITHUB_OUTPUT"
+      - name: Upload immutable NuGet package for publishing
+        uses: actions/upload-artifact@v7
+        with:
+          name: surge-net-nuget
+          path: nupkgs/${{ steps.package.outputs.package_name }}
+          if-no-files-found: error
+
+  publish-nuget:
+    name: Publish NuGet
+    needs: [validate-release, package-nuget]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+    steps:
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.302'
+      - name: Download immutable NuGet package
+        uses: actions/download-artifact@v8
+        with:
+          name: surge-net-nuget
+          path: nupkgs
+      - name: Verify immutable package handoff
+        env:
+          EXPECTED_PACKAGE_NAME: ${{ needs.package-nuget.outputs.package_name }}
+          EXPECTED_PACKAGE_SHA256: ${{ needs.package-nuget.outputs.package_sha256 }}
+          RELEASE_VERSION: ${{ needs.validate-release.outputs.release_version }}
+        run: |
+          set -euo pipefail
+          expected_path="nupkgs/${EXPECTED_PACKAGE_NAME}"
+          if [ "${EXPECTED_PACKAGE_NAME}" != "Surge.NET.${RELEASE_VERSION}.nupkg" ]; then
+            echo "::error::Unexpected package name: ${EXPECTED_PACKAGE_NAME}"
+            exit 1
+          fi
+          shopt -s nullglob
+          packages=(nupkgs/*.nupkg)
+          if [ "${#packages[@]}" -ne 1 ] || [ "${packages[0]}" != "${expected_path}" ]; then
+            echo "::error::Expected exactly one package at ${expected_path}."
+            exit 1
+          fi
+          actual_sha256="$(sha256sum "${expected_path}" | cut -d ' ' -f 1)"
+          if [ "${actual_sha256}" != "${EXPECTED_PACKAGE_SHA256}" ]; then
+            echo "::error::Downloaded workflow artifact does not match the immutable NuGet package."
+            exit 1
+          fi
+      - name: Authenticate to NuGet.org with Trusted Publishing
+        id: nuget-login
+        uses: NuGet/login@v1
+        with:
+          user: petersunde
+      - name: Push to NuGet.org
+        run: dotnet nuget push "nupkgs/${{ needs.package-nuget.outputs.package_name }}" --source https://api.nuget.org/v3/index.json --api-key "${{ steps.nuget-login.outputs.NUGET_API_KEY }}" --skip-duplicate
       - name: Push to GitHub Packages
-        run: dotnet nuget push ../nupkgs/*.nupkg --source https://nuget.pkg.github.com/fintermobilityas/index.json --api-key ${{ secrets.GITHUB_TOKEN }} --skip-duplicate
+        run: dotnet nuget push "nupkgs/${{ needs.package-nuget.outputs.package_name }}" --source https://nuget.pkg.github.com/fintermobilityas/index.json --api-key ${{ secrets.GITHUB_TOKEN }} --skip-duplicate
 
   publish-cargo-crates-io:
     name: Publish Cargo (crates.io)
@@ -201,7 +475,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ needs.validate-release.outputs.tag_commit }}
           submodules: true
       - uses: Swatinem/rust-cache@v2
         with:
@@ -215,29 +489,19 @@ jobs:
           fi
       - name: Set release version
         run: ./scripts/set-release-version.sh "${{ needs.validate-release.outputs.release_version }}"
-      - name: Publish surge-core to crates.io
-        run: cargo publish -p surge-core --allow-dirty
-      - name: Publish surge-cli to crates.io
-        run: |
-          for attempt in $(seq 1 10); do
-            if cargo publish -p surge-cli --allow-dirty; then
-              exit 0
-            fi
-            if [ "${attempt}" -eq 10 ]; then
-              echo "Failed to publish surge-cli after waiting for surge-core to sync on crates.io."
-              exit 1
-            fi
-            sleep $((attempt * 5))
-          done
+      - name: Publish crates idempotently
+        run: bash ./scripts/publish-cargo-release.sh "${{ needs.validate-release.outputs.release_version }}"
 
   upload-release-assets:
     name: Upload Release Assets
-    needs: [validate-release, build-artifacts]
+    needs: [validate-release, build-artifacts, package-nuget]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ needs.validate-release.outputs.tag_commit }}
 
       - name: Download all artifacts
         uses: actions/download-artifact@v8
@@ -246,9 +510,16 @@ jobs:
 
       - name: Collect and verify release assets
         run: |
+          set -euo pipefail
           mkdir -p release-assets
 
-          required_dirs=(linux-x64 linux-arm64 win-x64 osx-x64)
+          source_date_epoch="$(git show -s --format=%ct "${{ needs.validate-release.outputs.tag_commit }}")"
+          if [[ ! "${source_date_epoch}" =~ ^[0-9]+$ ]]; then
+            echo "::error::Could not determine the release commit timestamp."
+            exit 1
+          fi
+
+          required_dirs=(linux-x64 linux-arm64 win-x64 osx-x64 osx-arm64)
           for dir in "${required_dirs[@]}"; do
             if [ ! -d "artifacts/$dir" ]; then
               echo "::error::Missing required artifact directory: $dir"
@@ -256,23 +527,209 @@ jobs:
             fi
           done
 
-          cd artifacts
-          tar czf ../release-assets/surge-linux-x64.tar.gz -C linux-x64 .
-          tar czf ../release-assets/surge-linux-arm64.tar.gz -C linux-arm64 .
-          tar czf ../release-assets/surge-osx-x64.tar.gz -C osx-x64 .
-          cd win-x64 && zip -r ../../release-assets/surge-win-x64.zip . && cd ..
+          normalize_unix_artifact() {
+            local dir="$1"
+            local library="$2"
+            local expected_entries actual_entries entry mode
+            local executables=(surge surge-installer surge-installer-ui surge-supervisor)
+            local expected=("${library}" "${executables[@]}")
 
-      - name: Generate checksums
+            expected_entries="$(printf '%s\n' "${expected[@]}" | LC_ALL=C sort)"
+            actual_entries="$(find "${dir}" -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)"
+            if [ "${actual_entries}" != "${expected_entries}" ]; then
+              echo "::error::${dir} does not contain exactly the five expected Unix release files."
+              printf 'Expected:\n%s\nActual:\n%s\n' "${expected_entries}" "${actual_entries}" >&2
+              exit 1
+            fi
+
+            for entry in "${expected[@]}"; do
+              if [ ! -f "${dir}/${entry}" ] || [ -L "${dir}/${entry}" ]; then
+                echo "::error::${dir}/${entry} must be a regular, non-symlink file."
+                exit 1
+              fi
+            done
+
+            chmod 0644 "${dir}/${library}"
+            chmod 0755 "${executables[@]/#/${dir}/}"
+
+            mode="$(stat -c '%a' "${dir}/${library}")"
+            if [ "${mode}" != "644" ]; then
+              echo "::error::${dir}/${library} has mode ${mode}, expected 644."
+              exit 1
+            fi
+            for entry in "${executables[@]}"; do
+              mode="$(stat -c '%a' "${dir}/${entry}")"
+              if [ "${mode}" != "755" ]; then
+                echo "::error::${dir}/${entry} has mode ${mode}, expected 755."
+                exit 1
+              fi
+            done
+          }
+
+          normalize_unix_artifact artifacts/linux-x64 libsurge.so
+          normalize_unix_artifact artifacts/linux-arm64 libsurge.so
+          normalize_unix_artifact artifacts/osx-x64 libsurge.dylib
+          normalize_unix_artifact artifacts/osx-arm64 libsurge.dylib
+
+          create_reproducible_tarball() {
+            local dir="$1"
+            local library="$2"
+            local output="$3"
+            tar \
+              --sort=name \
+              --format=gnu \
+              --owner=0 \
+              --group=0 \
+              --numeric-owner \
+              --mtime="@${source_date_epoch}" \
+              --no-recursion \
+              -cf - \
+              -C "${dir}" \
+              "${library}" \
+              surge \
+              surge-installer \
+              surge-installer-ui \
+              surge-supervisor \
+              | gzip -n -9 > "${output}"
+          }
+
+          create_reproducible_tarball \
+            artifacts/linux-x64 libsurge.so release-assets/surge-linux-x64.tar.gz
+          create_reproducible_tarball \
+            artifacts/linux-arm64 libsurge.so release-assets/surge-linux-arm64.tar.gz
+          create_reproducible_tarball \
+            artifacts/osx-x64 libsurge.dylib release-assets/surge-osx-x64.tar.gz
+          create_reproducible_tarball \
+            artifacts/osx-arm64 libsurge.dylib release-assets/surge-osx-arm64.tar.gz
+
+          windows_files=(
+            surge.dll
+            surge.dll.lib
+            surge.exe
+            surge-installer.exe
+            surge-installer-ui.exe
+            surge-supervisor.exe
+          )
+          expected_windows="$(printf '%s\n' "${windows_files[@]}" | LC_ALL=C sort)"
+          actual_windows="$(find artifacts/win-x64 -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)"
+          if [ "${actual_windows}" != "${expected_windows}" ]; then
+            echo "::error::artifacts/win-x64 does not contain exactly the expected release files."
+            printf 'Expected:\n%s\nActual:\n%s\n' "${expected_windows}" "${actual_windows}" >&2
+            exit 1
+          fi
+          for entry in "${windows_files[@]}"; do
+            path="artifacts/win-x64/${entry}"
+            if [ ! -f "${path}" ] || [ -L "${path}" ]; then
+              echo "::error::${path} must be a regular, non-symlink file."
+              exit 1
+            fi
+            chmod 0644 "${path}"
+            touch --date="@${source_date_epoch}" "${path}"
+          done
+          (
+            cd artifacts/win-x64
+            printf '%s\n' "${windows_files[@]}" \
+              | LC_ALL=C sort \
+              | TZ=UTC zip -X -9 ../../release-assets/surge-win-x64.zip -@
+          )
+
+          cp include/surge/surge_api.h release-assets/surge_api.h
+
+          nuget_package_name="${{ needs.package-nuget.outputs.package_name }}"
+          nuget_artifact_dir="artifacts/surge-net-nuget"
+          if [ "${nuget_package_name}" != "Surge.NET.${{ needs.validate-release.outputs.release_version }}.nupkg" ]; then
+            echo "::error::Unexpected NuGet package name: ${nuget_package_name}"
+            exit 1
+          fi
+          shopt -s nullglob
+          nuget_packages=("${nuget_artifact_dir}"/*.nupkg)
+          if [ "${#nuget_packages[@]}" -ne 1 ] || [ "$(basename "${nuget_packages[0]}")" != "${nuget_package_name}" ]; then
+            echo "::error::Expected exactly one NuGet workflow artifact named ${nuget_package_name}."
+            exit 1
+          fi
+          cp "${nuget_packages[0]}" "release-assets/${nuget_package_name}"
+
+      - name: Generate and verify checksums
         run: |
           cd release-assets
-          sha256sum *.tar.gz *.zip | tee SHA256SUMS.txt
+          expected_assets=(
+            "${{ needs.package-nuget.outputs.package_name }}"
+            surge-linux-arm64.tar.gz
+            surge-linux-x64.tar.gz
+            surge-osx-arm64.tar.gz
+            surge-osx-x64.tar.gz
+            surge-win-x64.zip
+            surge_api.h
+          )
+          for asset in "${expected_assets[@]}"; do
+            if [ ! -f "${asset}" ]; then
+              echo "::error::Missing release asset: ${asset}"
+              exit 1
+            fi
+          done
+          sha256sum "${expected_assets[@]}" > SHA256SUMS.txt
+          sha256sum --check --strict SHA256SUMS.txt
 
       - name: Upload assets to GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.validate-release.outputs.tag_name }}
         run: |
-          gh release upload "${{ github.event.release.tag_name }}" \
-            release-assets/* \
-            include/surge/surge_api.h \
-            --repo "${{ github.repository }}" \
-            --clobber
+          set -euo pipefail
+          comparison_dir="$(mktemp -d)"
+          trap 'rm -rf "${comparison_dir}"' EXIT
+
+          publish_immutable_asset() {
+            local path="$1"
+            local name release_json asset_count local_digest remote_digest was_missing
+            name="$(basename "${path}")"
+            release_json="$(gh api "/repos/${{ github.repository }}/releases/tags/${RELEASE_TAG}")"
+            asset_count="$(jq --arg name "${name}" \
+              '[.assets[] | select(.name == $name)] | length' <<< "${release_json}")"
+
+            case "${asset_count}" in
+              0)
+                gh release upload "${RELEASE_TAG}" "${path}" \
+                  --repo "${{ github.repository }}"
+                was_missing="true"
+                ;;
+              1)
+                was_missing="false"
+                ;;
+              *)
+                echo "::error::Expected at most one release asset named ${name}, found ${asset_count}."
+                exit 1
+                ;;
+            esac
+
+            gh release download "${RELEASE_TAG}" \
+              --pattern "${name}" \
+              --dir "${comparison_dir}" \
+              --repo "${{ github.repository }}"
+            local_digest="$(sha256sum "${path}" | cut -d ' ' -f 1)"
+            remote_digest="$(sha256sum "${comparison_dir}/${name}" | cut -d ' ' -f 1)"
+            if [ "${local_digest}" != "${remote_digest}" ]; then
+              echo "::error::Published release asset ${name} differs from the exact-tag rebuild."
+              echo "::error::Published SHA-256: ${remote_digest}; rebuilt SHA-256: ${local_digest}."
+              exit 1
+            fi
+            if [ "${was_missing}" = "true" ]; then
+              echo "Uploaded and verified immutable release asset ${name}."
+            else
+              echo "Release asset ${name} already matches exactly; skipping upload."
+            fi
+          }
+
+          immutable_assets=(
+            "release-assets/${{ needs.package-nuget.outputs.package_name }}"
+            release-assets/surge-linux-arm64.tar.gz
+            release-assets/surge-linux-x64.tar.gz
+            release-assets/surge-osx-arm64.tar.gz
+            release-assets/surge-osx-x64.tar.gz
+            release-assets/surge-win-x64.zip
+            release-assets/surge_api.h
+            release-assets/SHA256SUMS.txt
+          )
+          for asset in "${immutable_assets[@]}"; do
+            publish_immutable_asset "${asset}"
+          done

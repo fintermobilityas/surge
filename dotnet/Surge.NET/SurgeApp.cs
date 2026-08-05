@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Reflection;
 using System.Runtime.InteropServices;
 
 namespace Surge
@@ -22,6 +23,7 @@ namespace Surge
 
         private static SurgeAppInfo? _current;
         private static readonly object _lock = new object();
+        private static readonly string _version = GetLibraryVersion();
 
         /// <summary>
         /// Information about the currently installed application, or null if not
@@ -71,9 +73,30 @@ namespace Surge
         }
 
         /// <summary>
-        /// The Surge library version.
+        /// The exact Surge package version, including any prerelease suffix.
         /// </summary>
-        public static string Version => "0.1.0";
+        public static string Version => _version;
+
+        internal static string NormalizeInformationalVersion(string informationalVersion)
+        {
+            int metadataSeparator = informationalVersion.IndexOf('+');
+            return metadataSeparator < 0
+                ? informationalVersion
+                : informationalVersion.Substring(0, metadataSeparator);
+        }
+
+        private static string GetLibraryVersion()
+        {
+            var assembly = typeof(SurgeApp).Assembly;
+            var informationalVersion = assembly
+                .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?
+                .InformationalVersion;
+
+            if (informationalVersion != null && informationalVersion.Length != 0)
+                return NormalizeInformationalVersion(informationalVersion);
+
+            return assembly.GetName().Version?.ToString(3) ?? "0.0.0";
+        }
 
         /// <summary>
         /// Process application lifecycle events. Should be called early in the

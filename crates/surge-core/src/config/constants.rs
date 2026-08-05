@@ -1,5 +1,5 @@
 /// Current version of the Surge framework.
-pub const VERSION: &str = "0.1.0";
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Default Surge working directory name.
 pub const SURGE_DIR: &str = ".surge";
@@ -45,3 +45,13 @@ pub const SHA256_HEX_LEN: usize = 64;
 
 /// Chunk size for streaming file operations (64 KB).
 pub const IO_CHUNK_SIZE: usize = 64 * 1024;
+
+#[cfg(test)]
+mod tests {
+    use super::VERSION;
+
+    #[test]
+    fn framework_version_matches_package_version() {
+        assert_eq!(VERSION, env!("CARGO_PKG_VERSION"));
+    }
+}

@@ -111,7 +111,8 @@ pub struct SurgeBspatchCtxFfi {
 /// Acquire a named distributed lock.
 ///
 /// On success, `*challenge_out` receives a C string that must be passed to
-/// `surge_lock_release`. The caller must free it with `free()`.
+/// `surge_lock_release`. The caller must then free it exactly once with
+/// `surge_free_cstring`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn surge_lock_acquire(
     ctx: *mut SurgeContextHandle,
@@ -119,17 +120,21 @@ pub unsafe extern "C" fn surge_lock_acquire(
     timeout_seconds: i32,
     challenge_out: *mut *mut c_char,
 ) -> i32 {
-    if ctx.is_null() || name.is_null() || challenge_out.is_null() {
+    if challenge_out.is_null() {
+        return SURGE_ERROR;
+    }
+    // SAFETY: `challenge_out` is checked non-null above. Clear it before
+    // validating any other input so every failure has a deterministic output.
+    unsafe { *challenge_out = ptr::null_mut() };
+
+    if ctx.is_null() || name.is_null() {
         return SURGE_ERROR;
     }
 
     catch_ffi(std::panic::AssertUnwindSafe(|| {
-        // SAFETY: `ctx`/`challenge_out` are checked non-null above. The out
-        // pointer is cleared immediately to avoid stale outputs on failure.
-        let handle = unsafe {
-            *challenge_out = ptr::null_mut();
-            &*ctx
-        };
+        // SAFETY: `ctx` is checked non-null above and remains valid for this
+        // call. The out pointer was already cleared.
+        let handle = unsafe { &*ctx };
         handle.clear_last_error();
 
         if handle.ctx.is_cancelled() {
@@ -482,7 +487,7 @@ pub unsafe extern "C" fn surge_process_events(
 }
 
 // =========================================================================
-//  10. Cancellation (1 function)
+//  10. Cancellation (2 functions)
 // =========================================================================
 
 /// Request cancellation of any in-progress operation on `ctx`.
@@ -495,8 +500,27 @@ pub unsafe extern "C" fn surge_cancel(ctx: *mut SurgeContextHandle) -> i32 {
     }
 
     catch_ffi(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: `ctx` is checked non-null above and remains valid for this call.
         let handle = unsafe { &*ctx };
         handle.ctx.cancel();
+        SURGE_OK
+    }))
+}
+
+/// Clear a previous cancellation so the context can start another operation.
+///
+/// The caller must ensure that no operation using this context or a child
+/// handle created from it is still running while cancellation is reset.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn surge_reset_cancel(ctx: *mut SurgeContextHandle) -> i32 {
+    if ctx.is_null() {
+        return SURGE_ERROR;
+    }
+
+    catch_ffi(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: `ctx` is checked non-null above and remains valid for this call.
+        let handle = unsafe { &*ctx };
+        handle.ctx.reset_cancel();
         SURGE_OK
     }))
 }
@@ -505,19 +529,23 @@ pub unsafe extern "C" fn surge_cancel(ctx: *mut SurgeContextHandle) -> i32 {
 //  11. Allocator (1 function)
 // =========================================================================
 
-/// Free a NUL-terminated C string that was returned by a Surge FFI call which
-/// documents its output as `free()`-owned (for example
-/// `surge_update_status_read_json`). Safe to call with NULL.
+/// Free a Surge-owned NUL-terminated C string returned through a `char**`
+/// output. Each non-null output must be passed here exactly once and must never
+/// be freed by the host allocator. Safe to call with null.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn surge_free_cstring(ptr: *mut c_char) {
-    // SAFETY: caller guarantees `ptr` was returned by a Surge FFI function
-    // documented as `free()`-owned, or is null.
+    // SAFETY: caller guarantees `ptr` is a Surge-owned string returned through
+    // a `char**` output, or is null.
     unsafe { crate::shared::libc_free(ptr.cast::<c_void>()) };
 }
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::CString;
     use std::path::{Path, PathBuf};
+    use std::ptr;
+
+    use crate::shared::{SURGE_ERROR, SURGE_OK};
 
     struct TestInstallDir {
         path: PathBuf,
@@ -557,6 +585,60 @@ mod tests {
             format!("id: demo-app\nversion: {version}\nchannel: test\n"),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn lock_acquire_clears_challenge_before_other_input_validation() {
+        let stale = CString::new("stale").unwrap().into_raw();
+        let mut challenge = stale;
+        let rc = unsafe {
+            // SAFETY: the out pointer is valid; null inputs exercise the API's
+            // guarded failure path and are not dereferenced.
+            super::surge_lock_acquire(ptr::null_mut(), ptr::null(), 0, &mut challenge)
+        };
+        assert_eq!(rc, SURGE_ERROR);
+        assert!(challenge.is_null());
+        // SAFETY: `stale` came from `CString::into_raw`, and the failing API
+        // call cleared the out pointer without taking ownership of it.
+        drop(unsafe { CString::from_raw(stale) });
+
+        let ctx = super::surge_context_create();
+        assert!(!ctx.is_null());
+        let stale = CString::new("stale").unwrap().into_raw();
+        let mut challenge = stale;
+        let rc = unsafe {
+            // SAFETY: `ctx` and the out pointer are valid; the null name
+            // deliberately exercises the guarded failure path.
+            super::surge_lock_acquire(ctx, ptr::null(), 0, &mut challenge)
+        };
+        assert_eq!(rc, SURGE_ERROR);
+        assert!(challenge.is_null());
+        // SAFETY: `stale` came from `CString::into_raw`, and the failing API
+        // call cleared the out pointer without taking ownership of it.
+        drop(unsafe { CString::from_raw(stale) });
+        unsafe {
+            // SAFETY: `ctx` is a live handle created above and is destroyed once.
+            super::surge_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn cancellation_state_can_be_reset_between_operations() {
+        let ctx = super::surge_context_create();
+        assert!(!ctx.is_null());
+
+        unsafe {
+            // SAFETY: `ctx` is a live handle, no operation is running, and it
+            // is destroyed exactly once after inspecting its state.
+            assert_eq!(super::surge_cancel(ctx), SURGE_OK);
+            assert!((*ctx).ctx.is_cancelled());
+            assert_eq!(super::surge_reset_cancel(ctx), SURGE_OK);
+            assert!(!(*ctx).ctx.is_cancelled());
+            super::surge_context_destroy(ctx);
+
+            // SAFETY: null is an explicitly guarded invalid input.
+            assert_eq!(super::surge_reset_cancel(ptr::null_mut()), SURGE_ERROR);
+        }
     }
 
     #[test]

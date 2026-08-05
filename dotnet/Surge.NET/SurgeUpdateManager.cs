@@ -60,6 +60,7 @@ namespace Surge
         private string _currentVersion = "0.0.0";
         private int _releaseRetentionLimit = 1;
         private SurgeArtifactRetentionPolicy _artifactRetentionPolicy = SurgeArtifactRetentionPolicy.ReleaseGraph;
+        private int _updateOperationActive;
 
         /// <summary>
         /// Maximum number of old installed versions to retain on disk after updating.
@@ -238,8 +239,15 @@ namespace Surge
         /// <param name="cancellationToken">Token to cancel the operation.</param>
         /// <returns>
         /// The <see cref="SurgeAppInfo"/> for the newly installed version,
-        /// or null if no updates were available or the operation was cancelled.
+        /// or null if no updates were available or native cancellation occurred
+        /// without the supplied token being cancelled.
         /// </returns>
+        /// <exception cref="OperationCanceledException">
+        /// The supplied cancellation token was cancelled.
+        /// </exception>
+        /// <exception cref="InvalidOperationException">
+        /// Another update operation is already running on this manager.
+        /// </exception>
         public Task<SurgeAppInfo?> UpdateToLatestReleaseAsync(
             ISurgeProgressSource? progressSource = null,
             Action<ISurgeChannelReleases>? onUpdatesAvailable = null,
@@ -252,36 +260,44 @@ namespace Surge
 
             return Task.Run(() =>
             {
+                if (Interlocked.CompareExchange(ref _updateOperationActive, 1, 0) != 0)
+                    throw new InvalidOperationException("Only one update operation can run on a manager at a time.");
+
                 // Register cancellation
                 CancellationTokenRegistration registration = default;
                 IntPtr ctx = _nativeCtx;
-                if (cancellationToken.CanBeCanceled)
-                {
-                    registration = cancellationToken.Register(() =>
-                    {
-                        if (ctx != IntPtr.Zero)
-                            _ = NativeMethods.Cancel(ctx);
-                    });
-                }
 
                 try
                 {
+                    ResetNativeCancellation();
+
+                    if (cancellationToken.CanBeCanceled)
+                    {
+                        registration = cancellationToken.Register(() =>
+                        {
+                            if (ctx != IntPtr.Zero)
+                                _ = NativeMethods.Cancel(ctx);
+                        });
+                    }
+
                     cancellationToken.ThrowIfCancellationRequested();
 
                     // Check for updates
                     int checkResult = NativeMethods.UpdateCheck(_nativeMgr, out IntPtr releasesInfoPtr);
-
-                    if (checkResult == -3) // SURGE_NOT_FOUND
-                        return null;
-
-                    if (checkResult != 0)
-                    {
-                        var errorMsg = GetLastError();
-                        throw new SurgeException(checkResult, errorMsg ?? "Update check failed.");
-                    }
-
                     try
                     {
+                        if (checkResult == -3) // SURGE_NOT_FOUND
+                            return null;
+
+                        if (HandleNativeCancellation(checkResult, cancellationToken))
+                            return null;
+
+                        if (checkResult != 0)
+                        {
+                            var errorMsg = GetLastError();
+                            throw new SurgeException(checkResult, errorMsg ?? "Update check failed.");
+                        }
+
                         cancellationToken.ThrowIfCancellationRequested();
                         ApplyRetentionSettings();
 
@@ -356,11 +372,8 @@ namespace Surge
                                 nativeProgressCb,
                                 IntPtr.Zero);
 
-                            if (applyResult == -2) // SURGE_CANCELLED
-                            {
-                                cancellationToken.ThrowIfCancellationRequested();
+                            if (HandleNativeCancellation(applyResult, cancellationToken))
                                 return null;
-                            }
 
                             if (applyResult != 0)
                             {
@@ -398,14 +411,32 @@ namespace Surge
                     }
                     finally
                     {
-                        NativeMethods.ReleasesDestroy(releasesInfoPtr);
+                        if (releasesInfoPtr != IntPtr.Zero)
+                            NativeMethods.ReleasesDestroy(releasesInfoPtr);
                     }
                 }
                 finally
                 {
-                    registration.Dispose();
+                    try
+                    {
+                        // Wait for any in-flight callback before clearing its
+                        // native cancellation request.
+                        registration.Dispose();
+                    }
+                    finally
+                    {
+                        try
+                        {
+                            if (ctx != IntPtr.Zero)
+                                _ = NativeMethods.ResetCancel(ctx);
+                        }
+                        finally
+                        {
+                            Volatile.Write(ref _updateOperationActive, 0);
+                        }
+                    }
                 }
-            }, cancellationToken);
+            }, CancellationToken.None);
         }
 
         private static int ParseStorageProvider(string provider)
@@ -436,6 +467,25 @@ namespace Surge
         private static string? NullIfEmpty(string value)
         {
             return string.IsNullOrWhiteSpace(value) ? null : value;
+        }
+
+        internal static bool HandleNativeCancellation(int result, CancellationToken cancellationToken)
+        {
+            if (result != -2) // SURGE_CANCELLED
+                return false;
+
+            cancellationToken.ThrowIfCancellationRequested();
+            return true;
+        }
+
+        private void ResetNativeCancellation()
+        {
+            int result = NativeMethods.ResetCancel(_nativeCtx);
+            if (result != 0)
+            {
+                var errorMsg = GetLastError();
+                throw new SurgeException(result, errorMsg ?? "Failed to reset native cancellation state.");
+            }
         }
 
         private void SetCurrentVersionInternal(string version)

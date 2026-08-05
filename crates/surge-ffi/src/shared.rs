@@ -228,8 +228,9 @@ pub(crate) unsafe fn collect_argv(argc: c_int, argv: *const *const c_char) -> Ve
     args
 }
 
-/// Thin wrapper around platform `malloc` for allocating buffers that C callers
-/// will free with `free()`.
+/// Thin wrapper around platform `malloc` for allocating Surge-owned buffers.
+/// Public callers release these only through `surge_free_cstring` so allocation
+/// and deallocation always cross the same library boundary.
 ///
 /// Returns a pointer to `size` bytes of uninitialized memory, or null on failure.
 pub(crate) fn libc_malloc(size: usize) -> *mut u8 {
@@ -241,8 +242,7 @@ pub(crate) fn libc_malloc(size: usize) -> *mut u8 {
     unsafe { malloc(size).cast::<u8>() }
 }
 
-/// Counterpart to [`libc_malloc`]: frees a pointer returned by any Surge FFI
-/// function that documents its output as `free()`-owned.
+/// Internal counterpart to [`libc_malloc`] used by `surge_free_cstring`.
 ///
 /// # Safety
 /// `ptr` must have been returned by a Surge FFI call that allocated via

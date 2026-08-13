@@ -428,6 +428,7 @@ jobs:
 
   publish-nuget:
     name: Publish NuGet
+    if: ${{ !cancelled() && needs.validate-release.result == 'success' && needs.package-nuget.result == 'success' }}
     needs: [validate-release, package-nuget]
     runs-on: ubuntu-latest
     permissions:

@@ -9,6 +9,14 @@ on:
         description: Existing published release tag to recover
         required: true
         type: string
+      recovery_mode:
+        description: Work to run for an existing release
+        required: true
+        default: full
+        type: choice
+        options:
+          - full
+          - nuget
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.release.tag_name || inputs.tag_name }}
@@ -142,6 +150,7 @@ jobs:
 
   build-artifacts:
     name: Artifacts (${{ matrix.name }})
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.recovery_mode == 'full' }}
     needs: validate-release
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
@@ -258,6 +267,7 @@ jobs:
 
   package-nuget:
     name: Package NuGet
+    if: ${{ !cancelled() && needs.validate-release.result == 'success' && (needs.build-artifacts.result == 'success' || (github.event_name == 'workflow_dispatch' && inputs.recovery_mode == 'nuget')) }}
     needs: [validate-release, build-artifacts]
     runs-on: ubuntu-latest
     permissions:
@@ -432,7 +442,8 @@ jobs:
         with:
           name: surge-net-nuget
           path: nupkgs
-      - name: Verify immutable package handoff
+      - id: verify_package
+        name: Verify immutable package handoff
         env:
           EXPECTED_PACKAGE_NAME: ${{ needs.package-nuget.outputs.package_name }}
           EXPECTED_PACKAGE_SHA256: ${{ needs.package-nuget.outputs.package_sha256 }}
@@ -468,10 +479,12 @@ jobs:
             --api-key "${NUGET_API_KEY}" \
             --skip-duplicate
       - name: Push to GitHub Packages
+        if: ${{ !cancelled() && steps.verify_package.outcome == 'success' }}
         run: dotnet nuget push "nupkgs/${{ needs.package-nuget.outputs.package_name }}" --source https://nuget.pkg.github.com/fintermobilityas/index.json --api-key ${{ secrets.GITHUB_TOKEN }} --skip-duplicate
 
   publish-cargo-crates-io:
     name: Publish Cargo (crates.io)
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.recovery_mode == 'full' }}
     needs: [validate-release, build-artifacts]
     runs-on: ubuntu-latest
     env:
@@ -498,6 +511,7 @@ jobs:
 
   upload-release-assets:
     name: Upload Release Assets
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.recovery_mode == 'full' }}
     needs: [validate-release, build-artifacts, package-nuget]
     runs-on: ubuntu-latest
     permissions:

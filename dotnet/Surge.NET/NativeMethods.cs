@@ -1,5 +1,6 @@
 using System;
 using System.Runtime.InteropServices;
+using System.Threading;
 
 namespace Surge
 {
@@ -405,5 +406,67 @@ namespace Surge
         internal static extern int ResetCancel(IntPtr ctx);
 #pragma warning restore CA2101
 #endif
+
+        private const int ResetCancelUnknown = 0;
+        private const int ResetCancelAvailable = 1;
+        private const int ResetCancelUnavailable = 2;
+        private static readonly object ResetCancelProbeLock = new object();
+        private static int resetCancelState = ResetCancelUnknown;
+
+        internal static bool TryResetCancel(IntPtr ctx, out int result) =>
+            TryResetCancelCore(ctx, ResetCancel, out result);
+
+        internal static bool TryResetCancelCore(
+            IntPtr ctx,
+            Func<IntPtr, int> invoke,
+            out int result)
+        {
+            result = 0;
+            if (ctx == IntPtr.Zero)
+                return false;
+
+            var state = Volatile.Read(ref resetCancelState);
+            if (state == ResetCancelUnavailable)
+                return false;
+
+            if (state == ResetCancelAvailable)
+            {
+                result = invoke(ctx);
+                return true;
+            }
+
+            lock (ResetCancelProbeLock)
+            {
+                state = Volatile.Read(ref resetCancelState);
+                if (state == ResetCancelUnavailable)
+                    return false;
+
+                if (state == ResetCancelUnknown)
+                {
+                    try
+                    {
+                        result = invoke(ctx);
+                        Volatile.Write(ref resetCancelState, ResetCancelAvailable);
+                        return true;
+                    }
+                    catch (EntryPointNotFoundException)
+                    {
+                        Volatile.Write(ref resetCancelState, ResetCancelUnavailable);
+                        return false;
+                    }
+                }
+            }
+
+            result = invoke(ctx);
+            return true;
+        }
+
+        internal static void ResetResetCancelProbeForTesting()
+        {
+            lock (ResetCancelProbeLock)
+            {
+                Volatile.Write(ref resetCancelState, ResetCancelUnknown);
+            }
+        }
     }
 }

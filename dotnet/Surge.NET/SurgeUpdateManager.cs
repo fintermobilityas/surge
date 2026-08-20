@@ -428,7 +428,7 @@ namespace Surge
                         try
                         {
                             if (ctx != IntPtr.Zero)
-                                _ = NativeMethods.ResetCancel(ctx);
+                                _ = NativeMethods.TryResetCancel(ctx, out _);
                         }
                         finally
                         {
@@ -480,7 +480,9 @@ namespace Surge
 
         private void ResetNativeCancellation()
         {
-            int result = NativeMethods.ResetCancel(_nativeCtx);
+            if (!NativeMethods.TryResetCancel(_nativeCtx, out int result))
+                return;
+
             if (result != 0)
             {
                 var errorMsg = GetLastError();

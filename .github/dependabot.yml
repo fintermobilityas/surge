@@ -3,13 +3,13 @@ updates:
   - package-ecosystem: nuget
     directory: "/dotnet"
     schedule:
-      interval: weekly
+      interval: daily
       time: "04:00"
 
   - package-ecosystem: cargo
     directory: "/"
     schedule:
-      interval: weekly
+      interval: daily
       time: "04:00"
     groups:
       egui-stack:

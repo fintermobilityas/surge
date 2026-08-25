@@ -9,7 +9,7 @@ pub(crate) const REMOTE_INSTALLER_PID_PATH: &str = "/tmp/.surge-installer.pid";
 
 /// A full package download on a slow tailnet link can take hours; the
 /// detached monitor must outlive the interactive 30-minute stream timeout.
-pub(crate) const DETACHED_INSTALL_MONITOR_TIMEOUT: Duration = Duration::from_mins(360);
+pub(crate) const DETACHED_INSTALL_MONITOR_TIMEOUT: Duration = Duration::from_hours(6);
 pub(crate) const DETACHED_INSTALL_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// The status file is the authoritative liveness signal; allow more slack
 /// than the interactive watchdog because every check is a fresh SSH round

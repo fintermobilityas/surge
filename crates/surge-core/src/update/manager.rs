@@ -3106,6 +3106,200 @@ echo started > new-child-started
     }
 
     #[tokio::test]
+    async fn test_download_and_apply_delta_aborts_when_verification_failures_exhaust_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("store");
+        let install_root = tmp.path().join("install");
+        let app_id = "test-app";
+        std::fs::create_dir_all(&store_root).unwrap();
+        std::fs::create_dir_all(&install_root).unwrap();
+        let app_store = app_scoped_store_root(&store_root, app_id);
+
+        let rid = current_rid();
+        let os = current_os_label_for_tests();
+
+        // Clean source trees for three releases; the installed app drifts by
+        // carrying an extra file that no delta removes, so every rebuilt
+        // archive hash-mismatches, and every stored full is corrupted, so
+        // every restore and the full-package fallback fail verification too.
+        let make_source = |name: &str, payload: &str| {
+            let dir = tmp.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("payload.txt"), payload).unwrap();
+            dir
+        };
+        let source_v1 = make_source("source-v1", "v1 payload");
+        let source_v2 = make_source("source-v2", "v2 payload");
+        let source_v3 = make_source("source-v3", "v3 payload");
+
+        let pack = |dir: &Path| {
+            let mut packer = ArchivePacker::new(3).unwrap();
+            packer.add_directory(dir, "").unwrap();
+            packer.finalize().unwrap()
+        };
+        let full_v1 = pack(&source_v1);
+        let full_v2 = pack(&source_v2);
+        let full_v3 = pack(&source_v3);
+
+        let corrupt = |bytes: &[u8]| {
+            let mut corrupted = bytes.to_vec();
+            corrupted.push(0xff);
+            corrupted
+        };
+
+        let delta_v2 = zstd::encode_all(
+            build_sparse_file_patch(&full_v1, &full_v2, 3, 0, &ChunkedDiffOptions::default())
+                .unwrap()
+                .as_slice(),
+            3,
+        )
+        .unwrap();
+        let delta_v3 = zstd::encode_all(
+            build_sparse_file_patch(&full_v2, &full_v3, 3, 0, &ChunkedDiffOptions::default())
+                .unwrap()
+                .as_slice(),
+            3,
+        )
+        .unwrap();
+
+        let full_v1_name = format!("{app_id}-1.0.0-{rid}-full.tar.zst");
+        let full_v2_name = format!("{app_id}-1.1.0-{rid}-full.tar.zst");
+        let full_v3_name = format!("{app_id}-1.2.0-{rid}-full.tar.zst");
+        let delta_v2_name = format!("{app_id}-1.1.0-{rid}-delta.tar.zst");
+        let delta_v3_name = format!("{app_id}-1.2.0-{rid}-delta.tar.zst");
+
+        // Valid deltas; every full (base, intermediate, target) corrupted.
+        std::fs::write(app_store.join(&full_v1_name), corrupt(&full_v1)).unwrap();
+        std::fs::write(app_store.join(&full_v2_name), corrupt(&full_v2)).unwrap();
+        std::fs::write(app_store.join(&full_v3_name), corrupt(&full_v3)).unwrap();
+        std::fs::write(app_store.join(&delta_v2_name), &delta_v2).unwrap();
+        std::fs::write(app_store.join(&delta_v3_name), &delta_v3).unwrap();
+
+        let release =
+            |version: &str, genesis: bool, full_name: &str, full: &[u8], deltas: Vec<DeltaArtifact>| ReleaseEntry {
+                version: version.to_string(),
+                channels: vec!["stable".to_string()],
+                os: os.clone(),
+                rid: rid.clone(),
+                is_genesis: genesis,
+                full_filename: full_name.to_string(),
+                full_size: i64::try_from(full.len()).unwrap(),
+                full_sha256: sha256_hex(full),
+                full_compression_level: 0,
+                full_zstd_workers: 0,
+                preferred_delta_id: if deltas.is_empty() {
+                    String::new()
+                } else {
+                    "primary".to_string()
+                },
+                deltas,
+                created_utc: chrono::Utc::now().to_rfc3339(),
+                release_notes: String::new(),
+                name: String::new(),
+                main_exe: app_id.to_string(),
+                install_directory: app_id.to_string(),
+                supervisor_id: String::new(),
+                icon: String::new(),
+                shortcuts: Vec::new(),
+                persistent_assets: Vec::new(),
+                installers: Vec::new(),
+                environment: std::collections::BTreeMap::new(),
+            };
+        let index = ReleaseIndex {
+            app_id: app_id.to_string(),
+            releases: vec![
+                release("1.0.0", true, &full_v1_name, &full_v1, Vec::new()),
+                release(
+                    "1.1.0",
+                    false,
+                    &full_v2_name,
+                    &full_v2,
+                    vec![DeltaArtifact::sparse_file_ops_zstd(
+                        "primary",
+                        "1.0.0",
+                        &delta_v2_name,
+                        delta_v2.len() as i64,
+                        &sha256_hex(&delta_v2),
+                    )],
+                ),
+                release(
+                    "1.2.0",
+                    false,
+                    &full_v3_name,
+                    &full_v3,
+                    vec![DeltaArtifact::sparse_file_ops_zstd(
+                        "primary",
+                        "1.1.0",
+                        &delta_v3_name,
+                        delta_v3.len() as i64,
+                        &sha256_hex(&delta_v3),
+                    )],
+                ),
+            ],
+            ..ReleaseIndex::default()
+        };
+        write_app_scoped_release_index(&store_root, app_id, &index);
+
+        // Installed app for 1.0.0, drifted by an extra file no delta removes.
+        let active_app_dir = install_root.join("app");
+        std::fs::create_dir_all(active_app_dir.join(".surge")).unwrap();
+        std::fs::write(active_app_dir.join("payload.txt"), "v1 payload").unwrap();
+        std::fs::write(active_app_dir.join("extra.txt"), "drift").unwrap();
+        std::fs::write(
+            active_app_dir.join(crate::install::RUNTIME_MANIFEST_RELATIVE_PATH),
+            format!("id: {app_id}\nversion: 1.0.0\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            active_app_dir.join(crate::install::LEGACY_RUNTIME_MANIFEST_RELATIVE_PATH),
+            format!("id: {app_id}\nversion: 1.0.0\n"),
+        )
+        .unwrap();
+
+        let ctx = Arc::new(Context::new());
+        ctx.set_storage(
+            StorageProvider::Filesystem,
+            store_root.to_str().unwrap(),
+            "",
+            "",
+            "",
+            "",
+        );
+
+        let mut manager = UpdateManager::new(ctx, app_id, "1.0.0", "stable", install_root.to_str().unwrap()).unwrap();
+        let info = manager.check_for_updates().await.unwrap().unwrap();
+        assert_eq!(info.apply_strategy, ApplyStrategy::Delta);
+
+        let error = manager
+            .download_and_apply(&info, None::<fn(ProgressInfo)>)
+            .await
+            .expect_err("a corrupt chain must fail the attempt")
+            .to_string();
+        assert!(
+            error.contains("verification failure budget exhausted"),
+            "expected the bounded-abort error, got: {error}"
+        );
+        assert!(
+            error.contains("4 verification failures in this attempt"),
+            "expected the failure count in the abort, got: {error}"
+        );
+
+        let status = status::read_update_status(&install_root).unwrap().unwrap();
+        assert_eq!(status.state, status::UpdateConvergenceState::Failed);
+        assert!(
+            status
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("verification failure budget exhausted")
+        );
+
+        // The install must be untouched: still running the pre-attempt version.
+        let installed = std::fs::read_to_string(install_root.join("app").join("payload.txt")).unwrap();
+        assert_eq!(installed, "v1 payload");
+    }
+
+    #[tokio::test]
     async fn test_download_and_apply_delta_prefers_app_scoped_release_index_lineage() {
         let tmp = tempfile::tempdir().unwrap();
         let store_root = tmp.path().join("store");

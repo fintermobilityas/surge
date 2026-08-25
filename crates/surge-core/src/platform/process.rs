@@ -194,7 +194,7 @@ pub fn probe_pid_liveness(pid: u32) -> PidLiveness {
             .lines()
             .filter_map(|line| line.split_whitespace().nth(1))
             .any(|field| field == pid.to_string())
-            .then(PidLiveness::Alive)
+            .then_some(PidLiveness::Alive)
             .unwrap_or(PidLiveness::Dead)
     }
     #[cfg(not(any(unix, windows)))]

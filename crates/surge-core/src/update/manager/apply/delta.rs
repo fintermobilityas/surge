@@ -54,8 +54,17 @@ where
 
         let delta_path = staging_dir.join(&delta.filename);
         let delta_compressed = tokio::fs::read(&delta_path).await?;
-        let patch = decode_delta_patch(delta_compressed.as_slice(), &delta)
-            .map_err(|e| SurgeError::Archive(format!("Failed to decompress delta {}: {e}", delta.filename)))?;
+        let patch = decode_delta_patch(delta_compressed.as_slice(), &delta).map_err(|e| {
+            let error = SurgeError::Archive(format!("Failed to decompress delta {}: {e}", delta.filename));
+            if is_verification_failure(&error) {
+                // A budget-exhausting failure returns the bounded-abort
+                // error instead of the raw decode error.
+                if let Err(abort) = verify_budget.record_failure(&error.to_string()) {
+                    return abort;
+                }
+            }
+            error
+        })?;
         let progress_for_delta = progress.cloned();
         let completed_bytes_before_delta = apply_delta_bytes_done;
         let completed_items_before_delta = apply_delta_items_done;

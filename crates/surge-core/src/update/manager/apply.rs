@@ -26,15 +26,19 @@ pub(super) use self::installed_app::find_previous_app_dir;
 #[cfg(test)]
 pub(super) use self::installed_app::synthesize_current_full_archive_from_installed_app;
 
-/// Maximum verification failures a single update attempt may accumulate while
-/// restoring and applying the current package.
+/// Maximum verification-failure passes a single update attempt may pay for
+/// while restoring and applying the current package.
 ///
-/// The materialization ladder deliberately re-runs expensive work after
+/// The materialization ladder intentionally re-runs expensive work after
 /// verification failures (installed-app base -> release-graph base -> full
-/// package fallback). Without a budget, a persistently corrupt artifact chain
-/// re-runs GB-scale restore/apply passes over and over, advancing progress on
-/// every pass so the attempt looks healthy while it burns disk and CPU (see
-/// #237). The budget turns that into a bounded, readable failure.
+/// package fallback), which is what makes a single corrupted artifact cheap
+/// to recover from. When the whole chain is corrupt, however, every pass
+/// fails verification and the attempt can pay for GB-scale restore/apply
+/// work with no chance of converging (see #237). The budget caps how many
+/// failed verification passes one attempt pays for; the failure beyond the
+/// budget aborts the attempt with a readable, counted error and skips the
+/// remaining expensive passes, so the failure is visible instead of
+/// masquerading as healthy progress.
 pub(super) const MAX_VERIFY_FAILURES: u32 = 3;
 
 /// Marker prefix of the budget-abort error so the retry ladder can tell an
@@ -82,6 +86,7 @@ fn is_verification_failure(error: &SurgeError) -> bool {
             message.contains("SHA-256 mismatch")
                 || message.contains("Failed to apply delta")
                 || message.contains("Failed to decode")
+                || message.contains("Failed to decompress")
         }
         _ => false,
     }
@@ -536,6 +541,9 @@ mod tests {
         )));
         assert!(is_verification_failure(&SurgeError::Archive(
             "Failed to decode delta artifact".into()
+        )));
+        assert!(is_verification_failure(&SurgeError::Archive(
+            "Failed to decompress delta artifact: corrupt".into()
         )));
 
         assert!(!is_verification_failure(&SurgeError::Storage(

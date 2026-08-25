@@ -14,6 +14,7 @@ use super::super::progress::{
 };
 use super::super::progress_substep::{PhaseProgressEmitter, labels as apply_phase};
 use super::super::{UpdateInfo, UpdateManager};
+use super::{VerifyFailureBudget, is_verification_failure};
 
 pub(super) async fn apply_target_deltas<F>(
     manager: &UpdateManager,
@@ -24,6 +25,7 @@ pub(super) async fn apply_target_deltas<F>(
     progress_emitter: &PhaseProgressEmitter<'_, F>,
     apply_delta_total_items: i64,
     apply_delta_total_bytes: i64,
+    verify_budget: &mut VerifyFailureBudget,
 ) -> Result<Vec<u8>>
 where
     F: Fn(ProgressInfo) + Send + Sync,
@@ -52,8 +54,17 @@ where
 
         let delta_path = staging_dir.join(&delta.filename);
         let delta_compressed = tokio::fs::read(&delta_path).await?;
-        let patch = decode_delta_patch(delta_compressed.as_slice(), &delta)
-            .map_err(|e| SurgeError::Archive(format!("Failed to decompress delta {}: {e}", delta.filename)))?;
+        let patch = decode_delta_patch(delta_compressed.as_slice(), &delta).map_err(|e| {
+            let error = SurgeError::Archive(format!("Failed to decompress delta {}: {e}", delta.filename));
+            if is_verification_failure(&error) {
+                // A budget-exhausting failure returns the bounded-abort
+                // error instead of the raw decode error.
+                if let Err(abort) = verify_budget.record_failure(&error.to_string()) {
+                    return abort;
+                }
+            }
+            error
+        })?;
         let progress_for_delta = progress.cloned();
         let completed_bytes_before_delta = apply_delta_bytes_done;
         let completed_items_before_delta = apply_delta_items_done;
@@ -95,15 +106,27 @@ where
         };
 
         rebuilt_archive = apply_delta_patch_with_progress(&rebuilt_archive, &patch, &delta, Some(&delta_progress))
-            .map_err(|e| SurgeError::Update(format!("Failed to apply delta {}: {e}", delta.filename)))?;
+            .map_err(|e| {
+                let error = SurgeError::Update(format!("Failed to apply delta {}: {e}", delta.filename));
+                if is_verification_failure(&error) {
+                    // A budget-exhausting failure returns the bounded-abort
+                    // error instead of the raw apply error.
+                    if let Err(abort) = verify_budget.record_failure(&error.to_string()) {
+                        return abort;
+                    }
+                }
+                error
+            })?;
 
         if !release.full_sha256.is_empty() {
             let hash = sha256_hex(&rebuilt_archive);
             if hash != release.full_sha256 {
-                return Err(SurgeError::Update(format!(
+                let message = format!(
                     "SHA-256 mismatch for rebuilt full archive {}: expected {}, got {hash}",
                     release.version, release.full_sha256
-                )));
+                );
+                verify_budget.record_failure(&message)?;
+                return Err(SurgeError::Update(message));
             }
         }
 

@@ -21,6 +21,7 @@ use super::super::progress::{
 use super::super::progress_substep::{HEARTBEAT_INTERVAL, PhaseProgressEmitter, labels as apply_phase};
 use super::super::{UpdateInfo, UpdateManager};
 use super::installed_app::synthesize_current_full_archive_from_installed_app;
+use super::{VerifyFailureBudget, is_verification_failure};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum BaseFullArchiveSource {
@@ -39,6 +40,7 @@ pub(super) async fn restore_base_full_archive<F>(
     artifact_cache_dir: &Path,
     progress: Option<&Arc<F>>,
     progress_emitter: &PhaseProgressEmitter<'_, F>,
+    verify_budget: &mut VerifyFailureBudget,
 ) -> Result<BaseFullArchive>
 where
     F: Fn(ProgressInfo) + Send + Sync,
@@ -61,6 +63,12 @@ where
                 });
             }
             Err(installed_app_err) => {
+                if is_verification_failure(&installed_app_err) {
+                    verify_budget.record_failure(&format!(
+                        "installed-app base restoration of {}: {installed_app_err}",
+                        manager.current_version
+                    ))?;
+                }
                 debug!(
                     version = %manager.current_version,
                     error = %installed_app_err,
@@ -78,6 +86,7 @@ where
         artifact_cache_dir,
         progress,
         progress_emitter,
+        verify_budget,
     )
     .await
     .map(|archive| BaseFullArchive {
@@ -91,6 +100,7 @@ pub(super) async fn restore_release_graph_base_full_archive<F>(
     artifact_cache_dir: &Path,
     progress: Option<&Arc<F>>,
     progress_emitter: &PhaseProgressEmitter<'_, F>,
+    verify_budget: &mut VerifyFailureBudget,
 ) -> Result<BaseFullArchive>
 where
     F: Fn(ProgressInfo) + Send + Sync,
@@ -104,6 +114,7 @@ where
         artifact_cache_dir,
         progress,
         progress_emitter,
+        verify_budget,
     )
     .await
     .map(|archive| BaseFullArchive {
@@ -139,6 +150,7 @@ async fn restore_base_full_archive_from_release_graph<F>(
     artifact_cache_dir: &Path,
     progress: Option<&Arc<F>>,
     progress_emitter: &PhaseProgressEmitter<'_, F>,
+    verify_budget: &mut VerifyFailureBudget,
 ) -> Result<Vec<u8>>
 where
     F: Fn(ProgressInfo) + Send + Sync,
@@ -193,19 +205,30 @@ where
         .await
     {
         Ok(archive) => Ok(archive),
-        Err(restore_err) => synthesize_current_full_archive_from_installed_app(
-            &manager.install_dir,
-            &manager.current_version,
-            current_release,
-            artifact_cache_dir,
-            &manager.ctx,
-        )
-        .map_err(|fallback_err| {
-            SurgeError::Update(format!(
-                "Failed to restore base full archive for {}: {restore_err}; installed-app fallback failed: {fallback_err}",
-                manager.current_version
-            ))
-        }),
+        Err(restore_err) => {
+            if is_verification_failure(&restore_err) {
+                // Budget-gate the expensive installed-app synthesis fallback:
+                // once the attempt has burned its verification failures, fail
+                // with the bounded-abort error instead of re-running work.
+                verify_budget.record_failure(&format!(
+                    "release-graph restore of current package {}: {restore_err}",
+                    manager.current_version
+                ))?;
+            }
+            synthesize_current_full_archive_from_installed_app(
+                &manager.install_dir,
+                &manager.current_version,
+                current_release,
+                artifact_cache_dir,
+                &manager.ctx,
+            )
+            .map_err(|fallback_err| {
+                SurgeError::Update(format!(
+                    "Failed to restore base full archive for {}: {restore_err}; installed-app fallback failed: {fallback_err}",
+                    manager.current_version
+                ))
+            })
+        }
     }
 }
 

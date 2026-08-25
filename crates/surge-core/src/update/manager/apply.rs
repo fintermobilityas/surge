@@ -26,6 +26,76 @@ pub(super) use self::installed_app::find_previous_app_dir;
 #[cfg(test)]
 pub(super) use self::installed_app::synthesize_current_full_archive_from_installed_app;
 
+/// Maximum verification-failure passes a single update attempt may pay for
+/// while restoring and applying the current package.
+///
+/// The materialization ladder intentionally re-runs expensive work after
+/// verification failures (installed-app base -> release-graph base -> full
+/// package fallback), which is what makes a single corrupted artifact cheap
+/// to recover from. When the whole chain is corrupt, however, every pass
+/// fails verification and the attempt can pay for GB-scale restore/apply
+/// work with no chance of converging (see #237). The budget caps how many
+/// failed verification passes one attempt pays for; the failure beyond the
+/// budget aborts the attempt with a readable, counted error and skips the
+/// remaining expensive passes, so the failure is visible instead of
+/// masquerading as healthy progress.
+pub(super) const MAX_VERIFY_FAILURES: u32 = 3;
+
+/// Marker prefix of the budget-abort error so the retry ladder can tell an
+/// abort apart from an ordinary verification failure (which it would
+/// otherwise retry with another expensive pass).
+const VERIFY_ABORT_MARKER: &str = "verification failure budget exhausted";
+
+/// Verification-failure budget for one update attempt. Each verification
+/// failure (hash mismatch, patch decode/apply failure, corrupted artifact)
+/// consumes the budget; once it is exhausted the attempt must fail with a
+/// readable error instead of re-running expensive work.
+pub(super) struct VerifyFailureBudget {
+    failures: Vec<String>,
+}
+
+impl VerifyFailureBudget {
+    #[must_use]
+    pub(super) fn new() -> Self {
+        Self { failures: Vec::new() }
+    }
+
+    /// Record a verification failure. Returns `Ok(())` while the budget is
+    /// not exhausted and an abort error on the first failure beyond it.
+    pub(super) fn record_failure(&mut self, context: &str) -> Result<()> {
+        self.failures.push(context.to_string());
+        if self.failures.len() <= usize::try_from(MAX_VERIFY_FAILURES).unwrap_or(usize::MAX) {
+            return Ok(());
+        }
+        let last = self.failures.last().map_or("", String::as_str);
+        Err(SurgeError::Update(format!(
+            "{VERIFY_ABORT_MARKER}: {} verification failures in this attempt ({} allowed, last: {last}); the release artifacts for this update chain appear corrupt or inconsistent. The attempt fails and backs off; retry later or republish the affected release.",
+            self.failures.len(),
+            MAX_VERIFY_FAILURES
+        )))
+    }
+}
+
+/// Whether an error indicates a verification failure (content/hash mismatch
+/// or a patch that could not be decoded/applied) as opposed to a transient
+/// or environmental failure (network, IO, missing object).
+fn is_verification_failure(error: &SurgeError) -> bool {
+    match error {
+        SurgeError::Integrity(_) | SurgeError::Diff(_) => true,
+        SurgeError::Archive(message) | SurgeError::Update(message) | SurgeError::Storage(message) => {
+            message.contains("SHA-256 mismatch")
+                || message.contains("Failed to apply delta")
+                || message.contains("Failed to decode")
+                || message.contains("Failed to decompress")
+        }
+        _ => false,
+    }
+}
+
+fn is_verify_abort(error: &SurgeError) -> bool {
+    matches!(error, SurgeError::Update(message) if message.contains(VERIFY_ABORT_MARKER))
+}
+
 pub(super) async fn materialize_update_payload<F>(
     manager: &UpdateManager,
     info: &UpdateInfo,
@@ -38,6 +108,7 @@ pub(super) async fn materialize_update_payload<F>(
 where
     F: Fn(ProgressInfo) + Send + Sync,
 {
+    let mut verify_budget = VerifyFailureBudget::new();
     if matches!(info.apply_strategy, ApplyStrategy::Delta) {
         match materialize_delta_payload(
             manager,
@@ -47,11 +118,18 @@ where
             extract_dir,
             progress,
             progress_emitter,
+            &mut verify_budget,
         )
         .await
         {
             Ok(path) => Ok(path),
             Err(SurgeError::Cancelled) => Err(SurgeError::Cancelled),
+            Err(delta_error) if is_verify_abort(&delta_error) => {
+                // The verification budget is exhausted: failing now (with the
+                // bounded-abort error) instead of re-running the expensive
+                // full-package pass is the point of the budget.
+                Err(delta_error)
+            }
             Err(delta_error) => {
                 materialize_full_payload_after_delta_failure(
                     manager,
@@ -61,6 +139,7 @@ where
                     extract_dir,
                     progress,
                     delta_error,
+                    &mut verify_budget,
                 )
                 .await
             }
@@ -137,6 +216,7 @@ async fn materialize_full_payload_after_delta_failure<F>(
     extract_dir: &Path,
     progress: Option<&Arc<F>>,
     delta_error: SurgeError,
+    verify_budget: &mut VerifyFailureBudget,
 ) -> Result<PathBuf>
 where
     F: Fn(ProgressInfo) + Send + Sync,
@@ -195,6 +275,17 @@ where
     )
     .await
     .map_err(|fallback_error| {
+        if is_verification_failure(&fallback_error) {
+            // Terminal path: if this verification failure exhausts the
+            // budget, surface the bounded-abort error instead of the raw
+            // download error so the failure reason names the pattern.
+            if let Err(abort) = verify_budget.record_failure(&format!(
+                "full package fallback download of {}: {fallback_error}",
+                latest.full_filename
+            )) {
+                return abort;
+            }
+        }
         SurgeError::Update(format!(
             "Delta materialization failed: {delta_error}; full package fallback failed: {fallback_error}"
         ))
@@ -221,6 +312,7 @@ async fn materialize_delta_payload<F>(
     extract_dir: &Path,
     progress: Option<&Arc<F>>,
     progress_emitter: &PhaseProgressEmitter<'_, F>,
+    verify_budget: &mut VerifyFailureBudget,
 ) -> Result<PathBuf>
 where
     F: Fn(ProgressInfo) + Send + Sync,
@@ -243,7 +335,15 @@ where
         },
     );
 
-    let base_archive = restore_base_full_archive(manager, info, artifact_cache_dir, progress, progress_emitter).await?;
+    let base_archive = restore_base_full_archive(
+        manager,
+        info,
+        artifact_cache_dir,
+        progress,
+        progress_emitter,
+        verify_budget,
+    )
+    .await?;
     let rebuilt_archive = match apply_target_deltas(
         manager,
         info,
@@ -253,21 +353,28 @@ where
         progress_emitter,
         apply_delta_total_items,
         apply_delta_total_bytes,
+        verify_budget,
     )
     .await
     {
         Ok(archive) => archive,
         Err(delta_error)
             if base_archive.source == BaseFullArchiveSource::InstalledApp
+                && !is_verify_abort(&delta_error)
                 && should_retry_delta_with_release_graph(&delta_error) =>
         {
             warn!(
                 error = %delta_error,
                 "Installed app base did not produce a valid delta result; retrying with release graph base"
             );
-            let release_graph_base =
-                restore_release_graph_base_full_archive(manager, artifact_cache_dir, progress, progress_emitter)
-                    .await?;
+            let release_graph_base = restore_release_graph_base_full_archive(
+                manager,
+                artifact_cache_dir,
+                progress,
+                progress_emitter,
+                verify_budget,
+            )
+            .await?;
             apply_target_deltas(
                 manager,
                 info,
@@ -277,6 +384,7 @@ where
                 progress_emitter,
                 apply_delta_total_items,
                 apply_delta_total_bytes,
+                verify_budget,
             )
             .await
             .map_err(|retry_error| {
@@ -376,4 +484,72 @@ where
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_VERIFY_FAILURES, VerifyFailureBudget, is_verification_failure, is_verify_abort};
+    use crate::error::SurgeError;
+
+    #[test]
+    fn verify_budget_allows_bounded_failures_then_aborts() {
+        let mut budget = VerifyFailureBudget::new();
+        for attempt in 1..=usize::try_from(MAX_VERIFY_FAILURES).unwrap() {
+            budget
+                .record_failure(&format!("failure {attempt}"))
+                .unwrap_or_else(|e| panic!("failure {attempt} should be within budget: {e}"));
+        }
+        let abort = budget
+            .record_failure("one failure too many")
+            .expect_err("the failure beyond the budget must abort");
+        let message = abort.to_string();
+        assert!(
+            message.contains("verification failure budget exhausted"),
+            "message was: {message}"
+        );
+        assert!(message.contains("one failure too many"), "message was: {message}");
+        assert!(
+            is_verify_abort(&abort),
+            "the abort error must be recognized by the ladder"
+        );
+    }
+
+    #[test]
+    fn verify_abort_is_not_ordinary_verification_failure() {
+        let mut budget = VerifyFailureBudget::new();
+        for _ in 0..=MAX_VERIFY_FAILURES {
+            let _ = budget.record_failure("fill");
+        }
+        let abort = budget.record_failure("overflow").unwrap_err();
+        assert!(
+            !is_verification_failure(&abort),
+            "an abort must not be charged again by another ladder step"
+        );
+    }
+
+    #[test]
+    fn verification_failure_classification_covers_hash_and_patch_errors() {
+        assert!(is_verification_failure(&SurgeError::Integrity(
+            "SHA-256 mismatch".into()
+        )));
+        assert!(is_verification_failure(&SurgeError::Diff("patch corrupt".into())));
+        assert!(is_verification_failure(&SurgeError::Update(
+            "SHA-256 mismatch for rebuilt full archive".into()
+        )));
+        assert!(is_verification_failure(&SurgeError::Storage(
+            "SHA-256 mismatch after download".into()
+        )));
+        assert!(is_verification_failure(&SurgeError::Archive(
+            "Failed to decode delta artifact".into()
+        )));
+        assert!(is_verification_failure(&SurgeError::Archive(
+            "Failed to decompress delta artifact: corrupt".into()
+        )));
+
+        assert!(!is_verification_failure(&SurgeError::Storage(
+            "connection reset".into()
+        )));
+        assert!(!is_verification_failure(&SurgeError::NotFound("object missing".into())));
+        assert!(!is_verification_failure(&SurgeError::Cancelled));
+    }
 }

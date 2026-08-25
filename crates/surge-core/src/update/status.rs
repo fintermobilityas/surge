@@ -461,7 +461,7 @@ pub fn now_utc_rfc3339() -> String {
 /// Base delay before the first retry of a retry-safe update failure.
 pub const RETRY_BACKOFF_BASE: Duration = Duration::from_mins(5);
 /// Maximum delay between consecutive retries of a failed update attempt.
-pub const RETRY_BACKOFF_CAP: Duration = Duration::from_mins(360);
+pub const RETRY_BACKOFF_CAP: Duration = Duration::from_hours(6);
 
 /// A retry-backoff schedule for a new retry-safe failure, derived from the
 /// record it replaces.

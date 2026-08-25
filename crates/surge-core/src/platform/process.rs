@@ -161,6 +161,12 @@ pub fn is_pid_alive(pid: u32) -> bool {
             // FFI is outside surge-core's allowed FFI boundary). The check
             // runs once per update-attempt start, so the process spawn cost
             // is acceptable.
+            //
+            // PID 0 is not a valid Windows process id; reject it up front so
+            // tasklist filter edge cases can never report it alive.
+            if pid == 0 {
+                return false;
+            }
             let Ok(output) = std::process::Command::new("tasklist")
                 .args(["/FI", &format!("PID eq {pid}"), "/NH"])
                 .output()
@@ -170,11 +176,13 @@ pub fn is_pid_alive(pid: u32) -> bool {
             if !output.status.success() {
                 return false;
             }
-            // `/NH` omits the header; each line starts with the image name
-            // followed by the pid column.
+            // `/NH` omits the header; the PID is the second whitespace-
+            // separated column (image name, PID, session, ...). Matching the
+            // PID column instead of any field avoids image-name collisions.
             String::from_utf8_lossy(&output.stdout)
                 .lines()
-                .any(|line| line.split_whitespace().any(|field| field == pid.to_string()))
+                .filter_map(|line| line.split_whitespace().nth(1))
+                .any(|field| field == pid.to_string())
         }
     }
     #[cfg(not(any(unix, windows)))]

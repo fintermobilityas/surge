@@ -4,13 +4,19 @@
 //! to the status file. When a later attempt finds an `InProgress` record it
 //! classifies that attempt against the worker marker:
 //! - worker pid is this process → the attempt is (re)started by us; proceed.
-//! - worker pid is another *live* process → a concurrent updater is active;
-//!   never reclassify it, even if its progress heartbeat is stale.
+//! - worker pid is another *live* process with recent progress → a
+//!   concurrent updater is active; never reclassify it.
+//! - worker pid is another *live* process whose progress has been silent
+//!   past the stalled-work deadline → presumed hung; fail it so the retry
+//!   machinery can requeue the work (a hung process will never converge on
+//!   its own).
 //! - worker pid is *dead* → the attempt can never make progress again; fail
 //!   it immediately and schedule a backoff, without waiting out the
 //!   progress-staleness window.
-//! - no worker marker (records written before the marker existed) → fall
-//!   back to the progress-staleness window.
+//! - the liveness probe is inconclusive (`Unknown`, e.g. the probe utility
+//!   failed) or there is no worker marker → fall back to the
+//!   progress-staleness window; never fail an attempt on an inconclusive
+//!   probe.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -19,7 +25,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, SurgeError};
 use crate::platform::fs::write_file_atomic;
-use crate::platform::process::is_pid_alive;
+use crate::platform::process::{PidLiveness, probe_pid_liveness};
 
 use super::{
     FailureContext, UpdateConvergenceState, UpdateStatusRecord, next_retry_timestamp, now_utc_rfc3339,
@@ -27,6 +33,14 @@ use super::{
 };
 
 const UPDATE_WORKER_FILE_NAME: &str = ".surge-update-worker.json";
+
+/// A live worker whose progress has been silent this long is presumed hung
+/// (deadlocked or stalled on a frozen connection): active update work emits
+/// progress heartbeats, so silence this long means no forward progress is
+/// possible. The deadline is deliberately far above the progress-staleness
+/// window used without a marker, because a live substep may be quiet for a
+/// while without being hung.
+const STALLED_LIVE_WORKER_PROGRESS_DEADLINE: Duration = Duration::from_mins(30);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct UpdateWorkerRecord {
@@ -147,28 +161,75 @@ fn fail_abandoned_in_progress_update_at(
         return Ok(None);
     }
 
-    if is_pid_alive(worker.pid) {
-        // A concurrent live worker may be inside a long substep that does not
-        // emit progress; never reclassify a live attempt.
-        return Ok(None);
+    match probe_pid_liveness(worker.pid) {
+        PidLiveness::Dead => {
+            // Dead foreign worker: the attempt can never make progress again,
+            // so fail it immediately instead of waiting out the staleness
+            // window.
+            let age_note = stale_progress_age(&record, now)
+                .map(|age| format!(" (last progress {}s ago)", age.as_secs()))
+                .unwrap_or_default();
+            let failed = abandoned_failure(
+                &record,
+                now,
+                &format!(
+                    "previous update worker (pid {}) exited without completing{age_note} at phase '{}'",
+                    worker.pid,
+                    abandoned_phase(&record)
+                ),
+            );
+            write_update_status(install_dir, &failed)?;
+            Ok(Some(failed))
+        }
+        PidLiveness::Unknown => {
+            // The probe could not run or exited abnormally; an inconclusive
+            // probe must never fail a live attempt. Use the same
+            // progress-staleness window as the missing-marker case.
+            let Some(age) = stale_progress_age(&record, now) else {
+                return Ok(None);
+            };
+            if age < stale_after {
+                return Ok(None);
+            }
+            let failed = abandoned_failure(
+                &record,
+                now,
+                &format!(
+                    "previous update worker (pid {}) could not be probed and has made no progress for {}s at phase '{}'",
+                    worker.pid,
+                    age.as_secs(),
+                    abandoned_phase(&record)
+                ),
+            );
+            write_update_status(install_dir, &failed)?;
+            Ok(Some(failed))
+        }
+        PidLiveness::Alive => {
+            // A live concurrent worker inside an active substep is never
+            // reclassified. A live worker whose progress has been silent
+            // past the stalled-work deadline is presumed hung: failing it
+            // lets the retry/backoff machinery requeue the work instead of
+            // leaving the status in_progress forever.
+            let Some(age) = stale_progress_age(&record, now) else {
+                return Ok(None);
+            };
+            if age < STALLED_LIVE_WORKER_PROGRESS_DEADLINE {
+                return Ok(None);
+            }
+            let failed = abandoned_failure(
+                &record,
+                now,
+                &format!(
+                    "previous update worker (pid {}) is alive but has made no progress for {}s at phase '{}'; presumed stalled",
+                    worker.pid,
+                    age.as_secs(),
+                    abandoned_phase(&record)
+                ),
+            );
+            write_update_status(install_dir, &failed)?;
+            Ok(Some(failed))
+        }
     }
-
-    // Dead foreign worker: the attempt can never make progress again, so fail
-    // it immediately instead of waiting out the staleness window.
-    let age_note = stale_progress_age(&record, now)
-        .map(|age| format!(" (last progress {}s ago)", age.as_secs()))
-        .unwrap_or_default();
-    let failed = abandoned_failure(
-        &record,
-        now,
-        &format!(
-            "previous update worker (pid {}) exited without completing{age_note} at phase '{}'",
-            worker.pid,
-            abandoned_phase(&record)
-        ),
-    );
-    write_update_status(install_dir, &failed)?;
-    Ok(Some(failed))
 }
 
 fn abandoned_phase(record: &UpdateStatusRecord) -> String {
@@ -237,6 +298,7 @@ fn update_worker_path(install_dir: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::process::is_pid_alive;
     use std::time::Instant;
 
     #[test]
@@ -375,7 +437,7 @@ mod tests {
     }
 
     #[test]
-    fn live_foreign_worker_is_never_abandoned_even_when_progress_is_stale() {
+    fn live_foreign_worker_is_never_abandoned_within_the_stalled_work_deadline() {
         let dir = tempfile::tempdir().unwrap();
         let record = UpdateStatusRecord::in_progress(
             "demo-app",
@@ -389,6 +451,8 @@ mod tests {
         let (pid, mut child) = live_helper_pid();
         write_worker_file(dir.path(), pid, "demo-app", "9999.0.0");
 
+        // Progress is 9 minutes stale: past the markerless staleness window
+        // but inside the stalled-work deadline for a live worker.
         let now = chrono::DateTime::parse_from_rfc3339("2026-05-15T20:10:00Z")
             .unwrap()
             .with_timezone(&chrono::Utc);
@@ -405,6 +469,54 @@ mod tests {
         assert!(result.is_none(), "a live concurrent worker must never be reclassified");
         let persisted = read_update_status(dir.path()).unwrap().unwrap();
         assert_eq!(persisted.state, UpdateConvergenceState::InProgress);
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn live_foreign_worker_stalled_past_deadline_is_failed_as_retry_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = UpdateStatusRecord::in_progress(
+            "demo-app",
+            "9998.0.0",
+            "9999.0.0",
+            "stable",
+            "2026-05-15T20:00:00Z".to_string(),
+        )
+        .with_current_phase_at("package apply started", "2026-05-15T20:01:00Z".to_string());
+        write_update_status(dir.path(), &record).unwrap();
+        let (pid, mut child) = live_helper_pid();
+        write_worker_file(dir.path(), pid, "demo-app", "9999.0.0");
+
+        // Progress is 59 minutes stale: past the stalled-work deadline, so a
+        // live-but-hung worker must be failed instead of staying in_progress
+        // forever.
+        let now = chrono::DateTime::parse_from_rfc3339("2026-05-15T21:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let result = fail_abandoned_in_progress_update_at(
+            dir.path(),
+            "demo-app",
+            "9999.0.0",
+            "stable",
+            Duration::from_mins(1),
+            now,
+        )
+        .unwrap();
+
+        let failed = result.expect("a stalled live worker must be failed");
+        assert_eq!(failed.state, UpdateConvergenceState::Failed);
+        assert_eq!(failed.retry_safe, Some(true));
+        assert!(
+            failed
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("presumed stalled")),
+            "reason was: {:?}",
+            failed.reason
+        );
+        let persisted = read_update_status(dir.path()).unwrap().unwrap();
+        assert_eq!(persisted.state, UpdateConvergenceState::Failed);
         let _ = child.kill();
         let _ = child.wait();
     }

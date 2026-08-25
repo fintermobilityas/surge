@@ -144,6 +144,35 @@ namespace Surge
         }
 
         /// <summary>
+        /// True when a persisted failed status record defers an attempt that
+        /// would apply <paramref name="targetVersion"/> on
+        /// <paramref name="channel"/> for <paramref name="appId"/>.
+        /// </summary>
+        /// <remarks>
+        /// The backoff schedule is per target: the native side resets it when
+        /// the target changes, so a channel switch or a newly published
+        /// release must not be suppressed by a backoff that belongs to a
+        /// different target. Call this only after the available release has
+        /// been determined.
+        /// </remarks>
+        internal static bool ShouldDeferUpdateForTarget(
+            SurgeUpdateStatus? status,
+            string targetVersion,
+            string channel,
+            string appId,
+            DateTimeOffset nowUtc)
+        {
+            if (status is null)
+                return false;
+            if (!string.Equals(status.TargetVersion, targetVersion, StringComparison.Ordinal)
+                || !string.Equals(status.Channel, channel, StringComparison.Ordinal)
+                || !string.Equals(status.AppId, appId, StringComparison.Ordinal))
+                return false;
+
+            return ShouldDeferUpdate(status, nowUtc);
+        }
+
+        /// <summary>
         /// Read the persisted update convergence record from <paramref name="installDirectory"/>.
         /// Returns <c>null</c> when no record has been written yet (e.g. clean
         /// install that has never run an update).

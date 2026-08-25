@@ -222,5 +222,48 @@ namespace Surge.Tests
             // Offset form parses and compares against UTC.
             Assert.True(SurgeUpdateStatus.ShouldDeferUpdate(Status("failed", true, "2026-05-11T16:05:00+02:00"), now));
         }
+
+        [Fact]
+        public void ShouldDeferUpdateForTarget_OnlySuppressesTheFailedTarget()
+        {
+            var now = new DateTimeOffset(2026, 5, 11, 14, 0, 0, TimeSpan.Zero);
+            var failedTarget = new SurgeUpdateStatus
+            {
+                State = SurgeUpdateConvergenceState.Failed,
+                RetrySafe = true,
+                NextRetryAtUtc = "2026-05-11T14:05:00Z",
+                AppId = "demo-app",
+                TargetVersion = "9999.0.0",
+                Channel = "stable",
+            };
+
+            // Same target inside the window: defer.
+            Assert.True(SurgeUpdateStatus.ShouldDeferUpdateForTarget(failedTarget, "9999.0.0", "stable", "demo-app", now));
+
+            // A newly published release for the same channel is not the
+            // failed target: not suppressed.
+            Assert.False(SurgeUpdateStatus.ShouldDeferUpdateForTarget(failedTarget, "9999.1.0", "stable", "demo-app", now));
+
+            // A channel switch is not the failed target: not suppressed.
+            Assert.False(SurgeUpdateStatus.ShouldDeferUpdateForTarget(failedTarget, "9999.0.0", "beta", "demo-app", now));
+
+            // A different app is not the failed target: not suppressed.
+            Assert.False(SurgeUpdateStatus.ShouldDeferUpdateForTarget(failedTarget, "9999.0.0", "stable", "other-app", now));
+
+            // Window elapsed for the matching target: not deferred.
+            var elapsedTarget = new SurgeUpdateStatus
+            {
+                State = SurgeUpdateConvergenceState.Failed,
+                RetrySafe = true,
+                NextRetryAtUtc = "2026-05-11T13:55:00Z",
+                AppId = "demo-app",
+                TargetVersion = "9999.0.0",
+                Channel = "stable",
+            };
+            Assert.False(SurgeUpdateStatus.ShouldDeferUpdateForTarget(elapsedTarget, "9999.0.0", "stable", "demo-app", now));
+
+            // No record: never defer.
+            Assert.False(SurgeUpdateStatus.ShouldDeferUpdateForTarget(null, "9999.0.0", "stable", "demo-app", now));
+        }
     }
 }

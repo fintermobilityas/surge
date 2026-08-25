@@ -1,3 +1,4 @@
+using System;
 using Xunit;
 
 namespace Surge.Tests
@@ -129,6 +130,140 @@ namespace Surge.Tests
             Assert.Null(SurgeUpdateStatus.Parse("{not json"));
             Assert.Null(SurgeUpdateStatus.Parse(""));
             Assert.Null(SurgeUpdateStatus.Parse("[]"));
+        }
+
+        [Fact]
+        public void Parse_FailedRecord_ReadsRetryScheduleFields()
+        {
+            const string json = """
+                {
+                  "state": "failed",
+                  "installed_version": "9998.0.0",
+                  "target_version": "9999.0.0",
+                  "channel": "stable",
+                  "app_id": "demo-app",
+                  "supervisor_restart_confirmed": false,
+                  "attempted_at_utc": "2026-05-11T14:00:00Z",
+                  "reason": "storage backend returned 503",
+                  "retry_safe": true,
+                  "next_retry_at_utc": "2026-05-11T14:05:00Z",
+                  "retry_count": 2
+                }
+                """;
+
+            var status = SurgeUpdateStatus.Parse(json);
+            Assert.NotNull(status);
+            Assert.True(status!.RetrySafe);
+            Assert.Equal("2026-05-11T14:05:00Z", status.NextRetryAtUtc);
+            Assert.Equal(2, status.RetryCount);
+        }
+
+        [Fact]
+        public void Parse_LegacyFailedRecord_LacksRetryScheduleFields()
+        {
+            const string json = """
+                {
+                  "state": "failed",
+                  "installed_version": "9998.0.0",
+                  "target_version": "9999.0.0",
+                  "channel": "stable",
+                  "app_id": "demo-app",
+                  "supervisor_restart_confirmed": false,
+                  "attempted_at_utc": "2026-05-11T14:00:00Z",
+                  "reason": "storage backend returned 503",
+                  "retry_safe": true
+                }
+                """;
+
+            var status = SurgeUpdateStatus.Parse(json);
+            Assert.NotNull(status);
+            Assert.True(status!.RetrySafe);
+            Assert.Null(status.NextRetryAtUtc);
+            Assert.Null(status.RetryCount);
+        }
+
+        [Fact]
+        public void ShouldDeferUpdate_DeferOnlyRetrySafeFailuresInsideTheirWindow()
+        {
+            var now = new DateTimeOffset(2026, 5, 11, 14, 0, 0, TimeSpan.Zero);
+
+            // No record at all: never defer.
+            Assert.False(SurgeUpdateStatus.ShouldDeferUpdate(null, now));
+
+            SurgeUpdateStatus? Status(string state, bool? retrySafe, string? nextRetryAtUtc)
+                => new SurgeUpdateStatus
+                {
+                    State = state switch
+                    {
+                        "failed" => SurgeUpdateConvergenceState.Failed,
+                        "in_progress" => SurgeUpdateConvergenceState.InProgress,
+                        _ => SurgeUpdateConvergenceState.Converged
+                    },
+                    RetrySafe = retrySafe,
+                    NextRetryAtUtc = nextRetryAtUtc,
+                };
+
+            // Failed + retry-safe + window in the future: defer.
+            Assert.True(SurgeUpdateStatus.ShouldDeferUpdate(Status("failed", true, "2026-05-11T14:05:00Z"), now));
+            // Window exactly at now: not deferred (the window has elapsed).
+            Assert.False(SurgeUpdateStatus.ShouldDeferUpdate(Status("failed", true, "2026-05-11T14:00:00Z"), now));
+            // Window in the past: not deferred.
+            Assert.False(SurgeUpdateStatus.ShouldDeferUpdate(Status("failed", true, "2026-05-11T13:55:00Z"), now));
+            // No scheduled retry: never defer.
+            Assert.False(SurgeUpdateStatus.ShouldDeferUpdate(Status("failed", true, null), now));
+            Assert.False(SurgeUpdateStatus.ShouldDeferUpdate(Status("failed", null, "2026-05-11T14:05:00Z"), now));
+            // Not retry-safe: never defer.
+            Assert.False(SurgeUpdateStatus.ShouldDeferUpdate(Status("failed", false, "2026-05-11T14:05:00Z"), now));
+            // Non-failed states: never defer.
+            Assert.False(SurgeUpdateStatus.ShouldDeferUpdate(Status("in_progress", true, "2026-05-11T14:05:00Z"), now));
+            Assert.False(SurgeUpdateStatus.ShouldDeferUpdate(Status("converged", true, "2026-05-11T14:05:00Z"), now));
+            // Unparseable timestamp: fail open (do not defer).
+            Assert.False(SurgeUpdateStatus.ShouldDeferUpdate(Status("failed", true, "not-a-timestamp"), now));
+            // Offset form parses and compares against UTC.
+            Assert.True(SurgeUpdateStatus.ShouldDeferUpdate(Status("failed", true, "2026-05-11T16:05:00+02:00"), now));
+        }
+
+        [Fact]
+        public void ShouldDeferUpdateForTarget_OnlySuppressesTheFailedTarget()
+        {
+            var now = new DateTimeOffset(2026, 5, 11, 14, 0, 0, TimeSpan.Zero);
+            var failedTarget = new SurgeUpdateStatus
+            {
+                State = SurgeUpdateConvergenceState.Failed,
+                RetrySafe = true,
+                NextRetryAtUtc = "2026-05-11T14:05:00Z",
+                AppId = "demo-app",
+                TargetVersion = "9999.0.0",
+                Channel = "stable",
+            };
+
+            // Same target inside the window: defer.
+            Assert.True(SurgeUpdateStatus.ShouldDeferUpdateForTarget(failedTarget, "9999.0.0", "stable", "demo-app", now));
+
+            // A newly published release for the same channel is not the
+            // failed target: not suppressed.
+            Assert.False(SurgeUpdateStatus.ShouldDeferUpdateForTarget(failedTarget, "9999.1.0", "stable", "demo-app", now));
+
+            // A channel switch is not the failed target: not suppressed.
+            Assert.False(SurgeUpdateStatus.ShouldDeferUpdateForTarget(failedTarget, "9999.0.0", "beta", "demo-app", now));
+
+            // A different app is not the failed target: not suppressed.
+            Assert.False(SurgeUpdateStatus.ShouldDeferUpdateForTarget(failedTarget, "9999.0.0", "stable", "other-app", now));
+
+            // Window elapsed for the matching target: not deferred.
+            var elapsedTarget = new SurgeUpdateStatus
+            {
+                State = SurgeUpdateConvergenceState.Failed,
+                RetrySafe = true,
+                NextRetryAtUtc = "2026-05-11T13:55:00Z",
+                AppId = "demo-app",
+                TargetVersion = "9999.0.0",
+                Channel = "stable",
+            };
+            Assert.False(SurgeUpdateStatus.ShouldDeferUpdateForTarget(elapsedTarget, "9999.0.0", "stable", "demo-app", now));
+
+            // No record: never defer.
+            Assert.False(SurgeUpdateStatus.ShouldDeferUpdateForTarget(null, "9999.0.0", "stable", "demo-app", now));
         }
     }
 }

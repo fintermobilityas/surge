@@ -235,6 +235,11 @@ impl UpdateManager {
             )));
         }
 
+        let previous_attempt_status = status::read_update_status(&self.install_dir)
+            .ok()
+            .flatten()
+            .filter(|record| record.app_id == self.app_id && record.target_version == target_version);
+
         let _worker_guard = match UpdateWorkerGuard::record(&self.install_dir, &self.app_id, &target_version) {
             Ok(guard) => Some(guard),
             Err(e) => {
@@ -290,7 +295,7 @@ impl UpdateManager {
             }
             Err(e) => {
                 let status_context = status::read_update_status(&self.install_dir).ok().flatten();
-                let record = UpdateStatusRecord::failed_with_context(
+                let mut record = UpdateStatusRecord::failed_with_context(
                     &self.app_id,
                     &pre_attempt_version,
                     &target_version,
@@ -299,6 +304,13 @@ impl UpdateManager {
                     &e.to_string(),
                     FailureContext::from_record(status_context.as_ref(), true),
                 );
+                // A user-initiated cancellation is not a failure to back off
+                // from; the next attempt may start immediately.
+                if !matches!(e, SurgeError::Cancelled) {
+                    let schedule = status::retry_schedule(previous_attempt_status.as_ref(), &target_version);
+                    record = record
+                        .with_retry_schedule_at(&schedule, status::next_retry_timestamp(chrono::Utc::now(), &schedule));
+                }
                 if let Err(write_err) = status::write_update_status(&self.install_dir, &record) {
                     warn!(error = %write_err, "Failed to persist failed-update status (continuing)");
                 }
@@ -1432,6 +1444,95 @@ echo started > new-child-started
             reason.contains(&err_msg) || err_msg.contains(reason),
             "stored reason '{reason}' should match the propagated error '{err_msg}'"
         );
+    }
+
+    #[tokio::test]
+    async fn test_download_and_apply_failure_backoff_escalates_from_previous_failed_attempt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("store");
+        let install_root = tmp.path().join("install");
+        let app_id = "test-app";
+        std::fs::create_dir_all(&store_root).unwrap();
+        std::fs::create_dir_all(&install_root).unwrap();
+        let app_store = app_scoped_store_root(&store_root, app_id);
+
+        let previous_failed = status::UpdateStatusRecord::failed(
+            app_id,
+            "1.0.0",
+            "1.1.0",
+            "stable",
+            "2026-05-11T14:00:00Z".to_string(),
+            "previous failure",
+        )
+        .with_retry_schedule_at(&status::RetrySchedule::base(), "2026-05-11T14:05:00Z".to_string());
+        status::write_update_status(&install_root, &previous_failed).unwrap();
+
+        let rid = current_rid();
+        let full_filename = format!("{app_id}-1.1.0-{rid}-full.tar.zst");
+        let full_path = app_store.join(&full_filename);
+
+        let mut packer = ArchivePacker::new(3).unwrap();
+        packer.add_buffer("payload.txt", b"installed payload", 0o644).unwrap();
+        packer.finalize_to_file(&full_path).unwrap();
+
+        let full_size = std::fs::metadata(&full_path).unwrap().len() as i64;
+        let full_sha256 = sha256_hex_file(&full_path).unwrap();
+
+        let index = ReleaseIndex {
+            app_id: app_id.to_string(),
+            releases: vec![ReleaseEntry {
+                version: "1.1.0".to_string(),
+                channels: vec!["stable".to_string()],
+                os: current_os_label_for_tests(),
+                rid: rid.clone(),
+                is_genesis: true,
+                full_filename: full_filename.clone(),
+                full_size,
+                full_sha256,
+                full_compression_level: 0,
+                full_zstd_workers: 0,
+                deltas: Vec::new(),
+                preferred_delta_id: String::new(),
+                created_utc: chrono::Utc::now().to_rfc3339(),
+                release_notes: String::new(),
+                name: String::new(),
+                main_exe: app_id.to_string(),
+                install_directory: app_id.to_string(),
+                supervisor_id: String::new(),
+                icon: String::new(),
+                shortcuts: Vec::new(),
+                persistent_assets: Vec::new(),
+                installers: Vec::new(),
+                environment: std::collections::BTreeMap::new(),
+            }],
+            ..ReleaseIndex::default()
+        };
+
+        write_app_scoped_release_index(&store_root, app_id, &index);
+
+        let ctx = Arc::new(Context::new());
+        ctx.set_storage(
+            StorageProvider::Filesystem,
+            store_root.to_str().unwrap(),
+            "",
+            "",
+            "",
+            "",
+        );
+
+        let mut manager = UpdateManager::new(ctx, app_id, "1.0.0", "stable", install_root.to_str().unwrap()).unwrap();
+        let info = manager.check_for_updates().await.unwrap().unwrap();
+
+        std::fs::remove_file(&full_path).unwrap();
+        let _ = manager
+            .download_and_apply(&info, None::<fn(ProgressInfo)>)
+            .await
+            .expect_err("download_and_apply should fail when the full artifact is missing");
+
+        let status_record = status::read_update_status(&install_root).unwrap().unwrap();
+        assert_eq!(status_record.state, status::UpdateConvergenceState::Failed);
+        assert_eq!(status_record.retry_count, Some(2));
+        assert!(status_record.next_retry_at_utc.is_some());
     }
 
     #[tokio::test]

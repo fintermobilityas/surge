@@ -239,8 +239,9 @@ namespace Surge
         /// <param name="cancellationToken">Token to cancel the operation.</param>
         /// <returns>
         /// The <see cref="SurgeAppInfo"/> for the newly installed version,
-        /// or null if no updates were available or native cancellation occurred
-        /// without the supplied token being cancelled.
+        /// or null if no updates were available, native cancellation occurred
+        /// without the supplied token being cancelled, or a previous
+        /// retry-safe failure is still inside its retry-backoff window.
         /// </returns>
         /// <exception cref="OperationCanceledException">
         /// The supplied cancellation token was cancelled.
@@ -257,6 +258,7 @@ namespace Surge
             CancellationToken cancellationToken = default)
         {
             ThrowIfDisposed();
+            cancellationToken.ThrowIfCancellationRequested();
 
             return Task.Run(() =>
             {
@@ -336,6 +338,20 @@ namespace Surge
 
                         // Native releases are ordered oldest -> newest.
                         var latestRelease = releases[releases.Count - 1];
+
+                        // A retry-safe failure schedules a backoff window in
+                        // the persisted status record, for that failure's
+                        // target. Defer only when this call would apply that
+                        // same target; a channel switch or a newly published
+                        // release is not suppressed (the native schedule
+                        // resets for a different target).
+                        if (SurgeUpdateStatus.ShouldDeferUpdateForTarget(
+                                GetCurrentStatus(),
+                                latestRelease.Version,
+                                latestRelease.Channel,
+                                SurgeApp.Current?.Id ?? "",
+                                DateTimeOffset.UtcNow))
+                            return null;
 
                         // Before apply callback
                         onBeforeApplyUpdate?.Invoke(latestRelease);

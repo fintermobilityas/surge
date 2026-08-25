@@ -113,6 +113,19 @@ pub struct UpdateStatusRecord {
     /// Whether retrying the same setup/update command is expected to be safe.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry_safe: Option<bool>,
+    /// Earliest time a new attempt for this target may start again after a
+    /// retry-safe failure. Observers (for example in-app update loops) defer
+    /// new attempts until this instant, turning consecutive failures into a
+    /// bounded backoff instead of a tight retry loop. Only set on `Failed`
+    /// records.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_retry_at_utc: Option<String>,
+    /// One-based count of consecutive retry-safe failures for this target.
+    /// Together with [`Self::next_retry_at_utc`] it makes the backoff ladder
+    /// exact instead of re-deriving it from wall-clock gaps. Only set on
+    /// `Failed` records.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_count: Option<u32>,
 }
 
 impl UpdateStatusRecord {
@@ -133,6 +146,8 @@ impl UpdateStatusRecord {
             last_completed_phase: None,
             failure_phase: None,
             retry_safe: None,
+            next_retry_at_utc: None,
+            retry_count: None,
         }
     }
 
@@ -159,6 +174,8 @@ impl UpdateStatusRecord {
             last_completed_phase: None,
             failure_phase: None,
             retry_safe: None,
+            next_retry_at_utc: None,
+            retry_count: None,
         }
     }
 
@@ -219,6 +236,8 @@ impl UpdateStatusRecord {
             last_completed_phase: None,
             failure_phase: None,
             retry_safe: None,
+            next_retry_at_utc: None,
+            retry_count: None,
         }
     }
 
@@ -270,6 +289,8 @@ impl UpdateStatusRecord {
             last_completed_phase: None,
             failure_phase: Some(failure_phase.to_string()),
             retry_safe: Some(true),
+            next_retry_at_utc: None,
+            retry_count: None,
         }
     }
 
@@ -297,6 +318,8 @@ impl UpdateStatusRecord {
             last_completed_phase: None,
             failure_phase: None,
             retry_safe: Some(true),
+            next_retry_at_utc: None,
+            retry_count: None,
         }
     }
 
@@ -353,6 +376,24 @@ impl UpdateStatusRecord {
             last_completed_phase: context.last_completed_phase,
             failure_phase: context.failure_phase,
             retry_safe: Some(context.retry_safe),
+            next_retry_at_utc: None,
+            retry_count: None,
+        }
+    }
+
+    /// Stamp the retry-backoff schedule onto a `Failed` record. No-op for any
+    /// other state so converged/pending-restart records never advertise a
+    /// retry time.
+    #[must_use]
+    pub fn with_retry_schedule_at(self, schedule: &RetrySchedule, next_retry_at_utc: String) -> Self {
+        if matches!(self.state, UpdateConvergenceState::Failed) {
+            Self {
+                next_retry_at_utc: Some(next_retry_at_utc),
+                retry_count: Some(schedule.retry_count),
+                ..self
+            }
+        } else {
+            self
         }
     }
 }
@@ -415,6 +456,69 @@ pub fn write_update_status(install_dir: &Path, record: &UpdateStatusRecord) -> R
 #[must_use]
 pub fn now_utc_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
+}
+
+/// Base delay before the first retry of a retry-safe update failure.
+pub const RETRY_BACKOFF_BASE: Duration = Duration::from_mins(5);
+/// Maximum delay between consecutive retries of a failed update attempt.
+pub const RETRY_BACKOFF_CAP: Duration = Duration::from_hours(6);
+
+/// A retry-backoff schedule for a new retry-safe failure, derived from the
+/// record it replaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetrySchedule {
+    /// Delay to wait before the next attempt for this target.
+    pub backoff: Duration,
+    /// One-based count of consecutive retry-safe failures for the target.
+    pub retry_count: u32,
+}
+
+impl RetrySchedule {
+    #[must_use]
+    pub fn base() -> Self {
+        Self {
+            backoff: RETRY_BACKOFF_BASE,
+            retry_count: 1,
+        }
+    }
+}
+
+/// Compute the retry schedule for a new failure record.
+///
+/// The ladder starts at [`RETRY_BACKOFF_BASE`] and doubles per consecutive
+/// retry-safe failure for the same target, capped at [`RETRY_BACKOFF_CAP`].
+/// Any missing, non-failed, non-retry-safe, or differently-targeted previous
+/// record resets the ladder to the base schedule.
+#[must_use]
+pub fn retry_schedule(previous: Option<&UpdateStatusRecord>, target_version: &str) -> RetrySchedule {
+    let Some(previous) = previous else {
+        return RetrySchedule::base();
+    };
+    if !matches!(previous.state, UpdateConvergenceState::Failed)
+        || previous.retry_safe != Some(true)
+        || previous.target_version != target_version
+        || previous.next_retry_at_utc.is_none()
+    {
+        return RetrySchedule::base();
+    }
+
+    let retry_count = previous.retry_count.unwrap_or(1).saturating_add(1);
+    let exponent = retry_count.saturating_sub(1).min(63);
+    let backoff_secs = RETRY_BACKOFF_BASE
+        .as_secs()
+        .saturating_mul(1u64 << exponent)
+        .min(RETRY_BACKOFF_CAP.as_secs());
+    RetrySchedule {
+        backoff: Duration::from_secs(backoff_secs),
+        retry_count,
+    }
+}
+
+/// RFC 3339 UTC timestamp for the next retry given `now` and a schedule.
+#[must_use]
+pub fn next_retry_timestamp(now: chrono::DateTime<chrono::Utc>, schedule: &RetrySchedule) -> String {
+    let secs = i64::try_from(schedule.backoff.as_secs()).unwrap_or(i64::MAX);
+    (now + chrono::Duration::seconds(secs)).to_rfc3339()
 }
 
 /// Poll for the supervisor pid file to appear after a restart attempt.
@@ -673,5 +777,148 @@ mod tests {
             assert_eq!(decoded, state);
             assert_eq!(state.to_string(), state.as_str());
         }
+    }
+
+    #[test]
+    fn retry_schedule_starts_at_base_without_a_previous_failure() {
+        assert_eq!(retry_schedule(None, "9999.0.0"), RetrySchedule::base());
+
+        let in_progress = UpdateStatusRecord::in_progress(
+            "demo-app",
+            "9998.0.0",
+            "9999.0.0",
+            "stable",
+            "2026-05-11T14:00:00Z".to_string(),
+        );
+        assert_eq!(retry_schedule(Some(&in_progress), "9999.0.0"), RetrySchedule::base());
+    }
+
+    #[test]
+    fn retry_schedule_doubles_per_consecutive_failure_until_cap() {
+        let base = RetrySchedule::base();
+        let mut previous = failed_record_with_schedule("9999.0.0", base.retry_count, base.backoff);
+
+        for expected_count in 2u32..=7 {
+            let expected_backoff = Duration::from_secs(
+                RETRY_BACKOFF_BASE
+                    .as_secs()
+                    .saturating_mul(1u64 << (expected_count - 1))
+                    .min(RETRY_BACKOFF_CAP.as_secs()),
+            );
+            let schedule = retry_schedule(Some(&previous), "9999.0.0");
+            assert_eq!(schedule.retry_count, expected_count);
+            assert_eq!(schedule.backoff, expected_backoff);
+            previous = failed_record_with_schedule("9999.0.0", expected_count, expected_backoff);
+        }
+
+        let capped = retry_schedule(Some(&previous), "9999.0.0");
+        assert_eq!(capped.backoff, RETRY_BACKOFF_CAP);
+        assert_eq!(
+            retry_schedule(
+                Some(&failed_record_with_schedule("9999.0.0", 9, RETRY_BACKOFF_CAP)),
+                "9999.0.0"
+            )
+            .backoff,
+            RETRY_BACKOFF_CAP
+        );
+    }
+
+    #[test]
+    fn retry_schedule_resets_for_other_target_or_non_retry_safe_failure() {
+        let previous = failed_record_with_schedule("9999.0.0", 3, RETRY_BACKOFF_CAP);
+
+        assert_eq!(retry_schedule(Some(&previous), "9998.0.0"), RetrySchedule::base());
+
+        let not_retry_safe = UpdateStatusRecord::failed(
+            "demo-app",
+            "9998.0.0",
+            "9999.0.0",
+            "stable",
+            "2026-05-11T14:00:00Z".to_string(),
+            "not safe to retry",
+        );
+        assert_eq!(retry_schedule(Some(&not_retry_safe), "9999.0.0"), RetrySchedule::base());
+
+        let no_schedule = UpdateStatusRecord::failed(
+            "demo-app",
+            "9998.0.0",
+            "9999.0.0",
+            "stable",
+            "2026-05-11T14:00:00Z".to_string(),
+            "failure without schedule",
+        );
+        assert_eq!(retry_schedule(Some(&no_schedule), "9999.0.0"), RetrySchedule::base());
+    }
+
+    #[test]
+    fn with_retry_schedule_at_only_stamps_failed_records_and_omits_unset_fields() {
+        let failed = UpdateStatusRecord::failed(
+            "demo-app",
+            "9998.0.0",
+            "9999.0.0",
+            "stable",
+            "2026-05-11T14:00:00Z".to_string(),
+            "storage backend returned 503",
+        );
+        let raw = serde_json::to_string(&failed).unwrap();
+        assert!(
+            !raw.contains("next_retry_at_utc"),
+            "unset fields must be omitted: {raw}"
+        );
+        assert!(!raw.contains("retry_count"), "unset fields must be omitted: {raw}");
+
+        let stamped = failed.with_retry_schedule_at(&RetrySchedule::base(), "2026-05-11T14:05:00Z".to_string());
+        assert_eq!(stamped.next_retry_at_utc.as_deref(), Some("2026-05-11T14:05:00Z"));
+        assert_eq!(stamped.retry_count, Some(1));
+        let raw = serde_json::to_string(&stamped).unwrap();
+        assert!(raw.contains("\"next_retry_at_utc\":\"2026-05-11T14:05:00Z\""));
+        assert!(raw.contains("\"retry_count\":1"));
+
+        let in_progress = UpdateStatusRecord::in_progress(
+            "demo-app",
+            "9998.0.0",
+            "9999.0.0",
+            "stable",
+            "2026-05-11T14:00:00Z".to_string(),
+        );
+        let untouched = in_progress.with_retry_schedule_at(&RetrySchedule::base(), "2026-05-11T14:05:00Z".to_string());
+        assert!(untouched.next_retry_at_utc.is_none());
+        assert!(untouched.retry_count.is_none());
+    }
+
+    #[test]
+    fn legacy_status_json_without_retry_fields_still_deserializes() {
+        let json = r#"{
+            "state": "failed",
+            "installed_version": "9998.0.0",
+            "target_version": "9999.0.0",
+            "channel": "stable",
+            "app_id": "demo-app",
+            "supervisor_restart_confirmed": false,
+            "attempted_at_utc": "2026-05-11T14:00:00Z",
+            "reason": "storage backend returned 503",
+            "retry_safe": true
+        }"#;
+        let record: UpdateStatusRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(record.state, UpdateConvergenceState::Failed);
+        assert_eq!(record.retry_safe, Some(true));
+        assert!(record.next_retry_at_utc.is_none());
+        assert!(record.retry_count.is_none());
+        assert_eq!(retry_schedule(Some(&record), "9999.0.0"), RetrySchedule::base());
+    }
+
+    fn failed_record_with_schedule(target: &str, retry_count: u32, backoff: Duration) -> UpdateStatusRecord {
+        UpdateStatusRecord::failed(
+            "demo-app",
+            "9998.0.0",
+            target,
+            "stable",
+            "2026-05-11T14:00:00Z".to_string(),
+            "test failure",
+        )
+        .with_retry_schedule_at(
+            &RetrySchedule { backoff, retry_count },
+            "2026-05-11T14:05:00Z".to_string(),
+        )
     }
 }

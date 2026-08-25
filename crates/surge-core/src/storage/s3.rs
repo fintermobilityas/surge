@@ -12,7 +12,27 @@ use crate::context::StorageConfig;
 use crate::crypto::hmac_sha256::hmac_sha256;
 use crate::crypto::sha256::sha256_hex;
 use crate::error::{Result, SurgeError};
-use crate::storage::{ListEntry, ListResult, ObjectInfo, StorageBackend, TransferProgress, download_response_to_file};
+use crate::storage::{
+    ListEntry, ListResult, ObjectInfo, StorageBackend, TransferProgress, download_response_to_file,
+    download_response_to_file_from_offset,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumableDownloadResponseAction {
+    AppendFromOffset,
+    RestartFromZero,
+    Error,
+}
+
+fn resumable_download_response_action(status: reqwest::StatusCode) -> ResumableDownloadResponseAction {
+    if status == reqwest::StatusCode::PARTIAL_CONTENT {
+        ResumableDownloadResponseAction::AppendFromOffset
+    } else if status.is_success() {
+        ResumableDownloadResponseAction::RestartFromZero
+    } else {
+        ResumableDownloadResponseAction::Error
+    }
+}
 
 /// Characters that must NOT be percent-encoded in S3 URI paths (RFC 3986 unreserved + '/').
 const URI_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'.').remove(b'_').remove(b'~');
@@ -175,14 +195,28 @@ impl S3Backend {
         canonical_querystring: &str,
         payload_hash: &str,
         now: &chrono::DateTime<Utc>,
+        extra_headers: &[(String, String)],
     ) -> Vec<(String, String)> {
         let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
         let date_stamp = now.format("%Y%m%d").to_string();
         let host = self.host_header();
 
         // Canonical headers (must be sorted by lowercase header name).
-        let canonical_headers = format!("host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n");
-        let signed_headers = "host;x-amz-content-sha256;x-amz-date";
+        let mut header_lines = vec![format!("host:{host}")];
+        let mut signed_header_names: Vec<String> = vec!["host".to_string()];
+        for (name, value) in extra_headers {
+            let lower = name.to_ascii_lowercase();
+            header_lines.push(format!("{lower}:{value}"));
+            signed_header_names.push(lower);
+        }
+        header_lines.push(format!("x-amz-content-sha256:{payload_hash}"));
+        signed_header_names.push("x-amz-content-sha256".to_string());
+        header_lines.push(format!("x-amz-date:{amz_date}"));
+        signed_header_names.push("x-amz-date".to_string());
+        header_lines.sort();
+        signed_header_names.sort();
+        let canonical_headers = format!("{}\n", header_lines.join("\n"));
+        let signed_headers = signed_header_names.join(";");
 
         // Canonical request.
         let canonical_request = format!(
@@ -255,7 +289,7 @@ impl StorageBackend for S3Backend {
             format!("/{}", Self::encode_uri_path(&full_key))
         };
 
-        let headers = self.sign_request("PUT", &canonical_uri, "", &payload_hash, &now);
+        let headers = self.sign_request("PUT", &canonical_uri, "", &payload_hash, &now, &[]);
 
         let mut req = self.client.put(&url).body(data.to_vec());
         req = req.header("Content-Type", content_type);
@@ -285,7 +319,7 @@ impl StorageBackend for S3Backend {
             } else {
                 format!("/{}", Self::encode_uri_path(&full_key))
             };
-            let headers = self.sign_request("GET", &canonical_uri, "", &payload_hash, &now);
+            let headers = self.sign_request("GET", &canonical_uri, "", &payload_hash, &now, &[]);
             for (name, value) in &headers {
                 req = req.header(name.as_str(), value.as_str());
             }
@@ -318,7 +352,7 @@ impl StorageBackend for S3Backend {
             } else {
                 format!("/{}", Self::encode_uri_path(&full_key))
             };
-            let headers = self.sign_request("HEAD", &canonical_uri, "", &payload_hash, &now);
+            let headers = self.sign_request("HEAD", &canonical_uri, "", &payload_hash, &now, &[]);
             for (name, value) in &headers {
                 req = req.header(name.as_str(), value.as_str());
             }
@@ -378,7 +412,7 @@ impl StorageBackend for S3Backend {
             format!("/{}", Self::encode_uri_path(&full_key))
         };
 
-        let headers = self.sign_request("DELETE", &canonical_uri, "", &payload_hash, &now);
+        let headers = self.sign_request("DELETE", &canonical_uri, "", &payload_hash, &now, &[]);
 
         let mut req = self.client.delete(&url);
         for (name, value) in &headers {
@@ -428,7 +462,7 @@ impl StorageBackend for S3Backend {
             } else {
                 "/".to_string()
             };
-            let headers = self.sign_request("GET", &canonical_uri, &canonical_querystring, &payload_hash, &now);
+            let headers = self.sign_request("GET", &canonical_uri, &canonical_querystring, &payload_hash, &now, &[]);
             for (name, value) in &headers {
                 req = req.header(name.as_str(), value.as_str());
             }
@@ -458,7 +492,7 @@ impl StorageBackend for S3Backend {
             } else {
                 format!("/{}", Self::encode_uri_path(&full_key))
             };
-            let headers = self.sign_request("GET", &canonical_uri, "", &payload_hash, &now);
+            let headers = self.sign_request("GET", &canonical_uri, "", &payload_hash, &now, &[]);
             for (name, value) in &headers {
                 req = req.header(name.as_str(), value.as_str());
             }
@@ -479,6 +513,78 @@ impl StorageBackend for S3Backend {
         Ok(())
     }
 
+    fn supports_resumable_downloads(&self) -> bool {
+        true
+    }
+
+    async fn download_to_file_from_offset(
+        &self,
+        key: &str,
+        dest: &Path,
+        offset: u64,
+        progress: Option<&TransferProgress<'_>>,
+    ) -> Result<()> {
+        if offset == 0 {
+            return self.download_to_file(key, dest, progress).await;
+        }
+
+        let full_key = self.full_key(key);
+        let url = self.object_url(&full_key);
+        let range_header = format!("bytes={offset}-");
+
+        let mut req = self
+            .client
+            .get(&url)
+            .header(reqwest::header::RANGE, range_header.as_str());
+        if self.has_credentials() {
+            let payload_hash = sha256_hex(b"");
+            let now = Utc::now();
+            let canonical_uri = if self.path_style {
+                format!("/{}/{}", self.bucket, Self::encode_uri_path(&full_key))
+            } else {
+                format!("/{}/", Self::encode_uri_path(&full_key))
+            };
+            let headers = self.sign_request(
+                "GET",
+                &canonical_uri,
+                "",
+                &payload_hash,
+                &now,
+                &[("range".to_string(), range_header.clone())],
+            );
+            for (name, value) in &headers {
+                req = req.header(name.as_str(), value.as_str());
+            }
+        } else {
+            req = req.header("Host", self.host_header());
+        }
+
+        let resp = req.send().await?;
+        let status = resp.status();
+        match resumable_download_response_action(status) {
+            ResumableDownloadResponseAction::AppendFromOffset => {
+                download_response_to_file_from_offset(resp, dest, offset, progress).await?;
+            }
+            ResumableDownloadResponseAction::RestartFromZero => {
+                debug!(
+                    key = %full_key,
+                    dest = %dest.display(),
+                    offset,
+                    status = %status,
+                    "S3 endpoint ignored resumable range request; restarting download from byte zero"
+                );
+                download_response_to_file(resp, dest, progress).await?;
+            }
+            ResumableDownloadResponseAction::Error => {
+                let body = resp.text().await.unwrap_or_default();
+                return Self::check_response_status(status, &full_key, &body);
+            }
+        }
+
+        debug!(key = %full_key, dest = %dest.display(), offset, "S3 resumable download completed");
+        Ok(())
+    }
+
     async fn upload_from_file(&self, key: &str, src: &Path, progress: Option<&TransferProgress<'_>>) -> Result<()> {
         self.require_credentials("upload")?;
         let data = tokio::fs::read(src).await?;
@@ -495,7 +601,7 @@ impl StorageBackend for S3Backend {
             format!("/{}", Self::encode_uri_path(&full_key))
         };
 
-        let headers = self.sign_request("PUT", &canonical_uri, "", &payload_hash, &now);
+        let headers = self.sign_request("PUT", &canonical_uri, "", &payload_hash, &now, &[]);
 
         let mut req = self.client.put(&url).body(data);
         req = req.header("Content-Type", "application/octet-stream");
@@ -591,4 +697,29 @@ fn parse_list_objects_v2_xml(xml: &str) -> Result<ListResult> {
         next_marker,
         is_truncated,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resumable_download_response_action_maps_statuses() {
+        assert_eq!(
+            resumable_download_response_action(reqwest::StatusCode::PARTIAL_CONTENT),
+            ResumableDownloadResponseAction::AppendFromOffset
+        );
+        assert_eq!(
+            resumable_download_response_action(reqwest::StatusCode::OK),
+            ResumableDownloadResponseAction::RestartFromZero
+        );
+        assert_eq!(
+            resumable_download_response_action(reqwest::StatusCode::FORBIDDEN),
+            ResumableDownloadResponseAction::Error
+        );
+        assert_eq!(
+            resumable_download_response_action(reqwest::StatusCode::NOT_FOUND),
+            ResumableDownloadResponseAction::Error
+        );
+    }
 }

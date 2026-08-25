@@ -1,6 +1,7 @@
 #![allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 
 mod activation;
+mod detached;
 mod execution;
 mod installer_stage;
 mod published_installer;
@@ -24,10 +25,7 @@ use crate::commands::pack;
 use serde::Deserialize;
 use surge_core::update::manager::ApplyStrategy;
 
-pub(crate) use self::execution::{
-    REMOTE_INSTALLER_FINAL_PATH, resolve_tailscale_targets, run_tailscale_capture, run_tailscale_streaming,
-    run_tailscale_streaming_with_status_watchdog,
-};
+pub(crate) use self::execution::{resolve_tailscale_targets, run_tailscale_capture, run_tailscale_streaming};
 pub(crate) use self::published_installer::{
     build_installer_for_tailscale, missing_remote_installer_error, plan_remote_published_installer,
     plan_remote_published_installer_without_manifest, try_prepare_published_installer_for_tailscale,
@@ -46,7 +44,7 @@ pub(crate) use self::types::{
     RemoteTailscaleCachedState, RemoteTailscaleOperation, RemoteTailscaleTransferInputs,
     RemoteTailscaleTransferStrategy, ensure_supported_tailscale_rid,
 };
-pub(crate) use self::watchdog::RemoteSetupWatchdog;
+pub(crate) use self::watchdog::{RemoteSetupWatchdog, read_remote_update_status_file};
 
 #[cfg(test)]
 pub(crate) use self::activation::build_remote_app_copy_activation_script;
@@ -407,20 +405,84 @@ pub(super) async fn install_release_via_tailscale(
     } else {
         ""
     };
-    let run_cmd = format!(
-        "{REMOTE_INSTALLER_FINAL_PATH}{no_start_flag}{stage_flag}{reinstall_flag} && rm -f {REMOTE_INSTALLER_FINAL_PATH}"
-    );
-    let ssh_command = format!("sh -lc {}", shell_single_quote(&run_cmd));
-    if behavior.mode.is_stage() {
-        logline::info(&format!("Running installer in stage mode on '{file_target}'..."));
-    } else {
-        logline::info(&format!("Running installer on '{file_target}'..."));
-    }
     let remote_home = execution::detect_remote_home_directory(ssh_target).await?;
     let install_root_for_watchdog = staging::remote_install_root(&remote_home, app_id, &release.install_directory)?;
-    let watchdog = RemoteSetupWatchdog::new(ssh_target, &install_root_for_watchdog);
-    run_tailscale_streaming_with_status_watchdog(&["ssh", ssh_target, ssh_command.as_str()], "remote", watchdog)
+
+    // Reattach before staging: if a previously launched detached installer is
+    // still running, watch that install instead of starting a new one. This
+    // is what makes "re-run the same command" recover an install whose local
+    // orchestrator died instead of discarding progress.
+    let mut watch_log_offset = 0_u64;
+    let mut reattached = false;
+    let probe = detached::probe_remote_detached_install(ssh_target).await?;
+    if probe.alive {
+        let status_in_progress = read_remote_update_status_file(ssh_target, &install_root_for_watchdog)
+            .await?
+            .is_some_and(|status| status.state == "in_progress");
+        if status_in_progress {
+            logline::info(&format!(
+                "Detected a detached remote installer still running on '{file_target}' (pid {}); reattaching instead of starting a new install.",
+                probe.pid.as_deref().unwrap_or("unknown")
+            ));
+            watch_log_offset = probe.log_size;
+            reattached = true;
+        } else {
+            logline::warn(&format!(
+                "Found a leftover remote installer process on '{file_target}' without an in-progress install; stopping it before a fresh install."
+            ));
+            detached::stop_remote_detached_install(ssh_target).await?;
+        }
+    } else if let Some(status) = read_remote_update_status_file(ssh_target, &install_root_for_watchdog).await?
+        && status.state == "in_progress"
+    {
+        logline::warn(&format!(
+            "The previous remote installer on '{file_target}' exited without converging; starting a fresh install."
+        ));
+        if let Some(tail) = detached::read_remote_detached_install_tail(ssh_target).await {
+            logline::warn(&format!("Last installer log lines before the failure:\n{tail}"));
+        }
+    }
+
+    if !reattached {
+        warn_remote_full_download_downtime(
+            file_target,
+            app_id,
+            convergence_plan.action,
+            release,
+            behavior.mode.is_stage(),
+        );
+        if behavior.mode.is_stage() {
+            logline::info(&format!("Running installer in stage mode on '{file_target}'..."));
+        } else {
+            logline::info(&format!("Running installer on '{file_target}'..."));
+        }
+        stage_installer_file_for_tailscale(
+            ssh_target,
+            file_target,
+            &installer_path,
+            installer_size,
+            &installer_sha256,
+        )
         .await?;
+
+        // Launch the installer detached from this SSH session so a local
+        // orchestrator death cannot strand the node: the installer keeps
+        // running node-locally and this process only watches it.
+        let install_flags = format!("{no_start_flag}{stage_flag}{reinstall_flag}");
+        let launch_script = detached::build_remote_detached_install_launch_command(&install_flags);
+        let ssh_command = format!("sh -lc {}", shell_single_quote(&launch_script));
+        let launch_output = execution::run_tailscale_capture(&["ssh", ssh_target, ssh_command.as_str()]).await?;
+        logline::info(&format!(
+            "Remote installer launched on '{file_target}' ({}); the install will continue if this connection drops.",
+            launch_output.trim()
+        ));
+    }
+
+    detached::watch_remote_detached_install(ssh_target, file_target, &install_root_for_watchdog, watch_log_offset)
+        .await?;
+    if let Err(error) = detached::cleanup_remote_detached_install(ssh_target).await {
+        logline::warn(&format!("Could not remove remote installer transfer helpers: {error}"));
+    }
     if !behavior.mode.is_stage() {
         warn_if_remote_stage_cleanup_fails(ssh_target, app_id, release).await;
         verify_remote_runtime_after_install(
@@ -555,4 +617,36 @@ fn update_strategy_label(strategy: ApplyStrategy) -> &'static str {
         ApplyStrategy::Full => "full package",
         ApplyStrategy::Delta => "delta",
     }
+}
+
+/// Full-package transfers on a slow tailnet link take a long time, and a
+/// direct (non-staged) install keeps the app down for the whole transfer.
+/// Steer slow-link operators toward the staged flow, which downloads while
+/// the app stays up and cuts over quickly.
+const SLOW_LINK_STAGE_GUIDANCE_MIN_BYTES: i64 = 50 * 1024 * 1024;
+
+fn warn_remote_full_download_downtime(
+    file_target: &str,
+    app_id: &str,
+    action: RemoteConvergenceAction,
+    release: &ReleaseEntry,
+    stage_mode: bool,
+) {
+    if stage_mode {
+        return;
+    }
+    let stops_running_app = matches!(
+        action,
+        RemoteConvergenceAction::Reinstall | RemoteConvergenceAction::Update
+    );
+    if !stops_running_app || release.full_size < SLOW_LINK_STAGE_GUIDANCE_MIN_BYTES {
+        return;
+    }
+    logline::warn(&format!(
+        "This install will stop '{app_id}' on '{file_target}' and transfer {} over the tailscale link before the app comes back.",
+        crate::formatters::format_bytes(u64::try_from(release.full_size).unwrap_or(0))
+    ));
+    logline::warn(
+        "On a slow link that can take a long time. To keep the app up during the transfer, run the same command with --stage first, then re-run it to cut over.",
+    );
 }

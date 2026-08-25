@@ -47,7 +47,7 @@ pub(super) async fn wait_for_tailscale_command_with_status_watchdog(
         }
 
         if last_progress_at.elapsed() >= watchdog.stale_timeout {
-            let status = read_remote_update_status(watchdog).await?;
+            let status = read_remote_update_status_file(&watchdog.ssh_node, &watchdog.install_root).await?;
             if let Some(status) = status.as_ref() {
                 if status.is_terminal_failure() {
                     let _ = child.kill().await;
@@ -85,14 +85,17 @@ pub(super) async fn wait_for_tailscale_command_with_status_watchdog(
     }
 }
 
-async fn read_remote_update_status(watchdog: &RemoteSetupWatchdog) -> Result<Option<RemoteUpdateStatusSnapshot>> {
-    let status_path = watchdog.install_root.join(UPDATE_STATUS_FILE_NAME);
+pub(crate) async fn read_remote_update_status_file(
+    ssh_node: &str,
+    install_root: &Path,
+) -> Result<Option<RemoteUpdateStatusSnapshot>> {
+    let status_path = install_root.join(UPDATE_STATUS_FILE_NAME);
     let script = format!(
         "status_path={}; if [ -f \"$status_path\" ]; then cat \"$status_path\"; fi",
         shell_single_quote(&status_path.to_string_lossy())
     );
     let command = format!("sh -c {}", shell_single_quote(&script));
-    let raw = run_tailscale_capture(&["ssh", watchdog.ssh_node.as_str(), command.as_str()]).await?;
+    let raw = run_tailscale_capture(&["ssh", ssh_node, command.as_str()]).await?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Ok(None);
@@ -103,8 +106,8 @@ async fn read_remote_update_status(watchdog: &RemoteSetupWatchdog) -> Result<Opt
 }
 
 #[derive(Debug, Deserialize)]
-struct RemoteUpdateStatusSnapshot {
-    state: String,
+pub(crate) struct RemoteUpdateStatusSnapshot {
+    pub(crate) state: String,
     #[serde(default)]
     reason: Option<String>,
     #[serde(default)]
@@ -120,7 +123,11 @@ struct RemoteUpdateStatusSnapshot {
 }
 
 impl RemoteUpdateStatusSnapshot {
-    fn has_recent_progress(&self, stale_timeout: Duration) -> bool {
+    pub(crate) fn is_terminal_success(&self) -> bool {
+        self.state == "converged"
+    }
+
+    pub(crate) fn has_recent_progress(&self, stale_timeout: Duration) -> bool {
         let Some(last_progress_at_utc) = self.last_progress_at_utc.as_deref() else {
             return false;
         };
@@ -140,7 +147,7 @@ impl RemoteUpdateStatusSnapshot {
         self.state == "failed" || self.state == "pending_restart"
     }
 
-    fn format_context(&self) -> String {
+    pub(crate) fn format_context(&self) -> String {
         let mut parts = vec![format!("state={}", self.state)];
         if let Some(phase) = self
             .failure_phase

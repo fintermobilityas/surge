@@ -3,6 +3,7 @@ pub mod filesystem;
 pub mod gcs;
 pub mod github_releases;
 pub mod s3;
+mod s3_wire;
 
 use crate::context::{StorageConfig, StorageProvider};
 use crate::error::{Result, SurgeError};

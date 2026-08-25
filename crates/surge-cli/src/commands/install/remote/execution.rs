@@ -143,6 +143,9 @@ pub(crate) async fn stream_directory_entries_to_tailscale_node_with_command(
         if entries.len() == 1 { "y" } else { "ies" }
     );
     let transfer_spinner = make_spinner(&transfer_message);
+    let transfer_started_at = Instant::now();
+    let mut total_streamed = 0_u64;
+    let mut slow_link_warned = false;
     let transfer_result: Result<()> = async {
         let mut buffer = vec![0_u8; 128 * 1024];
         loop {
@@ -159,8 +162,20 @@ pub(crate) async fn stream_directory_entries_to_tailscale_node_with_command(
                 format!("streaming selected staged entries to '{node}'"),
             )
             .await?;
+            total_streamed = total_streamed.saturating_add(u64::try_from(read_bytes).unwrap_or(0));
             if let Some(spinner) = transfer_spinner.as_ref() {
                 spinner.tick();
+            }
+            if !slow_link_warned && transfer_started_at.elapsed() >= std::time::Duration::from_secs(45) {
+                let elapsed_secs = transfer_started_at.elapsed().as_secs_f64().max(1.0);
+                let rate = total_streamed as f64 / elapsed_secs;
+                if rate < 32_000.0 {
+                    slow_link_warned = true;
+                    logline::warn(&format!(
+                        "Slow transfer to '{node}' (~{} B/s). The transfer is resumable: if it is interrupted, re-run the same command to continue where it left off.",
+                        rate.round()
+                    ));
+                }
             }
         }
         await_transfer_progress(

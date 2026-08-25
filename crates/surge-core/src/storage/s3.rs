@@ -4,26 +4,36 @@ use async_trait::async_trait;
 use std::path::Path;
 
 use chrono::Utc;
-use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
+use percent_encoding::utf8_percent_encode;
 use reqwest::Client;
 use tracing::{debug, trace};
 
+use super::s3_wire::{self, URI_ENCODE_PATH_SET};
 use crate::context::StorageConfig;
 use crate::crypto::hmac_sha256::hmac_sha256;
 use crate::crypto::sha256::sha256_hex;
 use crate::error::{Result, SurgeError};
-use crate::storage::{ListEntry, ListResult, ObjectInfo, StorageBackend, TransferProgress, download_response_to_file};
+use crate::storage::{
+    ListResult, ObjectInfo, StorageBackend, TransferProgress, download_response_to_file,
+    download_response_to_file_from_offset,
+};
 
-/// Characters that must NOT be percent-encoded in S3 URI paths (RFC 3986 unreserved + '/').
-const URI_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'.').remove(b'_').remove(b'~');
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumableDownloadResponseAction {
+    AppendFromOffset,
+    RestartFromZero,
+    Error,
+}
 
-/// Same set but also preserves '/' (used for path components).
-const URI_ENCODE_PATH_SET: &AsciiSet = &NON_ALPHANUMERIC
-    .remove(b'-')
-    .remove(b'.')
-    .remove(b'_')
-    .remove(b'~')
-    .remove(b'/');
+fn resumable_download_response_action(status: reqwest::StatusCode) -> ResumableDownloadResponseAction {
+    if status == reqwest::StatusCode::PARTIAL_CONTENT {
+        ResumableDownloadResponseAction::AppendFromOffset
+    } else if status.is_success() {
+        ResumableDownloadResponseAction::RestartFromZero
+    } else {
+        ResumableDownloadResponseAction::Error
+    }
+}
 
 /// S3-compatible storage backend.
 pub struct S3Backend {
@@ -175,14 +185,28 @@ impl S3Backend {
         canonical_querystring: &str,
         payload_hash: &str,
         now: &chrono::DateTime<Utc>,
+        extra_headers: &[(String, String)],
     ) -> Vec<(String, String)> {
         let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
         let date_stamp = now.format("%Y%m%d").to_string();
         let host = self.host_header();
 
         // Canonical headers (must be sorted by lowercase header name).
-        let canonical_headers = format!("host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n");
-        let signed_headers = "host;x-amz-content-sha256;x-amz-date";
+        let mut header_lines = vec![format!("host:{host}")];
+        let mut signed_header_names: Vec<String> = vec!["host".to_string()];
+        for (name, value) in extra_headers {
+            let lower = name.to_ascii_lowercase();
+            header_lines.push(format!("{lower}:{value}"));
+            signed_header_names.push(lower);
+        }
+        header_lines.push(format!("x-amz-content-sha256:{payload_hash}"));
+        signed_header_names.push("x-amz-content-sha256".to_string());
+        header_lines.push(format!("x-amz-date:{amz_date}"));
+        signed_header_names.push("x-amz-date".to_string());
+        header_lines.sort();
+        signed_header_names.sort();
+        let canonical_headers = format!("{}\n", header_lines.join("\n"));
+        let signed_headers = signed_header_names.join(";");
 
         // Canonical request.
         let canonical_request = format!(
@@ -215,29 +239,6 @@ impl S3Backend {
             ("Authorization".to_string(), authorization),
         ]
     }
-
-    /// URI-encode a single path segment (does not encode '/').
-    fn encode_uri_path(path: &str) -> String {
-        utf8_percent_encode(path, URI_ENCODE_PATH_SET).to_string()
-    }
-
-    /// URI-encode a query parameter value.
-    fn encode_uri_component(value: &str) -> String {
-        utf8_percent_encode(value, URI_ENCODE_SET).to_string()
-    }
-
-    /// Map an HTTP response status to a `SurgeError` when appropriate.
-    fn check_response_status(status: reqwest::StatusCode, key: &str, body: &str) -> Result<()> {
-        if status.is_success() {
-            return Ok(());
-        }
-        if status == reqwest::StatusCode::NOT_FOUND {
-            return Err(SurgeError::NotFound(format!("S3 object not found: {key}")));
-        }
-        Err(SurgeError::Storage(format!(
-            "S3 request failed (HTTP {status}): {body}"
-        )))
-    }
 }
 
 #[async_trait]
@@ -250,12 +251,12 @@ impl StorageBackend for S3Backend {
         let now = Utc::now();
 
         let canonical_uri = if self.path_style {
-            format!("/{}/{}", self.bucket, Self::encode_uri_path(&full_key))
+            format!("/{}/{}", self.bucket, s3_wire::encode_uri_path(&full_key))
         } else {
-            format!("/{}", Self::encode_uri_path(&full_key))
+            format!("/{}", s3_wire::encode_uri_path(&full_key))
         };
 
-        let headers = self.sign_request("PUT", &canonical_uri, "", &payload_hash, &now);
+        let headers = self.sign_request("PUT", &canonical_uri, "", &payload_hash, &now, &[]);
 
         let mut req = self.client.put(&url).body(data.to_vec());
         req = req.header("Content-Type", content_type);
@@ -266,7 +267,7 @@ impl StorageBackend for S3Backend {
         let resp = req.send().await?;
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        Self::check_response_status(status, &full_key, &body)?;
+        s3_wire::check_response_status(status, &full_key, &body)?;
 
         debug!(key = %full_key, "S3 PUT completed");
         Ok(())
@@ -281,11 +282,11 @@ impl StorageBackend for S3Backend {
             let payload_hash = sha256_hex(b"");
             let now = Utc::now();
             let canonical_uri = if self.path_style {
-                format!("/{}/{}", self.bucket, Self::encode_uri_path(&full_key))
+                format!("/{}/{}", self.bucket, s3_wire::encode_uri_path(&full_key))
             } else {
-                format!("/{}", Self::encode_uri_path(&full_key))
+                format!("/{}", s3_wire::encode_uri_path(&full_key))
             };
-            let headers = self.sign_request("GET", &canonical_uri, "", &payload_hash, &now);
+            let headers = self.sign_request("GET", &canonical_uri, "", &payload_hash, &now, &[]);
             for (name, value) in &headers {
                 req = req.header(name.as_str(), value.as_str());
             }
@@ -298,7 +299,7 @@ impl StorageBackend for S3Backend {
         let bytes = resp.bytes().await?;
         if !status.is_success() {
             let body = String::from_utf8_lossy(&bytes).to_string();
-            Self::check_response_status(status, &full_key, &body)?;
+            s3_wire::check_response_status(status, &full_key, &body)?;
         }
 
         debug!(key = %full_key, size = bytes.len(), "S3 GET completed");
@@ -314,11 +315,11 @@ impl StorageBackend for S3Backend {
             let payload_hash = sha256_hex(b"");
             let now = Utc::now();
             let canonical_uri = if self.path_style {
-                format!("/{}/{}", self.bucket, Self::encode_uri_path(&full_key))
+                format!("/{}/{}", self.bucket, s3_wire::encode_uri_path(&full_key))
             } else {
-                format!("/{}", Self::encode_uri_path(&full_key))
+                format!("/{}", s3_wire::encode_uri_path(&full_key))
             };
-            let headers = self.sign_request("HEAD", &canonical_uri, "", &payload_hash, &now);
+            let headers = self.sign_request("HEAD", &canonical_uri, "", &payload_hash, &now, &[]);
             for (name, value) in &headers {
                 req = req.header(name.as_str(), value.as_str());
             }
@@ -373,12 +374,12 @@ impl StorageBackend for S3Backend {
         let now = Utc::now();
 
         let canonical_uri = if self.path_style {
-            format!("/{}/{}", self.bucket, Self::encode_uri_path(&full_key))
+            format!("/{}/{}", self.bucket, s3_wire::encode_uri_path(&full_key))
         } else {
-            format!("/{}", Self::encode_uri_path(&full_key))
+            format!("/{}", s3_wire::encode_uri_path(&full_key))
         };
 
-        let headers = self.sign_request("DELETE", &canonical_uri, "", &payload_hash, &now);
+        let headers = self.sign_request("DELETE", &canonical_uri, "", &payload_hash, &now, &[]);
 
         let mut req = self.client.delete(&url);
         for (name, value) in &headers {
@@ -390,7 +391,7 @@ impl StorageBackend for S3Backend {
         // S3 returns 204 for successful DELETE, and does not error on missing keys.
         if !status.is_success() && status != reqwest::StatusCode::NO_CONTENT {
             let body = resp.text().await.unwrap_or_default();
-            Self::check_response_status(status, &full_key, &body)?;
+            s3_wire::check_response_status(status, &full_key, &body)?;
         }
 
         debug!(key = %full_key, "S3 DELETE completed");
@@ -414,7 +415,13 @@ impl StorageBackend for S3Backend {
 
         let canonical_querystring = query_parts
             .iter()
-            .map(|(k, v)| format!("{}={}", Self::encode_uri_component(k), Self::encode_uri_component(v)))
+            .map(|(k, v)| {
+                format!(
+                    "{}={}",
+                    s3_wire::encode_uri_component(k),
+                    s3_wire::encode_uri_component(v)
+                )
+            })
             .collect::<Vec<_>>()
             .join("&");
 
@@ -428,7 +435,7 @@ impl StorageBackend for S3Backend {
             } else {
                 "/".to_string()
             };
-            let headers = self.sign_request("GET", &canonical_uri, &canonical_querystring, &payload_hash, &now);
+            let headers = self.sign_request("GET", &canonical_uri, &canonical_querystring, &payload_hash, &now, &[]);
             for (name, value) in &headers {
                 req = req.header(name.as_str(), value.as_str());
             }
@@ -439,10 +446,10 @@ impl StorageBackend for S3Backend {
         let resp = req.send().await?;
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        Self::check_response_status(status, &full_prefix, &body)?;
+        s3_wire::check_response_status(status, &full_prefix, &body)?;
 
         // Parse S3 ListObjectsV2 XML response.
-        parse_list_objects_v2_xml(&body)
+        s3_wire::parse_list_objects_v2_xml(&body)
     }
 
     async fn download_to_file(&self, key: &str, dest: &Path, progress: Option<&TransferProgress<'_>>) -> Result<()> {
@@ -454,11 +461,11 @@ impl StorageBackend for S3Backend {
             let payload_hash = sha256_hex(b"");
             let now = Utc::now();
             let canonical_uri = if self.path_style {
-                format!("/{}/{}", self.bucket, Self::encode_uri_path(&full_key))
+                format!("/{}/{}", self.bucket, s3_wire::encode_uri_path(&full_key))
             } else {
-                format!("/{}", Self::encode_uri_path(&full_key))
+                format!("/{}", s3_wire::encode_uri_path(&full_key))
             };
-            let headers = self.sign_request("GET", &canonical_uri, "", &payload_hash, &now);
+            let headers = self.sign_request("GET", &canonical_uri, "", &payload_hash, &now, &[]);
             for (name, value) in &headers {
                 req = req.header(name.as_str(), value.as_str());
             }
@@ -470,12 +477,84 @@ impl StorageBackend for S3Backend {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Self::check_response_status(status, &full_key, &body);
+            return s3_wire::check_response_status(status, &full_key, &body);
         }
 
         download_response_to_file(resp, dest, progress).await?;
 
         debug!(key = %full_key, dest = %dest.display(), "S3 download completed");
+        Ok(())
+    }
+
+    fn supports_resumable_downloads(&self) -> bool {
+        true
+    }
+
+    async fn download_to_file_from_offset(
+        &self,
+        key: &str,
+        dest: &Path,
+        offset: u64,
+        progress: Option<&TransferProgress<'_>>,
+    ) -> Result<()> {
+        if offset == 0 {
+            return self.download_to_file(key, dest, progress).await;
+        }
+
+        let full_key = self.full_key(key);
+        let url = self.object_url(&full_key);
+        let range_header = format!("bytes={offset}-");
+
+        let mut req = self
+            .client
+            .get(&url)
+            .header(reqwest::header::RANGE, range_header.as_str());
+        if self.has_credentials() {
+            let payload_hash = sha256_hex(b"");
+            let now = Utc::now();
+            let canonical_uri = if self.path_style {
+                format!("/{}/{}", self.bucket, s3_wire::encode_uri_path(&full_key))
+            } else {
+                format!("/{}/", s3_wire::encode_uri_path(&full_key))
+            };
+            let headers = self.sign_request(
+                "GET",
+                &canonical_uri,
+                "",
+                &payload_hash,
+                &now,
+                &[("range".to_string(), range_header.clone())],
+            );
+            for (name, value) in &headers {
+                req = req.header(name.as_str(), value.as_str());
+            }
+        } else {
+            req = req.header("Host", self.host_header());
+        }
+
+        let resp = req.send().await?;
+        let status = resp.status();
+        match resumable_download_response_action(status) {
+            ResumableDownloadResponseAction::AppendFromOffset => {
+                download_response_to_file_from_offset(resp, dest, offset, progress).await?;
+            }
+            ResumableDownloadResponseAction::RestartFromZero => {
+                debug!(
+                    key = %full_key,
+                    dest = %dest.display(),
+                    offset,
+                    status = %status,
+                    "S3 endpoint ignored resumable range request; restarting download from byte zero"
+                );
+                download_response_to_file(resp, dest, progress).await?;
+            }
+            ResumableDownloadResponseAction::Error => {
+                let body = resp.text().await.unwrap_or_default();
+                return s3_wire::check_response_status(status, &full_key, &body);
+            }
+        }
+
+        debug!(key = %full_key, dest = %dest.display(), offset, "S3 resumable download completed");
         Ok(())
     }
 
@@ -490,12 +569,12 @@ impl StorageBackend for S3Backend {
         let now = Utc::now();
 
         let canonical_uri = if self.path_style {
-            format!("/{}/{}", self.bucket, Self::encode_uri_path(&full_key))
+            format!("/{}/{}", self.bucket, s3_wire::encode_uri_path(&full_key))
         } else {
-            format!("/{}", Self::encode_uri_path(&full_key))
+            format!("/{}", s3_wire::encode_uri_path(&full_key))
         };
 
-        let headers = self.sign_request("PUT", &canonical_uri, "", &payload_hash, &now);
+        let headers = self.sign_request("PUT", &canonical_uri, "", &payload_hash, &now, &[]);
 
         let mut req = self.client.put(&url).body(data);
         req = req.header("Content-Type", "application/octet-stream");
@@ -506,7 +585,7 @@ impl StorageBackend for S3Backend {
         let resp = req.send().await?;
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        Self::check_response_status(status, &full_key, &body)?;
+        s3_wire::check_response_status(status, &full_key, &body)?;
 
         if let Some(cb) = progress {
             cb(total, total);
@@ -515,80 +594,27 @@ impl StorageBackend for S3Backend {
     }
 }
 
-// ---------------------------------------------------------------------------
-// XML parsing for S3 ListObjectsV2 response
-// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// Parse a ListObjectsV2 XML response into a `ListResult`.
-fn parse_list_objects_v2_xml(xml: &str) -> Result<ListResult> {
-    use quick_xml::Reader;
-    use quick_xml::events::Event;
-
-    let mut reader = Reader::from_str(xml);
-    let mut buf = Vec::new();
-    let mut entries = Vec::new();
-    let mut next_marker: Option<String> = None;
-    let mut is_truncated = false;
-
-    // State for parsing <Contents> elements.
-    let mut in_contents = false;
-    let mut current_key: Option<String> = None;
-    let mut current_size: Option<i64> = None;
-    let mut current_tag = String::new();
-
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(ref e)) => {
-                let tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
-                if tag == "Contents" {
-                    in_contents = true;
-                    current_key = None;
-                    current_size = None;
-                }
-                current_tag = tag;
-            }
-            Ok(Event::End(ref e)) => {
-                let tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
-                if tag == "Contents" {
-                    if let Some(key) = current_key.take() {
-                        entries.push(ListEntry {
-                            key,
-                            size: current_size.unwrap_or(0),
-                        });
-                    }
-                    in_contents = false;
-                }
-                current_tag.clear();
-            }
-            Ok(Event::Text(ref e)) => {
-                let text = String::from_utf8_lossy(e.as_ref()).to_string();
-                if in_contents {
-                    match current_tag.as_str() {
-                        "Key" => current_key = Some(text),
-                        "Size" => current_size = text.parse::<i64>().ok(),
-                        _ => {}
-                    }
-                } else {
-                    match current_tag.as_str() {
-                        "IsTruncated" => is_truncated = text == "true",
-                        "NextContinuationToken" => next_marker = Some(text),
-                        _ => {}
-                    }
-                }
-            }
-            Ok(Event::Eof) => break,
-            Err(e) => {
-                return Err(SurgeError::Storage(format!("Failed to parse S3 list response: {e}")));
-            }
-            _ => {}
-        }
-        buf.clear();
+    #[test]
+    fn resumable_download_response_action_maps_statuses() {
+        assert_eq!(
+            resumable_download_response_action(reqwest::StatusCode::PARTIAL_CONTENT),
+            ResumableDownloadResponseAction::AppendFromOffset
+        );
+        assert_eq!(
+            resumable_download_response_action(reqwest::StatusCode::OK),
+            ResumableDownloadResponseAction::RestartFromZero
+        );
+        assert_eq!(
+            resumable_download_response_action(reqwest::StatusCode::FORBIDDEN),
+            ResumableDownloadResponseAction::Error
+        );
+        assert_eq!(
+            resumable_download_response_action(reqwest::StatusCode::NOT_FOUND),
+            ResumableDownloadResponseAction::Error
+        );
     }
-
-    debug!(count = entries.len(), is_truncated, "S3 LIST parsed");
-    Ok(ListResult {
-        entries,
-        next_marker,
-        is_truncated,
-    })
 }

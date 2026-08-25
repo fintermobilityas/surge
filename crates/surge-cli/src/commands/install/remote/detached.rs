@@ -9,7 +9,7 @@ pub(crate) const REMOTE_INSTALLER_PID_PATH: &str = "/tmp/.surge-installer.pid";
 
 /// A full package download on a slow tailnet link can take hours; the
 /// detached monitor must outlive the interactive 30-minute stream timeout.
-pub(crate) const DETACHED_INSTALL_MONITOR_TIMEOUT: Duration = Duration::from_mins(360);
+pub(crate) const DETACHED_INSTALL_MONITOR_TIMEOUT: Duration = Duration::from_hours(6);
 pub(crate) const DETACHED_INSTALL_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// The status file is the authoritative liveness signal; allow more slack
 /// than the interactive watchdog because every check is a fresh SSH round
@@ -344,7 +344,10 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn script_for_temp_paths(script: &str, base: &Path) -> (String, std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    fn script_for_temp_paths(
+        script: &str,
+        base: &Path,
+    ) -> (String, std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
         let log_path = base.join(".surge-installer.log");
         let pid_path = base.join(".surge-installer.pid");
         let bin_path = base.join(".surge-installer");
@@ -359,13 +362,15 @@ mod tests {
     #[test]
     fn detached_launch_command_runs_installer_detached_and_reports_pid() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        let (script, bin_path, log_path, pid_path) = script_for_temp_paths(
-            &build_remote_detached_install_launch_command(""),
-            temp_dir.path(),
-        );
+        let (script, bin_path, log_path, pid_path) =
+            script_for_temp_paths(&build_remote_detached_install_launch_command(""), temp_dir.path());
 
         // Fake installer: reports start/end and stays alive long enough to probe.
-        std::fs::write(&bin_path, "#!/bin/sh\necho installer-started\nsleep 1\necho installer-done\n").unwrap();
+        std::fs::write(
+            &bin_path,
+            "#!/bin/sh\necho installer-started\nsleep 1\necho installer-done\n",
+        )
+        .unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&bin_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
@@ -379,7 +384,10 @@ mod tests {
         assert!(output.status.success(), "script failed: {stdout}");
         assert!(stdout.contains("launched "), "expected a launched pid, got: {stdout}");
 
-        let pid = std::fs::read_to_string(&pid_path).expect("pidfile written").trim().to_string();
+        let pid = std::fs::read_to_string(&pid_path)
+            .expect("pidfile written")
+            .trim()
+            .to_string();
         assert!(!pid.is_empty());
         let pid_alive = |pid: &str| {
             std::process::Command::new("kill")

@@ -25,15 +25,19 @@ pub(super) struct SetupStatus {
     target_version: String,
     channel: String,
     attempted_at_utc: String,
+    previous_attempt_record: Option<UpdateStatusRecord>,
 }
 
 impl SetupStatus {
     pub(super) fn new(manifest: &InstallerManifest, install_root: &Path) -> Self {
+        let app_id = manifest.app_id.trim().to_string();
+        let target_version = manifest.version.trim().to_string();
         Self {
             install_root: install_root.to_path_buf(),
-            app_id: manifest.app_id.trim().to_string(),
+            previous_attempt_record: current_record(install_root, &app_id, &target_version),
+            app_id,
             installed_version: installed_version(install_root),
-            target_version: manifest.version.trim().to_string(),
+            target_version,
             channel: manifest.channel.trim().to_string(),
             attempted_at_utc: update_status::now_utc_rfc3339(),
         }
@@ -80,7 +84,7 @@ impl SetupStatus {
 
     pub(super) fn record_failed(&self, reason: &str) {
         let current = self.current_record();
-        let schedule = update_status::retry_schedule(current.as_ref(), &self.target_version);
+        let schedule = update_status::retry_schedule(self.previous_attempt_record.as_ref(), &self.target_version);
         let record = UpdateStatusRecord::failed_with_context(
             &self.app_id,
             &self.installed_version,
@@ -108,15 +112,19 @@ impl SetupStatus {
     }
 
     fn current_record(&self) -> Option<UpdateStatusRecord> {
-        update_status::read_update_status(&self.install_root)
-            .ok()
-            .flatten()
-            .filter(|record| record.app_id == self.app_id && record.target_version == self.target_version)
+        current_record(&self.install_root, &self.app_id, &self.target_version)
     }
 
     fn write(&self, record: &UpdateStatusRecord) {
         let _ = write_update_status(&self.install_root, record);
     }
+}
+
+fn current_record(install_root: &Path, app_id: &str, target_version: &str) -> Option<UpdateStatusRecord> {
+    update_status::read_update_status(install_root)
+        .ok()
+        .flatten()
+        .filter(|record| record.app_id == app_id && record.target_version == target_version)
 }
 
 #[derive(Debug, Deserialize)]
@@ -138,5 +146,61 @@ fn installed_version(install_root: &Path) -> String {
         NOT_INSTALLED_VERSION.to_string()
     } else {
         version.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn record_failed_uses_pre_attempt_failed_record_for_backoff() {
+        let install_root = tempfile::tempdir().expect("temp install root");
+        let manifest: InstallerManifest = serde_yaml::from_str(
+            r#"
+schema: 1
+format: surge-installer-v1
+ui: console
+installer_type: online
+app_id: demo-app
+rid: linux-x64
+version: "1.2.3"
+channel: stable
+generated_utc: "2026-05-11T14:00:00Z"
+release_index_key: releases.zstd
+storage:
+  provider: filesystem
+  bucket: /tmp/store
+release:
+  full_filename: demo-full.tar.zst
+runtime:
+  name: Demo
+  main_exe: demo
+"#,
+        )
+        .expect("manifest parses");
+
+        let previous_failed = UpdateStatusRecord::failed(
+            "demo-app",
+            "1.2.2",
+            "1.2.3",
+            "stable",
+            "2026-05-11T14:00:00Z".to_string(),
+            "previous failure",
+        )
+        .with_retry_schedule_at(
+            &update_status::RetrySchedule::base(),
+            "2026-05-11T14:05:00Z".to_string(),
+        );
+        write_update_status(install_root.path(), &previous_failed).expect("seed previous failure status");
+
+        let setup = SetupStatus::new(&manifest, install_root.path());
+        setup.record_phase(PHASE_STAGE_RECEIVED);
+        setup.record_failed("current failure");
+
+        let failed = update_status::read_update_status(install_root.path())
+            .expect("status read succeeds")
+            .expect("status exists");
+        assert_eq!(failed.retry_count, Some(2));
     }
 }

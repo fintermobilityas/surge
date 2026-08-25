@@ -258,6 +258,7 @@ namespace Surge
             CancellationToken cancellationToken = default)
         {
             ThrowIfDisposed();
+            cancellationToken.ThrowIfCancellationRequested();
 
             // A retry-safe failure schedules a backoff window in the persisted
             // status record. Deferring here (instead of re-entering native

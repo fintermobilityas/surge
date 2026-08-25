@@ -290,7 +290,7 @@ impl UpdateManager {
             }
             Err(e) => {
                 let status_context = status::read_update_status(&self.install_dir).ok().flatten();
-                let record = UpdateStatusRecord::failed_with_context(
+                let mut record = UpdateStatusRecord::failed_with_context(
                     &self.app_id,
                     &pre_attempt_version,
                     &target_version,
@@ -299,6 +299,13 @@ impl UpdateManager {
                     &e.to_string(),
                     FailureContext::from_record(status_context.as_ref(), true),
                 );
+                // A user-initiated cancellation is not a failure to back off
+                // from; the next attempt may start immediately.
+                if !matches!(e, SurgeError::Cancelled) {
+                    let schedule = status::retry_schedule(status_context.as_ref(), &target_version);
+                    record = record
+                        .with_retry_schedule_at(&schedule, status::next_retry_timestamp(chrono::Utc::now(), &schedule));
+                }
                 if let Err(write_err) = status::write_update_status(&self.install_dir, &record) {
                     warn!(error = %write_err, "Failed to persist failed-update status (continuing)");
                 }

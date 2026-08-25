@@ -80,7 +80,8 @@ impl SetupStatus {
 
     pub(super) fn record_failed(&self, reason: &str) {
         let current = self.current_record();
-        self.write(&UpdateStatusRecord::failed_with_context(
+        let schedule = update_status::retry_schedule(current.as_ref(), &self.target_version);
+        let record = UpdateStatusRecord::failed_with_context(
             &self.app_id,
             &self.installed_version,
             &self.target_version,
@@ -88,7 +89,12 @@ impl SetupStatus {
             self.attempted_at_utc.clone(),
             reason,
             FailureContext::from_record(current.as_ref(), true),
-        ));
+        )
+        .with_retry_schedule_at(
+            &schedule,
+            update_status::next_retry_timestamp(chrono::Utc::now(), &schedule),
+        );
+        self.write(&record);
     }
 
     fn in_progress_record(&self) -> UpdateStatusRecord {

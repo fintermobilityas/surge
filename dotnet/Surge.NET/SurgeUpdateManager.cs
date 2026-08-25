@@ -239,8 +239,9 @@ namespace Surge
         /// <param name="cancellationToken">Token to cancel the operation.</param>
         /// <returns>
         /// The <see cref="SurgeAppInfo"/> for the newly installed version,
-        /// or null if no updates were available or native cancellation occurred
-        /// without the supplied token being cancelled.
+        /// or null if no updates were available, native cancellation occurred
+        /// without the supplied token being cancelled, or a previous
+        /// retry-safe failure is still inside its retry-backoff window.
         /// </returns>
         /// <exception cref="OperationCanceledException">
         /// The supplied cancellation token was cancelled.
@@ -257,6 +258,14 @@ namespace Surge
             CancellationToken cancellationToken = default)
         {
             ThrowIfDisposed();
+
+            // A retry-safe failure schedules a backoff window in the persisted
+            // status record. Deferring here (instead of re-entering native
+            // update work immediately) turns consecutive failures into a
+            // bounded retry cadence; cancelled attempts schedule no window
+            // and therefore never defer.
+            if (SurgeUpdateStatus.ShouldDeferUpdate(GetCurrentStatus(), DateTimeOffset.UtcNow))
+                return Task.FromResult<SurgeAppInfo?>(null);
 
             return Task.Run(() =>
             {

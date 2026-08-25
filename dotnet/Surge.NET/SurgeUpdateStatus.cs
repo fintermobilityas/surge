@@ -100,6 +100,50 @@ namespace Surge
         public string? FailurePhase { get; init; }
 
         /// <summary>
+        /// Whether retrying the same update is expected to be safe. Only set
+        /// on failed records.
+        /// </summary>
+        public bool? RetrySafe { get; init; }
+
+        /// <summary>
+        /// Earliest time (RFC 3339, UTC) a new attempt for this target may
+        /// start again after a retry-safe failure. <see
+        /// cref="SurgeUpdateManager.UpdateToLatestReleaseAsync"/> defers new
+        /// attempts until this instant so consecutive failures back off
+        /// instead of retrying in a tight loop. Null for records without a
+        /// scheduled retry.
+        /// </summary>
+        public string? NextRetryAtUtc { get; init; }
+
+        /// <summary>
+        /// One-based count of consecutive retry-safe failures for this
+        /// target. Only set on failed records.
+        /// </summary>
+        public int? RetryCount { get; init; }
+
+        /// <summary>
+        /// True when a persisted failed status record defers a new in-app
+        /// update attempt until its retry-backoff window has elapsed. Used by
+        /// <see cref="SurgeUpdateManager.UpdateToLatestReleaseAsync"/> to turn
+        /// consecutive failures into a bounded backoff.
+        /// </summary>
+        /// <param name="status">The persisted status, or null when no record exists.</param>
+        /// <param name="nowUtc">Current UTC time.</param>
+        internal static bool ShouldDeferUpdate(SurgeUpdateStatus? status, DateTimeOffset nowUtc)
+        {
+            if (status is null || status.State != SurgeUpdateConvergenceState.Failed || status.RetrySafe != true)
+                return false;
+
+            var raw = status.NextRetryAtUtc;
+            if (string.IsNullOrWhiteSpace(raw))
+                return false;
+            if (!DateTimeOffset.TryParse(raw, null, System.Globalization.DateTimeStyles.AssumeUniversal | System.Globalization.DateTimeStyles.AdjustToUniversal, out var nextRetry))
+                return false;
+
+            return nextRetry > nowUtc;
+        }
+
+        /// <summary>
         /// Read the persisted update convergence record from <paramref name="installDirectory"/>.
         /// Returns <c>null</c> when no record has been written yet (e.g. clean
         /// install that has never run an update).
@@ -150,6 +194,9 @@ namespace Surge
                 CompletedAtUtc = NullIfEmpty(GetString(fields, "completed_at_utc")),
                 Reason = NullIfEmpty(GetString(fields, "reason")),
                 FailurePhase = NullIfEmpty(GetString(fields, "failure_phase")),
+                RetrySafe = GetBoolNullable(fields, "retry_safe"),
+                NextRetryAtUtc = NullIfEmpty(GetString(fields, "next_retry_at_utc")),
+                RetryCount = GetInt(fields, "retry_count"),
             };
         }
 
@@ -178,6 +225,16 @@ namespace Surge
             return fields.TryGetValue(key, out var value) && value.Kind == JsonValueKind.Bool && value.BoolValue;
         }
 
+        private static bool? GetBoolNullable(Dictionary<string, JsonValue> fields, string key)
+        {
+            return fields.TryGetValue(key, out var value) && value.Kind == JsonValueKind.Bool ? value.BoolValue : null;
+        }
+
+        private static int? GetInt(Dictionary<string, JsonValue> fields, string key)
+        {
+            return fields.TryGetValue(key, out var value) && value.Kind == JsonValueKind.Int ? value.IntValue : null;
+        }
+
         private static string? MarshalUtf8(IntPtr ptr)
         {
 #if NETSTANDARD2_0
@@ -194,23 +251,26 @@ namespace Surge
         // update::status module exactly.
         // ----------------------------------------------------------------------
 
-        private enum JsonValueKind { Null, String, Bool }
+        private enum JsonValueKind { Null, String, Bool, Int }
 
         private readonly struct JsonValue
         {
             public JsonValueKind Kind { get; }
             public string? StringValue { get; }
             public bool BoolValue { get; }
+            public int IntValue { get; }
 
-            public static readonly JsonValue Null = new JsonValue(JsonValueKind.Null, null, false);
-            public static JsonValue OfString(string s) => new JsonValue(JsonValueKind.String, s, false);
-            public static JsonValue OfBool(bool b) => new JsonValue(JsonValueKind.Bool, null, b);
+            public static readonly JsonValue Null = new JsonValue(JsonValueKind.Null, null, false, 0);
+            public static JsonValue OfString(string s) => new JsonValue(JsonValueKind.String, s, false, 0);
+            public static JsonValue OfBool(bool b) => new JsonValue(JsonValueKind.Bool, null, b, 0);
+            public static JsonValue OfInt(int i) => new JsonValue(JsonValueKind.Int, null, false, i);
 
-            private JsonValue(JsonValueKind kind, string? stringValue, bool boolValue)
+            private JsonValue(JsonValueKind kind, string? stringValue, bool boolValue, int intValue)
             {
                 Kind = kind;
                 StringValue = stringValue;
                 BoolValue = boolValue;
+                IntValue = intValue;
             }
         }
 
@@ -251,6 +311,8 @@ namespace Surge
                     value = JsonValue.OfBool(false);
                 else if (TryReadKeyword(json, ref i, "null"))
                     value = JsonValue.Null;
+                else if (TryReadInt(json, ref i, out int iv))
+                    value = JsonValue.OfInt(iv);
                 else
                     return null;
 
@@ -290,6 +352,23 @@ namespace Surge
             }
             i += keyword.Length;
             return true;
+        }
+
+        private static bool TryReadInt(string s, ref int i, out int value)
+        {
+            value = 0;
+            int start = i;
+            if (i < s.Length && s[i] == '-')
+                i++;
+            while (i < s.Length && s[i] >= '0' && s[i] <= '9')
+                i++;
+            if (i == start || (i == start + 1 && s[start] == '-'))
+                return false;
+#if NETSTANDARD2_0
+            return int.TryParse(s.Substring(start, i - start), out value);
+#else
+            return int.TryParse(s.AsSpan(start, i - start), out value);
+#endif
         }
 
         private static bool TryReadString(string s, ref int i, out string value)

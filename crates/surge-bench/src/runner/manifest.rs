@@ -37,7 +37,7 @@ pub(super) fn installer_manifest(
             bucket: store_dir.to_string_lossy().to_string(),
             region: String::new(),
             endpoint: String::new(),
-            prefix: String::new(),
+            prefix: app_id.to_string(),
         },
         release: InstallerRelease {
             full_filename: full_filename.to_string(),
@@ -74,9 +74,10 @@ pub(super) fn write_bench_manifest(
 storage:
   provider: filesystem
   bucket: {bucket}
+  prefix: {app_id}
 pack:
   delta:
-    strategy: archive-chunked-bsdiff
+    strategy: sparse-file-ops
   compression:
     format: zstd
     level: {pack_zstd_level}

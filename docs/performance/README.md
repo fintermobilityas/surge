@@ -16,6 +16,21 @@ Files:
 - [pack-policy.md](/home/peters/github/surge/docs/performance/pack-policy.md): current defaults, why they were chosen, and what tune is allowed to write
 - [update-chains.md](/home/peters/github/surge/docs/performance/update-chains.md): what is known about long delta chains and what remains unresolved
 
+## Autoresearch Surfaces
+
+The iterative optimization loop lives under `auto/` (see `Autoresearch
+Methodology` in the repository `AGENTS.md`). Each surface measures one
+family of these findings through `surge-bench` and logs every attempt
+in its append-only `results.tsv`:
+
+- `auto/delta/` — delta patch size and diff/apply cost (canonical surface)
+- `auto/pack/` — full pack build throughput and artifact size
+- `auto/update/` — end-to-end client update cost across a delta chain
+
+The scenario/scale definitions in `benchmark-profiles.md` stay the single
+source of truth; surface `program.md` files reference them instead of
+defining new payload shapes.
+
 Maintenance rules:
 
 - Keep payload descriptions anonymized and generic.

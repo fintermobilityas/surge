@@ -1,0 +1,2 @@
+commit	score_apply_ms	download_bytes_delta_build_ms	status	description
+4578166	8525.814539	download_bytes=104328 delta_build_ms=796.1179999999999 index_ms=0.707	baseline	scale=0.05 scenario=sdk-only num_deltas=20 seed=42 runs=1

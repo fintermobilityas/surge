@@ -1,0 +1,2 @@
+commit	score_archive_create_ms	archive_bytes_zstd_ms	status	description
+4578166	78.346164	archive_bytes=7997458 zstd_ms=59.231683 unzstd_ms=32.514931 extract_ms=62.935144	baseline	scale=0.05 scenario=full-release seed=42 runs=1

@@ -1,0 +1,2 @@
+commit	score_patch_bytes	diff_ms_patch_ms	status	description
+4578166	42595	diff_ms=2053.0842740000003 patch_ms=199.086682	baseline	scale=0.25 scenario=sdk-only seed=42 runs=1

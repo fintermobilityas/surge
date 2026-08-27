@@ -226,12 +226,12 @@ pub async fn run_installer_scenario(
 
     let manifest_path = work_dir.join("installer-bench.surge.yml");
     write_bench_manifest(&manifest_path, &store_dir, app_id, &rid, pack_zstd_level)?;
-    let ctx = configure_benchmark_context(&store_dir, pack_zstd_level, pack_max_threads, pack_memory_mb)?;
+    let ctx = configure_benchmark_context(&store_dir, app_id, pack_zstd_level, pack_max_threads, pack_memory_mb)?;
 
     let template = PayloadTemplate::new(scale, seed);
     template.write_base(&artifacts_dir, seed)?;
     let publication = publish_release(Arc::clone(&ctx), &manifest_path, app_id, &rid, &version, &artifacts_dir).await?;
-    let full_package_path = store_dir.join(&publication.full_build.filename);
+    let full_package_path = store_dir.join(app_id).join(&publication.full_build.filename);
 
     let surge_binary = resolve_tool_binary("SURGE_INSTALLER_BINARY", surge_binary_name_for_rid(&rid))?;
     let installer_launcher = resolve_tool_binary("SURGE_INSTALLER_LAUNCHER", installer_launcher_name_for_rid(&rid))?;

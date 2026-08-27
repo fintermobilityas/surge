@@ -50,6 +50,7 @@ fn average_u64(values: &[u64]) -> u64 {
 
 pub(super) fn configure_benchmark_context(
     store_dir: &Path,
+    app_id: &str,
     pack_zstd_level: i32,
     pack_max_threads: Option<usize>,
     pack_memory_mb: u64,
@@ -65,6 +66,9 @@ pub(super) fn configure_benchmark_context(
         "",
         "",
     );
+    // The publisher must use the same app-scoped prefix the UpdateManager
+    // requires (surge-core #79: release index lives on <prefix>/<app_id>).
+    ctx.set_storage_prefix(app_id);
 
     let mut budget = ctx.resource_budget();
     let available_threads = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
@@ -143,7 +147,7 @@ pub async fn run_update_scenario(
     let manifest_path = work_dir.join("update-bench.surge.yml");
     write_bench_manifest(&manifest_path, &store_dir, app_id, &rid, pack_zstd_level)?;
 
-    let ctx = configure_benchmark_context(&store_dir, pack_zstd_level, pack_max_threads, pack_memory_mb)?;
+    let ctx = configure_benchmark_context(&store_dir, app_id, pack_zstd_level, pack_max_threads, pack_memory_mb)?;
 
     let template = PayloadTemplate::new(scale, seed);
     let base_input_bytes = template.write_base(&artifacts_dir, seed)?;
@@ -179,7 +183,8 @@ pub async fn run_update_scenario(
         let version = version_label(version_index);
         let publication =
             publish_release(Arc::clone(&ctx), &manifest_path, app_id, &rid, &version, &artifacts_dir).await?;
-        let release_index_size = fs::metadata(store_dir.join(RELEASES_FILE_COMPRESSED)).map_or(0, |meta| meta.len());
+        let release_index_size =
+            fs::metadata(store_dir.join(app_id).join(RELEASES_FILE_COMPRESSED)).map_or(0, |meta| meta.len());
         release_index_updates.push(publication.release_index_update);
         release_index_sizes.push(release_index_size);
 
@@ -280,7 +285,7 @@ pub async fn run_update_scenario(
     });
 
     let baseline_version = version_label(1);
-    let baseline_full = store_dir.join(&baseline_publication.full_build.filename);
+    let baseline_full = store_dir.join(app_id).join(&baseline_publication.full_build.filename);
     let baseline_bytes = fs::read(&baseline_full)?;
     let baseline_app_dir = install_dir.join("app");
     extractor::extract_to(&baseline_bytes, &baseline_app_dir, None)?;
@@ -295,7 +300,7 @@ pub async fn run_update_scenario(
             .ok_or_else(|| SurgeError::Config(format!("Install path is not valid UTF-8: {}", install_dir.display())))?,
     )?;
 
-    let releases_index_path = store_dir.join(RELEASES_FILE_COMPRESSED);
+    let releases_index_path = store_dir.join(app_id).join(RELEASES_FILE_COMPRESSED);
     let releases_index_size = fs::metadata(&releases_index_path).map_or(0, |meta| meta.len());
     let check_started = Instant::now();
     let info = update_manager

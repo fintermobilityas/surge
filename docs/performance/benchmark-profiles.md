@@ -94,6 +94,11 @@ use `archive-chunked-bsdiff` to measure the archive-level fallback
 shape). The `auto/update/` surface exposes it as the `STRATEGY` env
 knob.
 
+Set `BENCH_STEP_TIMING=1` to print one stderr line per applied delta
+(`[step] items_done=N elapsed_ms=...`) for chain-apply profiling —
+used to establish that per-delta apply cost is flat in chain depth
+(`docs/performance/update-chains.md`).
+
 Localized long chain:
 
 ```bash

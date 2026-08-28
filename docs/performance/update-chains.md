@@ -32,8 +32,13 @@ Large anonymized profile, `sdk_only`, `100` deltas, `sparse-file-ops`
 
 - client download: `510 KiB` (archive-chunked: `15.6 MiB` — ~30x less)
 - client apply, full 100-delta walk: `657 s` (archive-chunked: ~`18 s`)
-- apply is superlinear in chain length: ~`2.2 s` per delta at 20
-  deltas vs ~`6.6 s` per delta at 100 deltas
+- per-delta apply cost is **flat in chain depth**: with per-step
+  progress instrumentation, every one of the 100 steps took
+  ~`6.4 s` (a 20-delta control run under the same host load measured
+  ~`6.3 s`/delta). Per-step cost is CPU-bound (each step re-extracts
+  and re-packs the full current archive) and varies ~3x with host
+  load — an earlier 20-delta run on an idle host measured
+  ~`2.2 s`/delta, which is the same per-step cost, not a depth effect
 
 Meaning:
 
@@ -43,7 +48,8 @@ Meaning:
   caps the client walk at `max_chain_length` (8) with checkpoint
   fulls every `checkpoint_every` (10), so real client applies are
   bounded far below this figure
-- the superlinear apply growth is an open item (see below)
+- the per-step cost itself is the open item (see below): every delta
+  apply re-extracts and re-packs the entire current archive
 
 ### Broad churn is now bounded by file-aware deltas and full fallback
 
@@ -75,12 +81,16 @@ Meaning:
 
 ## What Is Not Solved Yet
 
-- per-delta apply under `sparse-file-ops` grows superlinearly with
-  chain depth (~2.2 s/delta at 20 deltas vs ~6.6 s/delta at 100
-  deltas, scale 1.0 sdk-only); the cause is unexplained. Production
-  checkpointing bounds real client walks, but any client that does
-  pay long-chain apply time would need this investigated before
-  `max_chain_length` is ever raised
+- each delta apply is O(archive size): `apply_target_deltas`
+  re-extracts the current full archive to a temp dir, applies the
+  per-file ops, re-packs it, and SHA-256s the result — so a chain
+  walk pays extract+repack per delta. Measured flat per step
+  (~2.2 s/delta idle host, ~6.4 s/delta loaded host, scale 1.0
+  sdk-only); production checkpointing bounds the walk at 8 deltas,
+  but edge-node CPU and SSD wear on long walks scale with archive
+  size. Candidate shapes: apply ops against the extracted tree
+  incrementally across the chain (extract once, repack once), or
+  batch the chain against a checkpoint full
 - retained full checkpoints still need long-history tuning in real feeds
 - broad-churn chains can still justify a fresh full checkpoint
 - local checkpoint retention policy may need calibration for very long-lived installs

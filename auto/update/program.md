@@ -78,17 +78,26 @@ tree still matches.
 
 - sparse file-ops deltas, zstd 3, `max_chain_length` 8,
   `checkpoint_every` 10, keep 2 latest fulls (pack-policy defaults)
-- localized 100-delta chain at large scale: download ≈ 15.6 MiB, apply
-  ≈ 18 s — acceptable (`docs/performance/update-chains.md`)
+- localized 100-delta chain at large scale (measured 2026-08-28):
+  download ≈ 510 KiB, full-chain apply ≈ 657 s worst-case walk
+  (archive-chunked reference: 15.6 MiB / ~18 s) —
+  `docs/performance/update-chains.md`
+- per-delta apply cost is **flat in chain depth** (measured with
+  `BENCH_STEP_TIMING=1`: ~6.4 s/delta constant across all 100 steps;
+  20-delta control under the same load ~6.3 s/delta). Per-step cost is
+  O(archive size) — extract + repack + hash per step — and ~3x
+  host-load sensitive. An earlier 2.2 s/delta reading was an idle-host
+  outlier, NOT a depth effect (corrects the initial superlinear
+  reading from the first 100-delta run)
 - broad churn is bounded by file-aware deltas + full fallback
-- publisher cost for a 101-release chain ≈ 337 s — retention policy
-  still matters
+- publisher cost for a 101-release chain ≈ 897 s under sparse
+  (~337 s under archive-chunked) — retention policy still matters
 - baseline (b397c0c, 48-core/251 GB machine, scale 0.05, 20 deltas):
   apply 8,569 ms, download 104,328 bytes, delta build 810 ms
-- same-session reference: the `archive-chunked-bsdiff` strategy applied
-  the identical chain in 2,931 ms (98,714 bytes) — per-file sparse apply
-  is ~2.9x slower at this small scale; verify at large scale before
-  drawing conclusions (per-file patches are smaller there)
+- small-scale strategy reference: `archive-chunked-bsdiff` applied the
+  identical 20-delta chain in 2,931 ms vs 8,526 ms for sparse (0.05
+  scale, 40 MiB archives); the gap widens at large scale because
+  sparse apply re-extracts/re-packs the full archive per step
 
 Open questions from `docs/performance/update-chains.md`:
 
@@ -101,24 +110,33 @@ Open questions from `docs/performance/update-chains.md`:
 Ranked by expected value; read `results.tsv` and
 `git log --oneline --all | grep -iE "dead end|autoresearch"` first.
 
-1. **Verification cost.** SHA-256 over the full payload on the client is
+1. **Per-delta archive rebuild (top candidate, found by the 100-delta
+   per-step profile).** Each chain step re-extracts the full current
+   archive, applies the per-file ops, re-packs, and re-hashes —
+   O(archive size) per delta, CPU-bound and host-load sensitive
+   (~2.2 s/delta idle, ~6.4 s/delta loaded at scale 1.0). Candidate
+   shapes: extract once and apply ops across the chain against the
+   tree (repack once at the end), or apply against the installed tree
+   instead of rebuilding archives per step. A keep changes the apply
+   path, so the install-tree-assertion bench gate applies directly.
+2. **Verification cost.** SHA-256 over the full payload on the client is
    measured in the microbench (`SHA-256 (file)`). Sweep: verify-then-
    apply vs apply-then-verify ordering, streaming hashes during
    download, and whether the delta's embedded hashes let us skip
    re-hashing untouched files in sparse ops.
-2. **Checkpoint reuse.** Local cache retention (`keepFullCount: 1`)
+3. **Checkpoint reuse.** Local cache retention (`keepFullCount: 1`)
    decides whether a chain walk rebuilds fulls from deltas or reuses a
    cached checkpoint. Measure the apply-time knee as a function of
    `keepFullCount` and chain distance from the nearest checkpoint.
-3. **Chain walk planning cost.** `Update check` reads the compressed
+4. **Chain walk planning cost.** `Update check` reads the compressed
    release index and walks the chain; for long histories the index
    grows unboundedly. Measure check time vs history length and tune
    `max_chain_length`/`checkpoint_every` against the large chain.
-4. **Restore parallelism.** Sparse apply writes per-file patches; check
+5. **Restore parallelism.** Sparse apply writes per-file patches; check
    whether patch application parallelizes safely across files (it may
    already) and whether the 256 MiB budget is the binding constraint on
    apply throughput for broad-churn deltas.
-5. **Download overlap.** Whether verify can start before the full
+6. **Download overlap.** Whether verify can start before the full
    download lands (streaming hash) on the common delta path.
 
 ## Dead Ends to Respect

@@ -323,8 +323,28 @@ pub async fn run_update_scenario(
     });
 
     let apply_started = Instant::now();
+    // Per-delta apply timing for chain analysis, enabled with
+    // BENCH_STEP_TIMING=1 (one stderr line per applied delta).
+    let step_timing = std::env::var_os("BENCH_STEP_TIMING").is_some();
+    let t0 = apply_started;
+    let last_items = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(-1));
+    let li = last_items.clone();
     update_manager
-        .download_and_apply(&info, None::<fn(ProgressInfo)>)
+        .download_and_apply(
+            &info,
+            Some(move |p: ProgressInfo| {
+                if step_timing && p.phase == 5 {
+                    let prev = li.swap(p.items_done, std::sync::atomic::Ordering::Relaxed);
+                    if p.items_done != prev {
+                        eprintln!(
+                            "[step] items_done={} elapsed_ms={}",
+                            p.items_done,
+                            t0.elapsed().as_millis()
+                        );
+                    }
+                }
+            }),
+        )
         .await?;
     let apply_duration = apply_started.elapsed();
     assert_directories_match(&install_dir.join("app"), &artifacts_dir)?;

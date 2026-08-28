@@ -111,6 +111,13 @@ cargo run -p surge-bench --release -- --update-only --scale 1.0 \
   derives the chunk from the memory budget, so the operational 256 MiB
   budget on a 48-core publisher clamps to 4 MiB — the byte-tax regime
   the sweep measured, but at ~40 chunks on a large-scale archive
+- large-scale knee (scale 1.0 sdk-only, same session): patch bytes fall
+  monotonically with chunk size — 4 MiB 277,540 B (+76% vs 64), 16 MiB
+  181,149 (+15%), 32 MiB 165,419 (+5%), 64 MiB 157,939, 256 MiB 150,284
+  (−4.8%, asymptote). Diff time falls the other way (375 ms → 9,874 ms).
+  The byte knee sits at ~64 MiB; the 256 MiB budget's 4 MiB clamp sits
+  on the byte-curve floor. Publisher-side diff time is CI minutes, not
+  fleet cost — the fleet pays the bytes on every node
 
 ## Optimization Ideas
 
@@ -118,21 +125,24 @@ Ranked by expected value; read `results.tsv` and
 `git log --oneline --all | grep -iE "dead end|autoresearch"` before
 starting any of these.
 
-1. **Chunk-size policy in `chunked_diff_options`.** The sweep shows the
-   64 MiB microbench default is a local bytes optimum while production
-   (256 MiB budget, many cores) clamps to 4 MiB and pays the byte tax.
-   Measure the bytes/time knee at large scale (scale 1.0, ~40+ chunks)
-   and tune `BYTES_PER_THREAD_FACTOR` / the 4 MiB clamp so the budget
-   derivation lands on the knee instead of the floor. Keep the memory
-   guardrail explicit.
+1. **Land the chunk derivation on the knee.** The knee is measured
+   (idea-1 sweeps above): bytes want ≥64 MiB, and the only thing keeping
+   production at 4 MiB is the shared 256 MiB budget. Candidate: the
+   publisher path uses the 64 MiB default chunk with threads derived
+   from the budget (1 thread at 256 MiB — 4.3 s diff, the byte knee),
+   while node-side local rebuilds keep the budget-derived small chunk
+   (time matters there, bytes do not). Measure through the update
+   surface (download bytes on the large chain) before keeping; this
+   changes published delta bytes fleet-wide, so the promotion gate is
+   mandatory.
 2. **Patch compression level.** Patches are zstd-compressed at the pack
    level; patches are far more compressible than archives. A higher
    zstd level *on the patch only* may shrink download bytes at negligible
-   edge apply cost (decompression is the cheap half).
-3. **Parallelism/memory trade.** `max_threads` scales with the memory
-   budget (`/12` per thread). The sweep showed diff time tracks the
-   largest chunk, not total work — the time lever is chunk granularity
-   under a memory cap, i.e. the same knee as idea 1.
+   edge apply cost (decompression is the cheap half). Independent of
+   idea 1 — the sweep patches were all zstd-3.
+3. **Parallelism/memory trade.** Subsumed by idea 1: the sweep showed
+   diff time tracks the largest chunk under the thread count the budget
+   allows, so the lever is the (chunk, threads) pair, not threads alone.
 4. **bsdiff C-backend tuning.** Suffix-array construction dominates
    classic bsdiff. Candidate: early-skip chunks whose content hashes are
    identical before diffing (needs a format version bump).
@@ -150,5 +160,8 @@ starting any of these.
 - **Chunk-size sweep 8/16/32/64/128 MiB** (scale 0.25 sdk-only, session
   of 4578166): no size beats 64 MiB on the score (patch bytes); smaller
   chunks trade bytes for diff time (+36% bytes / −82% time at 8 MiB).
-  Do not re-sweep the same axis at this scale; the open question is the
-  knee at large scale under the production memory budget (idea 1).
+- **Chunk-size sweep 4/8/16/32/64/128/256 MiB** (scale 1.0 sdk-only,
+  same session): bytes monotonic in chunk size, knee at ~64 MiB, 4 MiB
+  (the production clamp) is the byte-curve floor at +76%. Do not
+  re-sweep the axis; the open question is policy (idea 1): who gets
+  which (chunk, threads) pair under which budget.

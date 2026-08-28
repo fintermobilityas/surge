@@ -133,6 +133,7 @@ pub async fn run_update_scenario(
     pack_zstd_level: i32,
     pack_max_threads: Option<usize>,
     pack_memory_mb: u64,
+    pack_strategy: &str,
 ) -> Result<Vec<BenchmarkResult>> {
     let mut results = Vec::new();
     let version_count = num_deltas.max(1) + 1;
@@ -145,7 +146,7 @@ pub async fn run_update_scenario(
     fs::create_dir_all(&install_dir)?;
 
     let manifest_path = work_dir.join("update-bench.surge.yml");
-    write_bench_manifest(&manifest_path, &store_dir, app_id, &rid, pack_zstd_level)?;
+    write_bench_manifest(&manifest_path, &store_dir, app_id, &rid, pack_zstd_level, pack_strategy)?;
 
     let ctx = configure_benchmark_context(&store_dir, app_id, pack_zstd_level, pack_max_threads, pack_memory_mb)?;
 

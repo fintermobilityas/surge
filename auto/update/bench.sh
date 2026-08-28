@@ -15,6 +15,9 @@
 #   SCALE=0.05        payload scale (small: fast loop, real UpdateManager)
 #   SCENARIO=sdk-only localized churn (long-lived-install shape)
 #   NUM_DELTAS=20     chain length the single update walks
+#   STRATEGY=sparse-file-ops  delta strategy in the generated manifest
+#                     (production default; set archive-chunked-bsdiff to
+#                     measure the archive-level fallback shape)
 #   BENCH_SEED=42     payload PRNG seed (do not change without re-baselining)
 #   BENCH_RUNS=1      repeat the whole bench and record the median score
 set -euo pipefail
@@ -25,6 +28,7 @@ source config.sh
 SCALE="${SCALE:-0.05}"
 SCENARIO="${SCENARIO:-sdk-only}"
 NUM_DELTAS="${NUM_DELTAS:-20}"
+STRATEGY="${STRATEGY:-sparse-file-ops}"
 PACK_LEVEL="${PACK_LEVEL:-3}"
 PACK_MEMORY_MB="${PACK_MEMORY_MB:-256}"
 
@@ -40,6 +44,7 @@ for _ in $(seq 1 "$BENCH_RUNS"); do
     --num-deltas "$NUM_DELTAS" \
     --pack-zstd-level "$PACK_LEVEL" \
     --pack-memory-mb "$PACK_MEMORY_MB" \
+    --pack-strategy "$STRATEGY" \
     --seed "$BENCH_SEED" \
     --json >"$json"
   jsons+=("$json")
@@ -60,7 +65,7 @@ index_ms="$(bench_json "$first" "Release index update (avg)" duration)"
 metric="download_bytes=${download_bytes} delta_build_ms=${delta_build_ms} index_ms=${index_ms}"
 
 commit="$(bench_commit "${STATUS:-baseline}")"
-desc="scale=${SCALE} scenario=${SCENARIO} num_deltas=${NUM_DELTAS} seed=${BENCH_SEED} runs=${BENCH_RUNS}"
+desc="scale=${SCALE} scenario=${SCENARIO} num_deltas=${NUM_DELTAS} strategy=${STRATEGY} seed=${BENCH_SEED} runs=${BENCH_RUNS}"
 if [ "${#scores[@]}" -gt 1 ]; then
   desc="$desc scores=[${scores[*]}]"
 fi

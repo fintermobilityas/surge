@@ -225,7 +225,15 @@ pub async fn run_installer_scenario(
     fs::create_dir_all(&installers_dir)?;
 
     let manifest_path = work_dir.join("installer-bench.surge.yml");
-    write_bench_manifest(&manifest_path, &store_dir, app_id, &rid, pack_zstd_level)?;
+    // Installer bundles track the production default delta strategy.
+    write_bench_manifest(
+        &manifest_path,
+        &store_dir,
+        app_id,
+        &rid,
+        pack_zstd_level,
+        "sparse-file-ops",
+    )?;
     let ctx = configure_benchmark_context(&store_dir, app_id, pack_zstd_level, pack_max_threads, pack_memory_mb)?;
 
     let template = PayloadTemplate::new(scale, seed);

@@ -76,6 +76,11 @@ struct Args {
     #[arg(long, default_value = "256")]
     pack_memory_mb: u64,
 
+    /// Delta strategy written into the update-scenario manifest
+    /// (sparse-file-ops | archive-chunked-bsdiff | archive-bsdiff)
+    #[arg(long, default_value = "sparse-file-ops", value_name = "STRATEGY")]
+    pack_strategy: String,
+
     /// PRNG seed for reproducible payloads
     #[arg(long, default_value = "42")]
     seed: u64,
@@ -363,6 +368,7 @@ fn main() {
                 args.pack_zstd_level,
                 args.pack_max_threads,
                 args.pack_memory_mb,
+                &args.pack_strategy,
             ))
             .expect("update scenario");
         for result in &scenario_results {

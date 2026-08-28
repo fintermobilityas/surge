@@ -68,6 +68,7 @@ pub(super) fn write_bench_manifest(
     app_id: &str,
     rid: &str,
     pack_zstd_level: i32,
+    pack_strategy: &str,
 ) -> Result<()> {
     let manifest = format!(
         r"schema: 1
@@ -77,7 +78,7 @@ storage:
   prefix: {app_id}
 pack:
   delta:
-    strategy: sparse-file-ops
+    strategy: {pack_strategy}
   compression:
     format: zstd
     level: {pack_zstd_level}
@@ -90,7 +91,8 @@ apps:
     target:
       rid: {rid}
 ",
-        bucket = store_dir.display()
+        bucket = store_dir.display(),
+        pack_strategy = pack_strategy
     );
     fs::write(path, manifest)?;
     Ok(())

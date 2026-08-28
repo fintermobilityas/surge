@@ -133,18 +133,25 @@ Ranked by expected value; read `results.tsv` and
 `git log --oneline --all | grep -iE "dead end|autoresearch"` before
 starting any of these.
 
-1. **Knee-first chunking for the archive fallback only.** The knee is
-   real but archive-level (chained zstd stream). Candidate: apply the
-   knee-first derivation only to the `ArchiveChunkedBsdiff` path and
-   keep floor + full parallelism for `sparse-file-ops` (measured winner
-   for raw per-file diffs). Validate through the update surface with the
-   manifest strategy switched to `archive-chunked-bsdiff` — that is the
-   shape that actually pays the +76% today.
-2. **Patch compression level.** Patches are zstd-compressed at the pack
-   level; patches are far more compressible than archives. A higher
-   zstd level *on the patch only* may shrink download bytes at negligible
-   edge apply cost (decompression is the cheap half). Independent of
-   idea 1 — the sweep patches were all zstd-3.
+1. **CLOSED — Knee-first chunking for the archive fallback only.**
+   Measured through the real update chain at scale 1.0 / 20 deltas /
+   `archive-chunked-bsdiff` / 256 MiB budget on 48 cores: wire bytes
+   flat (+0.4%, 98,981 vs 98,597 B), 12x slower delta build (34,135 vs
+   2,822 ms), apply flat. The raw chunk-boundary byte tax (277 KB vs
+   158 KB patch) is redundant copy/seek structure that zstd crushes in
+   the packed pipeline — the microbench's raw-byte score overstates it.
+   Wire bytes are flat across 4-64 MiB chunks, so chunk policy is a
+   pure time lever and the current floor + parallel derivation is
+   correct as-is for both strategies. Do not retry either knee variant.
+2. **Patch compression level (top remaining candidate).** Patches are
+   zstd-compressed at the pack level; the wire-byte delta at scale 1.0
+   is ~5 KB per delta at level 3, i.e. the raw byte differences
+   measured above compress away. A higher zstd level *on the patch
+   only* is the only remaining wire-byte lever; expected headroom is
+   small (level 3 already crushes the literal tails), so measure it
+   through the update surface's `download_bytes` before spending
+   publisher CPU on it. This surface's raw patch-byte score will NOT
+   show the effect — use the update surface.
 3. **Parallelism/memory trade.** Subsumed by idea 1: the sweep showed
    diff time tracks the largest chunk under the thread count the budget
    allows, so the lever is the (chunk, threads) pair, not threads alone.
@@ -174,6 +181,16 @@ starting any of these.
   real update chain, 20 deltas, seed 42): byte-neutral (+0.4%),
   4.7x slower delta build, +23% client apply vs the current
   floor + full-parallel regime. The archive-level byte tax does not
-  transfer to raw per-file sparse diffs. Do not retry a global
-  knee-first derivation; only the strategy-scoped variant (idea 1)
-  remains open.
+  transfer to raw per-file sparse diffs.
+- **Knee-first scoped to `ArchiveChunkedBsdiff`** (scale 1.0 real
+  update chain, 20 deltas, seed 42, strategy `archive-chunked-bsdiff`):
+  wire bytes flat (+0.4%) and 12x slower delta build. The raw
+  chunk-boundary tax is masked by zstd in the packed pipeline; no
+  chunk size in 4-64 MiB moves download bytes. Both knee variants are
+  closed — do not retry.
+- **Metric caution:** the microbench score here is RAW patch bytes.
+  Wire cost is the zstd-compressed delta measured by the update
+  surface's `download_bytes`; the two diverge strongly for bsdiff
+  patches (redundant copy/seek structure compresses ~40:1). Always
+  gate on the update surface before treating raw bytes as the field
+  metric.

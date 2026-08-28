@@ -88,6 +88,12 @@ The autoresearch delta surface (`auto/delta/`) sweeps these via the
 
 ### Real update-manager chains
 
+The update scenario's manifest takes its delta strategy from
+`--pack-strategy` (default `sparse-file-ops`, the production default;
+use `archive-chunked-bsdiff` to measure the archive-level fallback
+shape). The `auto/update/` surface exposes it as the `STRATEGY` env
+knob.
+
 Localized long chain:
 
 ```bash

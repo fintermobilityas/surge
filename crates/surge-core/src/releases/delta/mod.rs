@@ -22,6 +22,7 @@ pub use self::format::{
     is_supported_delta, patch_format_from_magic_prefix,
 };
 pub use self::sparse_ops::build_sparse_file_patch;
+pub(crate) use self::sparse_ops::{apply_sparse_step_in_place, sparse_step_units_for};
 
 /// Progress information for CPU/disk work while applying one delta artifact.
 #[derive(Debug, Clone, Copy)]

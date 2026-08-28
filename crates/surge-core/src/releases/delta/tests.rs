@@ -2,8 +2,9 @@ use super::archive::{
     ARCHIVE_BSDIFF_MAGIC, ARCHIVE_CHUNKED_MAGIC, LEGACY_ARCHIVE_BSDIFF_MAGIC, LEGACY_ARCHIVE_CHUNKED_MAGIC,
     decode_archive_patch_payload,
 };
-use super::sparse_ops::SPARSE_FILE_OPS_MAGIC;
+use super::sparse_ops::{SPARSE_FILE_OPS_MAGIC, apply_sparse_file_patch_with_progress, apply_sparse_step_in_place};
 use super::*;
+use crate::archive::extractor::extract_to;
 use crate::archive::packer::ArchivePacker;
 use crate::crypto::sha256::sha256_hex;
 use crate::diff::chunked::ChunkedDiffOptions;
@@ -341,4 +342,56 @@ fn test_delta_target_archive_encoding_reads_archive_chunked_settings() {
 
     let encoding = delta_target_archive_encoding(&patch, &delta).unwrap();
     assert_eq!(encoding, Some((11, 4)));
+}
+
+#[test]
+fn test_in_place_chain_steps_match_single_shot_apply() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // v1: base; v2: config change; v3: model change.
+    let v1_dir = dir.path().join("v1");
+    let v2_dir = dir.path().join("v2");
+    let v3_dir = dir.path().join("v3");
+    for v in [&v1_dir, &v2_dir, &v3_dir] {
+        std::fs::create_dir_all(v.join("bin")).unwrap();
+        std::fs::create_dir_all(v.join("models")).unwrap();
+    }
+    for v in [&v1_dir, &v2_dir, &v3_dir] {
+        std::fs::write(v.join("bin").join("runtime.bin"), vec![b'A'; 256 * 1024]).unwrap();
+    }
+    std::fs::write(v1_dir.join("config.json"), br#"{"version":1}"#).unwrap();
+    std::fs::write(v2_dir.join("config.json"), br#"{"version":2}"#).unwrap();
+    std::fs::write(v3_dir.join("config.json"), br#"{"version":3}"#).unwrap();
+    std::fs::write(v3_dir.join("models").join("model.bin"), vec![b'M'; 256 * 1024]).unwrap();
+
+    let pack = |d: &std::path::Path| -> Vec<u8> {
+        let mut packer = ArchivePacker::new(7).unwrap();
+        packer.add_directory(d, "").unwrap();
+        packer.finalize().unwrap()
+    };
+    let full_v1 = pack(&v1_dir);
+    let full_v2 = pack(&v2_dir);
+    let full_v3 = pack(&v3_dir);
+
+    let opts = ChunkedDiffOptions {
+        chunk_size: 128 * 1024,
+        max_threads: 1,
+    };
+    let patch_12 = build_sparse_file_patch(&full_v1, &full_v2, 7, 0, &opts).unwrap();
+    let patch_23 = build_sparse_file_patch(&full_v2, &full_v3, 7, 0, &opts).unwrap();
+
+    // Single-shot reference: each delta applied to the previous archive.
+    let single_step1 = apply_sparse_file_patch_with_progress(&full_v1, &patch_12, None).unwrap();
+    assert_eq!(single_step1, full_v2);
+    let single_step2 = apply_sparse_file_patch_with_progress(&single_step1, &patch_23, None).unwrap();
+    assert_eq!(single_step2, full_v3);
+
+    // In-place chain: extract once, carry the tree across both steps.
+    let chain_dir = dir.path().join("chain");
+    std::fs::create_dir_all(&chain_dir).unwrap();
+    extract_to(&full_v1, &chain_dir, None).unwrap();
+    let chain_step1 = apply_sparse_step_in_place(&chain_dir, &patch_12, 0, None).unwrap();
+    assert_eq!(chain_step1, single_step1);
+    let chain_step2 = apply_sparse_step_in_place(&chain_dir, &patch_23, 0, None).unwrap();
+    assert_eq!(chain_step2, single_step2);
 }

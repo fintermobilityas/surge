@@ -2,11 +2,14 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::archive::extractor::extract_to;
 use crate::crypto::sha256::sha256_hex;
 use crate::error::{Result, SurgeError};
 use crate::releases::delta::{
-    DeltaApplyProgress, apply_delta_patch_with_progress, decode_delta_patch, is_supported_delta,
+    DeltaApplyProgress, apply_delta_patch_with_progress, apply_sparse_step_in_place, decode_delta_patch,
+    is_supported_delta, sparse_step_units_for,
 };
+use crate::releases::manifest::{DIFF_ALGORITHM_FILE_OPS, DeltaArtifact, PATCH_FORMAT_SPARSE_FILE_OPS_V1};
 
 use super::super::progress::{
     ProgressInfo, average_speed_bytes_per_sec, clamp_progress_percent, clamp_progress_percent_u64, emit_progress,
@@ -15,6 +18,11 @@ use super::super::progress::{
 use super::super::progress_substep::{PhaseProgressEmitter, labels as apply_phase};
 use super::super::{UpdateInfo, UpdateManager};
 use super::{VerifyFailureBudget, is_verification_failure};
+
+fn is_sparse_file_ops_delta(delta: &DeltaArtifact) -> bool {
+    delta.patch_format.eq_ignore_ascii_case(PATCH_FORMAT_SPARSE_FILE_OPS_V1)
+        && (delta.algorithm.trim().is_empty() || delta.algorithm.eq_ignore_ascii_case(DIFF_ALGORITHM_FILE_OPS))
+}
 
 pub(super) async fn apply_target_deltas<F>(
     manager: &UpdateManager,
@@ -33,6 +41,11 @@ where
     let apply_delta_started_at = Instant::now();
     let mut apply_delta_items_done = 0i64;
     let mut apply_delta_bytes_done = 0i64;
+    // Carried extracted tree for consecutive sparse deltas: the starting
+    // archive is extracted once and each step applies ops in place,
+    // skipping the per-step re-extract. Per-step repack and the full
+    // SHA-256 check below are unchanged.
+    let mut chain_workdir: Option<tempfile::TempDir> = None;
 
     progress_emitter.emit_substep(5, apply_phase::APPLYING_TARGET_DELTAS, 60);
     for release in &info.apply_releases {
@@ -105,18 +118,66 @@ where
             progress_emitter.persist_current_phase(apply_phase::APPLYING_TARGET_DELTAS);
         };
 
-        rebuilt_archive = apply_delta_patch_with_progress(&rebuilt_archive, &patch, &delta, Some(&delta_progress))
-            .map_err(|e| {
-                let error = SurgeError::Update(format!("Failed to apply delta {}: {e}", delta.filename));
-                if is_verification_failure(&error) {
-                    // A budget-exhausting failure returns the bounded-abort
-                    // error instead of the raw apply error.
-                    if let Err(abort) = verify_budget.record_failure(&error.to_string()) {
-                        return abort;
-                    }
+        let next_archive: Result<Vec<u8>> = if is_sparse_file_ops_delta(&delta) {
+            let (existing, needs_extract) = match chain_workdir.take() {
+                Some(wd) => (Some(wd), false),
+                None => (None, true),
+            };
+            let extract_units = if needs_extract {
+                u64::try_from(rebuilt_archive.len()).unwrap_or(u64::MAX).max(1)
+            } else {
+                0
+            };
+            let step_units = sparse_step_units_for(&patch, extract_units)?;
+            let total_units = extract_units.saturating_add(step_units);
+            let workdir = match existing {
+                Some(wd) => wd,
+                None => {
+                    let wd = tempfile::tempdir()?;
+                    let extract_progress = |items_done: u64, items_total: u64, bytes_done: u64, bytes_total: u64| {
+                        let frac = if bytes_total > 0 {
+                            bytes_done
+                                .checked_mul(1000)
+                                .and_then(|num| num.checked_div(bytes_total))
+                                .unwrap_or(1000)
+                        } else {
+                            items_done
+                                .checked_mul(1000)
+                                .and_then(|num| num.checked_div(items_total.max(1)))
+                                .unwrap_or(1000)
+                        };
+                        delta_progress(DeltaApplyProgress {
+                            units_done: extract_units.saturating_mul(frac) / 1000,
+                            units_total: total_units,
+                        });
+                    };
+                    extract_to(
+                        &rebuilt_archive,
+                        wd.path(),
+                        Some(&extract_progress as &crate::archive::extractor::ExtractProgress<'_>),
+                    )?;
+                    wd
                 }
-                error
-            })?;
+            };
+            let applied = apply_sparse_step_in_place(workdir.path(), &patch, extract_units, Some(&delta_progress))?;
+            chain_workdir = Some(workdir);
+            Ok(applied)
+        } else {
+            // A non-sparse hop rebuilds from archive bytes; the carried
+            // tree is stale at that point and gets dropped.
+            apply_delta_patch_with_progress(&rebuilt_archive, &patch, &delta, Some(&delta_progress))
+        };
+        rebuilt_archive = next_archive.map_err(|e| {
+            let error = SurgeError::Update(format!("Failed to apply delta {}: {e}", delta.filename));
+            if is_verification_failure(&error) {
+                // A budget-exhausting failure returns the bounded-abort
+                // error instead of the raw apply error.
+                if let Err(abort) = verify_budget.record_failure(&error.to_string()) {
+                    return abort;
+                }
+            }
+            error
+        })?;
 
         if !release.full_sha256.is_empty() {
             let hash = sha256_hex(&rebuilt_archive);

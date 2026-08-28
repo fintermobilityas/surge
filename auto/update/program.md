@@ -79,16 +79,22 @@ tree still matches.
 - sparse file-ops deltas, zstd 3, `max_chain_length` 8,
   `checkpoint_every` 10, keep 2 latest fulls (pack-policy defaults)
 - localized 100-delta chain at large scale (measured 2026-08-28):
-  download ≈ 510 KiB, full-chain apply ≈ 657 s worst-case walk
-  (archive-chunked reference: 15.6 MiB / ~18 s) —
-  `docs/performance/update-chains.md`
-- per-delta apply cost is **flat in chain depth** (measured with
-  `BENCH_STEP_TIMING=1`: ~6.4 s/delta constant across all 100 steps;
-  20-delta control under the same load ~6.3 s/delta). Per-step cost is
-  O(archive size) — extract + repack + hash per step — and ~3x
-  host-load sensitive. An earlier 2.2 s/delta reading was an idle-host
-  outlier, NOT a depth effect (corrects the initial superlinear
-  reading from the first 100-delta run)
+  download ≈ 510 KiB, full-chain apply ≈ 489 s with the carried-tree
+  walk (657 s before it; archive-chunked reference: 15.6 MiB / ~18 s)
+  — `docs/performance/update-chains.md`
+- **KEPT (this session): carried-tree chain apply.** The chain walker
+  extracts the starting archive once and applies consecutive sparse
+  deltas in place, keeping the per-step repack + full SHA-256 check.
+  Measured: 100-delta apply 657 s → 489 s (−26%), 20-delta 128.7 s →
+  100.7 s / 101.1 s (two runs, −22%), 0.25-scale 35.1 s → 28.2 s;
+  download bytes and installed payload byte-identical (unit
+  equivalence test + install-tree bench assertion). Per-step cost is
+  now ~4.8 s, dominated by the file-ops phase (~4.3 s) — the repack
+  + hash (~0.7 s) is what keeps per-step verification possible.
+- per-delta apply cost is flat in chain depth (measured with
+  `BENCH_STEP_TIMING=1`); per-step cost is CPU/IO-bound and ~3x
+  host-load sensitive (an idle-host 2.2 s/delta reading was a load
+  outlier, NOT a depth effect — see the correction history)
 - broad churn is bounded by file-aware deltas + full fallback
 - publisher cost for a 101-release chain ≈ 897 s under sparse
   (~337 s under archive-chunked) — retention policy still matters
@@ -110,15 +116,18 @@ Open questions from `docs/performance/update-chains.md`:
 Ranked by expected value; read `results.tsv` and
 `git log --oneline --all | grep -iE "dead end|autoresearch"` first.
 
-1. **Per-delta archive rebuild (top candidate, found by the 100-delta
-   per-step profile).** Each chain step re-extracts the full current
-   archive, applies the per-file ops, re-packs, and re-hashes —
-   O(archive size) per delta, CPU-bound and host-load sensitive
-   (~2.2 s/delta idle, ~6.4 s/delta loaded at scale 1.0). Candidate
-   shapes: extract once and apply ops across the chain against the
-   tree (repack once at the end), or apply against the installed tree
-   instead of rebuilding archives per step. A keep changes the apply
-   path, so the install-tree-assertion bench gate applies directly.
+1. **KEPT — Carried-tree chain apply (per-delta re-extract removed).**
+   The 100-delta per-step profile showed each step paying extract
+   (~1.0 s) + ops (~4.3 s) + repack (~0.6 s) + hash (~0.07 s). The
+   walker now carries the extracted tree across consecutive sparse
+   deltas: extract once, apply ops in place per step, repack +
+   SHA-256-verify per step (verification semantics unchanged).
+   Result: −22 to −26% apply across scales, payload byte-identical.
+   **Remaining shape (not worth it today):** applying against the
+   installed tree instead of rebuilding archives per step would also
+   remove the per-step repack + hash (~0.7 s, ~14% of the step), but
+   changes the apply flow and verification shape; with
+   `max_chain_length` = 8 the absolute win is small.
 2. **Verification cost.** SHA-256 over the full payload on the client is
    measured in the microbench (`SHA-256 (file)`). Sweep: verify-then-
    apply vs apply-then-verify ordering, streaming hashes during

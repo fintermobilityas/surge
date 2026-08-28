@@ -143,15 +143,18 @@ starting any of these.
    Wire bytes are flat across 4-64 MiB chunks, so chunk policy is a
    pure time lever and the current floor + parallel derivation is
    correct as-is for both strategies. Do not retry either knee variant.
-2. **Patch compression level (top remaining candidate).** Patches are
-   zstd-compressed at the pack level; the wire-byte delta at scale 1.0
-   is ~5 KB per delta at level 3, i.e. the raw byte differences
-   measured above compress away. A higher zstd level *on the patch
-   only* is the only remaining wire-byte lever; expected headroom is
-   small (level 3 already crushes the literal tails), so measure it
-   through the update surface's `download_bytes` before spending
-   publisher CPU on it. This surface's raw patch-byte score will NOT
-   show the effect — use the update surface.
+2. **CLOSED — Patch compression level.** Measured on 20 real
+   sparse-file-ops patch documents (scale 1.0 sdk-only): wire bytes
+   L9 −0.09% / L19 −0.97% vs L3, with L19 encode +38%. The
+   compressible part of an SFD1 patch is JSON structure, which L3
+   already crushes; the payload is bsdiff patch data with no level
+   headroom. Not worth a manifest/pack-policy knob. **With ideas 1-2
+   closed, the wire-byte axis (chunk size, zstd level) is exhausted
+   for this payload shape** — remaining headroom is format-level
+   (ideas 4-6) or a different payload shape (broad churn, many large
+   changed files). The large-scale validation owed to the update
+   surface is the 100-delta sparse chain rerun (see
+   `docs/performance/update-chains.md`, "When To Rerun").
 3. **Parallelism/memory trade.** Subsumed by idea 1: the sweep showed
    diff time tracks the largest chunk under the thread count the budget
    allows, so the lever is the (chunk, threads) pair, not threads alone.

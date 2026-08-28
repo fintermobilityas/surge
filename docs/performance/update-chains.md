@@ -18,9 +18,18 @@ That means the benchmark now measures:
 
 ## Current Findings
 
+> Measurement note: the figures below were recorded while the update
+> scenario ran the `archive-chunked-bsdiff` bench strategy. The bench
+> manifest now pins `sparse-file-ops`, the production default, so the
+> large-scale numbers are pending a rerun before they can be attributed
+> to the default strategy (see "When To Rerun"). Small-scale reference
+> under the new configuration: `sdk_only`, 20 deltas, scale 0.05 —
+> apply ≈ 8.5 s, download ≈ 102 KiB (48-core/251 GB host, seed 42).
+
 ### Localized long chains are acceptable
 
-Large anonymized profile, `sdk_only`, `100` deltas:
+Large anonymized profile, `sdk_only`, `100` deltas (measured under
+`archive-chunked-bsdiff` — see measurement note above):
 
 - client download stayed around `15.6 MiB`
 - client apply time was about `18s`
@@ -53,6 +62,10 @@ Meaning:
 
 ## What Is Not Solved Yet
 
+- the large-scale chain numbers above have not been re-measured under
+  the `sparse-file-ops` bench configuration; per-file apply was ~2.9x
+  slower than archive-chunked at small scale, so whether the 15.6 MiB /
+  18 s client figures hold at scale is open
 - retained full checkpoints still need long-history tuning in real feeds
 - broad-churn chains can still justify a fresh full checkpoint
 - local checkpoint retention policy may need calibration for very long-lived installs

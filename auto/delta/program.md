@@ -58,6 +58,9 @@ SCALE=0.25 SCENARIO=sdk-only ./bench.sh
   production default per-file `sparse-file-ops` patching is measured
   end to end by the update surface (`auto/update/`), which is also this
   surface's promotion gate.
+- chunk size and diff threads are knobs: `CHUNK_MB` (default 64) and
+  `DIFF_THREADS` (default 0 = memory-aware auto) pass through to
+  `--chunk-mb` / `--diff-threads` on `surge-bench`.
 - classic (non-chunked) bsdiff is skipped by default: it needs ~8x file
   size of RAM and is not the production default path. Set
   `INCLUDE_CLASSIC=1` to include it as a reference metric.
@@ -93,9 +96,21 @@ cargo run -p surge-bench --release -- --update-only --scale 1.0 \
 - fallback: patch >= full package → publish a full checkpoint instead
 - zstd level 3 was measured fastest on the calibrated large profile
   (see `docs/performance/pack-policy.md`)
-- baseline (b397c0c, 48-core/251 GB machine): 42,595-byte patch for the
-  v1→v2 archive at scale 0.25 sdk-only; chunked bsdiff 2,247 ms, chunked
-  bspatch 201 ms
+- baseline (4578166, 48-core/251 GB machine): 42,595-byte patch for the
+  v1→v2 archive at scale 0.25 sdk-only; chunked bsdiff 2,053 ms, chunked
+  bspatch 199 ms (chunk 64 MiB, threads auto)
+- chunk-size sweep (8/16/32/64/128 MiB, same session): bytes are flat at
+  64 and 128 (single-chunk regime, archive ≈ 40 MiB at this scale) and
+  **grow as chunks shrink** (58,145 B at 8 MiB, +36%) while diff time
+  **falls** (389 ms at 8 MiB, −82%). Cause: the zstd-compressed archive
+  is a chained stream — a localized mutation changes bytes from the
+  mutation point to the end, so smaller chunks both parallelize the
+  suffix-array build and cut cross-chunk copy opportunities, which bsdiff
+  would otherwise exploit
+- production does NOT run the 64 MiB default: `chunked_diff_options`
+  derives the chunk from the memory budget, so the operational 256 MiB
+  budget on a 48-core publisher clamps to 4 MiB — the byte-tax regime
+  the sweep measured, but at ~40 chunks on a large-scale archive
 
 ## Optimization Ideas
 
@@ -103,22 +118,24 @@ Ranked by expected value; read `results.tsv` and
 `git log --oneline --all | grep -iE "dead end|autoresearch"` before
 starting any of these.
 
-1. **Chunk-size sweep.** The 64 MiB default (and the budget-derived clamp)
-   is never tuned per workload. Sweep 8/16/32/64/128 MiB for both the
-   dominant-SDK and broad-churn shapes; chunk boundaries determine which
-   unchanged regions diff cleanly.
+1. **Chunk-size policy in `chunked_diff_options`.** The sweep shows the
+   64 MiB microbench default is a local bytes optimum while production
+   (256 MiB budget, many cores) clamps to 4 MiB and pays the byte tax.
+   Measure the bytes/time knee at large scale (scale 1.0, ~40+ chunks)
+   and tune `BYTES_PER_THREAD_FACTOR` / the 4 MiB clamp so the budget
+   derivation lands on the knee instead of the floor. Keep the memory
+   guardrail explicit.
 2. **Patch compression level.** Patches are zstd-compressed at the pack
    level; patches are far more compressible than archives. A higher
    zstd level *on the patch only* may shrink download bytes at negligible
    edge apply cost (decompression is the cheap half).
 3. **Parallelism/memory trade.** `max_threads` scales with the memory
-   budget (`/12` per thread). Measure the time/bytes knee; the edge
-   publisher (CI) and the edge node have very different budgets.
+   budget (`/12` per thread). The sweep showed diff time tracks the
+   largest chunk, not total work — the time lever is chunk granularity
+   under a memory cap, i.e. the same knee as idea 1.
 4. **bsdiff C-backend tuning.** Suffix-array construction dominates
-   classic bsdiff. Candidate: smaller rolling hash / block-restricted
-   matching for the localized-churn shape where most chunks are
-   unchanged (early-skip chunks whose hashes are identical before
-   diffing — needs a format version bump).
+   classic bsdiff. Candidate: early-skip chunks whose content hashes are
+   identical before diffing (needs a format version bump).
 5. **Per-file strategy heuristics.** Sparse ops already diff per file;
    consider skipping the diff entirely for files below a threshold where
    a full-file entry in the sparse patch would be smaller (measure the
@@ -130,6 +147,8 @@ starting any of these.
 
 ## Dead Ends to Respect
 
-None recorded yet. Record every failed attempt here (and in
-`results.tsv`) with the measured numbers so the next agent does not
-re-test it.
+- **Chunk-size sweep 8/16/32/64/128 MiB** (scale 0.25 sdk-only, session
+  of 4578166): no size beats 64 MiB on the score (patch bytes); smaller
+  chunks trade bytes for diff time (+36% bytes / −82% time at 8 MiB).
+  Do not re-sweep the same axis at this scale; the open question is the
+  knee at large scale under the production memory budget (idea 1).

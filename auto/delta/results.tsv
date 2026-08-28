@@ -1,2 +1,6 @@
 commit	score_patch_bytes	diff_ms_patch_ms	status	description
-4578166	42595	diff_ms=2053.0842740000003 patch_ms=199.086682	baseline	scale=0.25 scenario=sdk-only seed=42 runs=1
+4578166	42595	diff_ms=2053.0842740000003 patch_ms=199.086682	baseline	scale=0.25 scenario=sdk-only chunk_mb=64 diff_threads=0 seed=42 runs=1
+0000000	58145	diff_ms=389.368969 patch_ms=48.132181	discard	sweep point chunk_mb=8: bytes +36% (lost cross-chunk copy opportunities across the chained zstd stream; changed tail spans 3-5 chunks) but diff -82% (5 chunks parallel vs 1). Rejected as new default: score (bytes) regressed. scale=0.25 sdk-only seed=42
+0000000	50362	diff_ms=905.559973 patch_ms=95.97269299999999	discard	sweep point chunk_mb=16: bytes +18%, diff -58% (3 chunks). Rejected: score regressed. scale=0.25 sdk-only seed=42
+0000000	46460	diff_ms=1812.819885 patch_ms=177.168337	discard	sweep point chunk_mb=32: bytes +9%, diff -16% (2 chunks). Rejected: score regressed. scale=0.25 sdk-only seed=42
+0000000	42595	diff_ms=2174.7845780000002 patch_ms=210.21666199999999	discard	sweep point chunk_mb=128: identical to 64 (single-chunk regime: archive ~40 MiB < chunk). No information beyond the 64 MiB baseline. scale=0.25 sdk-only seed=42

@@ -201,11 +201,10 @@ pub fn run_installer_offline(v1_dir: &Path) -> BenchmarkResult {
     }
 }
 
-pub fn run_chunked_bsdiff(v1_data: &[u8], v2_data: &[u8]) -> (BenchmarkResult, Vec<u8>) {
+pub fn run_chunked_bsdiff(v1_data: &[u8], v2_data: &[u8], opts: &ChunkedDiffOptions) -> (BenchmarkResult, Vec<u8>) {
     let input_size = (v1_data.len() + v2_data.len()) as u64;
-    let opts = ChunkedDiffOptions::default();
 
-    let (patch, duration) = time(|| chunked::chunked_bsdiff(v1_data, v2_data, &opts).expect("chunked bsdiff failed"));
+    let (patch, duration) = time(|| chunked::chunked_bsdiff(v1_data, v2_data, opts).expect("chunked bsdiff failed"));
 
     let output_size = patch.len() as u64;
     (
@@ -219,12 +218,16 @@ pub fn run_chunked_bsdiff(v1_data: &[u8], v2_data: &[u8]) -> (BenchmarkResult, V
     )
 }
 
-pub fn run_chunked_bspatch(v1_data: &[u8], patch: &[u8], expected_size: u64) -> BenchmarkResult {
+pub fn run_chunked_bspatch(
+    v1_data: &[u8],
+    patch: &[u8],
+    expected_size: u64,
+    opts: &ChunkedDiffOptions,
+) -> BenchmarkResult {
     let input_size = (v1_data.len() + patch.len()) as u64;
-    let opts = ChunkedDiffOptions::default();
 
     let (_reconstructed, duration) =
-        time(|| chunked::chunked_bspatch(v1_data, patch, &opts).expect("chunked bspatch failed"));
+        time(|| chunked::chunked_bspatch(v1_data, patch, opts).expect("chunked bspatch failed"));
 
     BenchmarkResult {
         name: "chunked bspatch".to_string(),

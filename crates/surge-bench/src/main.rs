@@ -80,6 +80,14 @@ struct Args {
     #[arg(long, default_value = "42")]
     seed: u64,
 
+    /// Chunk size in MiB for the chunked bsdiff/bspatch microbench sections
+    #[arg(long, default_value_t = 64, value_name = "MB")]
+    chunk_mb: u64,
+
+    /// Max threads for the chunked bsdiff/bspatch microbench sections (0 = memory-aware auto)
+    #[arg(long, default_value_t = 0)]
+    diff_threads: usize,
+
     /// Emit JSON output instead of human-readable text
     #[arg(long)]
     json: bool,
@@ -284,6 +292,10 @@ fn main() {
 
         // 7-8. bsdiff/bspatch (classic + chunked)
         if !args.skip_diff {
+            let chunked_opts = surge_core::diff::chunked::ChunkedDiffOptions {
+                chunk_size: (args.chunk_mb.saturating_mul(1024 * 1024)).max(1) as usize,
+                max_threads: args.diff_threads,
+            };
             // Use the archives for diffing (more realistic than raw files)
             let mut packer_v2 = surge_core::archive::packer::ArchivePacker::new(3).expect("packer v2");
             packer_v2.add_directory(&generated.v2_dir, "").expect("add v2 dir");
@@ -311,7 +323,8 @@ fn main() {
             }
 
             // Chunked bsdiff
-            let (chunked_diff_result, chunked_patch) = runner::run_chunked_bsdiff(&first_archive, &archive_v2);
+            let (chunked_diff_result, chunked_patch) =
+                runner::run_chunked_bsdiff(&first_archive, &archive_v2, &chunked_opts);
             log!(
                 json_mode,
                 "  {} {}",
@@ -321,7 +334,7 @@ fn main() {
             results.push(chunked_diff_result);
 
             let chunked_patch_result =
-                runner::run_chunked_bspatch(&first_archive, &chunked_patch, archive_v2.len() as u64);
+                runner::run_chunked_bspatch(&first_archive, &chunked_patch, archive_v2.len() as u64, &chunked_opts);
             log!(
                 json_mode,
                 "  {} {}",

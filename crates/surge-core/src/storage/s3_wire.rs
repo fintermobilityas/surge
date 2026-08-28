@@ -62,7 +62,7 @@ pub(super) fn parse_list_objects_v2_xml(xml: &str) -> Result<ListResult> {
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) => {
-                let tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let tag = e.name().as_ref().to_string();
                 if tag == "Contents" {
                     in_contents = true;
                     current_key = None;
@@ -71,7 +71,7 @@ pub(super) fn parse_list_objects_v2_xml(xml: &str) -> Result<ListResult> {
                 current_tag = tag;
             }
             Ok(Event::End(ref e)) => {
-                let tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let tag = e.name().as_ref().to_string();
                 if tag == "Contents" {
                     if let Some(key) = current_key.take() {
                         entries.push(ListEntry {
@@ -84,7 +84,7 @@ pub(super) fn parse_list_objects_v2_xml(xml: &str) -> Result<ListResult> {
                 current_tag.clear();
             }
             Ok(Event::Text(ref e)) => {
-                let text = String::from_utf8_lossy(e.as_ref()).to_string();
+                let text = e.as_ref().to_string();
                 if in_contents {
                     match current_tag.as_str() {
                         "Key" => current_key = Some(text),

@@ -36,7 +36,7 @@ pub(super) fn parse_azure_list_blobs_xml(xml: &str) -> Result<ListResult> {
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) => {
-                let tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let tag = e.name().as_ref().to_string();
                 match tag.as_str() {
                     "Blob" => {
                         in_blob = true;
@@ -51,7 +51,7 @@ pub(super) fn parse_azure_list_blobs_xml(xml: &str) -> Result<ListResult> {
                 current_tag = tag;
             }
             Ok(Event::End(ref e)) => {
-                let tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let tag = e.name().as_ref().to_string();
                 match tag.as_str() {
                     "Blob" => {
                         if let Some(name) = current_name.take() {
@@ -71,7 +71,7 @@ pub(super) fn parse_azure_list_blobs_xml(xml: &str) -> Result<ListResult> {
                 current_tag.clear();
             }
             Ok(Event::Text(ref e)) => {
-                let text = String::from_utf8_lossy(e.as_ref()).to_string();
+                let text = e.as_ref().to_string();
                 if in_blob && !in_properties && current_tag == "Name" {
                     current_name = Some(text);
                 } else if in_properties && current_tag == "Content-Length" {

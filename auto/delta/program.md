@@ -118,6 +118,14 @@ cargo run -p surge-bench --release -- --update-only --scale 1.0 \
   The byte knee sits at ~64 MiB; the 256 MiB budget's 4 MiB clamp sits
   on the byte-curve floor. Publisher-side diff time is CI minutes, not
   fleet cost — the fleet pays the bytes on every node
+- the knee is archive-level: the production default `sparse-file-ops`
+  diffs raw files, where the byte tax does not exist (no chained zstd
+  stream inside a file). Measured: the knee-first derivation (21.3 MiB ×
+  1 thread at 256 MiB/48) vs current (4 MiB × 48) on the real update
+  chain at scale 0.25 — download bytes +0.4% (104,689 vs 104,305),
+  delta build 4.7x slower (7,918 vs 1,689 ms), client apply +23%
+  (45,170 vs 36,690 ms). The current floor + full-parallel regime wins
+  on both metrics for the default strategy
 
 ## Optimization Ideas
 
@@ -125,16 +133,13 @@ Ranked by expected value; read `results.tsv` and
 `git log --oneline --all | grep -iE "dead end|autoresearch"` before
 starting any of these.
 
-1. **Land the chunk derivation on the knee.** The knee is measured
-   (idea-1 sweeps above): bytes want ≥64 MiB, and the only thing keeping
-   production at 4 MiB is the shared 256 MiB budget. Candidate: the
-   publisher path uses the 64 MiB default chunk with threads derived
-   from the budget (1 thread at 256 MiB — 4.3 s diff, the byte knee),
-   while node-side local rebuilds keep the budget-derived small chunk
-   (time matters there, bytes do not). Measure through the update
-   surface (download bytes on the large chain) before keeping; this
-   changes published delta bytes fleet-wide, so the promotion gate is
-   mandatory.
+1. **Knee-first chunking for the archive fallback only.** The knee is
+   real but archive-level (chained zstd stream). Candidate: apply the
+   knee-first derivation only to the `ArchiveChunkedBsdiff` path and
+   keep floor + full parallelism for `sparse-file-ops` (measured winner
+   for raw per-file diffs). Validate through the update surface with the
+   manifest strategy switched to `archive-chunked-bsdiff` — that is the
+   shape that actually pays the +76% today.
 2. **Patch compression level.** Patches are zstd-compressed at the pack
    level; patches are far more compressible than archives. A higher
    zstd level *on the patch only* may shrink download bytes at negligible
@@ -165,3 +170,10 @@ starting any of these.
   (the production clamp) is the byte-curve floor at +76%. Do not
   re-sweep the axis; the open question is policy (idea 1): who gets
   which (chunk, threads) pair under which budget.
+- **Knee-first `chunked_diff_options` for all strategies** (scale 0.25
+  real update chain, 20 deltas, seed 42): byte-neutral (+0.4%),
+  4.7x slower delta build, +23% client apply vs the current
+  floor + full-parallel regime. The archive-level byte tax does not
+  transfer to raw per-file sparse diffs. Do not retry a global
+  knee-first derivation; only the strategy-scoped variant (idea 1)
+  remains open.

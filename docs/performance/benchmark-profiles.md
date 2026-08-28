@@ -77,6 +77,15 @@ Large:
 cargo run -p surge-bench --release -- --scale 1.0 --scenario full-release --zstd-levels 3 --skip-classic-diff --skip-installers --skip-update-scenario
 ```
 
+The microbench's chunked bsdiff/bspatch section also accepts:
+
+- `--chunk-mb <MB>` — chunk size for the chunked diff (default 64)
+- `--diff-threads <N>` — max threads for the chunked diff (default 0 =
+  memory-aware auto)
+
+The autoresearch delta surface (`auto/delta/`) sweeps these via the
+`CHUNK_MB` / `DIFF_THREADS` env knobs in its `bench.sh`.
+
 ### Real update-manager chains
 
 Localized long chain:

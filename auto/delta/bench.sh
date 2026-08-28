@@ -13,6 +13,8 @@
 #   BENCH_RUNS=1      repeat the whole bench and record the median score
 #   INCLUDE_CLASSIC=0 set 1 to also report classic (non-chunked) bsdiff as a
 #                     reference metric (needs ~8x file size of RAM, slower)
+#   CHUNK_MB=64       chunk size (MiB) for the chunked bsdiff/bspatch section
+#   DIFF_THREADS=0    max threads for that section (0 = memory-aware auto)
 set -euo pipefail
 SURFACE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$(dirname "$SURFACE_DIR")"
@@ -21,6 +23,8 @@ source config.sh
 SCALE="${SCALE:-0.25}"
 SCENARIO="${SCENARIO:-sdk-only}"
 LEVELS="${LEVELS:-3}"
+CHUNK_MB="${CHUNK_MB:-64}"
+DIFF_THREADS="${DIFF_THREADS:-0}"
 INCLUDE_CLASSIC="${INCLUDE_CLASSIC:-0}"
 
 ensure_bench_bin
@@ -42,6 +46,8 @@ for _ in $(seq 1 "$BENCH_RUNS"); do
     "${diff_flags[@]}" \
     --skip-installers \
     --skip-update-scenario \
+    --chunk-mb "$CHUNK_MB" \
+    --diff-threads "$DIFF_THREADS" \
     --seed "$BENCH_SEED" \
     --json >"$json"
   jsons+=("$json")
@@ -66,7 +72,7 @@ if [ "$INCLUDE_CLASSIC" = "1" ]; then
 fi
 
 commit="$(bench_commit "${STATUS:-baseline}")"
-desc="scale=${SCALE} scenario=${SCENARIO} seed=${BENCH_SEED} runs=${BENCH_RUNS}"
+desc="scale=${SCALE} scenario=${SCENARIO} chunk_mb=${CHUNK_MB} diff_threads=${DIFF_THREADS} seed=${BENCH_SEED} runs=${BENCH_RUNS}"
 if [ "${#scores[@]}" -gt 1 ]; then
   desc="$desc scores=[${scores[*]}]"
 fi

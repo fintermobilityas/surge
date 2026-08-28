@@ -1,2 +1,14 @@
 commit	score_patch_bytes	diff_ms_patch_ms	status	description
-4578166	42595	diff_ms=2053.0842740000003 patch_ms=199.086682	baseline	scale=0.25 scenario=sdk-only seed=42 runs=1
+4578166	42595	diff_ms=2053.0842740000003 patch_ms=199.086682	baseline	scale=0.25 scenario=sdk-only chunk_mb=64 diff_threads=0 seed=42 runs=1
+0000000	58145	diff_ms=389.368969 patch_ms=48.132181	discard	sweep(0.25) chunk_mb=8: bytes +36% / diff -82% (5 chunks parallel, cross-chunk copy loss on chained zstd stream). Rejected as default: score regressed. seed=42
+0000000	50362	diff_ms=905.559973 patch_ms=95.97269299999999	discard	sweep(0.25) chunk_mb=16: bytes +18% / diff -58%. Rejected: score regressed. seed=42
+0000000	46460	diff_ms=1812.819885 patch_ms=177.168337	discard	sweep(0.25) chunk_mb=32: bytes +9% / diff -16%. Rejected: score regressed. seed=42
+0000000	42595	diff_ms=2174.7845780000002 patch_ms=210.21666199999999	discard	sweep(0.25) chunk_mb=128: identical to 64 (single-chunk regime, archive ~40 MiB). No new information. seed=42
+0000000	277540	diff_ms=374.834465 patch_ms=90.441568	discard	sweep(1.0) chunk_mb=4 = production clamp under 256 MiB budget on 48 cores: bytes +76% vs 64 MiB, diff -91%. The budget-derived chunk lands on the byte-curve floor. seed=42
+0000000	212600	diff_ms=679.125049 patch_ms=132.600916	discard	sweep(1.0) chunk_mb=8: bytes +35% / diff -84% vs 64 MiB. seed=42
+0000000	181149	diff_ms=1209.258691 patch_ms=163.02510900000001	discard	sweep(1.0) chunk_mb=16: bytes +15% / diff -72% vs 64 MiB — knee region. seed=42
+0000000	165419	diff_ms=2289.99637 patch_ms=246.49731	discard	sweep(1.0) chunk_mb=32: bytes +5% / diff -47% vs 64 MiB. seed=42
+0000000	157939	diff_ms=4333.945966 patch_ms=388.635588	discard	sweep(1.0) chunk_mb=64: byte knee (further gains -2.4% at 128, -4.8% at 256 for 2.3x time). Reference point, not a landed change. seed=42
+0000000	154208	diff_ms=8532.583361 patch_ms=676.17158499999999	discard	sweep(1.0) chunk_mb=128: bytes -2.4% vs 64, diff 2x. Byte curve flattening. seed=42
+0000000	150284	diff_ms=9873.934232 patch_ms=763.86955	discard	sweep(1.0) chunk_mb=256: bytes -4.8% vs 64, diff 2.3x. Asymptote of the single-chunk regime. seed=42
+0000000	104689	before=104305 apply_before_ms=36690 apply_after_ms=45170 delta_build_before_ms=1689 delta_build_after_ms=7918	discard	knee-policy chunked_diff_options (chunk=budget/12=21.3 MiB, threads=1 at 256 MiB/48) vs current (4 MiB x 48): byte-neutral on per-file sparse-ops (+0.4% download) — the archive-level chunk-boundary byte tax does NOT transfer to raw per-file diffs (no chained zstd stream inside a file); single-threaded 21 MiB is 4.7x slower publisher-side and +23% client apply. Keep current floor+parallel regime for sparse-file-ops; the archive knee applies only to the ArchiveChunkedBsdiff fallback. scale=0.25 sdk-only num_deltas=20 seed=42

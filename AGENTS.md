@@ -132,9 +132,24 @@ If the local environment cannot run a listed command, document the exact gap in 
 
 ## Performance Memory
 - Benchmark and pack-policy memory lives under `docs/performance/`.
-- When changing pack defaults, delta strategy, `surge tune pack`, `surge-bench`, or `.github/workflows/benchmark.yml`, update the relevant files in `docs/performance/` in the same change.
+- When changing pack defaults, delta strategy, `surge tune pack`, `surge-bench`, or the `auto/` benchmark harnesses, update the relevant files in `docs/performance/` in the same change.
 - Keep benchmark payload descriptions anonymized and generic; do not add private product names or file names to docs, workflow labels, or benchmark fixtures.
-- Keep `.github/workflows/benchmark.yml` aligned with `docs/performance/benchmark-profiles.md` and `docs/performance/pack-policy.md`.
+
+## Autoresearch Methodology
+- "Autoresearch" in this repository means the iterative optimization loop rooted at `auto/`: define one metric, baseline it, propose one hypothesis, implement, measure, then record the result as `keep` or `discard`. Every experiment — successful or not — is recorded so the next agent does not repeat it.
+- Each autoresearch surface has its own folder under `auto/`:
+  - `program.md` — scope, constraints, baseline setup, metric definition, optimization ideas.
+  - `bench.sh` — the canonical benchmark for that surface, built on `surge-bench` (no ad hoc binaries); sources `auto/config.sh` for the shared build/seed/TSV helpers.
+  - `results.tsv` — append-only experiment log, one row per attempt: `commit  score  <metric>  status  description`. Use `0000000` as the commit field for `discard` entries that did not land, and the real short commit hash for `keep` and `baseline` rows.
+- Current surfaces — `auto/delta/` is the canonical surface when the user says "autoresearch" without further qualification:
+  - `auto/delta/` — delta patch size and diff/apply cost (bsdiff/chunked bsdiff, chunk sizing, patch compression); the core field-bandwidth and edge-apply cost.
+  - `auto/pack/` — full pack/archive build throughput and artifact size (zstd policy, packing layout); the publisher-side CI cost per release.
+  - `auto/update/` — end-to-end client update cost across a real delta chain (download bytes + apply time through the real `UpdateManager`); the number the fleet feels.
+- Reproducibility: `surge-bench` payloads are seeded (`--seed 42` by default; never change the seed without re-baselining). Re-baseline the reference configuration in the same session before claiming a win, and record medians (`BENCH_RUNS=3`) when the machine is shared. Do not claim cold-vs-warm or cross-machine deltas as wins.
+- **Before proposing a new optimization**, read the full `results.tsv` for the relevant surface plus recent dead-end commits (`git log --oneline --all | grep -iE "dead end|autoresearch"`).
+- **`keep`** means the same product behavior — byte-identical installed payload and release-index semantics for the same inputs — and a measurable score improvement that survives repeated runs on the same machine. **`discard`** means anything that changes behavior, breaks determinism, or fails to beat the same-session baseline. Record `discard` entries with enough detail (numbers, signatures, why) that the next agent does not re-test the idea.
+- Surface `program.md` files list a promotion gate (a larger or end-to-end `surge-bench` scenario) that must pass before a keep lands. Persistent findings that change defaults, policies, or tracked scenarios go to `docs/performance/` in the same change (see Performance Memory).
+- New surfaces follow the same pattern: one `program.md`, one `bench.sh` sourcing `auto/config.sh`, one `results.tsv` initialized with a measured baseline row.
 
 ## Anonymized Communication
 - In agent-authored issues, PRs, plans, summaries, and troubleshooting notes, use fictional placeholder names for products, customers, sites, hosts, and environments by default.

@@ -339,7 +339,7 @@ where
         return Ok(0);
     }
 
-    let pids = app_process_pids(protected_pid, &matches_exe);
+    let pids = app_process_pids(protected_pid, &matches_exe)?;
     if pids.is_empty() {
         return Ok(0);
     }
@@ -350,12 +350,12 @@ where
         }
     }
 
-    if wait_until_app_processes_exit(protected_pid, &matches_exe, Duration::from_secs(5)) {
+    if wait_until_app_processes_exit(protected_pid, &matches_exe, Duration::from_secs(5))? {
         info!(count = pids.len(), process_scope, "Terminated app processes");
         return Ok(pids.len());
     }
 
-    let remaining = app_process_pids(protected_pid, &matches_exe);
+    let remaining = app_process_pids(protected_pid, &matches_exe)?;
     for pid in &remaining {
         match signal_pid(*pid, Signal::SIGKILL) {
             Ok(()) | Err(Errno::ESRCH) => {}
@@ -365,7 +365,7 @@ where
         }
     }
 
-    if wait_until_app_processes_exit(protected_pid, &matches_exe, Duration::from_secs(2)) {
+    if wait_until_app_processes_exit(protected_pid, &matches_exe, Duration::from_secs(2))? {
         info!(
             count = pids.len(),
             forced = remaining.len(),
@@ -411,32 +411,31 @@ fn terminate_active_app_processes_except(
 }
 
 #[cfg(unix)]
-fn wait_until_app_processes_exit<F>(protected_pid: u32, matches_exe: &F, timeout: Duration) -> bool
+fn wait_until_app_processes_exit<F>(protected_pid: u32, matches_exe: &F, timeout: Duration) -> Result<bool>
 where
     F: Fn(&Path) -> bool,
 {
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        if app_process_pids(protected_pid, matches_exe).is_empty() {
-            return true;
+        if app_process_pids(protected_pid, matches_exe)?.is_empty() {
+            return Ok(true);
         }
         if std::time::Instant::now() >= deadline {
-            return false;
+            return Ok(false);
         }
         std::thread::sleep(Duration::from_millis(100));
     }
 }
 
-#[cfg(unix)]
-fn app_process_pids<F>(protected_pid: u32, matches_exe: &F) -> Vec<u32>
+#[cfg(target_os = "linux")]
+fn app_process_pids<F>(protected_pid: u32, matches_exe: &F) -> Result<Vec<u32>>
 where
     F: Fn(&Path) -> bool,
 {
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return Vec::new();
-    };
+    let entries = std::fs::read_dir("/proc")
+        .map_err(|e| SurgeError::Platform(format!("Failed to enumerate processes from /proc: {e}")))?;
 
-    entries
+    Ok(entries
         .filter_map(std::result::Result::ok)
         .filter_map(|entry| entry.file_name().to_string_lossy().parse::<u32>().ok())
         .filter(|pid| *pid != protected_pid)
@@ -445,7 +444,36 @@ where
                 .map(normalize_proc_exe_path)
                 .is_ok_and(|exe| matches_exe(&exe))
         })
-        .collect()
+        .collect())
+}
+
+#[cfg(target_os = "macos")]
+fn app_process_pids<F>(protected_pid: u32, matches_exe: &F) -> Result<Vec<u32>>
+where
+    F: Fn(&Path) -> bool,
+{
+    use sysinfo::{ProcessesToUpdate, System};
+
+    let mut system = System::new();
+    let _ = system.refresh_processes(ProcessesToUpdate::All, true);
+    Ok(system
+        .processes()
+        .iter()
+        .filter_map(|(pid, process)| {
+            let pid = pid.as_u32();
+            (pid != protected_pid && process.exe().is_some_and(matches_exe)).then_some(pid)
+        })
+        .collect())
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn app_process_pids<F>(_protected_pid: u32, _matches_exe: &F) -> Result<Vec<u32>>
+where
+    F: Fn(&Path) -> bool,
+{
+    Err(SurgeError::Platform(
+        "Active application process discovery is unsupported on this Unix platform".to_string(),
+    ))
 }
 
 #[cfg(unix)]
@@ -651,7 +679,7 @@ mod tests {
         ));
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn active_app_process_is_terminated_before_swap() {
         use std::os::unix::fs::PermissionsExt;
@@ -669,9 +697,9 @@ mod tests {
         let mut child = Command::new(&app_path).arg("30").spawn().unwrap();
         let child_pid = child.id();
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        while !std::fs::read_link(format!("/proc/{child_pid}/exe"))
-            .map(normalize_proc_exe_path)
-            .is_ok_and(|exe| is_active_app_exe(&active_app_dir, "demo", &exe))
+        while !app_process_pids(u32::MAX, &|exe| is_active_app_exe(&active_app_dir, "demo", exe))
+            .unwrap()
+            .contains(&child_pid)
         {
             assert!(
                 std::time::Instant::now() < deadline,

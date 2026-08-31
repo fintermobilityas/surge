@@ -578,27 +578,6 @@ mod tests {
         app_store
     }
 
-    fn write_app_scoped_release_index_with_current(
-        store_root: &Path,
-        app_id: &str,
-        index: &ReleaseIndex,
-        current_version: &str,
-    ) -> PathBuf {
-        let mut index = index.clone();
-        if !index.releases.iter().any(|release| release.version == current_version) {
-            let mut current = index.releases.first().cloned().unwrap_or_default();
-            current.version = current_version.to_string();
-            current.is_genesis = true;
-            current.full_filename.clear();
-            current.full_size = 0;
-            current.full_sha256.clear();
-            current.deltas.clear();
-            current.preferred_delta_id.clear();
-            index.releases.push(current);
-        }
-        write_app_scoped_release_index(store_root, app_id, &index)
-    }
-
     fn write_runtime_identity(active_app_dir: &Path, app_id: &str, version: &str, main_exe: &str, supervisor_id: &str) {
         let manifest_path = active_app_dir.join(crate::install::RUNTIME_MANIFEST_RELATIVE_PATH);
         std::fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();

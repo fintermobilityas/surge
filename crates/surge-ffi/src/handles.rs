@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use surge_core::config::manifest::InstallArtifactCachePolicy;
 use surge_core::context::Context;
 use surge_core::pack::builder::PackBuilder;
-use surge_core::update::manager::UpdateInfo;
+use surge_core::update::manager::{UpdateCheckState, UpdateInfo};
 
 use crate::utils::{lock_recover, to_lossy_cstring};
 
@@ -138,6 +138,9 @@ pub struct SurgeReleasesInfoHandle {
     /// Preserved for `surge_update_download_and_apply` to forward full
     /// `ReleaseEntry` data back to the core.
     pub update_info: Option<UpdateInfo>,
+    /// Preserves the current-release process identity resolved by the update
+    /// check even though the binding creates a fresh core manager to apply it.
+    pub update_check_state: Option<UpdateCheckState>,
 }
 
 impl SurgeReleasesInfoHandle {
@@ -200,6 +203,7 @@ mod tests {
             }],
             cached_strings: Vec::new(),
             update_info: None,
+            update_check_state: None,
         };
         info.cache_strings();
         assert_eq!(info.cached_strings.len(), 1);

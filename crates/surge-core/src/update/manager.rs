@@ -8,6 +8,7 @@ mod progress;
 mod progress_substep;
 mod release_index;
 
+use std::cmp::Ordering;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,6 +19,7 @@ use crate::config::manifest::{InstallArtifactCachePolicy, InstallArtifactCacheRe
 use crate::context::Context;
 use crate::error::{Result, SurgeError};
 use crate::releases::manifest::{ReleaseEntry, ReleaseIndex};
+use crate::releases::version::compare_versions;
 use crate::storage::{StorageBackend, create_storage_backend};
 use crate::update::status::{self, FailureContext, UpdateStatusRecord, UpdateWorkerGuard};
 
@@ -58,6 +60,19 @@ pub struct UpdateInfo {
     pub apply_strategy: ApplyStrategy,
     /// Reason a full update was selected when a delta path was unavailable.
     pub fallback_reason: Option<String>,
+}
+
+/// Opaque state produced by an update check and required to apply its result.
+///
+/// This is public so language bindings can preserve the check-time release
+/// identity when their ABI uses separate check and apply calls.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct UpdateCheckState {
+    app_id: String,
+    current_version: String,
+    channel: String,
+    current_release_identity: Option<ReleaseEntry>,
 }
 
 const DEFAULT_RELEASE_RETENTION_LIMIT: usize = 1;
@@ -142,6 +157,35 @@ impl UpdateManager {
     #[must_use]
     pub fn current_version(&self) -> &str {
         &self.current_version
+    }
+
+    /// Capture the check-time state needed to apply the returned update plan.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn capture_check_state(&self) -> UpdateCheckState {
+        UpdateCheckState {
+            app_id: self.app_id.clone(),
+            current_version: self.current_version.clone(),
+            channel: self.channel.clone(),
+            current_release_identity: self.current_release_identity.clone(),
+        }
+    }
+
+    /// Restore state captured by the manager that produced an update plan.
+    #[doc(hidden)]
+    pub fn restore_check_state(&mut self, state: &UpdateCheckState) -> Result<()> {
+        if self.app_id != state.app_id
+            || compare_versions(&self.current_version, &state.current_version) != Ordering::Equal
+            || self.channel != state.channel
+        {
+            return Err(SurgeError::Update(
+                "Update check state does not match the manager applying the update".to_string(),
+            ));
+        }
+
+        self.current_release_identity
+            .clone_from(&state.current_release_identity);
+        Ok(())
     }
 
     /// Return the number of versioned app snapshots retained after updates.

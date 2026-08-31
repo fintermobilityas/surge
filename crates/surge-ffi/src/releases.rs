@@ -133,6 +133,7 @@ mod tests {
             }],
             cached_strings: Vec::new(),
             update_info: None,
+            update_check_state: None,
         });
         info.cache_strings();
         Box::into_raw(info)

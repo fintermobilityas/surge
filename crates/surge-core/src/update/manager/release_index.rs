@@ -9,7 +9,6 @@ use crate::releases::delta::is_supported_delta;
 use crate::releases::manifest::{
     ReleaseEntry, ReleaseIndex, decompress_release_index, get_delta_chain, get_releases_newer_than,
 };
-use crate::releases::restore::find_release_for_version_rid;
 use crate::releases::version::compare_versions;
 use crate::storage::create_storage_backend;
 use crate::storage_config::append_prefix;
@@ -82,13 +81,17 @@ fn app_scoped_prefix(base_prefix: &str, app_id: &str) -> Option<String> {
 }
 
 pub(super) fn resolve_update_info(manager: &mut UpdateManager, index: ReleaseIndex) -> Result<Option<UpdateInfo>> {
+    let target_rid = current_rid();
+    let current_os = normalize_os_label(target_rid.split('-').next().unwrap_or_default());
+    manager.current_release_identity =
+        find_compatible_current_release(&index, &manager.current_version, &target_rid, &current_os).cloned();
     let planned = plan_update_from_index(
         &index,
         &manager.app_id,
         &manager.current_version,
         &manager.channel,
         None,
-        &current_rid(),
+        &target_rid,
     )?;
     manager.cached_index = Some(index);
     Ok(planned)
@@ -110,8 +113,6 @@ pub fn plan_update_from_index(
             index.app_id, app_id
         )));
     }
-
-    let current_release = find_release_for_version_rid(index, target_rid, current_version).cloned();
 
     let mut compatible_index = index.clone();
     compatible_index.releases.retain(|release| {
@@ -171,7 +172,6 @@ pub fn plan_update_from_index(
     );
 
     Ok(Some(UpdateInfo {
-        current_release,
         available_releases,
         latest_version,
         delta_available,
@@ -180,6 +180,27 @@ pub fn plan_update_from_index(
         apply_strategy,
         fallback_reason,
     }))
+}
+
+fn find_compatible_current_release<'a>(
+    index: &'a ReleaseIndex,
+    current_version: &str,
+    target_rid: &str,
+    current_os: &str,
+) -> Option<&'a ReleaseEntry> {
+    index
+        .releases
+        .iter()
+        .filter(|release| {
+            compare_versions(&release.version, current_version) == Ordering::Equal
+                && release_matches_rid(release, target_rid)
+                && release_matches_os(release, current_os)
+        })
+        .max_by_key(|release| {
+            let exact_rid = u8::from(release.rid == target_rid);
+            let exact_os = u8::from(!release.os.is_empty() && normalize_os_label(&release.os) == current_os);
+            (exact_rid + exact_os, exact_rid, exact_os)
+        })
 }
 
 fn resolve_supported_delta_chain(
@@ -271,8 +292,8 @@ pub(super) fn normalize_os_label(raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_delta_chain_for_current_install;
-    use crate::releases::manifest::{DeltaArtifact, ReleaseEntry};
+    use super::{find_compatible_current_release, resolve_delta_chain_for_current_install};
+    use crate::releases::manifest::{DeltaArtifact, ReleaseEntry, ReleaseIndex};
 
     fn release_with_deltas(version: &str, deltas: Vec<DeltaArtifact>) -> ReleaseEntry {
         ReleaseEntry {
@@ -357,5 +378,30 @@ mod tests {
         );
 
         assert!(resolve_delta_chain_for_current_install(&[&release], "1.0.0").is_none());
+    }
+
+    #[test]
+    fn current_release_selection_prefers_exact_target_metadata() {
+        let mut generic = release_with_deltas("1.0.0", Vec::new());
+        generic.os.clear();
+        generic.rid.clear();
+        generic.main_exe = "generic-app".to_string();
+
+        let mut wrong_target = release_with_deltas("1.0.0", Vec::new());
+        wrong_target.os = "windows".to_string();
+        wrong_target.rid = "win-x64".to_string();
+        wrong_target.main_exe = "wrong-app".to_string();
+
+        let mut exact = release_with_deltas("1.0.0", Vec::new());
+        exact.main_exe = "linux-app".to_string();
+
+        let index = ReleaseIndex {
+            releases: vec![generic, wrong_target, exact],
+            ..ReleaseIndex::default()
+        };
+
+        let selected =
+            find_compatible_current_release(&index, "1.0", "linux-x64", "linux").expect("matching current release");
+        assert_eq!(selected.main_exe, "linux-app");
     }
 }

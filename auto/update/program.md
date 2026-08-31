@@ -97,7 +97,9 @@ tree still matches.
   outlier, NOT a depth effect — see the correction history)
 - broad churn is bounded by file-aware deltas + full fallback
 - publisher cost for a 101-release chain ≈ 897 s under sparse
-  (~337 s under archive-chunked) — retention policy still matters
+  (~337 s under archive-chunked); identity-chunk patches (v2) cut the
+  same session's 100-delta publish to ~725 s (−14%) — retention
+  policy still matters
 - baseline (b397c0c, 48-core/251 GB machine, scale 0.05, 20 deltas):
   apply 8,569 ms, download 104,328 bytes, delta build 810 ms
 - small-scale strategy reference: `archive-chunked-bsdiff` applied the
@@ -116,6 +118,18 @@ Open questions from `docs/performance/update-chains.md`:
 Ranked by expected value; read `results.tsv` and
 `git log --oneline --all | grep -iE "dead end|autoresearch"` first.
 
+0. **KEPT — Identity-chunk chunked patches (format v2, `CSDF`).**
+   Phase instrumentation of a 100-delta step showed the "ops" cost
+   was ~3.5-5.0 s of chunked `bspatch` re-deriving 15 of 16
+   unchanged 64 MiB chunks of the 1 GB file (the actual change: one
+   4 KiB page). Format v2 adds a per-chunk identity bitset: the diff
+   side skips bsdiff for identical chunks (memcmp instead of a
+   suffix array), the apply side copies unchanged chunks straight
+   through. v1 patches still apply; v2 patches fail closed on v1
+   readers via the version byte. Same-session 100-delta A/B: apply
+   480,505 → 223,108/218,318 ms (−54%, 2.2% spread), publish
+   846,109 → 707,846/741,469 ms (−14%), download 522,171 →
+   503,524 B (−3.6%, deterministic), install tree byte-identical.
 1. **KEPT — Carried-tree chain apply (per-delta re-extract removed).**
    The 100-delta per-step profile showed each step paying extract
    (~1.0 s) + ops (~4.3 s) + repack (~0.6 s) + hash (~0.07 s). The
@@ -128,11 +142,21 @@ Ranked by expected value; read `results.tsv` and
    remove the per-step repack + hash (~0.7 s, ~14% of the step), but
    changes the apply flow and verification shape; with
    `max_chain_length` = 8 the absolute win is small.
-2. **Verification cost.** SHA-256 over the full payload on the client is
-   measured in the microbench (`SHA-256 (file)`). Sweep: verify-then-
-   apply vs apply-then-verify ordering, streaming hashes during
-   download, and whether the delta's embedded hashes let us skip
-   re-hashing untouched files in sparse ops.
+2. **Verification cost (top candidate after v2).** The per-step
+   profile now shows the ops phase at ~`2 s`: one full read/write of
+   the changed file plus two full-file SHA-256 passes (basis +
+   target). The target hash of step N is exactly the basis hash of
+   step N+1, so a cross-step verified-hash cache carried through
+   `apply_target_deltas` would remove one full-file hash per step
+   (~0.55 s at scale 1.0) without weakening verification (every file
+   state is still hash-verified before it is used as a basis — just
+   not twice). The in-step target hash can also be streamed into the
+   bspatch write to remove the second full read.
+3. **Verification cost (general).** SHA-256 over the full payload on
+   the client is measured in the microbench (`SHA-256 (file)`).
+   Sweep: verify-then-apply vs apply-then-verify ordering, streaming
+   hashes during download, and whether the delta's embedded hashes
+   let us skip re-hashing untouched files in sparse ops.
 3. **Checkpoint reuse.** Local cache retention (`keepFullCount: 1`)
    decides whether a chain walk rebuilds fulls from deltas or reuses a
    cached checkpoint. Measure the apply-time knee as a function of

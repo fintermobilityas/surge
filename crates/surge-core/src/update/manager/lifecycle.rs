@@ -298,6 +298,10 @@ pub(super) fn terminate_superseded_app_processes(
     terminate_superseded_app_processes_except(install_dir, active_app_dir, main_exe, current_pid())
 }
 
+pub(super) fn terminate_active_app_processes_before_swap(active_app_dir: &Path, main_exe: &str) -> Result<usize> {
+    terminate_active_app_processes_except(active_app_dir, main_exe, current_pid())
+}
+
 #[cfg(unix)]
 fn terminate_superseded_app_processes_except(
     install_dir: &Path,
@@ -305,6 +309,28 @@ fn terminate_superseded_app_processes_except(
     main_exe: &str,
     protected_pid: u32,
 ) -> Result<usize> {
+    terminate_matching_app_processes(main_exe, protected_pid, "superseded", |exe| {
+        is_superseded_app_exe(install_dir, active_app_dir, main_exe, exe)
+    })
+}
+
+#[cfg(unix)]
+fn terminate_active_app_processes_except(active_app_dir: &Path, main_exe: &str, protected_pid: u32) -> Result<usize> {
+    terminate_matching_app_processes(main_exe, protected_pid, "active", |exe| {
+        is_active_app_exe(active_app_dir, main_exe, exe)
+    })
+}
+
+#[cfg(unix)]
+fn terminate_matching_app_processes<F>(
+    main_exe: &str,
+    protected_pid: u32,
+    process_scope: &'static str,
+    matches_exe: F,
+) -> Result<usize>
+where
+    F: Fn(&Path) -> bool,
+{
     use nix::errno::Errno;
     use nix::sys::signal::Signal;
 
@@ -313,58 +339,44 @@ fn terminate_superseded_app_processes_except(
         return Ok(0);
     }
 
-    let pids = superseded_app_process_pids(install_dir, active_app_dir, main_exe, protected_pid);
+    let pids = app_process_pids(protected_pid, &matches_exe);
     if pids.is_empty() {
         return Ok(0);
     }
 
     for pid in &pids {
         if let Err(e) = signal_pid(*pid, Signal::SIGTERM) {
-            warn!(pid, error = %e, "Failed to request stale app process termination");
+            warn!(pid, error = %e, process_scope, "Failed to request app process termination");
         }
     }
 
-    if wait_until_superseded_processes_exit(
-        install_dir,
-        active_app_dir,
-        main_exe,
-        protected_pid,
-        Duration::from_secs(5),
-    ) {
-        info!(
-            count = pids.len(),
-            "Terminated stale app processes from superseded install directories"
-        );
+    if wait_until_app_processes_exit(protected_pid, &matches_exe, Duration::from_secs(5)) {
+        info!(count = pids.len(), process_scope, "Terminated app processes");
         return Ok(pids.len());
     }
 
-    let remaining = superseded_app_process_pids(install_dir, active_app_dir, main_exe, protected_pid);
+    let remaining = app_process_pids(protected_pid, &matches_exe);
     for pid in &remaining {
         match signal_pid(*pid, Signal::SIGKILL) {
             Ok(()) | Err(Errno::ESRCH) => {}
             Err(e) => {
-                warn!(pid, error = %e, "Failed to force-kill stale app process");
+                warn!(pid, error = %e, process_scope, "Failed to force-kill app process");
             }
         }
     }
 
-    if wait_until_superseded_processes_exit(
-        install_dir,
-        active_app_dir,
-        main_exe,
-        protected_pid,
-        Duration::from_secs(2),
-    ) {
+    if wait_until_app_processes_exit(protected_pid, &matches_exe, Duration::from_secs(2)) {
         info!(
             count = pids.len(),
             forced = remaining.len(),
-            "Force-killed stale app processes from superseded install directories"
+            process_scope,
+            "Force-killed app processes"
         );
         return Ok(pids.len());
     }
 
     Err(SurgeError::Platform(format!(
-        "Timed out waiting for stale '{main_exe}' processes from superseded install directories to exit"
+        "Timed out waiting for {process_scope} '{main_exe}' processes to exit"
     )))
 }
 
@@ -389,17 +401,23 @@ fn terminate_superseded_app_processes_except(
     Ok(0)
 }
 
+#[cfg(not(unix))]
+fn terminate_active_app_processes_except(
+    _active_app_dir: &Path,
+    _main_exe: &str,
+    _protected_pid: u32,
+) -> Result<usize> {
+    Ok(0)
+}
+
 #[cfg(unix)]
-fn wait_until_superseded_processes_exit(
-    install_dir: &Path,
-    active_app_dir: &Path,
-    main_exe: &str,
-    protected_pid: u32,
-    timeout: Duration,
-) -> bool {
+fn wait_until_app_processes_exit<F>(protected_pid: u32, matches_exe: &F, timeout: Duration) -> bool
+where
+    F: Fn(&Path) -> bool,
+{
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        if superseded_app_process_pids(install_dir, active_app_dir, main_exe, protected_pid).is_empty() {
+        if app_process_pids(protected_pid, matches_exe).is_empty() {
             return true;
         }
         if std::time::Instant::now() >= deadline {
@@ -410,12 +428,10 @@ fn wait_until_superseded_processes_exit(
 }
 
 #[cfg(unix)]
-fn superseded_app_process_pids(
-    install_dir: &Path,
-    active_app_dir: &Path,
-    main_exe: &str,
-    protected_pid: u32,
-) -> Vec<u32> {
+fn app_process_pids<F>(protected_pid: u32, matches_exe: &F) -> Vec<u32>
+where
+    F: Fn(&Path) -> bool,
+{
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return Vec::new();
     };
@@ -427,7 +443,7 @@ fn superseded_app_process_pids(
         .filter(|pid| {
             std::fs::read_link(format!("/proc/{pid}/exe"))
                 .map(normalize_proc_exe_path)
-                .is_ok_and(|exe| is_superseded_app_exe(install_dir, active_app_dir, main_exe, &exe))
+                .is_ok_and(|exe| matches_exe(&exe))
         })
         .collect()
 }
@@ -439,6 +455,11 @@ fn normalize_proc_exe_path(path: PathBuf) -> PathBuf {
         path_text.strip_suffix(" (deleted)").map(PathBuf::from)
     };
     normalized.unwrap_or(path)
+}
+
+#[cfg(unix)]
+fn is_active_app_exe(active_app_dir: &Path, main_exe: &str, exe: &Path) -> bool {
+    exe == active_app_dir.join(main_exe)
 }
 
 #[cfg(unix)]
@@ -628,6 +649,42 @@ mod tests {
             "demo",
             Path::new("/srv/other/app-1.0.0/demo")
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn active_app_process_is_terminated_before_swap() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let active_app_dir = tmp.path().join("app");
+        std::fs::create_dir_all(&active_app_dir).unwrap();
+        let app_path = active_app_dir.join("demo");
+        std::fs::copy("/bin/sleep", &app_path).unwrap();
+        let mut permissions = std::fs::metadata(&app_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&app_path, permissions).unwrap();
+
+        let mut child = Command::new(&app_path).arg("30").spawn().unwrap();
+        let child_pid = child.id();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !std::fs::read_link(format!("/proc/{child_pid}/exe"))
+            .map(normalize_proc_exe_path)
+            .is_ok_and(|exe| is_active_app_exe(&active_app_dir, "demo", &exe))
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "test child did not enter the active app path"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let terminated = terminate_active_app_processes_except(&active_app_dir, "demo", u32::MAX).unwrap();
+        let status = child.wait().unwrap();
+
+        assert_eq!(terminated, 1);
+        assert!(!status.success());
     }
 
     #[cfg(unix)]

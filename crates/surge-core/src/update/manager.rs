@@ -2123,6 +2123,12 @@ echo started > new-child-started
             .map(|progress| progress.phase_label)
             .collect();
         assert!(
+            finalize_labels.contains(&finalize_phase::QUIESCING_ACTIVE_APP),
+            "expected finalize substep '{}' in {:?}",
+            finalize_phase::QUIESCING_ACTIVE_APP,
+            finalize_labels
+        );
+        assert!(
             finalize_labels.contains(&finalize_phase::PREPARING_SWAP),
             "expected finalize substep '{}' in {:?}",
             finalize_phase::PREPARING_SWAP,
@@ -2247,6 +2253,14 @@ echo started > new-child-started
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
 
+        assert!(
+            observed_phases
+                .iter()
+                .any(|phase| phase.as_deref() == Some(finalize_phase::QUIESCING_ACTIVE_APP)),
+            "expected current_phase to include '{}' in {:?}",
+            finalize_phase::QUIESCING_ACTIVE_APP,
+            observed_phases,
+        );
         assert!(
             observed_phases
                 .iter()

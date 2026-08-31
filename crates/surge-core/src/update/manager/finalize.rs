@@ -81,6 +81,9 @@ where
         lifecycle::request_supervisor_shutdown(&manager.install_dir, &latest.supervisor_id).await?;
     }
 
+    progress_emitter.emit_substep(6, finalize_phase::QUIESCING_ACTIVE_APP, 92);
+    lifecycle::terminate_active_app_processes_before_swap(&active_app_dir, &latest.main_exe)?;
+
     progress_emitter.emit_substep(6, finalize_phase::PREPARING_SWAP, 92);
     if next_app_dir.exists() {
         tokio::fs::remove_dir_all(&next_app_dir).await?;

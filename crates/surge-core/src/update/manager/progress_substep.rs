@@ -34,6 +34,7 @@ pub(crate) mod labels {
     pub const EXTRACTING_REBUILT_PACKAGE: &str = "extracting rebuilt package";
     pub const PACKAGE_APPLY_COMPLETED: &str = "package apply completed";
     pub const STOPPING_SUPERVISOR: &str = "stopping supervisor";
+    pub const QUIESCING_ACTIVE_APP: &str = "quiescing active app before swap";
     pub const PREPARING_SWAP: &str = "preparing app swap";
     pub const SWAPPING_APP_DIRECTORY: &str = "swapping app directory";
     pub const COPYING_PERSISTENT_ASSETS: &str = "copying persistent assets";

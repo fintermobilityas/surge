@@ -17,7 +17,14 @@ enum Interpreter {
 impl Identity {
     pub(super) fn matches_interpreter(&self, executable: &Path, argv0: Option<&OsStr>) -> bool {
         match &self.interpreter {
-            Interpreter::Resolved(expected) => executable == expected,
+            Interpreter::Resolved(expected) => {
+                executable == expected
+                    || argv0.is_some_and(|argument| {
+                        let argument = Path::new(argument);
+                        argument.is_absolute()
+                            && std::fs::canonicalize(argument).is_ok_and(|resolved| resolved == *expected)
+                    })
+            }
             Interpreter::EnvCommand(expected) => argv0 == Some(expected.as_os_str()),
         }
     }
@@ -87,6 +94,7 @@ fn parse_env_command(argument: &str) -> Result<Vec<String>> {
         .map(str::trim_start);
     let command = split_command.unwrap_or(argument);
     let words = split_command_words(command)?;
+    #[cfg(not(target_os = "macos"))]
     if split_command.is_none() && words.len() > 1 {
         return Err(SurgeError::Platform(
             "Active application env shebang with multiple arguments must use -S".to_string(),

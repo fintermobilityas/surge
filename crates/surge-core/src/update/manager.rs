@@ -4477,6 +4477,74 @@ echo started > new-child-started
         assert!(!install_root.join(".surge-app-prev").exists());
     }
 
+    #[tokio::test]
+    async fn test_download_and_apply_handles_missing_current_release_identity_by_platform() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("store");
+        let install_root = tmp.path().join("install");
+        let app_id = "test-app";
+        std::fs::create_dir_all(&store_root).unwrap();
+        std::fs::create_dir_all(&install_root).unwrap();
+        let app_store = app_scoped_store_root(&store_root, app_id);
+
+        let active_app_dir = install_root.join("app");
+        std::fs::create_dir_all(&active_app_dir).unwrap();
+        std::fs::write(active_app_dir.join("old-app"), "old payload").unwrap();
+
+        let rid = current_rid();
+        let full_filename = format!("{app_id}-1.1.0-{rid}-full.tar.zst");
+        let full_path = app_store.join(&full_filename);
+        let mut packer = ArchivePacker::new(3).unwrap();
+        packer.add_buffer("new-app", b"new payload", 0o755).unwrap();
+        packer.finalize_to_file(&full_path).unwrap();
+
+        let mut latest = make_entry("1.1.0", "stable", &current_os_label_for_tests(), &rid);
+        latest.is_genesis = true;
+        latest.main_exe = "new-app".to_string();
+        latest.full_filename = full_filename;
+        latest.full_size = std::fs::metadata(&full_path).unwrap().len() as i64;
+        latest.full_sha256 = sha256_hex_file(&full_path).unwrap();
+        latest.deltas.clear();
+        latest.preferred_delta_id.clear();
+        let index = ReleaseIndex {
+            app_id: app_id.to_string(),
+            releases: vec![latest],
+            ..ReleaseIndex::default()
+        };
+        write_app_scoped_release_index(&store_root, app_id, &index);
+
+        let ctx = Arc::new(Context::new());
+        ctx.set_storage(
+            StorageProvider::Filesystem,
+            store_root.to_str().unwrap(),
+            "",
+            "",
+            "",
+            "",
+        );
+        let mut manager = UpdateManager::new(ctx, app_id, "1.0.0", "stable", install_root.to_str().unwrap()).unwrap();
+        let info = manager.check_for_updates().await.unwrap().unwrap();
+        assert!(manager.current_release_identity.is_none());
+
+        let result = manager.download_and_apply(&info, None::<fn(ProgressInfo)>).await;
+
+        #[cfg(unix)]
+        {
+            let error = result.unwrap_err();
+            assert!(error.to_string().contains("Current release 1.0.0 is unavailable"));
+            assert_eq!(
+                std::fs::read_to_string(active_app_dir.join("old-app")).unwrap(),
+                "old payload"
+            );
+            assert!(!active_app_dir.join("new-app").exists());
+        }
+        #[cfg(not(unix))]
+        {
+            result.unwrap();
+            assert!(active_app_dir.join("new-app").is_file());
+        }
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn test_download_and_apply_quiesces_installed_executable_when_target_name_changes() {

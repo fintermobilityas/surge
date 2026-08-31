@@ -288,6 +288,10 @@ fn is_active_app_process(
     process: &AppProcess,
 ) -> bool {
     is_active_app_exe(active_exe, &process.exe)
+        || process
+            .command
+            .first()
+            .is_some_and(|argument| process_argument_resolves_to(argument, process.cwd.as_deref(), active_exe))
         || interpreted_main.is_some_and(|identity| {
             identity.matches_interpreter(&process.exe, process.command.first().map(OsString::as_os_str))
                 && process
@@ -453,10 +457,7 @@ mod tests {
             let interpreter_dir = tmp.path().join("child-path");
             std::fs::create_dir_all(&interpreter_dir).unwrap();
             let interpreter_path = interpreter_dir.join(interpreter_name);
-            std::fs::copy("/bin/sh", &interpreter_path).unwrap();
-            let mut permissions = std::fs::metadata(&interpreter_path).unwrap().permissions();
-            permissions.set_mode(0o755);
-            std::fs::set_permissions(&interpreter_path, permissions).unwrap();
+            std::os::unix::fs::symlink("/bin/sh", &interpreter_path).unwrap();
             let updater_path = std::env::var_os("PATH").unwrap_or_default();
             let mut child_paths = vec![interpreter_dir];
             child_paths.extend(std::env::split_paths(&updater_path));
@@ -563,5 +564,10 @@ mod tests {
     #[test]
     fn direct_interpreted_app_with_multiple_options_is_terminated_before_swap() {
         assert_interpreted_active_app_process_is_terminated_before_swap("#!/bin/sh -e -u", None);
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn env_interpreted_app_with_multiple_options_is_terminated_before_swap() {
+        assert_interpreted_active_app_process_is_terminated_before_swap("#!/usr/bin/env /bin/sh -e -u", None);
     }
 }

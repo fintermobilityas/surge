@@ -1,5 +1,3 @@
-#[cfg(unix)]
-use std::io::Read;
 use std::path::Path;
 #[cfg(unix)]
 use std::time::Duration;
@@ -18,6 +16,8 @@ use crate::error::Result;
 use crate::error::SurgeError;
 use crate::platform::process::current_pid;
 
+#[cfg(unix)]
+mod interpreted_main;
 pub(in crate::update::manager) fn terminate_superseded_app_processes(
     install_dir: &Path,
     active_app_dir: &Path,
@@ -85,14 +85,9 @@ fn terminate_active_app_processes_except(
             "The updater is running from the active application executable; in-process swap explicitly allowed, quiescing other active application processes only"
         );
     }
-    let interpreted_main = is_interpreted_main(&active_exe)?;
-    if interpreted_main {
-        return Err(SurgeError::Platform(
-            "Cannot safely quiesce an interpreted active application executable before swap".to_string(),
-        ));
-    }
+    let interpreted_main = interpreted_main::resolve(&active_exe)?;
     terminate_matching_app_processes(main_exe, protected_pid, "active", |process| {
-        is_active_app_process(&active_exe, interpreted_main, process)
+        is_active_app_process(&active_exe, interpreted_main.as_ref(), process)
     })
 }
 
@@ -287,30 +282,19 @@ pub(in crate::update::manager) fn wait_for_native_test_app(app_path: &Path, chil
 }
 
 #[cfg(unix)]
-fn is_interpreted_main(active_exe: &Path) -> Result<bool> {
-    let mut file = std::fs::File::open(active_exe).map_err(|e| {
-        SurgeError::Platform(format!(
-            "Failed to inspect active application executable before swap: {e}"
-        ))
-    })?;
-    let mut prefix = [0_u8; 2];
-    let read = file.read(&mut prefix).map_err(|e| {
-        SurgeError::Platform(format!(
-            "Failed to inspect active application executable before swap: {e}"
-        ))
-    })?;
-    Ok(read == prefix.len() && prefix == *b"#!")
-}
-
-#[cfg(unix)]
-fn is_active_app_process(active_exe: &Path, interpreted_main: bool, process: &AppProcess) -> bool {
+fn is_active_app_process(
+    active_exe: &Path,
+    interpreted_main: Option<&interpreted_main::Identity>,
+    process: &AppProcess,
+) -> bool {
     is_active_app_exe(active_exe, &process.exe)
-        || interpreted_main
-            && process
-                .command
-                .iter()
-                .take(3)
-                .any(|argument| process_argument_resolves_to(argument, process.cwd.as_deref(), active_exe))
+        || interpreted_main.is_some_and(|identity| {
+            process.exe == identity.interpreter
+                && process
+                    .command
+                    .get(identity.script_argument_index)
+                    .is_some_and(|argument| process_argument_resolves_to(argument, process.cwd.as_deref(), active_exe))
+        })
 }
 
 #[cfg(unix)]
@@ -455,8 +439,7 @@ mod tests {
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn interpreted_active_app_refuses_swap_without_signalling_running_process() {
+    fn assert_interpreted_active_app_process_is_terminated_before_swap(shebang: &str) {
         use std::os::unix::fs::PermissionsExt;
         use std::process::Command;
 
@@ -464,20 +447,46 @@ mod tests {
         let active_app_dir = tmp.path().join("app");
         std::fs::create_dir_all(&active_app_dir).unwrap();
         let app_path = active_app_dir.join("demo-script");
-        std::fs::write(&app_path, "#!/bin/sh\nwhile :; do sleep 1; done\n").unwrap();
+        std::fs::write(&app_path, format!("{shebang}\nwhile :; do sleep 1; done\n")).unwrap();
         let mut permissions = std::fs::metadata(&app_path).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&app_path, permissions).unwrap();
-        let mut child = Command::new(&app_path).spawn().unwrap();
-        let error = terminate_active_app_processes_except(&active_app_dir, "demo-script", u32::MAX, false).unwrap_err();
-        let child_still_running = child.try_wait().unwrap().is_none();
-        if child_still_running {
-            child.kill().unwrap();
-        }
-        let _ = child.wait();
+        let resolved_app_path = std::fs::canonicalize(&app_path).unwrap();
+        let interpreted_main = interpreted_main::resolve(&resolved_app_path).unwrap().unwrap();
 
-        assert!(error.to_string().contains("Cannot safely quiesce an interpreted"));
-        assert!(child_still_running);
+        let spawn_deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let mut child = loop {
+            match Command::new(&app_path).spawn() {
+                Ok(child) => break child,
+                Err(error)
+                    if error.raw_os_error() == Some(nix::errno::Errno::ETXTBSY as i32)
+                        && std::time::Instant::now() < spawn_deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("failed to launch interpreted app fixture: {error}"),
+            }
+        };
+        let child_pid = child.id();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !app_process_pids(u32::MAX, &|process| {
+            is_active_app_process(&resolved_app_path, Some(&interpreted_main), process)
+        })
+        .unwrap()
+        .contains(&child_pid)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "test child did not expose the interpreted app launch identity"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let terminated = terminate_active_app_processes_except(&active_app_dir, "demo-script", u32::MAX, false).unwrap();
+        let status = child.wait().unwrap();
+
+        assert_eq!(terminated, 1);
+        assert!(!status.success());
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -505,5 +514,17 @@ mod tests {
                 .contains("resolves outside the active application directory")
         );
         assert!(unrelated_still_running);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn interpreted_active_app_process_is_terminated_before_swap() {
+        assert_interpreted_active_app_process_is_terminated_before_swap("#!/bin/sh");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn interpreted_active_app_with_multiple_interpreter_options_is_terminated_before_swap() {
+        assert_interpreted_active_app_process_is_terminated_before_swap("#!/usr/bin/env -S /bin/sh -e -u");
     }
 }

@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use std::ffi::OsString;
 use std::path::Path;
 #[cfg(unix)]
 use std::time::Duration;
@@ -16,6 +18,8 @@ use crate::error::Result;
 use crate::error::SurgeError;
 use crate::platform::process::current_pid;
 
+#[cfg(unix)]
+mod active_entrypoint;
 #[cfg(unix)]
 mod interpreted_main;
 pub(in crate::update::manager) fn terminate_superseded_app_processes(
@@ -58,23 +62,10 @@ fn terminate_active_app_processes_except(
         return Ok(0);
     }
 
-    let active_app_root = std::fs::canonicalize(active_app_dir).map_err(|e| {
-        SurgeError::Platform(format!(
-            "Failed to resolve active application directory before swap: {e}"
-        ))
+    let active_entrypoint = active_entrypoint::Identity::resolve(active_app_dir, main_exe)?.ok_or_else(|| {
+        SurgeError::Platform("Failed to resolve active application executable before swap".to_string())
     })?;
-    let active_exe = std::fs::canonicalize(active_app_root.join(main_exe)).map_err(|e| {
-        SurgeError::Platform(format!(
-            "Failed to resolve active application executable before swap: {e}"
-        ))
-    })?;
-    if !active_exe.starts_with(&active_app_root) {
-        return Err(SurgeError::Platform(format!(
-            "Active application executable '{}' resolves outside the active application directory; refusing to signal a shared executable",
-            active_app_root.join(main_exe).display()
-        )));
-    }
-    if updater_runs_from_active_exe(&active_exe, protected_pid)? {
+    if updater_runs_from_active_exe(&active_entrypoint.resolved, protected_pid)? {
         if !allow_in_process_swap {
             return Err(SurgeError::Platform(
                 "The updater is running from the active application executable; refusing an in-process directory swap. Apply the update from an external Surge updater."
@@ -85,9 +76,9 @@ fn terminate_active_app_processes_except(
             "The updater is running from the active application executable; in-process swap explicitly allowed, quiescing other active application processes only"
         );
     }
-    let interpreted_main = interpreted_main::resolve(&active_exe)?;
+    let interpreted_main = interpreted_main::resolve(&active_entrypoint.resolved)?;
     terminate_matching_app_processes(main_exe, protected_pid, "active", |process| {
-        is_active_app_process(&active_exe, interpreted_main.as_ref(), process)
+        is_active_app_process(&active_entrypoint, interpreted_main.as_ref(), process)
     })
 }
 
@@ -224,16 +215,6 @@ where
     }
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
-fn is_active_app_exe(active_exe: &Path, exe: &Path) -> bool {
-    exe == active_exe
-}
-
-#[cfg(target_os = "macos")]
-fn is_active_app_exe(active_exe: &Path, exe: &Path) -> bool {
-    exe == active_exe || std::fs::canonicalize(exe).is_ok_and(|resolved| resolved == active_exe)
-}
-
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 const NATIVE_TEST_APP_FILTER: &str =
     "update::manager::lifecycle::process_quiescence::tests::native_app_process_fixture";
@@ -267,11 +248,17 @@ pub(in crate::update::manager) fn spawn_native_test_app(app_path: &Path) -> std:
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 pub(in crate::update::manager) fn wait_for_native_test_app(app_path: &Path, child_pid: u32) {
-    let resolved_app_path = std::fs::canonicalize(app_path).unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while !app_process_pids(u32::MAX, &|process| is_active_app_exe(&resolved_app_path, &process.exe))
+    let active_app_dir = app_path.parent().unwrap();
+    let main_exe = app_path.file_name().unwrap().to_str().unwrap();
+    let active_entrypoint = active_entrypoint::Identity::resolve(active_app_dir, main_exe)
         .unwrap()
-        .contains(&child_pid)
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !app_process_pids(u32::MAX, &|process| {
+        is_active_app_process(&active_entrypoint, None, process)
+    })
+    .unwrap()
+    .contains(&child_pid)
     {
         assert!(
             std::time::Instant::now() < deadline,
@@ -283,38 +270,22 @@ pub(in crate::update::manager) fn wait_for_native_test_app(app_path: &Path, chil
 
 #[cfg(unix)]
 fn is_active_app_process(
-    active_exe: &Path,
+    active_entrypoint: &active_entrypoint::Identity,
     interpreted_main: Option<&interpreted_main::Identity>,
     process: &AppProcess,
 ) -> bool {
-    is_active_app_exe(active_exe, &process.exe)
+    active_entrypoint.matches_executable(&process.exe)
         || process
             .command
             .first()
-            .is_some_and(|argument| process_argument_resolves_to(argument, process.cwd.as_deref(), active_exe))
+            .is_some_and(|argument| active_entrypoint.matches_argument(argument, process.cwd.as_deref()))
         || interpreted_main.is_some_and(|identity| {
             identity.matches_interpreter(&process.exe, process.command.first().map(OsString::as_os_str))
                 && process
                     .command
                     .get(identity.script_argument_index)
-                    .is_some_and(|argument| process_argument_resolves_to(argument, process.cwd.as_deref(), active_exe))
+                    .is_some_and(|argument| active_entrypoint.matches_argument(argument, process.cwd.as_deref()))
         })
-}
-
-#[cfg(unix)]
-fn process_argument_resolves_to(argument: &std::ffi::OsStr, cwd: Option<&Path>, expected: &Path) -> bool {
-    let argument = Path::new(argument);
-    if argument.as_os_str().is_empty() {
-        return false;
-    }
-    let candidate = if argument.is_absolute() {
-        argument.to_path_buf()
-    } else if let Some(cwd) = cwd {
-        cwd.join(argument)
-    } else {
-        return false;
-    };
-    std::fs::canonicalize(candidate).is_ok_and(|resolved| resolved == expected)
 }
 
 #[cfg(unix)]
@@ -443,6 +414,57 @@ mod tests {
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn symlinked_active_entrypoint_does_not_terminate_other_processes_using_shared_target() {
+        use std::os::unix::fs::symlink;
+        use std::process::Command;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let active_app_dir = tmp.path().join("app");
+        std::fs::create_dir_all(&active_app_dir).unwrap();
+        let app_path = active_app_dir.join("demo");
+        symlink("/bin/sleep", &app_path).unwrap();
+        let active_entrypoint = active_entrypoint::Identity::resolve(&active_app_dir, "demo")
+            .unwrap()
+            .unwrap();
+        assert!(active_entrypoint.requires_argument());
+
+        let mut app_child = Command::new(&app_path).arg("30").spawn().unwrap();
+        let app_child_pid = app_child.id();
+        let mut unrelated_child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let unrelated_child_pid = unrelated_child.id();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            let matches = app_process_pids(u32::MAX, &|process| {
+                is_active_app_process(&active_entrypoint, None, process)
+            })
+            .unwrap();
+            if matches.contains(&app_child_pid) {
+                assert!(!matches.contains(&unrelated_child_pid));
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "test child did not expose the symlinked app launch identity"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let terminated = terminate_active_app_processes_except(&active_app_dir, "demo", u32::MAX, false);
+        let app_status = app_child.wait().unwrap();
+        let unrelated_still_running = unrelated_child.try_wait().unwrap().is_none();
+        if unrelated_still_running {
+            unrelated_child.kill().unwrap();
+        }
+        let _ = unrelated_child.wait();
+
+        assert_eq!(terminated.unwrap(), 1);
+        assert!(!app_status.success());
+        assert!(unrelated_still_running);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn assert_interpreted_active_app_process_is_terminated_before_swap(
         shebang: &str,
         isolated_env_interpreter: Option<&str>,
@@ -473,8 +495,10 @@ mod tests {
         let mut permissions = std::fs::metadata(&app_path).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&app_path, permissions).unwrap();
-        let resolved_app_path = std::fs::canonicalize(&app_path).unwrap();
-        let interpreted_main = interpreted_main::resolve(&resolved_app_path).unwrap().unwrap();
+        let active_entrypoint = active_entrypoint::Identity::resolve(&active_app_dir, "demo-script")
+            .unwrap()
+            .unwrap();
+        let interpreted_main = interpreted_main::resolve(&active_entrypoint.resolved).unwrap().unwrap();
 
         let spawn_deadline = std::time::Instant::now() + Duration::from_secs(1);
         let mut child = loop {
@@ -496,7 +520,7 @@ mod tests {
         let child_pid = child.id();
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
         while !app_process_pids(u32::MAX, &|process| {
-            is_active_app_process(&resolved_app_path, Some(&interpreted_main), process)
+            is_active_app_process(&active_entrypoint, Some(&interpreted_main), process)
         })
         .unwrap()
         .contains(&child_pid)
@@ -508,7 +532,8 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
 
-        let terminated = terminate_active_app_processes_except(&active_app_dir, "demo-script", u32::MAX, false).unwrap();
+        let terminated =
+            terminate_active_app_processes_except(&active_app_dir, "demo-script", u32::MAX, false).unwrap();
         let status = child.wait().unwrap();
 
         assert_eq!(terminated, 1);
@@ -517,29 +542,18 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn shared_symlink_entrypoint_refuses_swap_without_signalling_unrelated_process() {
-        use std::os::unix::fs::symlink;
-        use std::process::Command;
-
+    fn missing_active_entrypoint_refuses_swap() {
         let tmp = tempfile::tempdir().unwrap();
         let active_app_dir = tmp.path().join("app");
         std::fs::create_dir_all(&active_app_dir).unwrap();
-        symlink("/bin/sleep", active_app_dir.join("demo")).unwrap();
 
-        let mut unrelated_child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
-        let error = terminate_active_app_processes_except(&active_app_dir, "demo", u32::MAX, false).unwrap_err();
-        let unrelated_still_running = unrelated_child.try_wait().unwrap().is_none();
-        if unrelated_still_running {
-            unrelated_child.kill().unwrap();
-        }
-        let _ = unrelated_child.wait();
+        let error = terminate_active_app_processes_except(&active_app_dir, "missing", u32::MAX, false).unwrap_err();
 
         assert!(
             error
                 .to_string()
-                .contains("resolves outside the active application directory")
+                .contains("Failed to resolve active application executable before swap")
         );
-        assert!(unrelated_still_running);
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

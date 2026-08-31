@@ -470,7 +470,7 @@ mod tests {
         isolated_env_interpreter: Option<&str>,
     ) {
         use std::os::unix::fs::PermissionsExt;
-        use std::process::Command;
+        use std::process::{Command, Stdio};
 
         let tmp = tempfile::tempdir().unwrap();
         let active_app_dir = tmp.path().join("app");
@@ -491,7 +491,7 @@ mod tests {
             (shebang.to_string(), None)
         };
         let app_path = active_app_dir.join("demo-script");
-        std::fs::write(&app_path, format!("{shebang}\nwhile :; do sleep 1; done\n")).unwrap();
+        std::fs::write(&app_path, format!("{shebang}\nread _\n")).unwrap();
         let mut permissions = std::fs::metadata(&app_path).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&app_path, permissions).unwrap();
@@ -503,6 +503,7 @@ mod tests {
         let spawn_deadline = std::time::Instant::now() + Duration::from_secs(1);
         let mut child = loop {
             let mut command = Command::new(&app_path);
+            command.stdin(Stdio::piped());
             if let Some(child_path) = &child_path {
                 command.env("PATH", child_path);
             }

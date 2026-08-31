@@ -244,7 +244,6 @@ fn parse_env_command(argument: &str) -> Result<EnvCommand> {
             "Active application env shebang with multiple arguments must use -S".to_string(),
         ));
     }
-
     let (command_index, search_path) = env_command_index(&words)?;
     Ok(EnvCommand {
         program: OsString::from(&words[command_index]),
@@ -497,7 +496,6 @@ mod tests {
         permissions.set_mode(0o755);
         std::fs::set_permissions(path, permissions).unwrap();
     }
-
     #[test]
     fn macos_direct_interpreter_arguments_are_counted_literally() {
         assert_eq!(

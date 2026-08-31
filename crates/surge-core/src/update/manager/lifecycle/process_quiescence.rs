@@ -68,9 +68,7 @@ fn prepare_app_quiescence_except(
         return Ok(None);
     }
 
-    let active_entrypoint = active_entrypoint::Identity::resolve(active_app_dir, main_exe)?.ok_or_else(|| {
-        SurgeError::Platform("Failed to resolve active application executable before swap".to_string())
-    })?;
+    let active_entrypoint = active_entrypoint::Identity::resolve(active_app_dir, main_exe)?;
     let interpreted_main = interpreted_main::resolve(&active_entrypoint.resolved)?;
     if allow_in_process_swap {
         info!("In-process swap explicitly allowed, quiescing other active application processes only");
@@ -327,9 +325,7 @@ pub(in crate::update::manager) fn spawn_native_test_app(app_path: &Path) -> std:
 pub(in crate::update::manager) fn wait_for_native_test_app(app_path: &Path, child_pid: u32) {
     let active_app_dir = app_path.parent().unwrap();
     let main_exe = app_path.file_name().unwrap().to_str().unwrap();
-    let active_entrypoint = active_entrypoint::Identity::resolve(active_app_dir, main_exe)
-        .unwrap()
-        .unwrap();
+    let active_entrypoint = active_entrypoint::Identity::resolve(active_app_dir, main_exe).unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while !app_process_pids(u32::MAX, &|process| {
         is_active_app_process(&active_entrypoint, None, process)
@@ -369,7 +365,6 @@ fn is_active_app_process(
             return Ok(true);
         }
     }
-
     let Some(identity) = interpreted_main else {
         return Ok(false);
     };
@@ -529,9 +524,7 @@ mod tests {
         std::fs::create_dir_all(&active_app_dir).unwrap();
         let app_path = active_app_dir.join("demo-script");
         std::fs::write(&app_path, "#!/bin/sh\n").unwrap();
-        let active_entrypoint = active_entrypoint::Identity::resolve(&active_app_dir, "demo-script")
-            .unwrap()
-            .unwrap();
+        let active_entrypoint = active_entrypoint::Identity::resolve(&active_app_dir, "demo-script").unwrap();
         let interpreted_main = interpreted_main::resolve(&active_entrypoint.resolved).unwrap().unwrap();
         let process = AppProcess {
             exe: std::fs::canonicalize("/bin/sh").unwrap(),
@@ -553,9 +546,7 @@ mod tests {
         std::fs::create_dir_all(&active_app_dir).unwrap();
         let app_path = active_app_dir.join("demo");
         std::fs::write(&app_path, "fixture").unwrap();
-        let active_entrypoint = active_entrypoint::Identity::resolve(&active_app_dir, "demo")
-            .unwrap()
-            .unwrap();
+        let active_entrypoint = active_entrypoint::Identity::resolve(&active_app_dir, "demo").unwrap();
         let process = AppProcess {
             exe: std::fs::canonicalize("/bin/sleep").unwrap(),
             command: vec![app_path.into_os_string()],
@@ -574,9 +565,7 @@ mod tests {
         std::fs::create_dir_all(&active_app_dir).unwrap();
         let app_path = active_app_dir.join("demo-script");
         std::fs::write(&app_path, "#!/bin/sh\n").unwrap();
-        let active_entrypoint = active_entrypoint::Identity::resolve(&active_app_dir, "demo-script")
-            .unwrap()
-            .unwrap();
+        let active_entrypoint = active_entrypoint::Identity::resolve(&active_app_dir, "demo-script").unwrap();
         let interpreted_main = interpreted_main::resolve(&active_entrypoint.resolved).unwrap().unwrap();
         let process = AppProcess {
             exe: std::fs::canonicalize("/bin/sleep").unwrap(),
@@ -596,9 +585,7 @@ mod tests {
         std::fs::create_dir_all(&active_app_dir).unwrap();
         let app_path = active_app_dir.join("demo-script");
         std::fs::write(&app_path, "#!/bin/sh\n").unwrap();
-        let active_entrypoint = active_entrypoint::Identity::resolve(&active_app_dir, "demo-script")
-            .unwrap()
-            .unwrap();
+        let active_entrypoint = active_entrypoint::Identity::resolve(&active_app_dir, "demo-script").unwrap();
         let interpreted_main = interpreted_main::resolve(&active_entrypoint.resolved).unwrap().unwrap();
         let process = AppProcess {
             exe: std::fs::canonicalize("/bin/sh").unwrap(),
@@ -620,9 +607,7 @@ mod tests {
         std::fs::create_dir_all(&active_app_dir).unwrap();
         let app_path = active_app_dir.join("demo-script");
         std::fs::write(&app_path, "#!/bin/sh\n").unwrap();
-        let active_entrypoint = active_entrypoint::Identity::resolve(&active_app_dir, "demo-script")
-            .unwrap()
-            .unwrap();
+        let active_entrypoint = active_entrypoint::Identity::resolve(&active_app_dir, "demo-script").unwrap();
         let interpreted_main = interpreted_main::resolve(&active_entrypoint.resolved).unwrap().unwrap();
         let process = AppProcess {
             exe: std::fs::canonicalize("/bin/sh").unwrap(),
@@ -644,9 +629,7 @@ mod tests {
         std::fs::create_dir_all(&active_app_dir).unwrap();
         let app_path = active_app_dir.join("demo-script");
         std::fs::write(&app_path, "#!/bin/sh\n").unwrap();
-        let active_entrypoint = active_entrypoint::Identity::resolve(&active_app_dir, "demo-script")
-            .unwrap()
-            .unwrap();
+        let active_entrypoint = active_entrypoint::Identity::resolve(&active_app_dir, "demo-script").unwrap();
         let interpreted_main = interpreted_main::resolve(&active_entrypoint.resolved).unwrap().unwrap();
         let process = AppProcess {
             exe: std::fs::canonicalize("/bin/sh").unwrap(),
@@ -669,9 +652,7 @@ mod tests {
         let active_app_dir = tmp.path().join("app");
         std::fs::create_dir_all(&active_app_dir).unwrap();
         symlink("/bin/sleep", active_app_dir.join("demo")).unwrap();
-        let active_entrypoint = active_entrypoint::Identity::resolve(&active_app_dir, "demo")
-            .unwrap()
-            .unwrap();
+        let active_entrypoint = active_entrypoint::Identity::resolve(&active_app_dir, "demo").unwrap();
         let process = AppProcess {
             exe: std::fs::canonicalize("/bin/sleep").unwrap(),
             command: vec![OsString::new()],
@@ -692,9 +673,7 @@ mod tests {
         std::fs::create_dir_all(&active_app_dir).unwrap();
         let app_path = active_app_dir.join("demo-script");
         std::fs::write(&app_path, "#!/bin/sh\n").unwrap();
-        let active_entrypoint = active_entrypoint::Identity::resolve(&active_app_dir, "demo-script")
-            .unwrap()
-            .unwrap();
+        let active_entrypoint = active_entrypoint::Identity::resolve(&active_app_dir, "demo-script").unwrap();
         let interpreted_main = interpreted_main::resolve(&active_entrypoint.resolved).unwrap().unwrap();
         let process = AppProcess {
             exe: std::fs::canonicalize("/bin/sh").unwrap(),
@@ -720,9 +699,7 @@ mod tests {
         std::fs::create_dir_all(&active_app_dir).unwrap();
         let app_path = active_app_dir.join("demo");
         symlink("/bin/sleep", &app_path).unwrap();
-        let active_entrypoint = active_entrypoint::Identity::resolve(&active_app_dir, "demo")
-            .unwrap()
-            .unwrap();
+        let active_entrypoint = active_entrypoint::Identity::resolve(&active_app_dir, "demo").unwrap();
         assert!(active_entrypoint.requires_argument());
 
         let mut app_child = Command::new(&app_path).arg("30").spawn().unwrap();
@@ -773,9 +750,7 @@ mod tests {
         let mut permissions = std::fs::metadata(&app_path).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&app_path, permissions).unwrap();
-        let active_entrypoint = active_entrypoint::Identity::resolve(&active_app_dir, "demo-script")
-            .unwrap()
-            .unwrap();
+        let active_entrypoint = active_entrypoint::Identity::resolve(&active_app_dir, "demo-script").unwrap();
         let interpreted_main = interpreted_main::resolve(&active_entrypoint.resolved).unwrap().unwrap();
 
         let spawn_deadline = std::time::Instant::now() + Duration::from_secs(1);
@@ -818,24 +793,31 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn missing_active_entrypoint_refuses_swap() {
-        let tmp = tempfile::tempdir().unwrap();
-        let active_app_dir = tmp.path().join("app");
-        std::fs::create_dir_all(&active_app_dir).unwrap();
-
-        let error = terminate_active_app_processes_except(&active_app_dir, "missing", u32::MAX, false).unwrap_err();
-
-        assert!(
-            error
-                .to_string()
-                .contains("Failed to resolve active application executable before swap")
-        );
+    fn interpreted_active_app_process_is_terminated_before_swap() {
+        assert_interpreted_active_app_process_is_terminated_before_swap("#!/bin/sh");
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn interpreted_active_app_process_is_terminated_before_swap() {
-        assert_interpreted_active_app_process_is_terminated_before_swap("#!/bin/sh");
+    fn interpreted_relative_entrypoint_with_changed_cwd_refuses_swap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let active_app_dir = tmp.path().join("app");
+        std::fs::create_dir_all(&active_app_dir).unwrap();
+        let app_path = active_app_dir.join("demo-script");
+        std::fs::write(&app_path, "#!/bin/sh\n").unwrap();
+        let active_entrypoint = active_entrypoint::Identity::resolve(&active_app_dir, "demo-script").unwrap();
+        let interpreted_main = interpreted_main::resolve(&active_entrypoint.resolved).unwrap().unwrap();
+        let process = AppProcess {
+            exe: std::fs::canonicalize("/bin/sh").unwrap(),
+            command: vec![OsString::from("/bin/sh"), OsString::from("./demo-script")],
+            command_inspected: true,
+            cwd: Some(std::path::PathBuf::from("/")),
+        };
+
+        let error = is_active_app_process(&active_entrypoint, Some(&interpreted_main), &process).unwrap_err();
+
+        assert!(error.to_string().contains("launch directory"));
+        assert!(error.to_string().contains("process identity is ambiguous"));
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -905,9 +887,7 @@ mod tests {
         let interpreter_name = "surge-test-unresolvable-env-interpreter";
         let app_path = active_app_dir.join("demo-script");
         std::fs::write(&app_path, format!("#!/usr/bin/env {interpreter_name}\n")).unwrap();
-        let active_entrypoint = active_entrypoint::Identity::resolve(&active_app_dir, "demo-script")
-            .unwrap()
-            .unwrap();
+        let active_entrypoint = active_entrypoint::Identity::resolve(&active_app_dir, "demo-script").unwrap();
         let interpreted_main = interpreted_main::resolve(&active_entrypoint.resolved).unwrap().unwrap();
         let process = AppProcess {
             exe: std::fs::canonicalize("/bin/sh").unwrap(),
@@ -934,9 +914,7 @@ mod tests {
         let app_path = active_app_dir.join("demo-script");
         let interpreter_name = "surge-test-unresolvable-env-interpreter";
         std::fs::write(&app_path, format!("#!/usr/bin/env {interpreter_name}\n")).unwrap();
-        let active_entrypoint = active_entrypoint::Identity::resolve(&active_app_dir, "demo-script")
-            .unwrap()
-            .unwrap();
+        let active_entrypoint = active_entrypoint::Identity::resolve(&active_app_dir, "demo-script").unwrap();
         let interpreted_main = interpreted_main::resolve(&active_entrypoint.resolved).unwrap().unwrap();
         let process = AppProcess {
             exe: std::fs::canonicalize("/bin/sh").unwrap(),
@@ -968,9 +946,7 @@ mod tests {
         std::fs::create_dir_all(&active_app_dir).unwrap();
         let app_path = active_app_dir.join("demo");
         symlink("/bin/sleep", &app_path).unwrap();
-        let active_entrypoint = active_entrypoint::Identity::resolve(&active_app_dir, "demo")
-            .unwrap()
-            .unwrap();
+        let active_entrypoint = active_entrypoint::Identity::resolve(&active_app_dir, "demo").unwrap();
         let mut command = vec![0];
         command.extend_from_slice(app_path.as_os_str().as_encoded_bytes());
         command.push(0);

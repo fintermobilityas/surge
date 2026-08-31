@@ -998,6 +998,82 @@ mod tests {
     }
 
     #[test]
+    fn restore_check_state_rejects_changed_installed_version_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("store");
+        let install_root = tmp.path().join("install");
+        let active_app_dir = install_root.join("app");
+        std::fs::create_dir_all(&store_root).unwrap();
+        std::fs::create_dir_all(&active_app_dir).unwrap();
+        write_runtime_identity(&active_app_dir, "app", "1.0.0", "app", "supervisor");
+
+        let ctx = Arc::new(Context::new());
+        ctx.set_storage(
+            StorageProvider::Filesystem,
+            store_root.to_str().unwrap(),
+            "",
+            "",
+            "",
+            "",
+        );
+        let mut checked =
+            UpdateManager::new(Arc::clone(&ctx), "app", "1.0", "stable", install_root.to_str().unwrap()).unwrap();
+        checked.current_release_identity = current_install::load(&checked).unwrap();
+        let check_state = checked.capture_check_state();
+
+        write_runtime_identity(&active_app_dir, "app", "1.0", "app", "supervisor");
+        let mut applying = UpdateManager::new(ctx, "app", "1.0", "stable", install_root.to_str().unwrap()).unwrap();
+
+        let error = applying.restore_check_state(&check_state).unwrap_err();
+
+        assert!(error.to_string().contains("identity changed"));
+    }
+
+    #[tokio::test]
+    async fn check_for_updates_rejects_invalid_runtime_identity_on_every_platform() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("store");
+        let install_root = tmp.path().join("install");
+        let app_id = "test-app";
+        let active_app_dir = install_root.join("app");
+        std::fs::create_dir_all(&store_root).unwrap();
+        std::fs::create_dir_all(active_app_dir.join(".surge")).unwrap();
+        std::fs::write(
+            active_app_dir.join(crate::install::RUNTIME_MANIFEST_RELATIVE_PATH),
+            "invalid: [runtime manifest",
+        )
+        .unwrap();
+
+        let rid = current_rid();
+        let mut latest = make_entry("1.1.0", "stable", &current_os_label_for_tests(), &rid);
+        latest.is_genesis = true;
+        latest.deltas.clear();
+        latest.preferred_delta_id.clear();
+        let index = ReleaseIndex {
+            app_id: app_id.to_string(),
+            releases: vec![latest],
+            ..ReleaseIndex::default()
+        };
+        write_app_scoped_release_index_with_current(&store_root, app_id, &index, "1.0.0");
+
+        let ctx = Arc::new(Context::new());
+        ctx.set_storage(
+            StorageProvider::Filesystem,
+            store_root.to_str().unwrap(),
+            "",
+            "",
+            "",
+            "",
+        );
+        let mut manager = UpdateManager::new(ctx, app_id, "1.0.0", "stable", install_root.to_str().unwrap()).unwrap();
+
+        let error = manager.check_for_updates().await.unwrap_err();
+
+        assert!(error.to_string().contains("Failed to parse runtime manifest"));
+        assert!(manager.current_release_identity.is_none());
+    }
+
+    #[test]
     fn test_os_normalization() {
         assert_eq!(release_index::normalize_os_label("windows"), "win");
         assert_eq!(release_index::normalize_os_label("win"), "win");

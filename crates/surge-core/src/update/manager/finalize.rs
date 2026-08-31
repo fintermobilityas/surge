@@ -119,7 +119,7 @@ where
         ));
     }
     #[cfg(unix)]
-    let (current_main_exe, current_supervisor_id) = if current_app_dir.is_some() {
+    let (current_version, current_main_exe, current_supervisor_id) = if current_app_dir.is_some() {
         let installed_identity = super::current_install::load(manager)?;
         if installed_identity != manager.current_release_identity {
             return Err(SurgeError::Update(
@@ -133,9 +133,13 @@ where
                 manager.current_version
             ))
         })?;
-        (current.main_exe.as_str(), current.supervisor_id.as_str())
+        (
+            current.version.as_str(),
+            current.main_exe.as_str(),
+            current.supervisor_id.as_str(),
+        )
     } else {
-        ("", "")
+        ("", "", "")
     };
     #[cfg(not(unix))]
     let (current_main_exe, current_supervisor_id) = manager.current_release_identity.as_ref().map_or_else(
@@ -162,14 +166,18 @@ where
     progress_emitter.emit_substep(6, finalize_phase::QUIESCING_ACTIVE_APP, 92);
     #[cfg(unix)]
     let current_quiescence = if let Some(current_app_dir) = current_app_dir {
-        lifecycle::prepare_app_quiescence(current_app_dir, current_main_exe, manager.allow_in_process_swap)?
+        prepare_and_quiesce_active_app_before_swap(
+            &manager.install_dir,
+            current_app_dir,
+            current_version,
+            current_main_exe,
+            current_supervisor_id,
+            supervisor_was_running,
+            manager.allow_in_process_swap,
+        )?
     } else {
         None
     };
-    #[cfg(unix)]
-    if let Some(current_quiescence) = &current_quiescence {
-        lifecycle::terminate_prepared_app_processes(current_quiescence)?;
-    }
     #[cfg(not(unix))]
     if let Some(current_app_dir) = current_app_dir {
         lifecycle::terminate_active_app_processes_before_swap(
@@ -230,17 +238,35 @@ where
             Ok::<(), SurgeError>(())
         })();
         if let Err(error) = quarantine_result {
-            return Err(restore_previous_swap_after_error(
+            let error = restore_previous_swap_after_error(
                 &previous_swap_dir,
                 &previous_swap_quarantine_dir,
+                error,
+            );
+            return Err(restore_previous_supervisor_after_quiescence_failure(
+                &manager.install_dir,
+                current_app_dir,
+                current_version,
+                current_main_exe,
+                current_supervisor_id,
+                supervisor_was_running,
                 error,
             ));
         }
         if let Err(error) = tokio::fs::remove_dir_all(&previous_swap_quarantine_dir).await {
-            return Err(restore_previous_swap_after_error(
+            let error = restore_previous_swap_after_error(
                 &previous_swap_dir,
                 &previous_swap_quarantine_dir,
                 error.into(),
+            );
+            return Err(restore_previous_supervisor_after_quiescence_failure(
+                &manager.install_dir,
+                current_app_dir,
+                current_version,
+                current_main_exe,
+                current_supervisor_id,
+                supervisor_was_running,
+                error,
             ));
         }
     }
@@ -263,7 +289,35 @@ where
             Ok::<(), SurgeError>(())
         })() {
             let _ = atomic_rename(&previous_swap_dir, &active_app_dir);
-            return Err(error);
+            return Err(restore_previous_supervisor_after_quiescence_failure(
+                &manager.install_dir,
+                Some(&active_app_dir),
+                current_version,
+                current_main_exe,
+                current_supervisor_id,
+                supervisor_was_running,
+                error,
+            ));
+        }
+    }
+    #[cfg(unix)]
+    if !active_app_was_present {
+        if let Err(error) = (|| {
+            if let Some(current_quiescence) = &current_quiescence {
+                lifecycle::terminate_prepared_app_processes(current_quiescence)?;
+            }
+            lifecycle::terminate_superseded_app_processes(&manager.install_dir, &active_app_dir, current_main_exe)?;
+            Ok::<(), SurgeError>(())
+        })() {
+            return Err(restore_previous_supervisor_after_quiescence_failure(
+                &manager.install_dir,
+                current_app_dir,
+                current_version,
+                current_main_exe,
+                current_supervisor_id,
+                supervisor_was_running,
+                error,
+            ));
         }
     }
     if let Err(err) = atomic_rename(&next_app_dir, &active_app_dir) {
@@ -272,13 +326,6 @@ where
             let _ = atomic_rename(&previous_swap_dir, &active_app_dir);
         }
         return Err(err);
-    }
-    #[cfg(unix)]
-    if !active_app_was_present {
-        if let Some(current_quiescence) = &current_quiescence {
-            lifecycle::terminate_prepared_app_processes(current_quiescence)?;
-        }
-        lifecycle::terminate_superseded_app_processes(&manager.install_dir, &active_app_dir, current_main_exe)?;
     }
 
     let previous_app_dir_for_assets = if previous_swap_dir.is_dir() {
@@ -474,4 +521,175 @@ where
     );
 
     Ok(restart_outcome)
+}
+
+#[cfg(unix)]
+fn prepare_and_quiesce_active_app_before_swap(
+    install_dir: &Path,
+    current_app_dir: &Path,
+    current_version: &str,
+    current_main_exe: &str,
+    current_supervisor_id: &str,
+    supervisor_was_running: bool,
+    allow_in_process_swap: bool,
+) -> Result<Option<lifecycle::PreparedAppQuiescence>> {
+    let result = (|| {
+        let prepared = lifecycle::prepare_app_quiescence(current_app_dir, current_main_exe, allow_in_process_swap)?;
+        if let Some(prepared) = &prepared {
+            lifecycle::terminate_prepared_app_processes(prepared)?;
+        }
+        Ok(prepared)
+    })();
+    let Err(error) = result else {
+        return result;
+    };
+
+    Err(restore_previous_supervisor_after_quiescence_failure(
+        install_dir,
+        Some(current_app_dir),
+        current_version,
+        current_main_exe,
+        current_supervisor_id,
+        supervisor_was_running,
+        error,
+    ))
+}
+
+#[cfg(unix)]
+fn restore_previous_supervisor_after_quiescence_failure(
+    install_dir: &Path,
+    current_app_dir: Option<&Path>,
+    current_version: &str,
+    current_main_exe: &str,
+    current_supervisor_id: &str,
+    supervisor_was_running: bool,
+    error: SurgeError,
+) -> SurgeError {
+    if supervisor_was_running && let Some(current_app_dir) = current_app_dir {
+        let restore_outcome = lifecycle::restore_previous_supervisor_after_failed_quiescence(
+            install_dir,
+            current_app_dir,
+            current_version,
+            current_main_exe,
+            current_supervisor_id,
+        );
+        match restore_outcome {
+            SupervisorRestartOutcome::NotApplicable => {
+                warn!(
+                    supervisor_id = current_supervisor_id,
+                    "Previous supervisor could not be restored after active application quiescence failed"
+                );
+            }
+            SupervisorRestartOutcome::PendingRestart { reason, failure_phase } => {
+                warn!(
+                    supervisor_id = current_supervisor_id,
+                    reason,
+                    failure_phase,
+                    "Requested previous supervisor restoration after active application quiescence failed"
+                );
+            }
+        }
+    }
+
+    error
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(target_os = "linux")]
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(target_os = "linux")]
+    use std::path::PathBuf;
+    #[cfg(target_os = "linux")]
+    use std::process::{Command, Stdio};
+
+    #[cfg(target_os = "linux")]
+    use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn quiescence_failure_restores_previous_supervisor_and_preserves_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install_dir = tmp.path();
+        let active_app_dir = install_dir.join("app");
+        std::fs::create_dir_all(&active_app_dir).unwrap();
+
+        let app_path = active_app_dir.join("cwd-changing-demo-script");
+        std::fs::write(&app_path, "#!/bin/sh\ncd /\nread _\n").unwrap();
+        make_executable(&app_path);
+
+        let supervisor_path = active_app_dir.join(crate::platform::process::supervisor_binary_name());
+        std::fs::write(
+            &supervisor_path,
+            r#"#!/bin/sh
+id=""
+dir=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --id) id="$2"; shift 2 ;;
+    --dir) dir="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+echo $$ > "$dir/.surge-supervisor-$id.pid"
+"#,
+        )
+        .unwrap();
+        make_executable(&supervisor_path);
+
+        let spawn_deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let mut child = loop {
+            match Command::new("./cwd-changing-demo-script")
+                .current_dir(&active_app_dir)
+                .stdin(Stdio::piped())
+                .spawn()
+            {
+                Ok(child) => break child,
+                Err(error)
+                    if error.raw_os_error() == Some(nix::errno::Errno::ETXTBSY as i32)
+                        && std::time::Instant::now() < spawn_deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("failed to launch changed-cwd app fixture: {error}"),
+            }
+        };
+        let cwd_path = PathBuf::from(format!("/proc/{}/cwd", child.id()));
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::fs::read_link(&cwd_path).ok().as_deref() != Some(Path::new("/")) {
+            assert!(std::time::Instant::now() < deadline, "test child did not change cwd");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let result = prepare_and_quiesce_active_app_before_swap(
+            install_dir,
+            &active_app_dir,
+            "1.0.0",
+            "cwd-changing-demo-script",
+            "demo-supervisor",
+            true,
+            false,
+        );
+        let child_still_running = child.try_wait().unwrap().is_none();
+        if child_still_running {
+            child.kill().unwrap();
+        }
+        let _ = child.wait();
+
+        let error = result.err().unwrap();
+        assert!(error.to_string().contains("process identity is ambiguous"));
+        assert!(child_still_running);
+        assert!(supervisor_pid_file(install_dir, "demo-supervisor").is_file());
+        assert_eq!(
+            crate::supervisor::state::read_supervisor_exe_path(install_dir, "demo-supervisor").as_deref(),
+            Some(app_path.as_path())
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn make_executable(path: &Path) {
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
 }

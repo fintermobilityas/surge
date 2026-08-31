@@ -23,7 +23,9 @@ mod process_quiescence;
 pub(super) use self::process_quiescence::terminate_active_app_processes_before_swap;
 pub(super) use self::process_quiescence::terminate_superseded_app_processes;
 #[cfg(unix)]
-pub(super) use self::process_quiescence::{prepare_app_quiescence, terminate_prepared_app_processes};
+pub(super) use self::process_quiescence::{
+    PreparedAppQuiescence, prepare_app_quiescence, terminate_prepared_app_processes,
+};
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 pub(in crate::update::manager) use self::process_quiescence::{spawn_native_test_app, wait_for_native_test_app};
 
@@ -163,6 +165,32 @@ pub(super) fn restart_supervisor_after_update(
     restart_supervisor_after_update_with_pid(install_dir, active_app_dir, latest, current_pid())
 }
 
+#[cfg(unix)]
+pub(super) fn restore_previous_supervisor_after_failed_quiescence(
+    install_dir: &Path,
+    active_app_dir: &Path,
+    version: &str,
+    main_exe: &str,
+    supervisor_id: &str,
+) -> SupervisorRestartOutcome {
+    let previous = ReleaseEntry {
+        version: version.to_string(),
+        main_exe: main_exe.to_string(),
+        supervisor_id: supervisor_id.to_string(),
+        ..ReleaseEntry::default()
+    };
+    restart_supervisor_after_update_with_config(
+        install_dir,
+        active_app_dir,
+        &previous,
+        current_pid(),
+        None,
+        SUPERVISOR_RESTART_CONFIRM_TIMEOUT,
+        SUPERVISOR_RESTART_MAX_ATTEMPTS,
+        SUPERVISOR_RESTART_RETRY_DELAY,
+    )
+}
+
 pub(super) fn restart_supervisor_after_update_with_pid(
     install_dir: &Path,
     active_app_dir: &Path,
@@ -174,6 +202,7 @@ pub(super) fn restart_supervisor_after_update_with_pid(
         active_app_dir,
         latest,
         watched_pid,
+        Some(&latest.version),
         SUPERVISOR_RESTART_CONFIRM_TIMEOUT,
         SUPERVISOR_RESTART_MAX_ATTEMPTS,
         SUPERVISOR_RESTART_RETRY_DELAY,
@@ -185,6 +214,7 @@ fn restart_supervisor_after_update_with_config(
     active_app_dir: &Path,
     latest: &ReleaseEntry,
     watched_pid: u32,
+    handoff_version: Option<&str>,
     confirm_timeout: Duration,
     max_attempts: u32,
     retry_delay: Duration,
@@ -242,7 +272,7 @@ fn restart_supervisor_after_update_with_config(
         }
     };
 
-    let args = supervisor_watch_args(supervisor_id, install_dir, watched_pid, &latest.version, &restart_args);
+    let args = supervisor_watch_args(supervisor_id, install_dir, watched_pid, handoff_version, &restart_args);
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
 
     let mut last_failure: Option<(String, &'static str)> = None;
@@ -254,11 +284,20 @@ fn restart_supervisor_after_update_with_config(
                     supervisor_id, attempt, "Restarted supervisor after update"
                 );
                 if confirm_supervisor_restart(install_dir, supervisor_id, confirm_timeout) {
+                    let reason = handoff_version.map_or_else(
+                        || {
+                            format!(
+                                "previous supervisor restoration accepted; waiting for process pid {watched_pid} to exit"
+                            )
+                        },
+                        |version| {
+                            format!(
+                                "supervisor handoff accepted; waiting for previous child pid {watched_pid} to exit and target version {version} to start"
+                            )
+                        },
+                    );
                     return SupervisorRestartOutcome::PendingRestart {
-                        reason: format!(
-                            "supervisor handoff accepted; waiting for previous child pid {watched_pid} to exit and target version {} to start",
-                            latest.version
-                        ),
+                        reason,
                         failure_phase: RESTART_HANDOFF_WAITING_FOR_OLD_CHILD_PHASE,
                     };
                 }
@@ -302,7 +341,7 @@ fn supervisor_watch_args(
     supervisor_id: &str,
     install_dir: &Path,
     watched_pid: u32,
-    handoff_version: &str,
+    handoff_version: Option<&str>,
     restart_args: &[String],
 ) -> Vec<String> {
     let mut args = vec![
@@ -313,9 +352,11 @@ fn supervisor_watch_args(
         install_dir.to_string_lossy().into_owned(),
         "--pid".to_string(),
         watched_pid.to_string(),
-        "--handoff-version".to_string(),
-        handoff_version.to_string(),
     ];
+    if let Some(handoff_version) = handoff_version {
+        args.push("--handoff-version".to_string());
+        args.push(handoff_version.to_string());
+    }
     if !restart_args.is_empty() {
         args.push("--".to_string());
         args.extend(restart_args.iter().cloned());
@@ -333,7 +374,13 @@ mod tests {
     fn supervisor_watch_args_include_handoff_version_before_child_args() {
         let restart_args = vec!["--app-mode".to_string(), "service".to_string()];
 
-        let args = supervisor_watch_args("demo-supervisor", Path::new("/opt/demo"), 42, "2.0.0", &restart_args);
+        let args = supervisor_watch_args(
+            "demo-supervisor",
+            Path::new("/opt/demo"),
+            42,
+            Some("2.0.0"),
+            &restart_args,
+        );
 
         assert_eq!(
             args,
@@ -356,6 +403,13 @@ mod tests {
             !args.iter().any(|arg| arg == "--exe"),
             "supervisor argv must not carry the app exe path so external pkill -f <app-path> cannot match it"
         );
+    }
+
+    #[test]
+    fn previous_supervisor_restoration_omits_update_handoff_version() {
+        let args = supervisor_watch_args("demo-supervisor", Path::new("/opt/demo"), 42, None, &[]);
+
+        assert!(!args.iter().any(|argument| argument == "--handoff-version"));
     }
 
     #[cfg(unix)]
@@ -397,6 +451,7 @@ mod tests {
             &active_app_dir,
             &latest,
             std::process::id(),
+            Some(&latest.version),
             Duration::from_millis(200),
             2,
             Duration::from_millis(10),

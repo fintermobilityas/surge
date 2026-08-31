@@ -11,38 +11,30 @@ pub(super) struct Identity {
 }
 
 impl Identity {
-    pub(super) fn resolve(active_app_dir: &Path, main_exe: &str) -> Result<Option<Self>> {
+    pub(super) fn resolve(active_app_dir: &Path, main_exe: &str) -> Result<Self> {
         let configured_launch_path = std::path::absolute(active_app_dir.join(main_exe)).map_err(|e| {
             SurgeError::Platform(format!(
                 "Failed to resolve configured active application path before swap: {e}"
             ))
         })?;
-        let active_app_root = match std::fs::canonicalize(active_app_dir) {
-            Ok(path) => path,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => {
-                return Err(SurgeError::Platform(format!(
-                    "Failed to resolve active application directory before swap: {e}"
-                )));
-            }
-        };
+        let active_app_root = std::fs::canonicalize(active_app_dir).map_err(|e| {
+            SurgeError::Platform(format!(
+                "Failed to resolve active application directory before swap: {e}"
+            ))
+        })?;
         let configured_path = active_app_root.join(main_exe);
-        let resolved = match std::fs::canonicalize(&configured_path) {
-            Ok(path) => path,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => {
-                return Err(SurgeError::Platform(format!(
-                    "Failed to resolve active application executable before swap: {e}"
-                )));
-            }
-        };
+        let resolved = std::fs::canonicalize(&configured_path).map_err(|e| {
+            SurgeError::Platform(format!(
+                "Failed to resolve active application executable before swap: {e}"
+            ))
+        })?;
 
-        Ok(Some(Self {
+        Ok(Self {
             configured_launch_path,
             require_entrypoint_argument: configured_path != resolved,
             path: configured_path,
             resolved,
-        }))
+        })
     }
 
     pub(super) fn matches_executable(&self, executable: &Path) -> bool {
@@ -150,7 +142,7 @@ mod tests {
         std::fs::write(shared_dir.join("demo"), "fixture").unwrap();
         symlink(&shared_dir, active_app_dir.join("bin")).unwrap();
 
-        let identity = Identity::resolve(&active_app_dir, "bin/demo").unwrap().unwrap();
+        let identity = Identity::resolve(&active_app_dir, "bin/demo").unwrap();
 
         assert!(identity.requires_argument());
         assert!(
@@ -174,7 +166,7 @@ mod tests {
         std::fs::write(shared_dir.join("demo"), "fixture").unwrap();
         symlink("shared/demo", active_app_dir.join("demo")).unwrap();
 
-        let identity = Identity::resolve(&active_app_dir, "demo").unwrap().unwrap();
+        let identity = Identity::resolve(&active_app_dir, "demo").unwrap();
 
         assert!(identity.requires_argument());
         assert!(
@@ -200,7 +192,7 @@ mod tests {
         symlink("shared/demo", active_app_dir.join("demo")).unwrap();
         symlink(&active_app_dir, &active_app_alias).unwrap();
 
-        let identity = Identity::resolve(&active_app_alias, "demo").unwrap().unwrap();
+        let identity = Identity::resolve(&active_app_alias, "demo").unwrap();
 
         assert!(identity.requires_argument());
         assert!(

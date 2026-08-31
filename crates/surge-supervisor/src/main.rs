@@ -599,19 +599,31 @@ mod tests {
         let exe_path_for_thread = exe_path.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         let supervisor = std::thread::spawn(move || {
-            let result = run_supervisor(
-                "demo-supervisor",
-                &install_dir_for_thread,
-                &exe_path_for_thread,
-                &[
-                    "--app-mode".to_string(),
-                    "service".to_string(),
-                    "--surge-first-run".to_string(),
-                    "2.0.0".to_string(),
-                ],
-                None,
-                None,
-            );
+            let spawn_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            let result = loop {
+                let result = run_supervisor(
+                    "demo-supervisor",
+                    &install_dir_for_thread,
+                    &exe_path_for_thread,
+                    &[
+                        "--app-mode".to_string(),
+                        "service".to_string(),
+                        "--surge-first-run".to_string(),
+                        "2.0.0".to_string(),
+                    ],
+                    None,
+                    None,
+                );
+                match &result {
+                    Err(SupervisorError::Io(error))
+                        if error.raw_os_error() == Some(nix::errno::Errno::ETXTBSY as i32)
+                            && std::time::Instant::now() < spawn_deadline =>
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    _ => break result,
+                }
+            };
             tx.send(result).unwrap();
         });
 

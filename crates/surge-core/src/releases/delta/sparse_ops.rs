@@ -1,4 +1,5 @@
 use std::fs;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -191,13 +192,7 @@ pub(super) fn apply_sparse_file_patch_with_progress(
     let working_dir = tempfile::tempdir()?;
 
     let extract_units = usize_to_u64_saturating(older.len()).max(1);
-    let ops_units = sparse_file_ops_work_units(&manifest.ops);
-    let repack_units = extract_units
-        .saturating_add(usize_to_u64_saturating(payloads.len()))
-        .max(1);
-    let total_units = extract_units.saturating_add(ops_units).saturating_add(repack_units);
-
-    emit_progress(progress, 0, total_units);
+    let total_units = extract_units.saturating_add(sparse_step_units(&manifest, payloads, extract_units));
 
     let extract_progress = |items_done: u64, items_total: u64, bytes_done: u64, bytes_total: u64| {
         let units_done = if bytes_total > 0 {
@@ -214,20 +209,77 @@ pub(super) fn apply_sparse_file_patch_with_progress(
     )?;
     emit_progress(progress, extract_units, total_units);
 
+    sparse_ops_and_repack(
+        working_dir.path(),
+        &manifest,
+        payloads,
+        extract_units,
+        total_units,
+        progress,
+    )
+}
+
+/// Unit space of one in-place chain step: ops + repack. The repack
+/// estimate mirrors the single-shot formula (the extract segment is
+/// folded in via `offset`, so a first step that includes the initial
+/// extract keeps the same progress shape).
+fn sparse_step_units(manifest: &SparseFileDeltaManifest, payloads: &[u8], offset: u64) -> u64 {
+    let ops_units = sparse_file_ops_work_units(&manifest.ops);
+    let repack_units = offset.saturating_add(usize_to_u64_saturating(payloads.len())).max(1);
+    ops_units.saturating_add(repack_units)
+}
+
+/// `sparse_step_units` for a decoded patch, so chain walkers can size
+/// the first step's unit space before extracting.
+pub(crate) fn sparse_step_units_for(patch: &[u8], extract_units: u64) -> Result<u64> {
+    let (manifest, payloads) = decode_sparse_file_ops_payload(patch)?;
+    Ok(sparse_step_units(&manifest, payloads, extract_units))
+}
+
+/// Apply one sparse delta to an already-extracted working directory and
+/// repack it. Chain walkers use this to carry the extracted tree across
+/// consecutive sparse deltas, skipping the per-step re-extract; the
+/// per-step repack and the caller's full-archive SHA-256 check are
+/// unchanged. `unit_offset` shifts the emitted unit space so a first
+/// step that included an extract stays monotonic.
+pub(crate) fn apply_sparse_step_in_place(
+    dir: &Path,
+    patch: &[u8],
+    unit_offset: u64,
+    progress: Option<&DeltaApplyProgressCallback<'_>>,
+) -> Result<Vec<u8>> {
+    let (manifest, payloads) = decode_sparse_file_ops_payload(patch)?;
+    let step_units = sparse_step_units(&manifest, payloads, unit_offset);
+    let total_units = unit_offset.saturating_add(step_units);
+    sparse_ops_and_repack(dir, &manifest, payloads, unit_offset, total_units, progress)
+}
+
+fn sparse_ops_and_repack(
+    dir: &Path,
+    manifest: &SparseFileDeltaManifest,
+    payloads: &[u8],
+    segment_base: u64,
+    total_units: u64,
+    progress: Option<&DeltaApplyProgressCallback<'_>>,
+) -> Result<Vec<u8>> {
+    let ops_units = sparse_file_ops_work_units(&manifest.ops);
+    emit_progress(progress, segment_base, total_units);
+
     let ops_progress = |done: u64, total: u64| {
         emit_progress(
             progress,
-            extract_units.saturating_add(scale_units(ops_units, done, total)),
+            segment_base.saturating_add(scale_units(ops_units, done, total)),
             total_units,
         );
     };
     apply_sparse_file_ops_with_progress(
-        working_dir.path(),
+        dir,
         &manifest.ops,
         payloads,
         progress.map(|_| &ops_progress as &super::fs_apply::SparseOpProgress<'_>),
     )?;
-    let repack_start_units = extract_units.saturating_add(ops_units);
+    let repack_start_units = segment_base.saturating_add(ops_units);
+    let repack_units = total_units.saturating_sub(repack_start_units);
     emit_progress(progress, repack_start_units, total_units);
 
     let mut packer = if manifest.zstd_workers > 1 {
@@ -246,7 +298,7 @@ pub(super) fn apply_sparse_file_patch_with_progress(
         emit_progress(progress, repack_start_units.saturating_add(units_done), total_units);
     };
     packer.add_directory_with_progress(
-        working_dir.path(),
+        dir,
         "",
         progress.map(|_| &repack_progress as &crate::archive::packer::PackProgress<'_>),
     )?;

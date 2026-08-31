@@ -31,25 +31,36 @@ Large anonymized profile, `sdk_only`, `100` deltas, `sparse-file-ops`
 (48-core/251 GB host, seed 42):
 
 - client download: `510 KiB` (archive-chunked: `15.6 MiB` — ~30x less)
-- client apply, full 100-delta walk: `657 s` (archive-chunked: ~`18 s`)
+- client apply, full 100-delta walk: `489 s` (before the carried-tree
+  apply below: `657 s`; archive-chunked: ~`18 s`)
 - per-delta apply cost is **flat in chain depth**: with per-step
-  progress instrumentation, every one of the 100 steps took
-  ~`6.4 s` (a 20-delta control run under the same host load measured
-  ~`6.3 s`/delta). Per-step cost is CPU-bound (each step re-extracts
-  and re-packs the full current archive) and varies ~3x with host
-  load — an earlier 20-delta run on an idle host measured
-  ~`2.2 s`/delta, which is the same per-step cost, not a depth effect
+  progress instrumentation, every step took a constant ~`6.4 s` before
+  the carried-tree apply and ~`4.8 s` after. Per-step cost is
+  CPU/IO-bound and varies ~3x with host load — an earlier 20-delta run
+  on an idle host measured ~`2.2 s`/delta, which is the same per-step
+  cost, not a depth effect
+- per-step cost breakdown (loaded host, scale 1.0): applying the
+  file ops ~`4.3 s` (materializing the changed files — the dominant,
+  unavoidable cost), extract ~`1.0 s`, repack ~`0.6 s`, hash ~`0.07 s`
+- **Carried-tree chain apply (landed)**: the chain walker now extracts
+  the starting archive once and applies consecutive sparse deltas in
+  place, repacking + SHA-256-verifying per step as before. This drops
+  the per-step extract: 100-delta apply `657 s` → `489 s` (−26%),
+  20-delta apply `128.7 s` → `100.7 s` (−22%), download bytes and the
+  applied payload unchanged (install-tree assertion + byte-identical
+  unit equivalence)
 
 Meaning:
 
 - for field bandwidth, sparse deltas win decisively: a 100-release
   localized chain costs half a MiB on the wire
-- the 657 s apply is a worst-case full-chain bench walk; production
+- the 489 s apply is a worst-case full-chain bench walk; production
   caps the client walk at `max_chain_length` (8) with checkpoint
   fulls every `checkpoint_every` (10), so real client applies are
   bounded far below this figure
-- the per-step cost itself is the open item (see below): every delta
-  apply re-extracts and re-packs the entire current archive
+- the remaining per-step cost is dominated by the file-ops phase
+  itself (materializing changed files), not by the archive
+  rebuild — see the open item below
 
 ### Broad churn is now bounded by file-aware deltas and full fallback
 
@@ -81,16 +92,15 @@ Meaning:
 
 ## What Is Not Solved Yet
 
-- each delta apply is O(archive size): `apply_target_deltas`
-  re-extracts the current full archive to a temp dir, applies the
-  per-file ops, re-packs it, and SHA-256s the result — so a chain
-  walk pays extract+repack per delta. Measured flat per step
-  (~2.2 s/delta idle host, ~6.4 s/delta loaded host, scale 1.0
-  sdk-only); production checkpointing bounds the walk at 8 deltas,
-  but edge-node CPU and SSD wear on long walks scale with archive
-  size. Candidate shapes: apply ops against the extracted tree
-  incrementally across the chain (extract once, repack once), or
-  batch the chain against a checkpoint full
+- the per-delta **ops phase** dominates apply (~4.3 s of ~4.8 s per
+  step at scale 1.0): materializing the changed files through
+  per-file patches is the work itself, and the carried-tree apply
+  only removed the re-extract overhead on top of it. The per-step
+  repack + hash (~0.7 s) is kept deliberately — it is what makes the
+  per-step full SHA-256 verification possible. A further win would
+  require applying against the installed tree instead of rebuilding
+  archives per step (changes the apply flow and verification shape;
+  not worth it while `max_chain_length` bounds walks at 8)
 - retained full checkpoints still need long-history tuning in real feeds
 - broad-churn chains can still justify a fresh full checkpoint
 - local checkpoint retention policy may need calibration for very long-lived installs

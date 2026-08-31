@@ -496,6 +496,7 @@ mod tests {
         permissions.set_mode(0o755);
         std::fs::set_permissions(path, permissions).unwrap();
     }
+
     #[test]
     fn macos_direct_interpreter_arguments_are_counted_literally() {
         assert_eq!(

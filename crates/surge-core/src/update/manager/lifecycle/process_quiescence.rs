@@ -690,6 +690,36 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
+    fn missing_active_entrypoint_refuses_swap_without_signalling_running_process() {
+        use std::os::unix::fs::symlink;
+        use std::process::Command;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let active_app_dir = tmp.path().join("app");
+        std::fs::create_dir_all(&active_app_dir).unwrap();
+        let app_path = active_app_dir.join("demo");
+        symlink("/bin/sleep", &app_path).unwrap();
+
+        let mut child = Command::new(&app_path).arg("30").spawn().unwrap();
+        std::fs::remove_file(&app_path).unwrap();
+
+        let error = terminate_active_app_processes_except(&active_app_dir, "demo", u32::MAX).unwrap_err();
+        let child_still_running = child.try_wait().unwrap().is_none();
+        if child_still_running {
+            child.kill().unwrap();
+        }
+        let _ = child.wait();
+
+        assert!(
+            error
+                .to_string()
+                .contains("Failed to resolve active application executable before swap")
+        );
+        assert!(child_still_running);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
     fn symlinked_active_entrypoint_does_not_terminate_other_processes_using_shared_target() {
         use std::os::unix::fs::symlink;
         use std::process::Command;
@@ -875,7 +905,7 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn interpreted_active_app_with_multiple_interpreter_options_is_terminated_before_swap() {
-        assert_interpreted_active_app_process_is_terminated_before_swap("#!/usr/bin/env -S /bin/sh -e -u");
+        assert_interpreted_active_app_process_is_terminated_before_swap("#!/usr/bin/env -S -i /bin/sh -e -u");
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

@@ -625,6 +625,28 @@ mod tests {
         app_store
     }
 
+    #[cfg(not(unix))]
+    fn write_app_scoped_release_index_with_current(
+        store_root: &Path,
+        app_id: &str,
+        index: &ReleaseIndex,
+        current_version: &str,
+    ) -> PathBuf {
+        let mut index = index.clone();
+        if !index.releases.iter().any(|release| release.version == current_version) {
+            let mut current = index.releases.first().cloned().unwrap_or_default();
+            current.version = current_version.to_string();
+            current.is_genesis = true;
+            current.full_filename.clear();
+            current.full_size = 0;
+            current.full_sha256.clear();
+            current.deltas.clear();
+            current.preferred_delta_id.clear();
+            index.releases.push(current);
+        }
+        write_app_scoped_release_index(store_root, app_id, &index)
+    }
+
     fn write_runtime_identity(active_app_dir: &Path, app_id: &str, version: &str, main_exe: &str, supervisor_id: &str) {
         write_runtime_identity_with_environment(active_app_dir, app_id, version, main_exe, supervisor_id, &[]);
     }

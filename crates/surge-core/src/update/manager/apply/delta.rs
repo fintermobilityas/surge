@@ -20,8 +20,13 @@ use super::super::{UpdateInfo, UpdateManager};
 use super::{VerifyFailureBudget, is_verification_failure};
 
 fn is_sparse_file_ops_delta(delta: &DeltaArtifact) -> bool {
-    delta.patch_format.eq_ignore_ascii_case(PATCH_FORMAT_SPARSE_FILE_OPS_V1)
-        && (delta.algorithm.trim().is_empty() || delta.algorithm.eq_ignore_ascii_case(DIFF_ALGORITHM_FILE_OPS))
+    // Mirrors the dispatch normalization in apply_delta_patch_with_progress
+    // (trimmed format/algorithm, case-insensitive) so the carry path and
+    // the archive path classify every descriptor the same way.
+    let patch_format = delta.patch_format.trim();
+    let algorithm = delta.algorithm.trim();
+    patch_format.eq_ignore_ascii_case(PATCH_FORMAT_SPARSE_FILE_OPS_V1)
+        && (algorithm.is_empty() || algorithm.eq_ignore_ascii_case(DIFF_ALGORITHM_FILE_OPS))
 }
 
 pub(super) async fn apply_target_deltas<F>(
@@ -119,52 +124,60 @@ where
         };
 
         let next_archive: Result<Vec<u8>> = if is_sparse_file_ops_delta(&delta) {
-            let (existing, needs_extract) = match chain_workdir.take() {
-                Some(wd) => (Some(wd), false),
-                None => (None, true),
+            // The closure returns Result so every failure in this arm flows
+            // through the shared error handler below (filename context +
+            // VerifyFailureBudget), like the archive path.
+            let apply_sparse_carry = |workdir_slot: &mut Option<tempfile::TempDir>| -> Result<Vec<u8>> {
+                let (existing, needs_extract) = match workdir_slot.take() {
+                    Some(wd) => (Some(wd), false),
+                    None => (None, true),
+                };
+                let extract_units = if needs_extract {
+                    u64::try_from(rebuilt_archive.len()).unwrap_or(u64::MAX).max(1)
+                } else {
+                    0
+                };
+                let step_units = sparse_step_units_for(&patch, extract_units)?;
+                let total_units = extract_units.saturating_add(step_units);
+                let workdir = match existing {
+                    Some(wd) => wd,
+                    None => {
+                        let wd = tempfile::tempdir()?;
+                        let extract_progress =
+                            |items_done: u64, items_total: u64, bytes_done: u64, bytes_total: u64| {
+                                let frac = if bytes_total > 0 {
+                                    bytes_done
+                                        .checked_mul(1000)
+                                        .and_then(|num| num.checked_div(bytes_total))
+                                        .unwrap_or(1000)
+                                } else {
+                                    items_done
+                                        .checked_mul(1000)
+                                        .and_then(|num| num.checked_div(items_total.max(1)))
+                                        .unwrap_or(1000)
+                                };
+                                delta_progress(DeltaApplyProgress {
+                                    units_done: extract_units.saturating_mul(frac) / 1000,
+                                    units_total: total_units,
+                                });
+                            };
+                        extract_to(
+                            &rebuilt_archive,
+                            wd.path(),
+                            Some(&extract_progress as &crate::archive::extractor::ExtractProgress<'_>),
+                        )?;
+                        wd
+                    }
+                };
+                let applied = apply_sparse_step_in_place(workdir.path(), &patch, extract_units, Some(&delta_progress))?;
+                *workdir_slot = Some(workdir);
+                Ok(applied)
             };
-            let extract_units = if needs_extract {
-                u64::try_from(rebuilt_archive.len()).unwrap_or(u64::MAX).max(1)
-            } else {
-                0
-            };
-            let step_units = sparse_step_units_for(&patch, extract_units)?;
-            let total_units = extract_units.saturating_add(step_units);
-            let workdir = match existing {
-                Some(wd) => wd,
-                None => {
-                    let wd = tempfile::tempdir()?;
-                    let extract_progress = |items_done: u64, items_total: u64, bytes_done: u64, bytes_total: u64| {
-                        let frac = if bytes_total > 0 {
-                            bytes_done
-                                .checked_mul(1000)
-                                .and_then(|num| num.checked_div(bytes_total))
-                                .unwrap_or(1000)
-                        } else {
-                            items_done
-                                .checked_mul(1000)
-                                .and_then(|num| num.checked_div(items_total.max(1)))
-                                .unwrap_or(1000)
-                        };
-                        delta_progress(DeltaApplyProgress {
-                            units_done: extract_units.saturating_mul(frac) / 1000,
-                            units_total: total_units,
-                        });
-                    };
-                    extract_to(
-                        &rebuilt_archive,
-                        wd.path(),
-                        Some(&extract_progress as &crate::archive::extractor::ExtractProgress<'_>),
-                    )?;
-                    wd
-                }
-            };
-            let applied = apply_sparse_step_in_place(workdir.path(), &patch, extract_units, Some(&delta_progress))?;
-            chain_workdir = Some(workdir);
-            Ok(applied)
+            apply_sparse_carry(&mut chain_workdir)
         } else {
-            // A non-sparse hop rebuilds from archive bytes; the carried
-            // tree is stale at that point and gets dropped.
+            // A non-sparse hop rebuilds from archive bytes; the carried tree
+            // is stale at that point, so drop it before applying.
+            chain_workdir = None;
             apply_delta_patch_with_progress(&rebuilt_archive, &patch, &delta, Some(&delta_progress))
         };
         rebuilt_archive = next_archive.map_err(|e| {
@@ -251,4 +264,33 @@ fn scale_apply_delta_items_percent(completed_items: i64, total_items: i64, done:
     let scaled_done = completed_items.saturating_mul(units_total).saturating_add(done);
     let scaled_total = total_items.saturating_mul(units_total);
     clamp_progress_percent_u64(scaled_done, scaled_total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_sparse_file_ops_delta;
+    use crate::releases::manifest::{DIFF_ALGORITHM_BSDIFF, DeltaArtifact};
+
+    fn sparse_delta() -> DeltaArtifact {
+        DeltaArtifact::sparse_file_ops_zstd("primary", "1.0.0", "delta.tar.zst", 10, "sha")
+    }
+
+    #[test]
+    fn sparse_classifier_matches_dispatch_normalization() {
+        assert!(is_sparse_file_ops_delta(&sparse_delta()));
+
+        // Padded descriptor values: the dispatch path normalizes them, so
+        // the classifier must take the same branch (carry path, not the
+        // re-extracting fallback).
+        let mut padded = sparse_delta();
+        padded.patch_format = format!(" {}", padded.patch_format);
+        padded.algorithm = format!("{} ", padded.algorithm);
+        assert!(is_sparse_file_ops_delta(&padded));
+
+        // A bsdiff algorithm on a sparse-format delta is unsupported by the
+        // dispatcher and must not be classified as carry-eligible.
+        let mut bsdiff_algo = sparse_delta();
+        bsdiff_algo.algorithm = DIFF_ALGORITHM_BSDIFF.to_string();
+        assert!(!is_sparse_file_ops_delta(&bsdiff_algo));
+    }
 }

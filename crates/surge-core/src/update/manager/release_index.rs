@@ -9,6 +9,7 @@ use crate::releases::delta::is_supported_delta;
 use crate::releases::manifest::{
     ReleaseEntry, ReleaseIndex, decompress_release_index, get_delta_chain, get_releases_newer_than,
 };
+use crate::releases::restore::find_release_for_version_rid;
 use crate::releases::version::compare_versions;
 use crate::storage::create_storage_backend;
 use crate::storage_config::append_prefix;
@@ -110,6 +111,8 @@ pub fn plan_update_from_index(
         )));
     }
 
+    let current_release = find_release_for_version_rid(index, target_rid, current_version).cloned();
+
     let mut compatible_index = index.clone();
     compatible_index.releases.retain(|release| {
         release.channels.iter().any(|candidate| candidate == channel)
@@ -168,6 +171,7 @@ pub fn plan_update_from_index(
     );
 
     Ok(Some(UpdateInfo {
+        current_release,
         available_releases,
         latest_version,
         delta_available,

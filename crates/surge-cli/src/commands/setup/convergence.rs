@@ -240,6 +240,7 @@ mod tests {
         );
 
         let mut update = UpdateInfo {
+            current_release: None,
             available_releases: vec![release("1.0.5"), release("1.1.0")],
             latest_version: "1.1.0".to_string(),
             delta_available: true,

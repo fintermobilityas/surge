@@ -48,6 +48,8 @@ struct RuntimeManifestFile<'a> {
     channel: &'a str,
     #[serde(rename = "installDirectory")]
     install_directory: &'a str,
+    #[serde(rename = "mainExe", skip_serializing_if = "str::is_empty")]
+    main_exe: &'a str,
     #[serde(rename = "supervisorId", skip_serializing_if = "str::is_empty")]
     supervisor_id: &'a str,
     provider: &'a str,
@@ -59,8 +61,15 @@ struct RuntimeManifestFile<'a> {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct RuntimeManifestVersion {
-    version: String,
+pub(crate) struct RuntimeManifestIdentity {
+    #[serde(rename = "id", default)]
+    pub(crate) app_id: String,
+    #[serde(default)]
+    pub(crate) version: String,
+    #[serde(rename = "mainExe", default)]
+    pub(crate) main_exe: String,
+    #[serde(rename = "supervisorId", default)]
+    pub(crate) supervisor_id: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -135,6 +144,7 @@ pub fn write_runtime_manifest(
         version: metadata.version.trim(),
         channel: metadata.channel.trim(),
         install_directory: profile.install_directory.trim(),
+        main_exe: profile.main_exe.trim(),
         supervisor_id: profile.supervisor_id.trim(),
         provider: metadata.storage_provider.trim(),
         bucket: metadata.storage_bucket.trim(),
@@ -183,6 +193,10 @@ pub fn write_runtime_manifest(
 }
 
 pub fn read_runtime_manifest_version(active_app_dir: &Path) -> Result<Option<String>> {
+    Ok(read_runtime_manifest_identity(active_app_dir)?.map(|identity| identity.version))
+}
+
+pub(crate) fn read_runtime_manifest_identity(active_app_dir: &Path) -> Result<Option<RuntimeManifestIdentity>> {
     for relative_path in [RUNTIME_MANIFEST_RELATIVE_PATH, LEGACY_RUNTIME_MANIFEST_RELATIVE_PATH] {
         let path = active_app_dir.join(relative_path);
         if !path.is_file() {
@@ -190,11 +204,14 @@ pub fn read_runtime_manifest_version(active_app_dir: &Path) -> Result<Option<Str
         }
 
         let raw = std::fs::read(&path)?;
-        let manifest: RuntimeManifestVersion = serde_yaml::from_slice(&raw)
+        let mut manifest: RuntimeManifestIdentity = serde_yaml::from_slice(&raw)
             .map_err(|e| SurgeError::Config(format!("Failed to parse runtime manifest '{}': {e}", path.display())))?;
-        let version = manifest.version.trim();
-        if !version.is_empty() {
-            return Ok(Some(version.to_string()));
+        if !manifest.version.trim().is_empty() {
+            manifest.app_id = manifest.app_id.trim().to_string();
+            manifest.version = manifest.version.trim().to_string();
+            manifest.main_exe = manifest.main_exe.trim().to_string();
+            manifest.supervisor_id = manifest.supervisor_id.trim().to_string();
+            return Ok(Some(manifest));
         }
     }
 

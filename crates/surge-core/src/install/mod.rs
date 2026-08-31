@@ -14,6 +14,7 @@ pub use self::activation::{
 };
 pub use self::launch::{auto_start_after_install, auto_start_after_install_sequence, launch_installed_application};
 pub use self::persistent_assets::{copy_persistent_assets, validate_relative_persistent_asset_path};
+pub(crate) use self::runtime_manifest::read_runtime_manifest_identity;
 pub use self::runtime_manifest::{
     LEGACY_RUNTIME_MANIFEST_RELATIVE_PATH, RUNTIME_MANIFEST_RELATIVE_PATH, RuntimeManifestMetadata,
     read_runtime_manifest_version, storage_provider_manifest_name, write_runtime_manifest,
@@ -162,6 +163,7 @@ mod tests {
         assert!(raw.contains("version: 1.2.3"));
         assert!(raw.contains("channel: test"));
         assert!(raw.contains("installDirectory: demo-install"));
+        assert!(raw.contains("mainExe: demo"));
         assert!(raw.contains("supervisorId: demo-supervisor"));
         assert!(raw.contains("provider: azure"));
         assert!(raw.contains("bucket: demo-bucket"));

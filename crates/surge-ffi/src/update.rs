@@ -555,6 +555,16 @@ mod tests {
         assert_eq!(rc, SURGE_OK);
     }
 
+    fn write_runtime_identity(app_dir: &Path, main_exe: &str) {
+        let manifest_path = app_dir.join(surge_core::install::RUNTIME_MANIFEST_RELATIVE_PATH);
+        std::fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            manifest_path,
+            format!("id: demo\nversion: 1.0.0\nchannel: stable\nmainExe: \"{main_exe}\"\nsupervisorId: \"\"\n"),
+        )
+        .unwrap();
+    }
+
     fn create_manager(
         ctx: *mut crate::handles::SurgeContextHandle,
         install_dir: &Path,
@@ -816,7 +826,7 @@ mod tests {
     }
 
     #[test]
-    fn update_check_preserves_current_release_identity_for_separate_apply_call() {
+    fn update_check_preserves_local_current_release_identity_for_separate_apply_call() {
         let storage = TestDir::new("surge-ffi-checked-update-storage");
         let install = TestDir::new("surge-ffi-checked-update-install");
         let app_storage = storage.path().join("demo");
@@ -824,6 +834,7 @@ mod tests {
         std::fs::create_dir_all(&app_storage).unwrap();
         std::fs::create_dir_all(&active_app).unwrap();
         std::fs::write(active_app.join("old-app"), b"old payload").unwrap();
+        write_runtime_identity(&active_app, "old-app");
 
         let rid = current_rid();
         let os = rid.split('-').next().unwrap_or_default().to_string();
@@ -838,7 +849,7 @@ mod tests {
             channels: vec!["stable".to_string()],
             os: os.clone(),
             rid: rid.clone(),
-            main_exe: "old-app".to_string(),
+            main_exe: "republished-app".to_string(),
             install_directory: "demo".to_string(),
             ..ReleaseEntry::default()
         };

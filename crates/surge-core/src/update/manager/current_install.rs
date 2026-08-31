@@ -1,17 +1,33 @@
+#[cfg(unix)]
+use std::cmp::Ordering;
+#[cfg(unix)]
+use std::collections::BTreeMap;
+#[cfg(unix)]
 use std::path::{Component, Path};
 
+#[cfg(unix)]
 use crate::error::{Result, SurgeError};
+#[cfg(unix)]
 use crate::install::read_runtime_manifest_identity;
+#[cfg(unix)]
+use crate::releases::version::compare_versions;
+#[cfg(unix)]
 use crate::supervisor::state::read_supervisor_exe_path;
 
+#[cfg(unix)]
 use super::{UpdateManager, apply};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ReleaseIdentity {
+    #[cfg(unix)]
+    pub(super) version: String,
     pub(super) main_exe: String,
     pub(super) supervisor_id: String,
+    #[cfg(unix)]
+    pub(super) environment: BTreeMap<String, String>,
 }
 
+#[cfg(unix)]
 pub(super) fn load(manager: &UpdateManager) -> Result<Option<ReleaseIdentity>> {
     let Some(active_app_dir) = apply::find_previous_app_dir(&manager.install_dir, &manager.current_version) else {
         return Ok(None);
@@ -26,9 +42,9 @@ pub(super) fn load(manager: &UpdateManager) -> Result<Option<ReleaseIdentity>> {
             manifest.app_id, manager.app_id
         )));
     }
-    if manifest.version != manager.current_version {
+    if compare_versions(&manifest.version, &manager.current_version) != Ordering::Equal {
         return Err(SurgeError::Update(format!(
-            "Installed runtime manifest version '{}' does not exactly match update version '{}'",
+            "Installed runtime manifest version '{}' does not match update version '{}'",
             manifest.version, manager.current_version
         )));
     }
@@ -36,15 +52,20 @@ pub(super) fn load(manager: &UpdateManager) -> Result<Option<ReleaseIdentity>> {
     let main_exe = if manifest.main_exe.is_empty() {
         legacy_main_exe(manager, &active_app_dir, &manifest.app_id, &manifest.supervisor_id)
     } else {
-        Some(manifest.main_exe)
+        Some(safe_relative_path(Path::new(&manifest.main_exe)).ok_or_else(|| {
+            SurgeError::Update("Installed runtime manifest mainExe must be a safe relative path".to_string())
+        })?)
     };
 
     Ok(main_exe.map(|main_exe| ReleaseIdentity {
+        version: manifest.version,
         main_exe,
         supervisor_id: manifest.supervisor_id,
+        environment: manifest.environment,
     }))
 }
 
+#[cfg(unix)]
 fn legacy_main_exe(
     manager: &UpdateManager,
     active_app_dir: &Path,
@@ -82,6 +103,7 @@ fn legacy_main_exe(
     })
 }
 
+#[cfg(unix)]
 fn safe_relative_path(path: &Path) -> Option<String> {
     if path.as_os_str().is_empty()
         || path
@@ -93,7 +115,7 @@ fn safe_relative_path(path: &Path) -> Option<String> {
     path.to_str().map(ToString::to_string)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use std::sync::Arc;
 
@@ -131,7 +153,31 @@ mod tests {
 
         let identity = load(&manager).unwrap().unwrap();
 
+        assert_eq!(identity.version, "1.0.0");
         assert_eq!(identity.main_exe, "demo-entrypoint");
         assert_eq!(identity.supervisor_id, "demo-supervisor");
+    }
+
+    #[test]
+    fn runtime_manifest_rejects_main_exe_outside_the_install() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_dir = tmp.path().join("store");
+        let install_dir = tmp.path().join("install");
+        let active_app_dir = install_dir.join("app");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        std::fs::create_dir_all(active_app_dir.join(".surge")).unwrap();
+        std::fs::write(
+            active_app_dir.join(crate::install::RUNTIME_MANIFEST_RELATIVE_PATH),
+            "id: demo\nversion: 1.0.0\nmainExe: ../other-app\n",
+        )
+        .unwrap();
+
+        let ctx = Arc::new(Context::new());
+        ctx.set_storage(StorageProvider::Filesystem, store_dir.to_str().unwrap(), "", "", "", "");
+        let manager = UpdateManager::new(ctx, "demo", "1.0.0", "stable", install_dir.to_str().unwrap()).unwrap();
+
+        let error = load(&manager).unwrap_err();
+
+        assert!(error.to_string().contains("mainExe must be a safe relative path"));
     }
 }

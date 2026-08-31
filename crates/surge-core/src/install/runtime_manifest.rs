@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -58,6 +59,8 @@ struct RuntimeManifestFile<'a> {
     region: &'a str,
     #[serde(skip_serializing_if = "str::is_empty")]
     endpoint: &'a str,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    environment: &'a BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -70,6 +73,8 @@ pub(crate) struct RuntimeManifestIdentity {
     pub(crate) main_exe: String,
     #[serde(rename = "supervisorId", default)]
     pub(crate) supervisor_id: String,
+    #[serde(default)]
+    pub(crate) environment: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -150,6 +155,7 @@ pub fn write_runtime_manifest(
         bucket: metadata.storage_bucket.trim(),
         region: metadata.storage_region.trim(),
         endpoint: metadata.storage_endpoint.trim(),
+        environment: profile.environment,
     };
 
     if manifest.id.is_empty() {
@@ -216,4 +222,39 @@ pub(crate) fn read_runtime_manifest_identity(active_app_dir: &Path) -> Result<Op
     }
 
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::config::manifest::ShortcutLocation;
+
+    use super::*;
+
+    #[test]
+    fn runtime_manifest_preserves_launch_environment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shortcuts: [ShortcutLocation; 0] = [];
+        let persistent_assets: [String; 0] = [];
+        let environment = BTreeMap::from([
+            ("DEMO_MODE".to_string(), "recovery".to_string()),
+            ("PATH".to_string(), "/opt/demo/bin:/usr/bin:/bin".to_string()),
+        ]);
+        let profile = InstallProfile::new(
+            "demo-app",
+            "Demo App",
+            "demo",
+            "demo-app",
+            "demo-supervisor",
+            "",
+            &shortcuts,
+            &persistent_assets,
+            &environment,
+        );
+        let metadata = RuntimeManifestMetadata::new("1.0.0", "stable", "filesystem", ".", "", "");
+
+        write_runtime_manifest(tmp.path(), &profile, &metadata).unwrap();
+        let identity = read_runtime_manifest_identity(tmp.path()).unwrap().unwrap();
+
+        assert_eq!(identity.environment, environment);
+    }
 }

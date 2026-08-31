@@ -1,5 +1,5 @@
 use std::path::Path;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -490,7 +490,7 @@ where
     ))
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn normalize_proc_exe_path(path: PathBuf) -> PathBuf {
     let normalized = {
         let path_text = path.to_string_lossy();
@@ -732,7 +732,7 @@ mod tests {
         assert!(!status.success());
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn proc_exe_deleted_suffix_is_ignored_for_matching() {
         assert_eq!(

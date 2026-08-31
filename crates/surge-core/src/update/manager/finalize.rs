@@ -64,8 +64,49 @@ where
     let active_app_dir = manager.install_dir.join("app");
     let next_app_dir = manager.install_dir.join(".surge-app-next");
     let previous_swap_dir = manager.install_dir.join(".surge-app-prev");
-    let supervisor_was_running = !latest.supervisor_id.trim().is_empty()
-        && supervisor_pid_file(&manager.install_dir, &latest.supervisor_id).is_file();
+    let fallback_previous_app_dir = if active_app_dir.is_dir() {
+        None
+    } else {
+        apply::find_previous_app_dir(&manager.install_dir, &manager.current_version)
+    };
+    let current_app_dir = if active_app_dir.is_dir() {
+        Some(active_app_dir.as_path())
+    } else {
+        fallback_previous_app_dir.as_deref()
+    };
+    #[cfg(unix)]
+    if current_app_dir.is_none() && manager.current_release_identity.is_some() {
+        return Err(SurgeError::Update(
+            "Installed application directory disappeared after the update check; refusing to swap the active application"
+                .to_string(),
+        ));
+    }
+    #[cfg(unix)]
+    let (current_main_exe, current_supervisor_id) = if current_app_dir.is_some() {
+        let installed_identity = super::current_install::load(manager)?;
+        if installed_identity != manager.current_release_identity {
+            return Err(SurgeError::Update(
+                "Installed application identity changed after the update check; refusing to swap the active application"
+                    .to_string(),
+            ));
+        }
+        let current = manager.current_release_identity.as_ref().ok_or_else(|| {
+            SurgeError::Update(format!(
+                "Current release {} is unavailable; refusing to swap the active application without its locally persisted process identity",
+                manager.current_version
+            ))
+        })?;
+        (current.main_exe.as_str(), current.supervisor_id.as_str())
+    } else {
+        ("", "")
+    };
+    #[cfg(not(unix))]
+    let (current_main_exe, current_supervisor_id) = manager.current_release_identity.as_ref().map_or_else(
+        || (latest.main_exe.as_str(), latest.supervisor_id.as_str()),
+        |current| (current.main_exe.as_str(), current.supervisor_id.as_str()),
+    );
+    let supervisor_was_running = !current_supervisor_id.trim().is_empty()
+        && supervisor_pid_file(&manager.install_dir, current_supervisor_id).is_file();
 
     if supervisor_was_running {
         progress_emitter
@@ -74,15 +115,17 @@ where
                 finalize_phase::STOPPING_SUPERVISOR,
                 91,
                 HEARTBEAT_INTERVAL,
-                lifecycle::request_supervisor_shutdown(&manager.install_dir, &latest.supervisor_id),
+                lifecycle::request_supervisor_shutdown(&manager.install_dir, current_supervisor_id),
             )
             .await?;
     } else {
-        lifecycle::request_supervisor_shutdown(&manager.install_dir, &latest.supervisor_id).await?;
+        lifecycle::request_supervisor_shutdown(&manager.install_dir, current_supervisor_id).await?;
     }
 
     progress_emitter.emit_substep(6, finalize_phase::QUIESCING_ACTIVE_APP, 92);
-    lifecycle::terminate_active_app_processes_before_swap(&active_app_dir, &latest.main_exe)?;
+    if let Some(current_app_dir) = current_app_dir {
+        lifecycle::terminate_active_app_processes_before_swap(current_app_dir, current_main_exe)?;
+    }
 
     progress_emitter.emit_substep(6, finalize_phase::PREPARING_SWAP, 92);
     if next_app_dir.exists() {
@@ -91,13 +134,6 @@ where
     if previous_swap_dir.exists() {
         tokio::fs::remove_dir_all(&previous_swap_dir).await?;
     }
-
-    // Legacy installs may still be on `app-{version}` layout.
-    let fallback_previous_app_dir = if active_app_dir.is_dir() {
-        None
-    } else {
-        apply::find_previous_app_dir(&manager.install_dir, &manager.current_version)
-    };
 
     progress_emitter.emit_substep(6, finalize_phase::SWAPPING_APP_DIRECTORY, 93);
     atomic_rename(extracted_final_dir, &next_app_dir)?;

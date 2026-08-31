@@ -92,15 +92,13 @@ Meaning:
 
 ## What Is Not Solved Yet
 
-- the per-delta **ops phase** dominates apply (~4.3 s of ~4.8 s per
-  step at scale 1.0): materializing the changed files through
-  per-file patches is the work itself, and the carried-tree apply
-  only removed the re-extract overhead on top of it. The per-step
-  repack + hash (~0.7 s) is kept deliberately — it is what makes the
-  per-step full SHA-256 verification possible. A further win would
-  require applying against the installed tree instead of rebuilding
-  archives per step (changes the apply flow and verification shape;
-  not worth it while `max_chain_length` bounds walks at 8)
+- the per-delta **ops phase** still costs ~`2 s` per step at scale
+  1.0 even after the identity-chunk fix: the changed 1 GB file is
+  read once and written once for the bspatch, then hashed twice
+  (basis + target SHA-256). The redundant basis re-hash (the target
+  hash was already verified by the previous step) is the cheapest
+  remaining win; anything deeper (range-scoped ops) needs a new
+  sparse op kind
 - retained full checkpoints still need long-history tuning in real feeds
 - broad-churn chains can still justify a fresh full checkpoint
 - local checkpoint retention policy may need calibration for very long-lived installs

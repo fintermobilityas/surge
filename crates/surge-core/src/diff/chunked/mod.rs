@@ -4,6 +4,10 @@
 //! This reduces peak memory from O(8 × file_size) to O(8 × chunk_size) and
 //! enables parallel processing across chunks.
 
+mod format;
+
+pub use format::has_magic_prefix;
+use format::{ChunkedPatchData, deserialize_patch, serialize_patch};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
@@ -17,23 +21,11 @@ use crate::error::{Result, SurgeError};
 
 use super::wrapper;
 
-/// Magic bytes identifying the chunked patch format.
-const MAGIC: &[u8; 4] = b"CSDF";
-
-/// Format version.
-const VERSION: u8 = 1;
-
 /// Default chunk size: 64 MiB.
 pub const DEFAULT_CHUNK_SIZE: usize = 64 * 1024 * 1024;
 
 /// Progress callback for file-backed patch application: (bytes_done, bytes_total).
 pub type ByteProgress<'a> = dyn Fn(u64, u64) + 'a;
-
-/// Returns whether `data` starts with the chunked patch magic bytes.
-#[must_use]
-pub fn has_magic_prefix(data: &[u8]) -> bool {
-    data.starts_with(MAGIC)
-}
 
 /// Options for chunked diff/patch operations.
 pub struct ChunkedDiffOptions {
@@ -127,7 +119,7 @@ pub fn chunked_bsdiff(older: &[u8], newer: &[u8], opts: &ChunkedDiffOptions) -> 
 
     // Parallel chunk diffing
     let work_counter = AtomicUsize::new(0);
-    let results: Mutex<Vec<(usize, Vec<u8>)>> = Mutex::new(Vec::with_capacity(num_chunks));
+    let results: Mutex<Vec<(usize, Vec<u8>, bool)>> = Mutex::new(Vec::with_capacity(num_chunks));
     let error: Mutex<Option<SurgeError>> = Mutex::new(None);
 
     thread::scope(|s| {
@@ -160,13 +152,17 @@ pub fn chunked_bsdiff(older: &[u8], newer: &[u8], opts: &ChunkedDiffOptions) -> 
                         &[]
                     };
 
-                    let patch = if old_chunk.is_empty() {
-                        new_chunk.to_vec()
+                    let (patch, identity) = if old_chunk.is_empty() {
+                        (new_chunk.to_vec(), false)
                     } else if new_chunk.is_empty() {
-                        Vec::new()
+                        (Vec::new(), false)
+                    } else if old_chunk == new_chunk {
+                        // Unchanged chunk: record the identity marker instead
+                        // of paying for a whole-chunk bsdiff.
+                        (Vec::new(), true)
                     } else {
                         match wrapper::bsdiff_buffers(old_chunk, new_chunk) {
-                            Ok(p) => p,
+                            Ok(p) => (p, false),
                             Err(e) => {
                                 *lock_mutex(&error) = Some(e);
                                 return;
@@ -174,7 +170,7 @@ pub fn chunked_bsdiff(older: &[u8], newer: &[u8], opts: &ChunkedDiffOptions) -> 
                         }
                     };
 
-                    lock_mutex(&results).push((idx, patch));
+                    lock_mutex(&results).push((idx, patch, identity));
                 }
             });
         }
@@ -185,14 +181,21 @@ pub fn chunked_bsdiff(older: &[u8], newer: &[u8], opts: &ChunkedDiffOptions) -> 
     }
 
     let mut chunks = into_inner(results);
-    chunks.sort_by_key(|(idx, _)| *idx);
+    chunks.sort_by_key(|(idx, _, _)| *idx);
 
     serialize_patch(older.len(), newer.len(), chunk_size, &chunks)
 }
 
 /// Apply a chunked patch to reconstruct the newer file.
 pub fn chunked_bspatch(older: &[u8], patch: &[u8], opts: &ChunkedDiffOptions) -> Result<Vec<u8>> {
-    let (old_size, new_size, chunk_size, chunk_patches) = deserialize_patch(patch)?;
+    let decoded = deserialize_patch(patch)?;
+    let ChunkedPatchData {
+        old_size,
+        new_size,
+        chunk_size,
+        chunks: chunk_patches,
+        identity,
+    } = decoded;
 
     if older.len() != old_size {
         return Err(SurgeError::Diff(format!(
@@ -235,7 +238,13 @@ pub fn chunked_bspatch(older: &[u8], patch: &[u8], opts: &ChunkedDiffOptions) ->
                         &[]
                     };
 
-                    let new_chunk = if old_chunk.is_empty() {
+                    let new_chunk = if identity[idx] {
+                        if old_chunk.is_empty() {
+                            *lock_mutex(&error) = Some(SurgeError::Diff("identity chunk has no old content".into()));
+                            return;
+                        }
+                        old_chunk.to_vec()
+                    } else if old_chunk.is_empty() {
                         chunk_patch.to_vec()
                     } else if chunk_patch.is_empty() {
                         Vec::new()
@@ -248,7 +257,6 @@ pub fn chunked_bspatch(older: &[u8], patch: &[u8], opts: &ChunkedDiffOptions) ->
                             }
                         }
                     };
-
                     lock_mutex(&results).push((idx, new_chunk));
                 }
             });
@@ -295,7 +303,7 @@ pub fn chunked_bsdiff_files(older_path: &Path, newer_path: &Path, opts: &Chunked
     let num_chunks = num_old_chunks.max(num_new_chunks);
     let num_threads = opts.effective_threads();
     let work_counter = AtomicUsize::new(0);
-    let results: Mutex<Vec<(usize, Vec<u8>)>> = Mutex::new(Vec::with_capacity(num_chunks));
+    let results: Mutex<Vec<(usize, Vec<u8>, bool)>> = Mutex::new(Vec::with_capacity(num_chunks));
     let error: Mutex<Option<SurgeError>> = Mutex::new(None);
 
     thread::scope(|scope| {
@@ -343,20 +351,24 @@ pub fn chunked_bsdiff_files(older_path: &Path, newer_path: &Path, opts: &Chunked
                         }
                     };
 
-                    let patch = if old_chunk.is_empty() {
-                        new_chunk
+                    let (patch, identity) = if old_chunk.is_empty() {
+                        (new_chunk, false)
                     } else if new_chunk.is_empty() {
-                        Vec::new()
+                        (Vec::new(), false)
+                    } else if old_chunk == new_chunk {
+                        // Unchanged chunk: record the identity marker instead
+                        // of paying for a whole-chunk bsdiff.
+                        (Vec::new(), true)
                     } else {
                         match wrapper::bsdiff_buffers(&old_chunk, &new_chunk) {
-                            Ok(patch) => patch,
+                            Ok(patch) => (patch, false),
                             Err(err) => {
                                 *lock_mutex(&error) = Some(err);
                                 return;
                             }
                         }
                     };
-                    lock_mutex(&results).push((idx, patch));
+                    lock_mutex(&results).push((idx, patch, identity));
                 }
             });
         }
@@ -366,7 +378,7 @@ pub fn chunked_bsdiff_files(older_path: &Path, newer_path: &Path, opts: &Chunked
         return Err(err);
     }
     let mut chunks = into_inner(results);
-    chunks.sort_by_key(|(idx, _)| *idx);
+    chunks.sort_by_key(|(idx, _, _)| *idx);
     serialize_patch(old_size, new_size, chunk_size, &chunks)
 }
 
@@ -385,7 +397,14 @@ pub fn chunked_bspatch_file_with_progress(
     output_path: &Path,
     progress: Option<&ByteProgress<'_>>,
 ) -> Result<()> {
-    let (old_size, new_size, chunk_size, chunk_patches) = deserialize_patch(patch)?;
+    let decoded = deserialize_patch(patch)?;
+    let ChunkedPatchData {
+        old_size,
+        new_size,
+        chunk_size,
+        chunks: chunk_patches,
+        identity,
+    } = decoded;
     let actual_old_size = usize::try_from(fs::metadata(older_path)?.len())
         .map_err(|_| SurgeError::Diff("old file exceeds platform limits".into()))?;
     if actual_old_size != old_size {
@@ -405,7 +424,12 @@ pub fn chunked_bspatch_file_with_progress(
     for (idx, chunk_patch) in chunk_patches.iter().enumerate() {
         let old_chunk_len = chunk_len_for_index(old_size, idx, chunk_size);
         let old_chunk = read_exact_chunk(&mut old_file, old_chunk_len)?;
-        let new_chunk = if old_chunk.is_empty() {
+        let new_chunk = if identity[idx] {
+            if old_chunk.is_empty() {
+                return Err(SurgeError::Diff("identity chunk has no old content".into()));
+            }
+            old_chunk
+        } else if old_chunk.is_empty() {
             (*chunk_patch).to_vec()
         } else if chunk_patch.is_empty() {
             Vec::new()
@@ -436,61 +460,6 @@ fn usize_to_u64_saturating(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
 
-/// Patch format:
-///   MAGIC (4 bytes) "CSDF"
-///   VERSION (1 byte)
-///   chunk_size (8 bytes LE)
-///   old_size (8 bytes LE)
-///   new_size (8 bytes LE)
-///   num_chunks (4 bytes LE)
-///   For each chunk:
-///     patch_len (8 bytes LE)
-///     patch_data (patch_len bytes)
-fn serialize_patch(
-    old_size: usize,
-    new_size: usize,
-    chunk_size: usize,
-    chunks: &[(usize, Vec<u8>)],
-) -> Result<Vec<u8>> {
-    let header_size = 4 + 1 + 8 + 8 + 8 + 4;
-    let data_size: usize = chunks.iter().map(|(_, p)| 8 + p.len()).sum();
-    let mut buf = Vec::with_capacity(header_size + data_size);
-
-    buf.extend_from_slice(MAGIC);
-    buf.push(VERSION);
-    buf.extend_from_slice(
-        &u64::try_from(chunk_size)
-            .map_err(|_| SurgeError::Diff("chunk size exceeds supported patch format".into()))?
-            .to_le_bytes(),
-    );
-    buf.extend_from_slice(
-        &u64::try_from(old_size)
-            .map_err(|_| SurgeError::Diff("old size exceeds supported patch format".into()))?
-            .to_le_bytes(),
-    );
-    buf.extend_from_slice(
-        &u64::try_from(new_size)
-            .map_err(|_| SurgeError::Diff("new size exceeds supported patch format".into()))?
-            .to_le_bytes(),
-    );
-    buf.extend_from_slice(
-        &u32::try_from(chunks.len())
-            .map_err(|_| SurgeError::Diff("chunk count exceeds supported patch format".into()))?
-            .to_le_bytes(),
-    );
-
-    for (_, patch) in chunks {
-        buf.extend_from_slice(
-            &u64::try_from(patch.len())
-                .map_err(|_| SurgeError::Diff("patch chunk exceeds supported patch format".into()))?
-                .to_le_bytes(),
-        );
-        buf.extend_from_slice(patch);
-    }
-
-    Ok(buf)
-}
-
 fn chunk_len_for_index(total_len: usize, chunk_idx: usize, chunk_size: usize) -> usize {
     let start = chunk_idx.saturating_mul(chunk_size);
     if start >= total_len {
@@ -514,66 +483,6 @@ fn read_chunk_at(file: &mut fs::File, chunk_idx: usize, chunk_size: usize, chunk
         .map_err(|_| SurgeError::Diff("chunk offset exceeds supported limits".into()))?;
     file.seek(SeekFrom::Start(start))?;
     read_exact_chunk(file, chunk_len)
-}
-
-fn read_u64_le(data: &[u8], offset: usize) -> Result<u64> {
-    let bytes: [u8; 8] = data[offset..offset + 8]
-        .try_into()
-        .map_err(|_| SurgeError::Diff("patch truncated reading u64".into()))?;
-    Ok(u64::from_le_bytes(bytes))
-}
-
-fn read_u32_le(data: &[u8], offset: usize) -> Result<u32> {
-    let bytes: [u8; 4] = data[offset..offset + 4]
-        .try_into()
-        .map_err(|_| SurgeError::Diff("patch truncated reading u32".into()))?;
-    Ok(u32::from_le_bytes(bytes))
-}
-
-fn deserialize_patch(data: &[u8]) -> Result<(usize, usize, usize, Vec<&[u8]>)> {
-    let header_size = 4 + 1 + 8 + 8 + 8 + 4;
-    if data.len() < header_size {
-        return Err(SurgeError::Diff("patch too short for header".into()));
-    }
-
-    if &data[0..4] != MAGIC {
-        return Err(SurgeError::Diff("invalid chunked patch magic".into()));
-    }
-    if data[4] != VERSION {
-        return Err(SurgeError::Diff(format!(
-            "unsupported chunked patch version: {}",
-            data[4]
-        )));
-    }
-
-    let chunk_size = usize::try_from(read_u64_le(data, 5)?)
-        .map_err(|_| SurgeError::Diff("chunk size exceeds platform limits".into()))?;
-    let old_size = usize::try_from(read_u64_le(data, 13)?)
-        .map_err(|_| SurgeError::Diff("old size exceeds platform limits".into()))?;
-    let new_size = usize::try_from(read_u64_le(data, 21)?)
-        .map_err(|_| SurgeError::Diff("new size exceeds platform limits".into()))?;
-    let num_chunks = usize::try_from(read_u32_le(data, 29)?)
-        .map_err(|_| SurgeError::Diff("chunk count exceeds platform limits".into()))?;
-
-    let mut offset = header_size;
-    let mut chunks = Vec::with_capacity(num_chunks);
-
-    for _ in 0..num_chunks {
-        if offset + 8 > data.len() {
-            return Err(SurgeError::Diff("patch truncated at chunk length".into()));
-        }
-        let patch_len = usize::try_from(read_u64_le(data, offset)?)
-            .map_err(|_| SurgeError::Diff("patch chunk length exceeds platform limits".into()))?;
-        offset += 8;
-
-        if offset + patch_len > data.len() {
-            return Err(SurgeError::Diff("patch truncated at chunk data".into()));
-        }
-        chunks.push(&data[offset..offset + patch_len]);
-        offset += patch_len;
-    }
-
-    Ok((old_size, new_size, chunk_size, chunks))
 }
 
 #[cfg(test)]
@@ -680,5 +589,30 @@ mod tests {
         chunked_bspatch_file(&old_path, &patch, &rebuilt_path).expect("apply patch");
 
         assert_eq!(std::fs::read(&rebuilt_path).expect("read rebuilt"), new);
+    }
+
+    #[test]
+    fn test_chunked_v2_identity_bit_without_old_content_rejected() {
+        // Corrupt v2 patch: file grew so the last chunk has no old content,
+        // but its identity bit is set.
+        let chunk = 256usize;
+        let old: Vec<u8> = vec![1u8; chunk];
+        let new: Vec<u8> = vec![2u8; 2 * chunk];
+        let opts = ChunkedDiffOptions {
+            chunk_size: chunk,
+            max_threads: 1,
+        };
+        let patch = chunked_bsdiff(&old, &new, &opts).expect("bsdiff");
+        let header = 4 + 1 + 8 + 8 + 8 + 4;
+        let bitset = header;
+        let chunk0_len_off = bitset + 1;
+        let chunk0_len = u64::from_le_bytes(patch[chunk0_len_off..chunk0_len_off + 8].try_into().unwrap()) as usize;
+        let chunk1_len_off = chunk0_len_off + 8 + chunk0_len;
+        let mut corrupted = patch.clone();
+        corrupted[bitset] |= 1u8 << 1; // identity bit for chunk 1 (no old content)
+        // Zero chunk 1's payload length so deserialize accepts the marker.
+        corrupted[chunk1_len_off..chunk1_len_off + 8].copy_from_slice(&0u64.to_le_bytes());
+        let err = chunked_bspatch(&old, &corrupted, &opts).unwrap_err();
+        assert!(err.to_string().contains("identity chunk has no old content"), "{err}");
     }
 }

@@ -316,8 +316,22 @@ fn terminate_superseded_app_processes_except(
 
 #[cfg(unix)]
 fn terminate_active_app_processes_except(active_app_dir: &Path, main_exe: &str, protected_pid: u32) -> Result<usize> {
+    let main_exe = main_exe.trim();
+    if main_exe.is_empty() {
+        return Ok(0);
+    }
+
+    let active_exe = match std::fs::canonicalize(active_app_dir.join(main_exe)) {
+        Ok(active_exe) => active_exe,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => {
+            return Err(SurgeError::Platform(format!(
+                "Failed to resolve active application executable before swap: {e}"
+            )));
+        }
+    };
     terminate_matching_app_processes(main_exe, protected_pid, "active", |exe| {
-        is_active_app_exe(active_app_dir, main_exe, exe)
+        is_active_app_exe(&active_exe, exe)
     })
 }
 
@@ -486,8 +500,8 @@ fn normalize_proc_exe_path(path: PathBuf) -> PathBuf {
 }
 
 #[cfg(unix)]
-fn is_active_app_exe(active_app_dir: &Path, main_exe: &str, exe: &Path) -> bool {
-    exe == active_app_dir.join(main_exe)
+fn is_active_app_exe(active_exe: &Path, exe: &Path) -> bool {
+    exe == active_exe
 }
 
 #[cfg(unix)]
@@ -682,7 +696,7 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn active_app_process_is_terminated_before_swap() {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{PermissionsExt, symlink};
         use std::process::Command;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -693,11 +707,14 @@ mod tests {
         let mut permissions = std::fs::metadata(&app_path).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&app_path, permissions).unwrap();
+        let linked_active_app_dir = tmp.path().join("linked-app");
+        symlink(&active_app_dir, &linked_active_app_dir).unwrap();
+        let resolved_app_path = std::fs::canonicalize(&app_path).unwrap();
 
         let mut child = Command::new(&app_path).arg("30").spawn().unwrap();
         let child_pid = child.id();
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        while !app_process_pids(u32::MAX, &|exe| is_active_app_exe(&active_app_dir, "demo", exe))
+        while !app_process_pids(u32::MAX, &|exe| is_active_app_exe(&resolved_app_path, exe))
             .unwrap()
             .contains(&child_pid)
         {
@@ -708,7 +725,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
 
-        let terminated = terminate_active_app_processes_except(&active_app_dir, "demo", u32::MAX).unwrap();
+        let terminated = terminate_active_app_processes_except(&linked_active_app_dir, "demo", u32::MAX).unwrap();
         let status = child.wait().unwrap();
 
         assert_eq!(terminated, 1);

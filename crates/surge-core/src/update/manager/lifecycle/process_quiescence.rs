@@ -289,7 +289,7 @@ fn is_active_app_process(
 ) -> bool {
     is_active_app_exe(active_exe, &process.exe)
         || interpreted_main.is_some_and(|identity| {
-            process.exe == identity.interpreter
+            identity.matches_interpreter(&process.exe, process.command.first().map(OsString::as_os_str))
                 && process
                     .command
                     .get(identity.script_argument_index)
@@ -439,13 +439,34 @@ mod tests {
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn assert_interpreted_active_app_process_is_terminated_before_swap(shebang: &str) {
+    fn assert_interpreted_active_app_process_is_terminated_before_swap(
+        shebang: &str,
+        isolated_env_interpreter: Option<&str>,
+    ) {
         use std::os::unix::fs::PermissionsExt;
         use std::process::Command;
 
         let tmp = tempfile::tempdir().unwrap();
         let active_app_dir = tmp.path().join("app");
         std::fs::create_dir_all(&active_app_dir).unwrap();
+        let (shebang, child_path) = if let Some(interpreter_name) = isolated_env_interpreter {
+            let interpreter_dir = tmp.path().join("child-path");
+            std::fs::create_dir_all(&interpreter_dir).unwrap();
+            let interpreter_path = interpreter_dir.join(interpreter_name);
+            std::fs::copy("/bin/sh", &interpreter_path).unwrap();
+            let mut permissions = std::fs::metadata(&interpreter_path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&interpreter_path, permissions).unwrap();
+            let updater_path = std::env::var_os("PATH").unwrap_or_default();
+            let mut child_paths = vec![interpreter_dir];
+            child_paths.extend(std::env::split_paths(&updater_path));
+            (
+                format!("#!/usr/bin/env {interpreter_name}"),
+                Some(std::env::join_paths(child_paths).unwrap()),
+            )
+        } else {
+            (shebang.to_string(), None)
+        };
         let app_path = active_app_dir.join("demo-script");
         std::fs::write(&app_path, format!("{shebang}\nwhile :; do sleep 1; done\n")).unwrap();
         let mut permissions = std::fs::metadata(&app_path).unwrap().permissions();
@@ -456,7 +477,11 @@ mod tests {
 
         let spawn_deadline = std::time::Instant::now() + Duration::from_secs(1);
         let mut child = loop {
-            match Command::new(&app_path).spawn() {
+            let mut command = Command::new(&app_path);
+            if let Some(child_path) = &child_path {
+                command.env("PATH", child_path);
+            }
+            match command.spawn() {
                 Ok(child) => break child,
                 Err(error)
                     if error.raw_os_error() == Some(nix::errno::Errno::ETXTBSY as i32)
@@ -519,12 +544,24 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn interpreted_active_app_process_is_terminated_before_swap() {
-        assert_interpreted_active_app_process_is_terminated_before_swap("#!/bin/sh");
+        assert_interpreted_active_app_process_is_terminated_before_swap("#!/bin/sh", None);
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn interpreted_active_app_with_multiple_interpreter_options_is_terminated_before_swap() {
-        assert_interpreted_active_app_process_is_terminated_before_swap("#!/usr/bin/env -S /bin/sh -e -u");
+        assert_interpreted_active_app_process_is_terminated_before_swap("#!/usr/bin/env -S /bin/sh -e -u", None);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn env_interpreted_app_uses_launched_process_identity_when_paths_differ() {
+        assert_interpreted_active_app_process_is_terminated_before_swap("", Some("surge-test-env-interpreter"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn direct_interpreted_app_with_multiple_options_is_terminated_before_swap() {
+        assert_interpreted_active_app_process_is_terminated_before_swap("#!/bin/sh -e -u", None);
     }
 }

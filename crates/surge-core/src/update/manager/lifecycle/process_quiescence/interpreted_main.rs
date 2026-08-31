@@ -1,12 +1,26 @@
+use std::ffi::{OsStr, OsString};
 use std::io::Read;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Result, SurgeError};
 
 pub(super) struct Identity {
-    pub(super) interpreter: PathBuf,
+    interpreter: Interpreter,
     pub(super) script_argument_index: usize,
+}
+
+enum Interpreter {
+    Resolved(PathBuf),
+    EnvCommand(OsString),
+}
+
+impl Identity {
+    pub(super) fn matches_interpreter(&self, executable: &Path, argv0: Option<&OsStr>) -> bool {
+        match &self.interpreter {
+            Interpreter::Resolved(expected) => executable == expected,
+            Interpreter::EnvCommand(expected) => argv0 == Some(expected.as_os_str()),
+        }
+    }
 }
 
 pub(super) fn resolve(active_exe: &Path) -> Result<Option<Identity>> {
@@ -51,11 +65,11 @@ pub(super) fn resolve(active_exe: &Path) -> Result<Option<Identity>> {
                     "Active application env shebang has no interpreter command".to_string(),
                 ));
             };
-            (resolve_interpreter_path(program)?, fixed_arguments.len())
+            (Interpreter::EnvCommand(OsString::from(program)), fixed_arguments.len())
         } else {
             (
-                resolve_interpreter_path(interpreter)?,
-                usize::from(!argument.is_empty()),
+                Interpreter::Resolved(resolve_direct_interpreter_path(interpreter)?),
+                direct_interpreter_argument_count(argument)?,
             )
         };
 
@@ -123,37 +137,25 @@ fn split_command_words(command: &str) -> Result<Vec<String>> {
     Ok(words)
 }
 
-fn resolve_interpreter_path(interpreter: &str) -> Result<PathBuf> {
+fn resolve_direct_interpreter_path(interpreter: &str) -> Result<PathBuf> {
     let interpreter = Path::new(interpreter);
-    if interpreter.is_absolute() || interpreter.components().count() > 1 {
-        return std::fs::canonicalize(interpreter).map_err(|e| {
-            SurgeError::Platform(format!(
-                "Failed to resolve active application interpreter '{}': {e}",
-                interpreter.display()
-            ))
-        });
-    }
-
-    let path = std::env::var_os("PATH").ok_or_else(|| {
+    std::fs::canonicalize(interpreter).map_err(|e| {
         SurgeError::Platform(format!(
-            "Failed to resolve active application interpreter '{}': PATH is unavailable",
+            "Failed to resolve active application interpreter '{}': {e}",
             interpreter.display()
         ))
-    })?;
-    std::env::split_paths(&path)
-        .map(|directory| directory.join(interpreter))
-        .find_map(|candidate| {
-            let metadata = candidate.metadata().ok()?;
-            (metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
-                .then(|| std::fs::canonicalize(candidate).ok())
-                .flatten()
-        })
-        .ok_or_else(|| {
-            SurgeError::Platform(format!(
-                "Failed to resolve active application interpreter '{}' from PATH",
-                interpreter.display()
-            ))
-        })
+    })
+}
+
+fn direct_interpreter_argument_count(argument: &str) -> Result<usize> {
+    #[cfg(target_os = "macos")]
+    {
+        return Ok(split_command_words(argument)?.len());
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(usize::from(!argument.is_empty()))
+    }
 }
 
 #[cfg(test)]

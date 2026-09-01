@@ -690,6 +690,46 @@ mod tests {
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn interpreted_test_process_snapshot(pid: u32) -> String {
+        #[cfg(target_os = "linux")]
+        {
+            let exe = std::fs::read_link(format!("/proc/{pid}/exe"));
+            let command =
+                std::fs::read(format!("/proc/{pid}/cmdline")).map(|bytes| discovery::parse_proc_cmdline(&bytes));
+            let cwd = std::fs::read_link(format!("/proc/{pid}/cwd"));
+            return format!("exe={exe:?}, command={command:?}, cwd={cwd:?}");
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+
+            let pid = Pid::from_u32(pid);
+            let mut system = System::new();
+            let refreshed = system.refresh_processes_specifics(
+                ProcessesToUpdate::Some(&[pid]),
+                true,
+                ProcessRefreshKind::nothing()
+                    .with_exe(UpdateKind::Always)
+                    .with_cmd(UpdateKind::Always)
+                    .with_cwd(UpdateKind::Always),
+            );
+            return system.process(pid).map_or_else(
+                || format!("process unavailable after refreshing {refreshed} entries"),
+                |process| {
+                    format!(
+                        "exe={:?}, command={:?}, cwd={:?}, status={:?}",
+                        process.exe(),
+                        process.cmd(),
+                        process.cwd(),
+                        process.status()
+                    )
+                },
+            );
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn assert_interpreted_active_app_process_is_terminated_before_swap(shebang: &str) {
         use std::os::unix::fs::PermissionsExt;
         use std::process::{Command, Stdio};
@@ -724,24 +764,38 @@ mod tests {
         };
         let child_pid = child.id();
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        while !app_process_pids(u32::MAX, &|process| {
-            is_active_app_process(&active_entrypoint, Some(&interpreted_main), process)
-        })
-        .unwrap()
-        .contains(&child_pid)
-        {
+        loop {
+            let matches = app_process_pids(u32::MAX, &|process| {
+                is_active_app_process(&active_entrypoint, Some(&interpreted_main), process)
+            })
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{error}; child process snapshot: {}",
+                    interpreted_test_process_snapshot(child_pid)
+                )
+            });
+            if matches.contains(&child_pid) {
+                break;
+            }
             assert!(
                 std::time::Instant::now() < deadline,
-                "test child did not expose the interpreted app launch identity"
+                "test child did not expose the interpreted app launch identity; child process snapshot: {}",
+                interpreted_test_process_snapshot(child_pid)
             );
             std::thread::sleep(Duration::from_millis(10));
         }
 
-        let terminated =
-            terminate_active_app_processes_except(&active_app_dir, "demo-script", u32::MAX, false).unwrap();
+        let terminated = terminate_active_app_processes_except(&active_app_dir, "demo-script", u32::MAX, false)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{error}; child process snapshot: {}",
+                    interpreted_test_process_snapshot(child_pid)
+                )
+            });
+        let process_snapshot = interpreted_test_process_snapshot(child_pid);
         let status = child.wait().unwrap();
 
-        assert_eq!(terminated, 1);
+        assert_eq!(terminated, 1, "child process snapshot before wait: {process_snapshot}");
         assert!(!status.success());
     }
 

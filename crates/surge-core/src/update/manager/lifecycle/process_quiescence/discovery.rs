@@ -245,34 +245,64 @@ fn app_process_identities_impl<F, E, C>(
     protected_pid: u32,
     matches_process: &F,
     _executable_may_match: &E,
-    _command_may_match: &C,
+    command_may_match: &C,
 ) -> Result<Vec<ProcessIdentity>>
 where
     F: Fn(&AppProcess) -> Result<bool>,
     E: Fn(&Path) -> Result<bool>,
     C: Fn(&[OsString], Option<&Path>) -> Result<bool>,
 {
-    use sysinfo::{ProcessesToUpdate, System};
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System, UpdateKind};
 
     let mut system = System::new();
-    let _ = system.refresh_processes(ProcessesToUpdate::All, true);
+    let _ = system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing()
+            .with_exe(UpdateKind::Always)
+            .with_cmd(UpdateKind::Always)
+            .with_cwd(UpdateKind::Always)
+            .with_user(UpdateKind::Always),
+    );
+    let updater = system
+        .process(Pid::from_u32(crate::platform::process::current_pid()))
+        .ok_or_else(|| {
+            SurgeError::Platform("Failed to inspect updater process ownership before application swap".to_string())
+        })?;
+    let updater_user = updater
+        .effective_user_id()
+        .or_else(|| updater.user_id())
+        .ok_or_else(|| {
+            SurgeError::Platform("Failed to inspect updater user identity before application swap".to_string())
+        })?;
+
     let mut identities = Vec::new();
     for (pid, process) in system.processes() {
         let pid = pid.as_u32();
-        if pid == protected_pid {
+        if pid == protected_pid || process.effective_user_id().or_else(|| process.user_id()) != Some(updater_user) {
             continue;
         }
         let Some(identity) = inspected_process_identity(pid)? else {
             continue;
         };
-        let Some(exe) = process.exe() else {
-            continue;
+        let command = process.cmd().to_vec();
+        let cwd = process.cwd().map(Path::to_path_buf);
+        let Some(executable) = process.exe() else {
+            if matches!(process.status(), ProcessStatus::Dead | ProcessStatus::Zombie) {
+                continue;
+            }
+            if !command_may_match(&command, cwd.as_deref())? {
+                continue;
+            }
+            return Err(SurgeError::Platform(format!(
+                "Failed to inspect process {pid} executable before application swap"
+            )));
         };
         let app_process = AppProcess {
-            exe: exe.to_path_buf(),
-            command: process.cmd().to_vec(),
+            exe: executable.to_path_buf(),
+            command,
             command_inspected: !process.cmd().is_empty(),
-            cwd: process.cwd().map(Path::to_path_buf),
+            cwd,
         };
         if matches_process(&app_process)? && inspected_identity_still_matches(identity)? {
             identities.push(identity);

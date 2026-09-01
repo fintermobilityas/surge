@@ -29,12 +29,31 @@ pub const DEFAULT_CHUNK_SIZE: usize = 64 * 1024 * 1024;
 /// Progress callback for file-backed patch application: (bytes_done, bytes_total).
 pub type ByteProgress<'a> = dyn Fn(u64, u64) + 'a;
 
+/// On-disk format written for a chunked patch.
+///
+/// Readers accept both; the choice only affects what publishers emit. `Legacy`
+/// (format version 1) is the default because every reader in the field can apply
+/// it. `IdentityChunks` (format version 2) skips the bsdiff payload for chunks that
+/// did not change, which is much cheaper to produce and apply for large files with
+/// small edits, but readers older than the version that introduced it reject the
+/// patch — publish it only once every client has been upgraded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChunkedPatchFormat {
+    /// Format version 1: every chunk carries a bsdiff payload.
+    #[default]
+    Legacy,
+    /// Format version 2: unchanged chunks are marked in an identity bitset and carry no payload.
+    IdentityChunks,
+}
+
 /// Options for chunked diff/patch operations.
 pub struct ChunkedDiffOptions {
     /// Size of each chunk in bytes. Both files are split at these boundaries.
     pub chunk_size: usize,
     /// Maximum number of threads for parallel processing. 0 = auto (memory-aware).
     pub max_threads: usize,
+    /// Patch format to write. Ignored when applying a patch.
+    pub format: ChunkedPatchFormat,
 }
 
 impl Default for ChunkedDiffOptions {
@@ -42,6 +61,7 @@ impl Default for ChunkedDiffOptions {
         Self {
             chunk_size: DEFAULT_CHUNK_SIZE,
             max_threads: 0,
+            format: ChunkedPatchFormat::default(),
         }
     }
 }
@@ -158,7 +178,7 @@ pub fn chunked_bsdiff(older: &[u8], newer: &[u8], opts: &ChunkedDiffOptions) -> 
                         (new_chunk.to_vec(), false)
                     } else if new_chunk.is_empty() {
                         (Vec::new(), false)
-                    } else if old_chunk == new_chunk {
+                    } else if old_chunk == new_chunk && opts.format == ChunkedPatchFormat::IdentityChunks {
                         // Unchanged chunk: record the identity marker instead
                         // of paying for a whole-chunk bsdiff.
                         (Vec::new(), true)
@@ -185,7 +205,7 @@ pub fn chunked_bsdiff(older: &[u8], newer: &[u8], opts: &ChunkedDiffOptions) -> 
     let mut chunks = into_inner(results);
     chunks.sort_by_key(|(idx, _, _)| *idx);
 
-    serialize_patch(older.len(), newer.len(), chunk_size, &chunks)
+    serialize_patch(older.len(), newer.len(), chunk_size, &chunks, opts.format)
 }
 
 /// Apply a chunked patch to reconstruct the newer file.
@@ -210,6 +230,7 @@ pub fn chunked_bspatch(older: &[u8], patch: &[u8], opts: &ChunkedDiffOptions) ->
     let thread_opts = ChunkedDiffOptions {
         chunk_size,
         max_threads: opts.max_threads,
+        format: opts.format,
     };
     let num_threads = thread_opts.effective_threads();
 
@@ -357,7 +378,7 @@ pub fn chunked_bsdiff_files(older_path: &Path, newer_path: &Path, opts: &Chunked
                         (new_chunk, false)
                     } else if new_chunk.is_empty() {
                         (Vec::new(), false)
-                    } else if old_chunk == new_chunk {
+                    } else if old_chunk == new_chunk && opts.format == ChunkedPatchFormat::IdentityChunks {
                         // Unchanged chunk: record the identity marker instead
                         // of paying for a whole-chunk bsdiff.
                         (Vec::new(), true)
@@ -381,7 +402,7 @@ pub fn chunked_bsdiff_files(older_path: &Path, newer_path: &Path, opts: &Chunked
     }
     let mut chunks = into_inner(results);
     chunks.sort_by_key(|(idx, _, _)| *idx);
-    serialize_patch(old_size, new_size, chunk_size, &chunks)
+    serialize_patch(old_size, new_size, chunk_size, &chunks, opts.format)
 }
 
 /// Apply a chunked binary diff patch directly against a file, writing the
@@ -524,6 +545,7 @@ mod tests {
         let opts = ChunkedDiffOptions {
             chunk_size: 256,
             max_threads: 1,
+            format: ChunkedPatchFormat::Legacy,
         };
         let patch = chunked_bsdiff(&data, &data, &opts).expect("bsdiff");
         let reconstructed = chunked_bspatch(&data, &patch, &opts).expect("bspatch");
@@ -540,6 +562,7 @@ mod tests {
         let opts = ChunkedDiffOptions {
             chunk_size: 512,
             max_threads: 2,
+            format: ChunkedPatchFormat::Legacy,
         };
         let patch = chunked_bsdiff(&old, &new, &opts).expect("bsdiff");
         let reconstructed = chunked_bspatch(&old, &patch, &opts).expect("bspatch");
@@ -555,6 +578,7 @@ mod tests {
         let opts = ChunkedDiffOptions {
             chunk_size: 512,
             max_threads: 1,
+            format: ChunkedPatchFormat::Legacy,
         };
         let patch = chunked_bsdiff(&old, &new, &opts).expect("bsdiff");
         let reconstructed = chunked_bspatch(&old, &patch, &opts).expect("bspatch");
@@ -569,6 +593,7 @@ mod tests {
         let opts = ChunkedDiffOptions {
             chunk_size: 512,
             max_threads: 1,
+            format: ChunkedPatchFormat::Legacy,
         };
         let patch = chunked_bsdiff(&old, &new, &opts).expect("bsdiff");
         let reconstructed = chunked_bspatch(&old, &patch, &opts).expect("bspatch");
@@ -586,6 +611,7 @@ mod tests {
         let opts = ChunkedDiffOptions {
             chunk_size: 512,
             max_threads: 4,
+            format: ChunkedPatchFormat::Legacy,
         };
         let patch = chunked_bsdiff(&old, &new, &opts).expect("bsdiff");
         let reconstructed = chunked_bspatch(&old, &patch, &opts).expect("bspatch");
@@ -612,6 +638,7 @@ mod tests {
             &ChunkedDiffOptions {
                 chunk_size: 256 * 1024,
                 max_threads: 1,
+                format: ChunkedPatchFormat::Legacy,
             },
         )
         .expect("build patch");
@@ -630,6 +657,7 @@ mod tests {
         let opts = ChunkedDiffOptions {
             chunk_size: chunk,
             max_threads: 1,
+            format: ChunkedPatchFormat::IdentityChunks,
         };
         let patch = chunked_bsdiff(&old, &new, &opts).expect("bsdiff");
         let header = 4 + 1 + 8 + 8 + 8 + 4;

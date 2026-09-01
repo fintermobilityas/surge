@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -48,6 +49,8 @@ struct RuntimeManifestFile<'a> {
     channel: &'a str,
     #[serde(rename = "installDirectory")]
     install_directory: &'a str,
+    #[serde(rename = "mainExe", skip_serializing_if = "str::is_empty")]
+    main_exe: &'a str,
     #[serde(rename = "supervisorId", skip_serializing_if = "str::is_empty")]
     supervisor_id: &'a str,
     provider: &'a str,
@@ -56,11 +59,22 @@ struct RuntimeManifestFile<'a> {
     region: &'a str,
     #[serde(skip_serializing_if = "str::is_empty")]
     endpoint: &'a str,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    environment: &'a BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct RuntimeManifestVersion {
-    version: String,
+pub(crate) struct RuntimeManifestIdentity {
+    #[serde(rename = "id", default)]
+    pub(crate) app_id: String,
+    #[serde(default)]
+    pub(crate) version: String,
+    #[serde(rename = "mainExe", default)]
+    pub(crate) main_exe: String,
+    #[serde(rename = "supervisorId", default)]
+    pub(crate) supervisor_id: String,
+    #[serde(default)]
+    pub(crate) environment: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -135,11 +149,13 @@ pub fn write_runtime_manifest(
         version: metadata.version.trim(),
         channel: metadata.channel.trim(),
         install_directory: profile.install_directory.trim(),
+        main_exe: profile.main_exe.trim(),
         supervisor_id: profile.supervisor_id.trim(),
         provider: metadata.storage_provider.trim(),
         bucket: metadata.storage_bucket.trim(),
         region: metadata.storage_region.trim(),
         endpoint: metadata.storage_endpoint.trim(),
+        environment: profile.environment,
     };
 
     if manifest.id.is_empty() {
@@ -183,6 +199,10 @@ pub fn write_runtime_manifest(
 }
 
 pub fn read_runtime_manifest_version(active_app_dir: &Path) -> Result<Option<String>> {
+    Ok(read_runtime_manifest_identity(active_app_dir)?.map(|identity| identity.version))
+}
+
+pub(crate) fn read_runtime_manifest_identity(active_app_dir: &Path) -> Result<Option<RuntimeManifestIdentity>> {
     for relative_path in [RUNTIME_MANIFEST_RELATIVE_PATH, LEGACY_RUNTIME_MANIFEST_RELATIVE_PATH] {
         let path = active_app_dir.join(relative_path);
         if !path.is_file() {
@@ -190,13 +210,55 @@ pub fn read_runtime_manifest_version(active_app_dir: &Path) -> Result<Option<Str
         }
 
         let raw = std::fs::read(&path)?;
-        let manifest: RuntimeManifestVersion = serde_yaml::from_slice(&raw)
+        let mut manifest: RuntimeManifestIdentity = serde_yaml::from_slice(&raw)
             .map_err(|e| SurgeError::Config(format!("Failed to parse runtime manifest '{}': {e}", path.display())))?;
-        let version = manifest.version.trim();
-        if !version.is_empty() {
-            return Ok(Some(version.to_string()));
+        if !manifest.version.trim().is_empty() {
+            manifest.app_id = manifest.app_id.trim().to_string();
+            manifest.version = manifest.version.trim().to_string();
+            manifest.main_exe = manifest.main_exe.trim().to_string();
+            manifest.supervisor_id = manifest.supervisor_id.trim().to_string();
+            return Ok(Some(manifest));
         }
     }
 
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::config::manifest::ShortcutLocation;
+
+    use super::*;
+
+    #[test]
+    fn runtime_manifest_preserves_launch_environment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shortcuts: [ShortcutLocation; 0] = [];
+        let persistent_assets: [String; 0] = [];
+        let environment = BTreeMap::from([
+            ("DEMO_MODE".to_string(), "recovery".to_string()),
+            ("PATH".to_string(), "/opt/demo/bin:/usr/bin:/bin".to_string()),
+        ]);
+        let profile = InstallProfile::new(
+            "demo-app",
+            "Demo App",
+            "demo",
+            "demo-app",
+            "demo-supervisor",
+            "",
+            &shortcuts,
+            &persistent_assets,
+            &environment,
+        );
+        let metadata = RuntimeManifestMetadata::new("1.0.0", "stable", "filesystem", ".", "", "");
+
+        let manifest_path = write_runtime_manifest(tmp.path(), &profile, &metadata).unwrap();
+        let manifest = std::fs::read_to_string(manifest_path).unwrap();
+
+        assert!(manifest.contains("DEMO_MODE: recovery"));
+        assert!(manifest.contains("PATH: /opt/demo/bin:/usr/bin:/bin"));
+
+        let identity = read_runtime_manifest_identity(tmp.path()).unwrap().unwrap();
+        assert_eq!(identity.environment, environment);
+    }
 }

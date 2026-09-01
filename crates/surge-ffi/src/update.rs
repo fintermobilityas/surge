@@ -289,6 +289,7 @@ pub unsafe extern "C" fn surge_update_check(
                     releases: ffi_releases,
                     cached_strings: Vec::new(),
                     update_info: Some(update_info),
+                    update_check_state: Some(update_mgr.capture_check_state()),
                 });
                 releases_handle.cache_strings();
 
@@ -372,6 +373,16 @@ pub unsafe extern "C" fn surge_update_download_and_apply(
         };
         update_mgr.set_release_retention_limit(mgr_ref.release_retention_limit);
         if let Err(e) = update_mgr.set_artifact_retention_policy(mgr_ref.artifact_retention_policy) {
+            return set_shared_error(&mgr_ref.ctx, &mgr_ref.last_error, &e);
+        }
+        let check_state = match info_ref.update_check_state.as_ref() {
+            Some(state) => state,
+            None => {
+                let e = surge_core::error::SurgeError::Update("No update check state available".into());
+                return set_shared_error(&mgr_ref.ctx, &mgr_ref.last_error, &e);
+            }
+        };
+        if let Err(e) = update_mgr.restore_check_state(check_state) {
             return set_shared_error(&mgr_ref.ctx, &mgr_ref.last_error, &e);
         }
 
@@ -474,20 +485,24 @@ mod tests {
     use std::ptr;
     use std::time::Duration;
 
+    use surge_core::archive::packer::ArchivePacker;
     use surge_core::config::constants::{DEFAULT_ZSTD_LEVEL, RELEASES_FILE_COMPRESSED};
-    use surge_core::releases::manifest::{ReleaseIndex, compress_release_index};
+    use surge_core::crypto::sha256::sha256_hex_file;
+    use surge_core::platform::detect::current_rid;
+    use surge_core::releases::manifest::{ReleaseEntry, ReleaseIndex, compress_release_index};
     use surge_core::update::status::{UpdateStatusRecord, write_update_status};
 
     use crate::{
         surge_cancel, surge_config_set_storage, surge_context_create, surge_context_destroy, surge_context_last_error,
-        surge_free_cstring, surge_reset_cancel,
+        surge_free_cstring, surge_releases_destroy, surge_reset_cancel,
     };
 
     use super::{
         DEFAULT_UPDATE_CHECK_TIMEOUT, SURGE_CANCELLED, SURGE_ERROR, SURGE_NOT_FOUND, SURGE_OK, SurgeReleasesInfoHandle,
-        parse_update_check_timeout, surge_update_check, surge_update_manager_create, surge_update_manager_destroy,
-        surge_update_manager_set_artifact_retention_policy, surge_update_manager_set_channel,
-        surge_update_manager_set_release_retention_limit, surge_update_status_read_json,
+        parse_update_check_timeout, surge_update_check, surge_update_download_and_apply, surge_update_manager_create,
+        surge_update_manager_destroy, surge_update_manager_set_artifact_retention_policy,
+        surge_update_manager_set_channel, surge_update_manager_set_release_retention_limit,
+        surge_update_status_read_json,
     };
 
     struct TestDir(PathBuf);
@@ -538,6 +553,16 @@ mod tests {
             )
         };
         assert_eq!(rc, SURGE_OK);
+    }
+
+    fn write_runtime_identity(app_dir: &Path, main_exe: &str) {
+        let manifest_path = app_dir.join(surge_core::install::RUNTIME_MANIFEST_RELATIVE_PATH);
+        std::fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            manifest_path,
+            format!("id: demo\nversion: 1.0.0\nchannel: stable\nmainExe: \"{main_exe}\"\nsupervisorId: \"\"\n"),
+        )
+        .unwrap();
     }
 
     fn create_manager(
@@ -726,6 +751,7 @@ mod tests {
             releases: Vec::new(),
             cached_strings: Vec::new(),
             update_info: None,
+            update_check_state: None,
         });
         let stale_ptr = Box::into_raw(stale);
         let mut info_ptr = stale_ptr;
@@ -778,6 +804,7 @@ mod tests {
             releases: Vec::new(),
             cached_strings: Vec::new(),
             update_info: None,
+            update_check_state: None,
         });
         let stale_ptr = Box::into_raw(stale);
         let mut info_ptr = stale_ptr;
@@ -796,6 +823,85 @@ mod tests {
             surge_update_manager_destroy(mgr);
             surge_context_destroy(ctx);
         }
+    }
+
+    #[test]
+    fn update_check_preserves_local_current_release_identity_for_separate_apply_call() {
+        let storage = TestDir::new("surge-ffi-checked-update-storage");
+        let install = TestDir::new("surge-ffi-checked-update-install");
+        let app_storage = storage.path().join("demo");
+        let active_app = install.path().join("app");
+        std::fs::create_dir_all(&app_storage).unwrap();
+        std::fs::create_dir_all(&active_app).unwrap();
+        std::fs::write(active_app.join("old-app"), b"old payload").unwrap();
+        write_runtime_identity(&active_app, "old-app");
+
+        let rid = current_rid();
+        let os = rid.split('-').next().unwrap_or_default().to_string();
+        let full_filename = format!("demo-1.1.0-{rid}-full.tar.zst");
+        let full_path = app_storage.join(&full_filename);
+        let mut packer = ArchivePacker::new(3).unwrap();
+        packer.add_buffer("new-app", b"new payload", 0o755).unwrap();
+        packer.finalize_to_file(&full_path).unwrap();
+
+        let current = ReleaseEntry {
+            version: "1.0.0".to_string(),
+            channels: vec!["stable".to_string()],
+            os: os.clone(),
+            rid: rid.clone(),
+            main_exe: "republished-app".to_string(),
+            install_directory: "demo".to_string(),
+            ..ReleaseEntry::default()
+        };
+        let latest = ReleaseEntry {
+            version: "1.1.0".to_string(),
+            channels: vec!["stable".to_string()],
+            os,
+            rid,
+            is_genesis: true,
+            full_filename,
+            full_size: std::fs::metadata(&full_path).unwrap().len() as i64,
+            full_sha256: sha256_hex_file(&full_path).unwrap(),
+            main_exe: "new-app".to_string(),
+            install_directory: "demo".to_string(),
+            ..ReleaseEntry::default()
+        };
+        let index = ReleaseIndex {
+            app_id: "demo".to_string(),
+            releases: vec![current, latest],
+            ..ReleaseIndex::default()
+        };
+        let compressed = compress_release_index(&index, DEFAULT_ZSTD_LEVEL).unwrap();
+        std::fs::write(app_storage.join(RELEASES_FILE_COMPRESSED), compressed).unwrap();
+
+        let ctx = surge_context_create();
+        assert!(!ctx.is_null());
+        configure_filesystem_storage(ctx, &storage);
+        let mgr = create_manager(ctx, install.path());
+        assert!(!mgr.is_null());
+
+        let mut info = ptr::null_mut();
+        let check_result = unsafe {
+            // SAFETY: the manager and out pointer remain live for this call.
+            surge_update_check(mgr, &mut info)
+        };
+        assert_eq!(check_result, SURGE_OK);
+        assert!(!info.is_null());
+
+        let apply_result = unsafe {
+            // SAFETY: both handles came from successful FFI constructors and
+            // remain live until they are destroyed below.
+            surge_update_download_and_apply(mgr, info, None, ptr::null_mut())
+        };
+
+        unsafe {
+            // SAFETY: each live handle is destroyed exactly once.
+            surge_releases_destroy(info);
+            surge_update_manager_destroy(mgr);
+            surge_context_destroy(ctx);
+        }
+        assert_eq!(apply_result, SURGE_OK);
+        assert_eq!(std::fs::read(active_app.join("new-app")).unwrap(), b"new payload");
     }
 
     #[test]

@@ -367,7 +367,59 @@ namespace Surge
             }
         }
 
-        private static SurgeAppInfo? TryLoadCurrentAppFromManifest(string manifestPath, string assemblyDir)
+        private static int CountFlowMappingDepthDelta(string value, ref char quote, ref bool escaped)
+        {
+            var depth = 0;
+            for (var i = 0; i < value.Length; i++)
+            {
+                var current = value[i];
+                if (quote == '"')
+                {
+                    if (escaped)
+                    {
+                        escaped = false;
+                    }
+                    else if (current == '\\')
+                    {
+                        escaped = true;
+                    }
+                    else if (current == '"')
+                    {
+                        quote = '\0';
+                    }
+
+                    continue;
+                }
+
+                if (quote == '\'')
+                {
+                    if (current == '\'' && i + 1 < value.Length && value[i + 1] == '\'')
+                    {
+                        i++;
+                    }
+                    else if (current == '\'')
+                    {
+                        quote = '\0';
+                    }
+
+                    continue;
+                }
+
+                if (current == '#' && (i == 0 || char.IsWhiteSpace(value[i - 1])))
+                    break;
+
+                if (current == '"' || current == '\'')
+                    quote = current;
+                else if (current == '{')
+                    depth++;
+                else if (current == '}')
+                    depth--;
+            }
+
+            return depth;
+        }
+
+        internal static SurgeAppInfo? TryLoadCurrentAppFromManifest(string manifestPath, string assemblyDir)
         {
             if (!File.Exists(manifestPath))
                 return null;
@@ -383,15 +435,65 @@ namespace Surge
                 string? storageBucket = null;
                 string? storageRegion = null;
                 string? storageEndpoint = null;
+                int? environmentIndent = null;
+                var environmentFlowDepth = 0;
+                var environmentFlowQuote = '\0';
+                var environmentFlowEscaped = false;
 
                 foreach (var line in File.ReadLines(manifestPath))
                 {
-                    // Strip leading whitespace and YAML list marker (- )
-                    var trimmed = line.Trim();
+                    if (string.IsNullOrWhiteSpace(line))
+                        continue;
+
+                    var content = line.TrimStart();
+                    if (environmentFlowDepth == 0 && content[0] == '#')
+                        continue;
+
+                    if (environmentFlowDepth > 0)
+                    {
+                        environmentFlowDepth += CountFlowMappingDepthDelta(
+                            content,
+                            ref environmentFlowQuote,
+                            ref environmentFlowEscaped);
+                        if (environmentFlowDepth <= 0)
+                        {
+                            environmentFlowDepth = 0;
+                            environmentFlowQuote = '\0';
+                            environmentFlowEscaped = false;
+                        }
+
+                        continue;
+                    }
+
+                    var indentation = line.Length - content.Length;
+                    if (environmentIndent.HasValue)
+                    {
+                        if (indentation > environmentIndent.Value)
+                            continue;
+
+                        environmentIndent = null;
+                    }
+
+                    var trimmed = content.TrimEnd();
                     if (trimmed.StartsWith("- ", StringComparison.Ordinal))
                         trimmed = trimmed.Substring(2).Trim();
 
-                    if (trimmed.StartsWith("id:", StringComparison.Ordinal))
+                    if (trimmed.StartsWith("environment:", StringComparison.Ordinal))
+                    {
+                        var environmentValue = trimmed.Substring(12).TrimStart();
+                        if (environmentValue.Length == 0 || environmentValue[0] == '#')
+                        {
+                            environmentIndent = indentation;
+                        }
+                        else if (environmentValue[0] == '{')
+                        {
+                            environmentFlowDepth = CountFlowMappingDepthDelta(
+                                environmentValue,
+                                ref environmentFlowQuote,
+                                ref environmentFlowEscaped);
+                        }
+                    }
+                    else if (trimmed.StartsWith("id:", StringComparison.Ordinal))
                         appId = trimmed.Substring(3).Trim().Trim('"');
                     else if (trimmed.StartsWith("version:", StringComparison.Ordinal))
                         version = trimmed.Substring(8).Trim().Trim('"');

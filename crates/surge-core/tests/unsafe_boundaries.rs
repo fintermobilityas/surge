@@ -15,7 +15,7 @@ fn collect_rust_files(root: &Path, out: &mut Vec<PathBuf>) {
 }
 
 #[test]
-fn unsafe_is_confined_to_diff_modules() {
+fn unsafe_is_confined_to_boundary_modules() {
     let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut rust_files = Vec::new();
     collect_rust_files(&src_root, &mut rust_files);
@@ -29,7 +29,10 @@ fn unsafe_is_confined_to_diff_modules() {
 
         let allowed_unsafe_file = matches!(
             rel.as_str(),
-            "src/diff/bsdiff_sys.rs" | "src/diff/wrapper.rs" | "src/diff/mod.rs"
+            "src/diff/bsdiff_sys.rs"
+                | "src/diff/wrapper.rs"
+                | "src/diff/mod.rs"
+                | "src/platform/process/descriptors.rs"
         );
 
         let content = fs::read_to_string(&file).expect("failed to read rust source file");

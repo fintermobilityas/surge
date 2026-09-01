@@ -1,6 +1,6 @@
 use super::types::{
-    AppConfig, InstallArtifactCachePolicy, PackCompressionFormat, PackDeltaStrategy, PackPolicy, SurgeManifest,
-    TargetConfig,
+    AppConfig, InstallArtifactCachePolicy, PackChunkedPatchFormat, PackCompressionFormat, PackDeltaStrategy,
+    PackPolicy, SurgeManifest, TargetConfig,
 };
 use super::validate::canonicalize_installers;
 
@@ -16,6 +16,9 @@ impl SurgeManifest {
                 }
                 if let Some(max_chain_length) = delta.max_chain_length {
                     policy.max_chain_length = max_chain_length;
+                }
+                if let Some(format) = delta.chunked_patch_format.and_then(PackChunkedPatchFormat::parse) {
+                    policy.chunked_patch_format = format;
                 }
             }
 
@@ -153,5 +156,45 @@ impl AppConfig {
             resolved.environment = merged;
         }
         resolved
+    }
+}
+
+#[cfg(test)]
+mod chunked_patch_format_tests {
+    use super::super::types::{PackChunkedPatchFormat, SurgeManifest};
+
+    fn manifest(chunked_patch_format: Option<u8>) -> SurgeManifest {
+        let pack = chunked_patch_format.map_or(String::new(), |value| {
+            format!("pack:\n  delta:\n    chunked_patch_format: {value}\n")
+        });
+        let yaml = format!(
+            "schema: 1\nstorage:\n  provider: filesystem\n  bucket: /tmp/store\napps:\n  - id: demoapp\n    target:\n      rid: linux-x64\n{pack}"
+        );
+        SurgeManifest::parse(yaml.as_bytes()).expect("manifest should parse")
+    }
+
+    #[test]
+    fn chunked_patch_format_defaults_to_v1() {
+        let policy = manifest(None).effective_pack_policy();
+
+        assert_eq!(policy.chunked_patch_format, PackChunkedPatchFormat::V1);
+    }
+
+    #[test]
+    fn chunked_patch_format_two_opts_in_to_identity_chunks() {
+        let policy = manifest(Some(2)).effective_pack_policy();
+
+        assert_eq!(policy.chunked_patch_format, PackChunkedPatchFormat::V2);
+        assert_eq!(
+            crate::diff::chunked::ChunkedPatchFormat::from(policy.chunked_patch_format),
+            crate::diff::chunked::ChunkedPatchFormat::IdentityChunks
+        );
+    }
+
+    #[test]
+    fn unknown_chunked_patch_format_keeps_the_compatible_default() {
+        let policy = manifest(Some(3)).effective_pack_policy();
+
+        assert_eq!(policy.chunked_patch_format, PackChunkedPatchFormat::V1);
     }
 }

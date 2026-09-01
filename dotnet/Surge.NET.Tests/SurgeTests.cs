@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 using System.Reflection;
 using System.Threading;
 using Xunit;
@@ -111,6 +112,61 @@ namespace Surge.Tests
 
             Assert.Contains("channel: production", updated);
             Assert.EndsWith("channel: production" + Environment.NewLine, updated);
+        }
+
+        [Fact]
+        public void TryLoadCurrentAppFromManifest_IgnoresEnvironmentKeyCollisions()
+        {
+            var tempDirectory = Path.Combine(Path.GetTempPath(), "surge-tests-" + Guid.NewGuid().ToString("N"));
+            var manifestPath = Path.Combine(tempDirectory, "runtime.yml");
+            var installDirectory = Path.Combine(tempDirectory, "installed-app");
+            Directory.CreateDirectory(tempDirectory);
+
+            try
+            {
+                File.WriteAllText(
+                    manifestPath,
+                    "id: demoapp\n" +
+                    "version: 1.2.3\n" +
+                    "channel: production\n" +
+                    "installDirectory: " + installDirectory + "\n" +
+                    "supervisorId: demo-supervisor\n" +
+                    "provider: filesystem\n" +
+                    "bucket: /srv/releases\n" +
+                    "region: eu-north-1\n" +
+                    "endpoint: https://releases.example.test\n" +
+                    "environment: {\n" +
+                    "# launch variables\n" +
+                    "note: \"a quoted } does not close the map\",\n" +
+                    "# a commented } does not close the map\n" +
+                    "id: \"wrong-app\",\n" +
+                    "version: \"9.9.9\",\n" +
+                    "channel: \"wrong-channel\",\n" +
+                    "installDirectory: \"wrong-install\",\n" +
+                    "supervisorId: \"wrong-supervisor\",\n" +
+                    "provider: \"wrong-provider\",\n" +
+                    "bucket: \"wrong-bucket\",\n" +
+                    "region: \"wrong-region\",\n" +
+                    "endpoint: \"https://wrong.example.test\"\n" +
+                    "}\n");
+
+                var app = SurgeApp.TryLoadCurrentAppFromManifest(manifestPath, tempDirectory);
+
+                Assert.NotNull(app);
+                Assert.Equal("demoapp", app!.Id);
+                Assert.Equal("1.2.3", app.Version);
+                Assert.Equal("production", app.Channel);
+                Assert.Equal(installDirectory, app.InstallDirectory);
+                Assert.Equal("demo-supervisor", app.SupervisorId);
+                Assert.Equal("filesystem", app.StorageProvider);
+                Assert.Equal("/srv/releases", app.StorageBucket);
+                Assert.Equal("eu-north-1", app.StorageRegion);
+                Assert.Equal("https://releases.example.test", app.StorageEndpoint);
+            }
+            finally
+            {
+                Directory.Delete(tempDirectory, recursive: true);
+            }
         }
     }
 

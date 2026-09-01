@@ -1,0 +1,348 @@
+use std::collections::BTreeMap;
+use std::path::Path;
+
+use tracing::warn;
+
+use crate::error::{Result, SurgeError};
+
+use super::UpdateManager;
+use super::lifecycle::{self, SupervisorRestartOutcome};
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn prepare_and_quiesce_active_app_before_swap(
+    install_dir: &Path,
+    current_app_dir: &Path,
+    current_version: &str,
+    current_main_exe: &str,
+    current_supervisor_id: &str,
+    current_environment: Option<&BTreeMap<String, String>>,
+    supervisor_requires_restoration: bool,
+    supervised_child_pid: Option<u32>,
+    allow_in_process_swap: bool,
+) -> Result<Option<lifecycle::PreparedAppQuiescence>> {
+    let result = (|| {
+        let prepared = lifecycle::prepare_app_quiescence(current_app_dir, current_main_exe, allow_in_process_swap)?;
+        if let Some(prepared) = &prepared {
+            lifecycle::terminate_prepared_app_processes(prepared)?;
+        }
+        Ok(prepared)
+    })();
+    let Err(error) = result else {
+        return result;
+    };
+
+    Err(restore_previous_supervisor_after_quiescence_failure(
+        install_dir,
+        Some(current_app_dir),
+        current_version,
+        current_main_exe,
+        current_supervisor_id,
+        current_environment,
+        supervisor_requires_restoration,
+        supervised_child_pid,
+        error,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn restore_previous_supervisor_after_quiescence_failure(
+    install_dir: &Path,
+    current_app_dir: Option<&Path>,
+    current_version: &str,
+    current_main_exe: &str,
+    current_supervisor_id: &str,
+    current_environment: Option<&BTreeMap<String, String>>,
+    supervisor_requires_restoration: bool,
+    supervised_child_pid: Option<u32>,
+    error: SurgeError,
+) -> SurgeError {
+    if supervisor_requires_restoration
+        && let Some(current_app_dir) = current_app_dir
+        && let Some(current_environment) = current_environment
+    {
+        request_previous_supervisor_restoration(
+            install_dir,
+            current_app_dir,
+            current_version,
+            current_main_exe,
+            current_supervisor_id,
+            current_environment,
+            supervised_child_pid,
+        );
+    }
+
+    error
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn prepare_and_quiesce_previous_swap_before_reuse(
+    manager: &UpdateManager,
+    previous_swap_dir: &Path,
+    current_app_dir: Option<&Path>,
+    current_version: &str,
+    current_main_exe: &str,
+    current_supervisor_id: &str,
+    current_environment: Option<&BTreeMap<String, String>>,
+    supervisor_requires_restoration: bool,
+    supervised_child_pid: Option<u32>,
+) -> Result<Option<(lifecycle::PreparedAppQuiescence, String)>> {
+    let result: Result<Option<(lifecycle::PreparedAppQuiescence, String)>> = async {
+        let previous_swap_identity = super::current_install::load_previous_swap(manager, previous_swap_dir)?
+            .ok_or_else(|| {
+                SurgeError::Update(
+                    "Previous swap directory has no persisted process identity; refusing to delete or reuse it"
+                        .to_string(),
+                )
+            })?;
+        let _ =
+            lifecycle::request_supervisor_shutdown(&manager.install_dir, &previous_swap_identity.supervisor_id).await?;
+        let prepared = lifecycle::prepare_app_quiescence(
+            previous_swap_dir,
+            &previous_swap_identity.main_exe,
+            manager.allow_in_process_swap,
+        )?
+        .ok_or_else(|| {
+            SurgeError::Update(
+                "Previous swap application entrypoint disappeared before it could be quiesced".to_string(),
+            )
+        })?;
+        lifecycle::terminate_prepared_app_processes(&prepared)?;
+        Ok(Some((prepared, previous_swap_identity.main_exe)))
+    }
+    .await;
+
+    let Err(error) = result else {
+        return result;
+    };
+    Err(restore_previous_supervisor_after_quiescence_failure(
+        &manager.install_dir,
+        current_app_dir,
+        current_version,
+        current_main_exe,
+        current_supervisor_id,
+        current_environment,
+        supervisor_requires_restoration,
+        supervised_child_pid,
+        error,
+    ))
+}
+
+fn request_previous_supervisor_restoration(
+    install_dir: &Path,
+    current_app_dir: &Path,
+    current_version: &str,
+    current_main_exe: &str,
+    current_supervisor_id: &str,
+    current_environment: &BTreeMap<String, String>,
+    supervised_child_pid: Option<u32>,
+) {
+    let Some(supervised_child_pid) = supervised_child_pid else {
+        warn!(
+            supervisor_id = current_supervisor_id,
+            "Cannot safely restore the previous supervisor because it did not provide its surviving child PID"
+        );
+        return;
+    };
+    let restore_outcome = lifecycle::restore_previous_supervisor_after_failed_quiescence(
+        install_dir,
+        current_app_dir,
+        current_version,
+        current_main_exe,
+        current_supervisor_id,
+        current_environment,
+        supervised_child_pid,
+    );
+    match restore_outcome {
+        SupervisorRestartOutcome::NotApplicable => {
+            warn!(
+                supervisor_id = current_supervisor_id,
+                "Previous supervisor could not be restored after application quiescence failed"
+            );
+        }
+        SupervisorRestartOutcome::PendingRestart { reason, failure_phase } => {
+            warn!(
+                supervisor_id = current_supervisor_id,
+                reason, failure_phase, "Requested previous supervisor restoration after application quiescence failed"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    use crate::supervisor::state::supervisor_pid_file;
+
+    use super::*;
+
+    #[test]
+    fn quiescence_failure_restores_previous_supervisor_and_preserves_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install_dir = tmp.path();
+        let active_app_dir = install_dir.join("app");
+        std::fs::create_dir_all(&active_app_dir).unwrap();
+
+        let app_path = active_app_dir.join("cwd-changing-demo-script");
+        std::fs::write(&app_path, "#!/bin/sh\ncd /\nread _\n").unwrap();
+        make_executable(&app_path);
+        write_test_supervisor(&active_app_dir);
+
+        let spawn_deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let mut child = loop {
+            match Command::new("./cwd-changing-demo-script")
+                .current_dir(&active_app_dir)
+                .stdin(Stdio::piped())
+                .spawn()
+            {
+                Ok(child) => break child,
+                Err(error)
+                    if error.raw_os_error() == Some(nix::errno::Errno::ETXTBSY as i32)
+                        && std::time::Instant::now() < spawn_deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("failed to launch changed-cwd app fixture: {error}"),
+            }
+        };
+        let cwd_path = PathBuf::from(format!("/proc/{}/cwd", child.id()));
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::fs::read_link(&cwd_path).ok().as_deref() != Some(Path::new("/")) {
+            assert!(std::time::Instant::now() < deadline, "test child did not change cwd");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let current_environment = BTreeMap::from([("SURGE_TEST_MODE".to_string(), "preserved".to_string())]);
+        let child_pid = child.id();
+        let result = prepare_and_quiesce_active_app_before_swap(
+            install_dir,
+            &active_app_dir,
+            "1.0.0",
+            "cwd-changing-demo-script",
+            "demo-supervisor",
+            Some(&current_environment),
+            true,
+            Some(child_pid),
+            false,
+        );
+        let child_still_running = child.try_wait().unwrap().is_none();
+        if child_still_running {
+            child.kill().unwrap();
+        }
+        let _ = child.wait();
+
+        let error = result.err().unwrap();
+        assert!(error.to_string().contains("process identity is ambiguous"));
+        assert!(child_still_running);
+        assert!(supervisor_pid_file(install_dir, "demo-supervisor").is_file());
+        assert_eq!(
+            crate::supervisor::state::read_supervisor_exe_path(install_dir, "demo-supervisor").as_deref(),
+            Some(app_path.as_path())
+        );
+        assert_eq!(
+            std::fs::read_to_string(install_dir.join("restored-environment")).unwrap(),
+            "preserved"
+        );
+        assert_eq!(
+            std::fs::read_to_string(install_dir.join("restored-watched.pid"))
+                .unwrap()
+                .trim(),
+            child_pid.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn previous_swap_identity_failure_restores_current_supervisor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install_dir = tmp.path().join("install");
+        let store_dir = tmp.path().join("store");
+        let active_app_dir = install_dir.join("app");
+        let previous_swap_dir = install_dir.join(".surge-app-prev");
+        std::fs::create_dir_all(&active_app_dir).unwrap();
+        std::fs::create_dir_all(&previous_swap_dir).unwrap();
+        std::fs::create_dir_all(&store_dir).unwrap();
+
+        let app_path = active_app_dir.join("current-app");
+        std::fs::write(&app_path, "#!/bin/sh\nexit 0\n").unwrap();
+        make_executable(&app_path);
+        write_test_supervisor(&active_app_dir);
+
+        let ctx = std::sync::Arc::new(crate::context::Context::new());
+        ctx.set_storage(
+            crate::context::StorageProvider::Filesystem,
+            store_dir.to_str().unwrap(),
+            "",
+            "",
+            "",
+            "",
+        );
+        let manager = UpdateManager::new(ctx, "test-app", "1.0.0", "stable", install_dir.to_str().unwrap()).unwrap();
+
+        let current_environment = BTreeMap::from([("SURGE_TEST_MODE".to_string(), "preserved".to_string())]);
+        let error = prepare_and_quiesce_previous_swap_before_reuse(
+            &manager,
+            &previous_swap_dir,
+            Some(&active_app_dir),
+            "1.0.0",
+            "current-app",
+            "demo-supervisor",
+            Some(&current_environment),
+            true,
+            Some(4242),
+        )
+        .await
+        .err()
+        .unwrap();
+
+        assert!(error.to_string().contains("no persisted process identity"));
+        assert!(supervisor_pid_file(&install_dir, "demo-supervisor").is_file());
+        assert_eq!(
+            crate::supervisor::state::read_supervisor_exe_path(&install_dir, "demo-supervisor").as_deref(),
+            Some(app_path.as_path())
+        );
+        assert_eq!(
+            std::fs::read_to_string(install_dir.join("restored-environment")).unwrap(),
+            "preserved"
+        );
+        assert_eq!(
+            std::fs::read_to_string(install_dir.join("restored-watched.pid"))
+                .unwrap()
+                .trim(),
+            "4242"
+        );
+    }
+
+    fn write_test_supervisor(active_app_dir: &Path) {
+        let supervisor_path = active_app_dir.join(crate::platform::process::supervisor_binary_name());
+        std::fs::write(
+            &supervisor_path,
+            r#"#!/bin/sh
+id=""
+dir=""
+pid=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --id) id="$2"; shift 2 ;;
+    --dir) dir="$2"; shift 2 ;;
+    --pid) pid="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+printf '%s' "$SURGE_TEST_MODE" > "$dir/restored-environment"
+printf '%s' "$pid" > "$dir/restored-watched.pid"
+echo $$ > "$dir/.surge-supervisor-$id.pid"
+"#,
+        )
+        .unwrap();
+        make_executable(&supervisor_path);
+    }
+
+    fn make_executable(path: &Path) {
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+}

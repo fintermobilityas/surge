@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+#[cfg(unix)]
+use surge_core::supervisor::state::{clear_supervisor_takeover_pid, write_supervisor_takeover_pid};
 use surge_core::supervisor::state::{read_supervisor_exe_path, supervisor_pid_file, supervisor_stop_file};
 use thiserror::Error;
 
@@ -15,7 +17,7 @@ mod ownership;
 use child::{
     WaitOutcome, spawn_supervised_child, wait_before_restart, wait_for_pid_or_stop, wait_for_supervised_child,
 };
-#[cfg(all(test, unix))]
+#[cfg(unix)]
 use ownership::current_supervisor_owns_pid_file;
 use ownership::{remove_owned_supervisor_state, supervisor_was_superseded};
 
@@ -221,6 +223,8 @@ fn run_supervisor(
     let pid_file = supervisor_pid_file(install_dir, supervisor_id);
     let stop_file = supervisor_stop_file(install_dir, supervisor_id);
 
+    #[cfg(unix)]
+    clear_supervisor_takeover_pid(install_dir, supervisor_id);
     if stop_file.exists() {
         let _ = std::fs::remove_file(&stop_file);
     }
@@ -239,8 +243,16 @@ fn run_supervisor(
     let mut watched_pid = watched_pid;
 
     loop {
-        if shutdown.load(std::sync::atomic::Ordering::Acquire) || stop_file.exists() {
+        if shutdown.load(std::sync::atomic::Ordering::Acquire) {
             tracing::info!("Shutdown signal received, exiting supervisor loop");
+            break;
+        }
+        if stop_file.exists() {
+            #[cfg(unix)]
+            if let Some(pid) = watched_pid {
+                record_supervisor_takeover_pid_if_owned(install_dir, supervisor_id, &pid_file, own_pid, pid);
+            }
+            tracing::info!("Stop requested, exiting supervisor loop");
             break;
         }
 
@@ -258,6 +270,8 @@ fn run_supervisor(
                     tracing::info!("Observed process PID {pid} exited, starting replacement child");
                 }
                 WaitOutcome::StopRequested => {
+                    #[cfg(unix)]
+                    record_supervisor_takeover_pid_if_owned(install_dir, supervisor_id, &pid_file, own_pid, pid);
                     tracing::info!("Stop requested, exiting supervisor loop and leaving watched process running");
                     break;
                 }
@@ -278,6 +292,8 @@ fn run_supervisor(
 
         let child_args = next_child_args.take().unwrap_or_else(|| restart_args.clone());
         let mut child = spawn_supervised_child(exe_path, install_dir, &child_args)?;
+        #[cfg(unix)]
+        let child_pid = child.id();
 
         let Some(status) = wait_for_supervised_child(
             &mut child,
@@ -289,6 +305,10 @@ fn run_supervisor(
             &mut pending_handoff_version,
         )?
         else {
+            #[cfg(unix)]
+            if stop_file.exists() {
+                record_supervisor_takeover_pid_if_owned(install_dir, supervisor_id, &pid_file, own_pid, child_pid);
+            }
             break;
         };
 
@@ -322,6 +342,22 @@ fn run_supervisor(
 
     tracing::info!("Supervisor '{supervisor_id}' exiting");
     Ok(())
+}
+
+#[cfg(unix)]
+fn record_supervisor_takeover_pid_if_owned(
+    install_dir: &Path,
+    supervisor_id: &str,
+    supervisor_pid_file: &Path,
+    own_pid: u32,
+    child_pid: u32,
+) {
+    if !current_supervisor_owns_pid_file(supervisor_pid_file, own_pid) {
+        return;
+    }
+    if let Err(error) = write_supervisor_takeover_pid(install_dir, supervisor_id, child_pid) {
+        tracing::warn!(pid = child_pid, supervisor_id, %error, "Failed to persist child PID for supervisor takeover");
+    }
 }
 
 fn write_pid_file(path: &Path, own_pid: u32) -> Result<(), SupervisorError> {
@@ -640,6 +676,83 @@ mod tests {
 
         assert!(first_child_ran, "first child should have recorded its argv");
         assert_eq!(args.unwrap(), "--app-mode\nservice\n--surge-first-run\n2.0.0\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_request_persists_running_child_pid_for_takeover() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TestInstallDir::new("surge-supervisor-takeover-pid");
+        let install_dir = tmp.path();
+        let child_pid_path = install_dir.join("child.pid");
+        let exe_path = install_dir.join("target-child");
+        std::fs::write(
+            &exe_path,
+            format!("#!/bin/sh\necho $$ > '{}'\nexec sleep 30\n", child_pid_path.display()),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&exe_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&exe_path, permissions).unwrap();
+
+        let install_dir_for_thread = install_dir.to_path_buf();
+        let exe_path_for_thread = exe_path.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let supervisor = std::thread::spawn(move || {
+            tx.send(run_supervisor(
+                "demo-supervisor",
+                &install_dir_for_thread,
+                &exe_path_for_thread,
+                &[],
+                None,
+                None,
+            ))
+            .unwrap();
+        });
+
+        assert!(
+            wait_until(std::time::Duration::from_secs(5), || child_pid_path.is_file()),
+            "supervised child did not start"
+        );
+        let child_pid = std::fs::read_to_string(&child_pid_path)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        std::fs::write(supervisor_stop_file(install_dir, "demo-supervisor"), "surge-update").unwrap();
+
+        let supervisor_result = rx.recv_timeout(std::time::Duration::from_secs(5));
+        supervisor.join().unwrap();
+        let takeover_pid = surge_core::supervisor::state::take_supervisor_takeover_pid(install_dir, "demo-supervisor");
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(i32::try_from(child_pid).unwrap()),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+
+        supervisor_result
+            .expect("supervisor did not exit after stop file")
+            .unwrap();
+        assert_eq!(takeover_pid, Some(child_pid));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn superseded_supervisor_does_not_persist_takeover_pid() {
+        let tmp = TestInstallDir::new("surge-supervisor-superseded-takeover");
+        let install_dir = tmp.path();
+        let supervisor_id = "demo-supervisor";
+        let pid_file = supervisor_pid_file(install_dir, supervisor_id);
+        let own_pid = std::process::id();
+        let replacement_pid = if own_pid == 1 { 2 } else { 1 };
+
+        std::fs::write(&pid_file, replacement_pid.to_string()).unwrap();
+        record_supervisor_takeover_pid_if_owned(install_dir, supervisor_id, &pid_file, own_pid, 4242);
+
+        assert_eq!(
+            surge_core::supervisor::state::take_supervisor_takeover_pid(install_dir, supervisor_id),
+            None
+        );
     }
 
     #[cfg(unix)]

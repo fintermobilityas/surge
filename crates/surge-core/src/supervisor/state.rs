@@ -33,6 +33,38 @@ pub fn supervisor_exe_file(install_dir: &Path, supervisor_id: &str) -> PathBuf {
     supervisor_state_path(install_dir, supervisor_id, ".exe")
 }
 
+#[must_use]
+#[cfg(unix)]
+pub fn supervisor_takeover_pid_file(install_dir: &Path, supervisor_id: &str) -> PathBuf {
+    supervisor_state_path(install_dir, supervisor_id, ".takeover.pid")
+}
+
+#[cfg(unix)]
+pub fn write_supervisor_takeover_pid(install_dir: &Path, supervisor_id: &str, pid: u32) -> Result<()> {
+    std::fs::write(
+        supervisor_takeover_pid_file(install_dir, supervisor_id),
+        pid.to_string(),
+    )?;
+    Ok(())
+}
+
+#[must_use]
+#[cfg(unix)]
+pub fn take_supervisor_takeover_pid(install_dir: &Path, supervisor_id: &str) -> Option<u32> {
+    let path = supervisor_takeover_pid_file(install_dir, supervisor_id);
+    let pid = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|contents| contents.trim().parse::<u32>().ok())
+        .filter(|pid| *pid != 0);
+    let _ = std::fs::remove_file(path);
+    pid
+}
+
+#[cfg(unix)]
+pub fn clear_supervisor_takeover_pid(install_dir: &Path, supervisor_id: &str) {
+    let _ = std::fs::remove_file(supervisor_takeover_pid_file(install_dir, supervisor_id));
+}
+
 /// Persist the supervised executable path so the spawning side can omit it from
 /// the supervisor's argv. Keeping the app path out of argv stops an external
 /// `pkill -f <app-path>` from also matching the supervisor process.
@@ -136,5 +168,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(supervisor_exe_file(dir.path(), "demo-supervisor"), "   \n").unwrap();
         assert_eq!(read_supervisor_exe_path(dir.path(), "demo-supervisor"), None);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn supervisor_takeover_pid_is_consumed_once() {
+        let dir = tempfile::tempdir().unwrap();
+
+        write_supervisor_takeover_pid(dir.path(), "demo-supervisor", 42).unwrap();
+
+        assert_eq!(take_supervisor_takeover_pid(dir.path(), "demo-supervisor"), Some(42));
+        assert_eq!(take_supervisor_takeover_pid(dir.path(), "demo-supervisor"), None);
     }
 }

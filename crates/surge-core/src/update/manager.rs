@@ -4,6 +4,8 @@ mod apply;
 mod artifacts;
 mod current_install;
 mod finalize;
+#[cfg(unix)]
+mod finalize_quiescence;
 mod lifecycle;
 mod progress;
 mod progress_substep;
@@ -1112,10 +1114,16 @@ mod tests {
     #[tokio::test]
     async fn test_request_supervisor_shutdown_noop_when_supervisor_is_unknown() {
         let tmp = tempfile::tempdir().unwrap();
-        lifecycle::request_supervisor_shutdown(tmp.path(), "").await.unwrap();
-        lifecycle::request_supervisor_shutdown(tmp.path(), "missing")
-            .await
-            .unwrap();
+        assert_eq!(
+            lifecycle::request_supervisor_shutdown(tmp.path(), "").await.unwrap(),
+            None
+        );
+        assert_eq!(
+            lifecycle::request_supervisor_shutdown(tmp.path(), "missing")
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     #[tokio::test]
@@ -1140,17 +1148,38 @@ mod tests {
             panic!("timed out waiting for stop file to be created");
         });
 
-        lifecycle::request_supervisor_shutdown_with_timeout(
-            install_dir,
-            supervisor_id,
-            Duration::from_secs(2),
-            Duration::from_millis(10),
-        )
-        .await
-        .unwrap();
+        assert_eq!(
+            lifecycle::request_supervisor_shutdown_with_timeout(
+                install_dir,
+                supervisor_id,
+                Duration::from_secs(2),
+                Duration::from_millis(10),
+            )
+            .await
+            .unwrap(),
+            None
+        );
 
         waiter.await.unwrap();
         assert!(!stop_file.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_request_supervisor_shutdown_consumes_existing_takeover_when_pid_file_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::supervisor::state::write_supervisor_takeover_pid(tmp.path(), "test-supervisor", 42).unwrap();
+
+        assert_eq!(
+            lifecycle::request_supervisor_shutdown(tmp.path(), "test-supervisor")
+                .await
+                .unwrap(),
+            Some(42)
+        );
+        assert_eq!(
+            crate::supervisor::state::take_supervisor_takeover_pid(tmp.path(), "test-supervisor"),
+            None
+        );
     }
 
     #[tokio::test]

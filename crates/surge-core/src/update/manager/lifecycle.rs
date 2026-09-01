@@ -6,6 +6,8 @@ use tracing::{debug, info, warn};
 use crate::error::{Result, SurgeError};
 use crate::platform::process::{ProcessHandle, current_pid, spawn_detached, spawn_process, supervisor_binary_name};
 use crate::releases::manifest::ReleaseEntry;
+#[cfg(unix)]
+use crate::supervisor::state::{clear_supervisor_takeover_pid, take_supervisor_takeover_pid};
 use crate::supervisor::state::{
     read_restart_args, supervisor_pid_file, supervisor_stop_file, write_supervisor_exe_path,
 };
@@ -43,7 +45,7 @@ pub(super) enum SupervisorRestartOutcome {
     },
 }
 
-pub(super) async fn request_supervisor_shutdown(install_dir: &Path, supervisor_id: &str) -> Result<()> {
+pub(super) async fn request_supervisor_shutdown(install_dir: &Path, supervisor_id: &str) -> Result<Option<u32>> {
     request_supervisor_shutdown_with_timeout(
         install_dir,
         supervisor_id,
@@ -58,16 +60,21 @@ pub(super) async fn request_supervisor_shutdown_with_timeout(
     supervisor_id: &str,
     timeout: Duration,
     poll_interval: Duration,
-) -> Result<()> {
+) -> Result<Option<u32>> {
     let supervisor_id = supervisor_id.trim();
     if supervisor_id.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
 
     let pid_file = supervisor_pid_file(install_dir, supervisor_id);
     if !pid_file.is_file() {
-        return Ok(());
+        #[cfg(unix)]
+        return Ok(take_supervisor_takeover_pid(install_dir, supervisor_id));
+        #[cfg(not(unix))]
+        return Ok(None);
     }
+    #[cfg(unix)]
+    clear_supervisor_takeover_pid(install_dir, supervisor_id);
 
     let stop_file = supervisor_stop_file(install_dir, supervisor_id);
     tokio::fs::write(&stop_file, b"surge-update").await?;
@@ -83,7 +90,11 @@ pub(super) async fn request_supervisor_shutdown_with_timeout(
     }
 
     let _ = tokio::fs::remove_file(&stop_file).await;
-    Ok(())
+    #[cfg(unix)]
+    let takeover_pid = take_supervisor_takeover_pid(install_dir, supervisor_id);
+    #[cfg(not(unix))]
+    let takeover_pid = None;
+    Ok(takeover_pid)
 }
 
 pub(super) fn invoke_post_update_hook(install_dir: &Path, active_app_dir: &Path, latest: &ReleaseEntry) {
@@ -172,18 +183,21 @@ pub(super) fn restore_previous_supervisor_after_failed_quiescence(
     version: &str,
     main_exe: &str,
     supervisor_id: &str,
+    environment: &std::collections::BTreeMap<String, String>,
+    watched_pid: u32,
 ) -> SupervisorRestartOutcome {
     let previous = ReleaseEntry {
         version: version.to_string(),
         main_exe: main_exe.to_string(),
         supervisor_id: supervisor_id.to_string(),
+        environment: environment.clone(),
         ..ReleaseEntry::default()
     };
     restart_supervisor_after_update_with_config(
         install_dir,
         active_app_dir,
         &previous,
-        current_pid(),
+        watched_pid,
         None,
         SUPERVISOR_RESTART_CONFIRM_TIMEOUT,
         SUPERVISOR_RESTART_MAX_ATTEMPTS,

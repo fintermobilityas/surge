@@ -5,12 +5,16 @@
 use std::ffi::OsString;
 #[cfg(unix)]
 use std::path::PathBuf;
+#[cfg(target_os = "linux")]
+use std::time::Duration;
 
 #[cfg(target_os = "macos")]
 use std::path::Path;
 
 #[cfg(unix)]
 use crate::error::Result;
+#[cfg(target_os = "linux")]
+use crate::error::SurgeError;
 
 #[cfg(unix)]
 pub(super) struct AppProcess {
@@ -25,8 +29,6 @@ pub(super) fn app_process_pids<F>(protected_pid: u32, matches_exe: &F) -> Result
 where
     F: Fn(&AppProcess) -> Result<bool>,
 {
-    use crate::error::SurgeError;
-
     let entries = std::fs::read_dir("/proc")
         .map_err(|e| SurgeError::Platform(format!("Failed to enumerate processes from /proc: {e}")))?;
 
@@ -41,9 +43,9 @@ where
         let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe")).map(normalize_proc_exe_path) else {
             continue;
         };
-        let command = std::fs::read(format!("/proc/{pid}/cmdline"));
-        let command_inspected = command.is_ok();
-        let command = command.map_or_else(|_| Vec::new(), |bytes| parse_proc_cmdline(&bytes));
+        let Some((command, command_inspected)) = inspect_linux_process_command(pid)? else {
+            continue;
+        };
         let process = AppProcess {
             exe,
             command,
@@ -105,6 +107,49 @@ pub(super) fn parse_proc_cmdline(bytes: &[u8]) -> Vec<OsString> {
         .collect()
 }
 
+#[cfg(target_os = "linux")]
+fn inspect_linux_process_command(pid: u32) -> Result<Option<(Vec<OsString>, bool)>> {
+    let mut command = Vec::new();
+    let mut command_inspected = false;
+    for attempt in 0..3 {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if let Ok(bytes) = std::fs::read(format!("/proc/{pid}/cmdline")) {
+            command = parse_proc_cmdline(&bytes);
+            command_inspected = true;
+        }
+        if command.iter().any(|argument| !argument.is_empty()) {
+            return Ok(Some((command, command_inspected)));
+        }
+        if linux_process_is_gone_or_zombie(pid)? {
+            return Ok(None);
+        }
+    }
+    Ok(Some((command, command_inspected)))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_is_gone_or_zombie(pid: u32) -> Result<bool> {
+    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => {
+            return Err(SurgeError::Platform(format!(
+                "Failed to inspect process PID {pid} state before swap: {error}"
+            )));
+        }
+    };
+    proc_stat_is_zombie(&stat)
+        .ok_or_else(|| SurgeError::Platform(format!("Failed to parse process PID {pid} state before swap")))
+}
+
+#[cfg(target_os = "linux")]
+fn proc_stat_is_zombie(stat: &str) -> Option<bool> {
+    let state = stat.rsplit_once(") ")?.1.as_bytes().first()?;
+    Some(matches!(*state, b'Z' | b'X'))
+}
+
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 pub(super) fn app_process_pids<F>(_protected_pid: u32, _matches_exe: &F) -> Result<Vec<u32>>
 where
@@ -162,5 +207,13 @@ mod tests {
             vec![OsString::new(), OsString::from("/opt/demo/app/demo"), OsString::new()]
         );
         assert!(parse_proc_cmdline(b"").is_empty());
+    }
+
+    #[test]
+    fn proc_stat_recognizes_gone_process_states() {
+        assert_eq!(proc_stat_is_zombie("123 (demo) Z 1"), Some(true));
+        assert_eq!(proc_stat_is_zombie("123 (demo) X 1"), Some(true));
+        assert_eq!(proc_stat_is_zombie("123 (demo) S 1"), Some(false));
+        assert_eq!(proc_stat_is_zombie("malformed"), None);
     }
 }

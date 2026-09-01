@@ -118,12 +118,25 @@ fn process_identity_impl(pid: u32) -> io::Result<Option<ProcessIdentity>> {
         Err(error) if process_disappeared(&error) => return Ok(None),
         Err(error) => return Err(error),
     };
-    parse_linux_process_stat(pid, &stat)
-        .map(|generation| generation.map(|generation| ProcessIdentity { pid, generation }))
+    let stat = parse_linux_process_stat(pid, &stat)?;
+    if stat.is_zombie && !linux_thread_group_has_live_member(pid)? {
+        return Ok(None);
+    }
+    Ok(Some(ProcessIdentity {
+        pid,
+        generation: stat.generation,
+    }))
 }
 
 #[cfg(target_os = "linux")]
-fn parse_linux_process_stat(pid: u32, stat: &str) -> io::Result<Option<u64>> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LinuxProcessStat {
+    generation: u64,
+    is_zombie: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_process_stat(pid: u32, stat: &str) -> io::Result<LinuxProcessStat> {
     let Some((_, fields)) = stat.rsplit_once(") ") else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -134,9 +147,6 @@ fn parse_linux_process_stat(pid: u32, stat: &str) -> io::Result<Option<u64>> {
     let state = fields
         .next()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("process {pid} stat has no state")))?;
-    if matches!(state.as_bytes(), [b'Z' | b'X']) {
-        return Ok(None);
-    }
     let generation = fields
         .nth(18)
         .and_then(|value| value.parse::<u64>().ok())
@@ -146,7 +156,53 @@ fn parse_linux_process_stat(pid: u32, stat: &str) -> io::Result<Option<u64>> {
                 format!("process {pid} stat has no valid start time"),
             )
         })?;
-    Ok(Some(generation))
+    Ok(LinuxProcessStat {
+        generation,
+        is_zombie: matches!(state.as_bytes(), [b'Z' | b'X']),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_thread_group_has_live_member(pid: u32) -> io::Result<bool> {
+    let tasks = match std::fs::read_dir(format!("/proc/{pid}/task")) {
+        Ok(tasks) => tasks,
+        Err(error) if process_disappeared(&error) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    for task in tasks {
+        let task = match task {
+            Ok(task) => task,
+            Err(error) if process_disappeared(&error) => continue,
+            Err(error) => return Err(error),
+        };
+        let Some(tid) = task.file_name().to_string_lossy().parse::<u32>().ok() else {
+            continue;
+        };
+        let stat = match std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/stat")) {
+            Ok(stat) => stat,
+            Err(error) if process_disappeared(&error) => continue,
+            Err(error) => return Err(error),
+        };
+        if !linux_process_stat_is_zombie(tid, &stat)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_stat_is_zombie(pid: u32, stat: &str) -> io::Result<bool> {
+    let Some((_, fields)) = stat.rsplit_once(") ") else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("process {pid} stat has no command boundary"),
+        ));
+    };
+    let state = fields
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("process {pid} stat has no state")))?;
+    Ok(matches!(state.as_bytes(), [b'Z' | b'X']))
 }
 
 #[cfg(target_os = "linux")]
@@ -183,13 +239,34 @@ mod tests {
     #[test]
     fn linux_stat_parser_uses_start_time_after_complex_command_name() {
         let stat = "42 (worker ) name) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 123456 20";
-        assert_eq!(parse_linux_process_stat(42, stat).unwrap(), Some(123_456));
+        assert_eq!(
+            parse_linux_process_stat(42, stat).unwrap(),
+            LinuxProcessStat {
+                generation: 123_456,
+                is_zombie: false,
+            }
+        );
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn linux_stat_parser_treats_zombies_as_absent() {
-        assert_eq!(parse_linux_process_stat(42, "42 (worker) Z").unwrap(), None);
+    fn linux_stat_parser_retains_zombie_generation_for_thread_group_check() {
+        let stat = "42 (worker) Z 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 123456 20";
+        assert_eq!(
+            parse_linux_process_stat(42, stat).unwrap(),
+            LinuxProcessStat {
+                generation: 123_456,
+                is_zombie: true,
+            }
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_thread_state_distinguishes_live_workers_from_zombies() {
+        assert!(!linux_process_stat_is_zombie(43, "43 (worker) S 1").unwrap());
+        assert!(linux_process_stat_is_zombie(43, "43 (worker) Z 1").unwrap());
+        assert!(linux_process_stat_is_zombie(43, "43 (worker) X 1").unwrap());
     }
 
     #[cfg(target_os = "linux")]

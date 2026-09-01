@@ -153,11 +153,19 @@ Ranked by expected value; read `results.tsv` and
    Same-session 100-delta A/B: apply 216,777 → 156,599/158,057 ms
    (−27.4%, 0.9% spread), per step ~2.2 s → ~1.6 s, download +
    install tree identical.
-3. **Stream the target hash into the bspatch write.** The per-step
-   target SHA-256 is a separate full read after the bspatch write;
-   hashing the output as it is written removes that read (~0.3-0.5 s
-   at scale 1.0). Touches `chunked_bspatch_file*` (shared with the
-   archive strategy — keep the API additive).
+3. **KEPT — Streamed target hash into the bspatch write.** The
+   per-step target SHA-256 was a separate full read after the bspatch
+   write; `chunked_bspatch_file_with_progress_and_sha256` now returns
+   the output hash computed while writing (additive API; the
+   existing functions are untouched). The 0.55 s/step target-hash
+   phase is eliminated, but the hashing CPU moves into the write
+   loop, so the net is ~0.2-0.3 s/step. Phase-instrumented 10-step
+   A/B (same session, 4 pairs): per step ~2,270 ms → ~1,980-2,060 ms
+   in 3 of 4 pairs (the 4th was a load-spike window hitting both
+   sides); 100-delta same-session medians ~167 s vs ~172 s — the
+   gain sits near the shared-host wall-clock noise floor, which is
+   why the phase-level evidence carries the claim. Payload and
+   verification unchanged (tamper test still fail-closed).
 4. **Per-step repack variance.** The repack is the most load-variable
    component (0.6-3.0 s): zstd over ~1.2 GB per step, re-encoding
    unchanged files even though one file changed. Candidate: measure

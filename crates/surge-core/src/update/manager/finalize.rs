@@ -126,6 +126,18 @@ where
     if let Some(current_app_dir) = current_app_dir {
         lifecycle::terminate_active_app_processes_before_swap(current_app_dir, current_main_exe)?;
     }
+    #[cfg(unix)]
+    if previous_swap_dir.is_dir() {
+        let previous_swap_identity = super::current_install::load_previous_swap(manager, &previous_swap_dir)?
+            .ok_or_else(|| {
+                SurgeError::Update(
+                    "Previous swap directory has no persisted process identity; refusing to delete or reuse it"
+                        .to_string(),
+                )
+            })?;
+        lifecycle::request_supervisor_shutdown(&manager.install_dir, &previous_swap_identity.supervisor_id).await?;
+        lifecycle::terminate_active_app_processes_before_swap(&previous_swap_dir, &previous_swap_identity.main_exe)?;
+    }
 
     progress_emitter.emit_substep(6, finalize_phase::PREPARING_SWAP, 92);
     if next_app_dir.exists() {

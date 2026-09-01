@@ -57,16 +57,28 @@ fn terminate_active_app_processes_except(active_app_dir: &Path, main_exe: &str, 
         return Ok(0);
     }
 
-    let active_exe = match std::fs::canonicalize(active_app_dir.join(main_exe)) {
-        Ok(active_exe) => active_exe,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(e) => {
-            return Err(SurgeError::Platform(format!(
-                "Failed to resolve active application executable before swap: {e}"
-            )));
-        }
-    };
+    let active_app_root = std::fs::canonicalize(active_app_dir).map_err(|e| {
+        SurgeError::Platform(format!(
+            "Failed to resolve active application directory before swap: {e}"
+        ))
+    })?;
+    let active_exe = std::fs::canonicalize(active_app_root.join(main_exe)).map_err(|e| {
+        SurgeError::Platform(format!(
+            "Failed to resolve active application executable before swap: {e}"
+        ))
+    })?;
+    if !active_exe.starts_with(&active_app_root) {
+        return Err(SurgeError::Platform(format!(
+            "Active application executable '{}' resolves outside the active application directory; refusing to signal a shared executable",
+            active_app_root.join(main_exe).display()
+        )));
+    }
     let interpreted_main = is_interpreted_main(&active_exe)?;
+    if interpreted_main {
+        return Err(SurgeError::Platform(
+            "Cannot safely quiesce an interpreted active application executable before swap".to_string(),
+        ));
+    }
     terminate_matching_app_processes(main_exe, protected_pid, "active", |process| {
         is_active_app_process(&active_exe, interpreted_main, process)
     })
@@ -418,7 +430,7 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn interpreted_active_app_process_is_terminated_before_swap() {
+    fn interpreted_active_app_refuses_swap_without_signalling_running_process() {
         use std::os::unix::fs::PermissionsExt;
         use std::process::Command;
 
@@ -430,29 +442,43 @@ mod tests {
         let mut permissions = std::fs::metadata(&app_path).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&app_path, permissions).unwrap();
-        let resolved_app_path = std::fs::canonicalize(&app_path).unwrap();
-
         let mut child = Command::new(&app_path).spawn().unwrap();
-        let child_pid = child.id();
-        let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        while !app_process_pids(u32::MAX, &|process| {
-            is_active_app_process(&resolved_app_path, true, process)
-        })
-        .unwrap()
-        .contains(&child_pid)
-        {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "test child did not expose the interpreted app launch identity"
-            );
-            std::thread::sleep(Duration::from_millis(10));
+        let error = terminate_active_app_processes_except(&active_app_dir, "demo-script", u32::MAX).unwrap_err();
+        let child_still_running = child.try_wait().unwrap().is_none();
+        if child_still_running {
+            child.kill().unwrap();
         }
+        let _ = child.wait();
 
-        let terminated = terminate_active_app_processes_except(&active_app_dir, "demo-script", u32::MAX).unwrap();
-        let status = child.wait().unwrap();
+        assert!(error.to_string().contains("Cannot safely quiesce an interpreted"));
+        assert!(child_still_running);
+    }
 
-        assert_eq!(terminated, 1);
-        assert!(!status.success());
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn shared_symlink_entrypoint_refuses_swap_without_signalling_unrelated_process() {
+        use std::os::unix::fs::symlink;
+        use std::process::Command;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let active_app_dir = tmp.path().join("app");
+        std::fs::create_dir_all(&active_app_dir).unwrap();
+        symlink("/bin/sleep", active_app_dir.join("demo")).unwrap();
+
+        let mut unrelated_child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let error = terminate_active_app_processes_except(&active_app_dir, "demo", u32::MAX).unwrap_err();
+        let unrelated_still_running = unrelated_child.try_wait().unwrap().is_none();
+        if unrelated_still_running {
+            unrelated_child.kill().unwrap();
+        }
+        let _ = unrelated_child.wait();
+
+        assert!(
+            error
+                .to_string()
+                .contains("resolves outside the active application directory")
+        );
+        assert!(unrelated_still_running);
     }
 
     #[cfg(target_os = "linux")]

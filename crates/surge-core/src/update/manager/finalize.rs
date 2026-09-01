@@ -188,28 +188,16 @@ where
     }
     #[cfg(unix)]
     let previous_swap_quiescence = if previous_swap_dir.is_dir() {
-        let previous_swap_identity = super::current_install::load_previous_swap(manager, &previous_swap_dir)?
-            .ok_or_else(|| {
-                SurgeError::Update(
-                    "Previous swap directory has no persisted process identity; refusing to delete or reuse it"
-                        .to_string(),
-                )
-            })?;
-        lifecycle::request_supervisor_shutdown(&manager.install_dir, &previous_swap_identity.supervisor_id).await?;
-        let prepared = lifecycle::prepare_app_quiescence(
+        prepare_and_quiesce_previous_swap_before_reuse(
+            manager,
             &previous_swap_dir,
-            &previous_swap_identity.main_exe,
-            manager.allow_in_process_swap,
-        )?;
-        if let Some(prepared) = &prepared {
-            lifecycle::terminate_prepared_app_processes(prepared)?;
-        }
-        let prepared = prepared.ok_or_else(|| {
-            SurgeError::Update(
-                "Previous swap application entrypoint disappeared before it could be quiesced".to_string(),
-            )
-        })?;
-        Some((prepared, previous_swap_identity.main_exe))
+            current_app_dir,
+            current_version,
+            current_main_exe,
+            current_supervisor_id,
+            supervisor_was_running,
+        )
+        .await?
     } else {
         None
     };
@@ -566,32 +554,95 @@ fn restore_previous_supervisor_after_quiescence_failure(
     error: SurgeError,
 ) -> SurgeError {
     if supervisor_was_running && let Some(current_app_dir) = current_app_dir {
-        let restore_outcome = lifecycle::restore_previous_supervisor_after_failed_quiescence(
+        request_previous_supervisor_restoration(
             install_dir,
             current_app_dir,
             current_version,
             current_main_exe,
             current_supervisor_id,
         );
-        match restore_outcome {
-            SupervisorRestartOutcome::NotApplicable => {
-                warn!(
-                    supervisor_id = current_supervisor_id,
-                    "Previous supervisor could not be restored after active application quiescence failed"
-                );
-            }
-            SupervisorRestartOutcome::PendingRestart { reason, failure_phase } => {
-                warn!(
-                    supervisor_id = current_supervisor_id,
-                    reason,
-                    failure_phase,
-                    "Requested previous supervisor restoration after active application quiescence failed"
-                );
-            }
-        }
     }
 
     error
+}
+
+#[cfg(unix)]
+async fn prepare_and_quiesce_previous_swap_before_reuse(
+    manager: &UpdateManager,
+    previous_swap_dir: &Path,
+    current_app_dir: Option<&Path>,
+    current_version: &str,
+    current_main_exe: &str,
+    current_supervisor_id: &str,
+    supervisor_was_running: bool,
+) -> Result<Option<(lifecycle::PreparedAppQuiescence, String)>> {
+    let result: Result<Option<(lifecycle::PreparedAppQuiescence, String)>> = async {
+        let previous_swap_identity = super::current_install::load_previous_swap(manager, previous_swap_dir)?
+            .ok_or_else(|| {
+                SurgeError::Update(
+                    "Previous swap directory has no persisted process identity; refusing to delete or reuse it"
+                        .to_string(),
+                )
+            })?;
+        lifecycle::request_supervisor_shutdown(&manager.install_dir, &previous_swap_identity.supervisor_id).await?;
+        let prepared = lifecycle::prepare_app_quiescence(
+            previous_swap_dir,
+            &previous_swap_identity.main_exe,
+            manager.allow_in_process_swap,
+        )?
+        .ok_or_else(|| {
+            SurgeError::Update(
+                "Previous swap application entrypoint disappeared before it could be quiesced".to_string(),
+            )
+        })?;
+        lifecycle::terminate_prepared_app_processes(&prepared)?;
+        Ok(Some((prepared, previous_swap_identity.main_exe)))
+    }
+    .await;
+
+    let Err(error) = result else {
+        return result;
+    };
+    Err(restore_previous_supervisor_after_quiescence_failure(
+        &manager.install_dir,
+        current_app_dir,
+        current_version,
+        current_main_exe,
+        current_supervisor_id,
+        supervisor_was_running,
+        error,
+    ))
+}
+
+#[cfg(unix)]
+fn request_previous_supervisor_restoration(
+    install_dir: &Path,
+    current_app_dir: &Path,
+    current_version: &str,
+    current_main_exe: &str,
+    current_supervisor_id: &str,
+) {
+    let restore_outcome = lifecycle::restore_previous_supervisor_after_failed_quiescence(
+        install_dir,
+        current_app_dir,
+        current_version,
+        current_main_exe,
+        current_supervisor_id,
+    );
+    match restore_outcome {
+        SupervisorRestartOutcome::NotApplicable => {
+            warn!(
+                supervisor_id = current_supervisor_id,
+                "Previous supervisor could not be restored after application quiescence failed"
+            );
+        }
+        SupervisorRestartOutcome::PendingRestart { reason, failure_phase } => {
+            warn!(
+                supervisor_id = current_supervisor_id,
+                reason, failure_phase, "Requested previous supervisor restoration after application quiescence failed"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -618,24 +669,7 @@ mod tests {
         std::fs::write(&app_path, "#!/bin/sh\ncd /\nread _\n").unwrap();
         make_executable(&app_path);
 
-        let supervisor_path = active_app_dir.join(crate::platform::process::supervisor_binary_name());
-        std::fs::write(
-            &supervisor_path,
-            r#"#!/bin/sh
-id=""
-dir=""
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    --id) id="$2"; shift 2 ;;
-    --dir) dir="$2"; shift 2 ;;
-    *) shift ;;
-  esac
-done
-echo $$ > "$dir/.surge-supervisor-$id.pid"
-"#,
-        )
-        .unwrap();
-        make_executable(&supervisor_path);
+        write_test_supervisor(&active_app_dir);
 
         let spawn_deadline = std::time::Instant::now() + Duration::from_secs(1);
         let mut child = loop {
@@ -684,6 +718,77 @@ echo $$ > "$dir/.surge-supervisor-$id.pid"
             crate::supervisor::state::read_supervisor_exe_path(install_dir, "demo-supervisor").as_deref(),
             Some(app_path.as_path())
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn previous_swap_identity_failure_restores_current_supervisor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install_dir = tmp.path().join("install");
+        let store_dir = tmp.path().join("store");
+        let active_app_dir = install_dir.join("app");
+        let previous_swap_dir = install_dir.join(".surge-app-prev");
+        std::fs::create_dir_all(&active_app_dir).unwrap();
+        std::fs::create_dir_all(&previous_swap_dir).unwrap();
+        std::fs::create_dir_all(&store_dir).unwrap();
+
+        let app_path = active_app_dir.join("current-app");
+        std::fs::write(&app_path, "#!/bin/sh\nexit 0\n").unwrap();
+        make_executable(&app_path);
+        write_test_supervisor(&active_app_dir);
+
+        let ctx = std::sync::Arc::new(crate::context::Context::new());
+        ctx.set_storage(
+            crate::context::StorageProvider::Filesystem,
+            store_dir.to_str().unwrap(),
+            "",
+            "",
+            "",
+            "",
+        );
+        let manager = UpdateManager::new(ctx, "test-app", "1.0.0", "stable", install_dir.to_str().unwrap()).unwrap();
+
+        let error = prepare_and_quiesce_previous_swap_before_reuse(
+            &manager,
+            &previous_swap_dir,
+            Some(&active_app_dir),
+            "1.0.0",
+            "current-app",
+            "demo-supervisor",
+            true,
+        )
+        .await
+        .err()
+        .unwrap();
+
+        assert!(error.to_string().contains("no persisted process identity"));
+        assert!(supervisor_pid_file(&install_dir, "demo-supervisor").is_file());
+        assert_eq!(
+            crate::supervisor::state::read_supervisor_exe_path(&install_dir, "demo-supervisor").as_deref(),
+            Some(app_path.as_path())
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn write_test_supervisor(active_app_dir: &Path) {
+        let supervisor_path = active_app_dir.join(crate::platform::process::supervisor_binary_name());
+        std::fs::write(
+            &supervisor_path,
+            r#"#!/bin/sh
+id=""
+dir=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --id) id="$2"; shift 2 ;;
+    --dir) dir="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+echo $$ > "$dir/.surge-supervisor-$id.pid"
+"#,
+        )
+        .unwrap();
+        make_executable(&supervisor_path);
     }
 
     #[cfg(target_os = "linux")]

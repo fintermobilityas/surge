@@ -703,7 +703,7 @@ mod tests {
         let mut child = Command::new(&app_path).arg("30").spawn().unwrap();
         std::fs::remove_file(&app_path).unwrap();
 
-        let error = terminate_active_app_processes_except(&active_app_dir, "demo", u32::MAX).unwrap_err();
+        let error = terminate_active_app_processes_except(&active_app_dir, "demo", u32::MAX, false).unwrap_err();
         let child_still_running = child.try_wait().unwrap().is_none();
         if child_still_running {
             child.kill().unwrap();

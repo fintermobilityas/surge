@@ -666,10 +666,22 @@ mod tests {
     }
 
     fn write_archive(path: &Path, payload: &[u8]) {
+        write_archive_with_entrypoint(path, payload, b"#!/bin/sh\necho demo\n");
+    }
+
+    fn write_native_archive(path: &Path, payload: &[u8]) {
+        #[cfg(unix)]
+        let entrypoint = std::fs::read("/usr/bin/true")
+            .or_else(|_| std::fs::read("/bin/true"))
+            .expect("native test executable");
+        #[cfg(not(unix))]
+        let entrypoint = b"native test executable\n".to_vec();
+        write_archive_with_entrypoint(path, payload, &entrypoint);
+    }
+
+    fn write_archive_with_entrypoint(path: &Path, payload: &[u8], entrypoint: &[u8]) {
         let mut packer = ArchivePacker::new(3).expect("archive packer");
-        packer
-            .add_buffer("demoapp", b"#!/bin/sh\necho demo\n", 0o755)
-            .expect("demoapp entry");
+        packer.add_buffer("demoapp", entrypoint, 0o755).expect("demoapp entry");
         packer.add_buffer("payload.txt", payload, 0o644).expect("payload entry");
         packer.finalize_to_file(path).expect("archive file");
     }
@@ -1018,9 +1030,9 @@ mod tests {
         let full_v1_path = temp_dir.path().join(&full_v1_name);
         let full_v2_path = temp_dir.path().join(&full_v2_name);
         let full_v3_path = temp_dir.path().join(&full_v3_name);
-        write_archive(&full_v1_path, b"payload v1");
-        write_archive(&full_v2_path, b"payload v2");
-        write_archive(&full_v3_path, b"payload v3");
+        write_native_archive(&full_v1_path, b"payload v1");
+        write_native_archive(&full_v2_path, b"payload v2");
+        write_native_archive(&full_v3_path, b"payload v3");
         let full_v1 = std::fs::read(&full_v1_path).expect("v1 full");
         let full_v2 = std::fs::read(&full_v2_path).expect("v2 full");
         let full_v3 = std::fs::read(&full_v3_path).expect("v3 full");

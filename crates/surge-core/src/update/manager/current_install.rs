@@ -32,7 +32,21 @@ pub(super) fn load(manager: &UpdateManager) -> Result<Option<ReleaseIdentity>> {
     let Some(active_app_dir) = apply::find_previous_app_dir(&manager.install_dir, &manager.current_version) else {
         return Ok(None);
     };
-    let Some(manifest) = read_runtime_manifest_identity(&active_app_dir)? else {
+
+    load_from_app_dir(manager, &active_app_dir, Some(&manager.current_version))
+}
+
+#[cfg(unix)]
+pub(super) fn load_previous_swap(manager: &UpdateManager, app_dir: &Path) -> Result<Option<ReleaseIdentity>> {
+    load_from_app_dir(manager, app_dir, None)
+}
+
+fn load_from_app_dir(
+    manager: &UpdateManager,
+    app_dir: &Path,
+    expected_version: Option<&str>,
+) -> Result<Option<ReleaseIdentity>> {
+    let Some(manifest) = read_runtime_manifest_identity(app_dir)? else {
         return Ok(None);
     };
 
@@ -42,15 +56,24 @@ pub(super) fn load(manager: &UpdateManager) -> Result<Option<ReleaseIdentity>> {
             manifest.app_id, manager.app_id
         )));
     }
-    if compare_versions(&manifest.version, &manager.current_version) != Ordering::Equal {
+    if let Some(expected_version) = expected_version
+        && compare_versions(&manifest.version, expected_version) != Ordering::Equal
+    {
         return Err(SurgeError::Update(format!(
             "Installed runtime manifest version '{}' does not match update version '{}'",
-            manifest.version, manager.current_version
+            manifest.version, expected_version
         )));
     }
 
     let main_exe = if manifest.main_exe.is_empty() {
-        legacy_main_exe(manager, &active_app_dir, &manifest.app_id, &manifest.supervisor_id).ok_or_else(|| {
+        legacy_main_exe(
+            manager,
+            app_dir,
+            &manifest.version,
+            &manifest.app_id,
+            &manifest.supervisor_id,
+        )
+        .ok_or_else(|| {
             SurgeError::Update(format!(
                 "Installed runtime manifest for '{}' does not declare mainExe and no local executable identity could be inferred",
                 manifest.app_id
@@ -73,13 +96,14 @@ pub(super) fn load(manager: &UpdateManager) -> Result<Option<ReleaseIdentity>> {
 fn legacy_main_exe(
     manager: &UpdateManager,
     active_app_dir: &Path,
+    installed_version: &str,
     app_id: &str,
     supervisor_id: &str,
 ) -> Option<String> {
     if let Some(supervisor_exe) = read_supervisor_exe_path(&manager.install_dir, supervisor_id) {
         let bound_supervisor_exe = bind_absolute_parent(&supervisor_exe);
         let stable_app_dir = manager.install_dir.join("app");
-        let versioned_app_dir = manager.install_dir.join(format!("app-{}", manager.current_version));
+        let versioned_app_dir = manager.install_dir.join(format!("app-{installed_version}"));
         for root in [active_app_dir, stable_app_dir.as_path(), versioned_app_dir.as_path()] {
             if let Ok(relative) = bound_supervisor_exe.strip_prefix(root)
                 && is_executable_entry(&bound_supervisor_exe)

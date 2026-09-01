@@ -14,6 +14,7 @@ pub use self::activation::{
 };
 pub use self::launch::{auto_start_after_install, auto_start_after_install_sequence, launch_installed_application};
 pub use self::persistent_assets::{copy_persistent_assets, validate_relative_persistent_asset_path};
+#[cfg(unix)]
 pub(crate) use self::runtime_manifest::read_runtime_manifest_identity;
 pub use self::runtime_manifest::{
     LEGACY_RUNTIME_MANIFEST_RELATIVE_PATH, RUNTIME_MANIFEST_RELATIVE_PATH, RuntimeManifestMetadata,

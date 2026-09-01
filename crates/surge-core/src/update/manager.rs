@@ -2,13 +2,14 @@
 
 mod apply;
 mod artifacts;
+mod current_install;
 mod finalize;
 mod lifecycle;
 mod progress;
 mod progress_substep;
 mod release_index;
 
-use std::path::PathBuf;
+use std::path::{Component, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -57,9 +58,59 @@ pub struct UpdateInfo {
     pub fallback_reason: Option<String>,
 }
 
+/// Opaque state produced by an update check and required to apply its result.
+///
+/// This is public so language bindings can preserve the check-time release
+/// identity when their ABI uses separate check and apply calls.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct UpdateCheckState {
+    app_id: String,
+    current_version: String,
+    channel: String,
+    install_dir: PathBuf,
+    current_release_identity: Option<current_install::ReleaseIdentity>,
+}
+
 const DEFAULT_RELEASE_RETENTION_LIMIT: usize = 1;
 pub(super) const RELEASE_GRAPH_CHECKPOINT_FULLS: usize = 3;
 const ABANDONED_IN_PROGRESS_TIMEOUT: Duration = Duration::from_mins(5);
+
+fn bind_install_dir(install_dir: &str) -> Result<PathBuf> {
+    let absolute = std::path::absolute(install_dir)?;
+    for ancestor in absolute.ancestors() {
+        match std::fs::canonicalize(ancestor) {
+            Ok(mut resolved) => {
+                let suffix = absolute.strip_prefix(ancestor).map_err(|_| {
+                    SurgeError::Config(format!("Unable to bind install directory '{}'", absolute.display()))
+                })?;
+                for component in suffix.components() {
+                    match component {
+                        Component::CurDir => {}
+                        Component::ParentDir => {
+                            resolved.pop();
+                        }
+                        Component::Normal(part) => resolved.push(part),
+                        Component::Prefix(_) | Component::RootDir => {
+                            return Err(SurgeError::Config(format!(
+                                "Unable to bind install directory '{}'",
+                                absolute.display()
+                            )));
+                        }
+                    }
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    Err(SurgeError::Config(format!(
+        "Unable to bind install directory '{}'",
+        absolute.display()
+    )))
+}
 
 /// Manages checking for and applying application updates.
 pub struct UpdateManager {
@@ -72,6 +123,7 @@ pub struct UpdateManager {
     pub(super) install_dir: PathBuf,
     pub(super) storage: Box<dyn StorageBackend>,
     pub(super) cached_index: Option<ReleaseIndex>,
+    pub(in crate::update::manager) current_release_identity: Option<current_install::ReleaseIdentity>,
 }
 
 impl UpdateManager {
@@ -102,6 +154,7 @@ impl UpdateManager {
             ));
         }
         let storage = create_storage_backend(&storage_cfg)?;
+        let install_dir = bind_install_dir(install_dir)?;
 
         Ok(Self {
             ctx,
@@ -110,9 +163,10 @@ impl UpdateManager {
             channel: channel.to_string(),
             release_retention_limit: DEFAULT_RELEASE_RETENTION_LIMIT,
             artifact_retention_policy: InstallArtifactCachePolicy::default(),
-            install_dir: PathBuf::from(install_dir),
+            install_dir,
             storage,
             cached_index: None,
+            current_release_identity: None,
         })
     }
 
@@ -132,6 +186,7 @@ impl UpdateManager {
         }
         self.channel = normalized.to_string();
         self.cached_index = None;
+        self.current_release_identity = None;
         Ok(())
     }
 
@@ -139,6 +194,43 @@ impl UpdateManager {
     #[must_use]
     pub fn current_version(&self) -> &str {
         &self.current_version
+    }
+
+    /// Capture the check-time state needed to apply the returned update plan.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn capture_check_state(&self) -> UpdateCheckState {
+        UpdateCheckState {
+            app_id: self.app_id.clone(),
+            current_version: self.current_version.clone(),
+            channel: self.channel.clone(),
+            install_dir: self.install_dir.clone(),
+            current_release_identity: self.current_release_identity.clone(),
+        }
+    }
+
+    /// Restore state captured by the manager that produced an update plan.
+    #[doc(hidden)]
+    pub fn restore_check_state(&mut self, state: &UpdateCheckState) -> Result<()> {
+        if self.app_id != state.app_id
+            || self.current_version != state.current_version
+            || self.channel != state.channel
+            || self.install_dir != state.install_dir
+        {
+            return Err(SurgeError::Update(
+                "Update check state does not match the manager applying the update".to_string(),
+            ));
+        }
+
+        let installed_identity = current_install::load(self)?;
+        if installed_identity != state.current_release_identity {
+            return Err(SurgeError::Update(
+                "Installed application identity changed after the update check".to_string(),
+            ));
+        }
+
+        self.current_release_identity = installed_identity;
+        Ok(())
     }
 
     /// Return the number of versioned app snapshots retained after updates.
@@ -161,6 +253,7 @@ impl UpdateManager {
         }
         self.current_version = normalized.to_string();
         self.cached_index = None;
+        self.current_release_identity = None;
         Ok(())
     }
 
@@ -195,6 +288,7 @@ impl UpdateManager {
             "Checking for updates"
         );
 
+        self.current_release_identity = current_install::load(self)?;
         let index = self.load_release_index().await?;
         resolve_update_info(self, index)
     }
@@ -218,6 +312,13 @@ impl UpdateManager {
     where
         F: Fn(ProgressInfo) + Send + Sync,
     {
+        let installed_identity = current_install::load(self)?;
+        if installed_identity != self.current_release_identity {
+            return Err(SurgeError::Update(
+                "Installed application identity changed after the update check".to_string(),
+            ));
+        }
+
         let attempted_at_utc = status::now_utc_rfc3339();
         let pre_attempt_version = self.current_version.clone();
         let target_version = info.latest_version.clone();
@@ -510,6 +611,32 @@ mod tests {
         app_store
     }
 
+    fn write_runtime_identity(active_app_dir: &Path, app_id: &str, version: &str, main_exe: &str, supervisor_id: &str) {
+        write_runtime_identity_with_environment(active_app_dir, app_id, version, main_exe, supervisor_id, &[]);
+    }
+
+    fn write_runtime_identity_with_environment(
+        active_app_dir: &Path,
+        app_id: &str,
+        version: &str,
+        main_exe: &str,
+        supervisor_id: &str,
+        environment: &[(&str, &str)],
+    ) {
+        let manifest_path = active_app_dir.join(crate::install::RUNTIME_MANIFEST_RELATIVE_PATH);
+        std::fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
+        let mut manifest = format!(
+            "id: {app_id}\nversion: {version}\nchannel: stable\nmainExe: \"{main_exe}\"\nsupervisorId: \"{supervisor_id}\"\n"
+        );
+        if !environment.is_empty() {
+            manifest.push_str("environment:\n");
+            for (key, value) in environment {
+                manifest.push_str(&format!("  {key}: \"{value}\"\n"));
+            }
+        }
+        std::fs::write(manifest_path, manifest).unwrap();
+    }
+
     fn pseudo_random_bytes(len: usize) -> Vec<u8> {
         let mut state = 0x1234_5678_9abc_def0_u64;
         let mut bytes = Vec::with_capacity(len);
@@ -623,6 +750,237 @@ mod tests {
             })
             .unwrap_err();
         assert!(err.to_string().contains("keep_full_count"));
+    }
+
+    #[test]
+    fn restore_check_state_requires_exact_current_version_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("store");
+        std::fs::create_dir_all(&store_root).unwrap();
+
+        let ctx = Arc::new(Context::new());
+        ctx.set_storage(
+            StorageProvider::Filesystem,
+            store_root.to_str().unwrap(),
+            "",
+            "",
+            "",
+            "",
+        );
+        let checked =
+            UpdateManager::new(Arc::clone(&ctx), "app", "1.0", "stable", tmp.path().to_str().unwrap()).unwrap();
+        let check_state = checked.capture_check_state();
+        let mut applying = UpdateManager::new(ctx, "app", "1.0.0", "stable", tmp.path().to_str().unwrap()).unwrap();
+
+        let error = applying.restore_check_state(&check_state).unwrap_err();
+
+        assert!(error.to_string().contains("does not match"));
+    }
+
+    #[test]
+    fn restore_check_state_rejects_different_installation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("store");
+        std::fs::create_dir_all(&store_root).unwrap();
+
+        let ctx = Arc::new(Context::new());
+        ctx.set_storage(
+            StorageProvider::Filesystem,
+            store_root.to_str().unwrap(),
+            "",
+            "",
+            "",
+            "",
+        );
+        let checked = UpdateManager::new(
+            Arc::clone(&ctx),
+            "app",
+            "1.0.0",
+            "stable",
+            tmp.path().join("first").to_str().unwrap(),
+        )
+        .unwrap();
+        let check_state = checked.capture_check_state();
+        let mut applying = UpdateManager::new(
+            ctx,
+            "app",
+            "1.0.0",
+            "stable",
+            tmp.path().join("second").to_str().unwrap(),
+        )
+        .unwrap();
+
+        let error = applying.restore_check_state(&check_state).unwrap_err();
+
+        assert!(error.to_string().contains("does not match"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_check_state_rejects_retargeted_install_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("store");
+        let first_install = tmp.path().join("first");
+        let second_install = tmp.path().join("second");
+        let install_link = tmp.path().join("current");
+        std::fs::create_dir_all(&store_root).unwrap();
+        std::fs::create_dir_all(&first_install).unwrap();
+        std::fs::create_dir_all(&second_install).unwrap();
+        symlink(&first_install, &install_link).unwrap();
+
+        let ctx = Arc::new(Context::new());
+        ctx.set_storage(
+            StorageProvider::Filesystem,
+            store_root.to_str().unwrap(),
+            "",
+            "",
+            "",
+            "",
+        );
+        let checked = UpdateManager::new(
+            Arc::clone(&ctx),
+            "app",
+            "1.0.0",
+            "stable",
+            install_link.to_str().unwrap(),
+        )
+        .unwrap();
+        let check_state = checked.capture_check_state();
+        assert_eq!(checked.install_dir, std::fs::canonicalize(&first_install).unwrap());
+
+        std::fs::remove_file(&install_link).unwrap();
+        symlink(&second_install, &install_link).unwrap();
+        let mut applying = UpdateManager::new(ctx, "app", "1.0.0", "stable", install_link.to_str().unwrap()).unwrap();
+
+        let error = applying.restore_check_state(&check_state).unwrap_err();
+
+        assert!(error.to_string().contains("does not match"));
+        assert_eq!(applying.install_dir, std::fs::canonicalize(&second_install).unwrap());
+    }
+
+    #[test]
+    fn restore_check_state_rejects_each_changed_installed_identity_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("store");
+        let install_root = tmp.path().join("install");
+        let active_app_dir = install_root.join("app");
+        std::fs::create_dir_all(&store_root).unwrap();
+        std::fs::create_dir_all(&active_app_dir).unwrap();
+        write_runtime_identity_with_environment(
+            &active_app_dir,
+            "app",
+            "1.0.0",
+            "original-app",
+            "original-supervisor",
+            &[("MODE", "original")],
+        );
+
+        let ctx = Arc::new(Context::new());
+        ctx.set_storage(
+            StorageProvider::Filesystem,
+            store_root.to_str().unwrap(),
+            "",
+            "",
+            "",
+            "",
+        );
+        let mut checked = UpdateManager::new(
+            Arc::clone(&ctx),
+            "app",
+            "1.0.0",
+            "stable",
+            install_root.to_str().unwrap(),
+        )
+        .unwrap();
+        checked.current_release_identity = current_install::load(&checked).unwrap();
+        let check_state = checked.capture_check_state();
+
+        for (main_exe, supervisor_id, environment) in [
+            ("changed-app", "original-supervisor", "original"),
+            ("original-app", "changed-supervisor", "original"),
+            ("original-app", "original-supervisor", "changed"),
+        ] {
+            write_runtime_identity_with_environment(
+                &active_app_dir,
+                "app",
+                "1.0.0",
+                main_exe,
+                supervisor_id,
+                &[("MODE", environment)],
+            );
+            let mut applying = UpdateManager::new(
+                Arc::clone(&ctx),
+                "app",
+                "1.0.0",
+                "stable",
+                install_root.to_str().unwrap(),
+            )
+            .unwrap();
+
+            let error = applying.restore_check_state(&check_state).unwrap_err();
+
+            assert!(error.to_string().contains("identity changed"));
+        }
+    }
+
+    #[tokio::test]
+    async fn download_and_apply_rejects_identity_changed_after_same_manager_check() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("store");
+        let install_root = tmp.path().join("install");
+        let active_app_dir = install_root.join("app");
+        std::fs::create_dir_all(&store_root).unwrap();
+        std::fs::create_dir_all(&active_app_dir).unwrap();
+        write_runtime_identity_with_environment(
+            &active_app_dir,
+            "app",
+            "1.0.0",
+            "original-app",
+            "supervisor",
+            &[("MODE", "original")],
+        );
+
+        let rid = current_rid();
+        let mut release = make_entry("1.1.0", "stable", &current_os_label_for_tests(), &rid);
+        release.is_genesis = true;
+        release.set_primary_delta(None);
+        let index = ReleaseIndex {
+            app_id: "app".to_string(),
+            releases: vec![release],
+            ..ReleaseIndex::default()
+        };
+        write_app_scoped_release_index(&store_root, "app", &index);
+
+        let ctx = Arc::new(Context::new());
+        ctx.set_storage(
+            StorageProvider::Filesystem,
+            store_root.to_str().unwrap(),
+            "",
+            "",
+            "",
+            "",
+        );
+        let mut manager = UpdateManager::new(ctx, "app", "1.0.0", "stable", install_root.to_str().unwrap()).unwrap();
+        let info = manager.check_for_updates().await.unwrap().unwrap();
+
+        write_runtime_identity_with_environment(
+            &active_app_dir,
+            "app",
+            "1.0.0",
+            "original-app",
+            "supervisor",
+            &[("MODE", "changed")],
+        );
+
+        let error = manager
+            .download_and_apply(&info, None::<fn(ProgressInfo)>)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("identity changed"));
+        assert!(!status::update_status_path(&install_root).exists());
     }
 
     #[test]
@@ -1282,7 +1640,7 @@ echo started > new-child-started
                 created_utc: chrono::Utc::now().to_rfc3339(),
                 release_notes: String::new(),
                 name: String::new(),
-                main_exe: app_id.to_string(),
+                main_exe: "payload.txt".to_string(),
                 install_directory: app_id.to_string(),
                 supervisor_id: String::new(),
                 icon: String::new(),
@@ -1327,8 +1685,11 @@ echo started > new-child-started
         assert!(runtime_manifest_raw.contains("id: test-app"));
         assert!(runtime_manifest_raw.contains("version: 1.1.0"));
         assert!(runtime_manifest_raw.contains("channel: stable"));
+        assert!(runtime_manifest_raw.contains("mainExe: payload.txt"));
 
         std::fs::remove_file(app_store.join(&full_filename)).unwrap();
+        manager.set_current_version("1.1.0").unwrap();
+        manager.current_release_identity = current_install::load(&manager).unwrap();
         manager
             .download_and_apply(&info, None::<fn(ProgressInfo)>)
             .await
@@ -1554,6 +1915,7 @@ echo started > new-child-started
         std::fs::write(current_app_dir.join("state").join("user.db"), "persisted state").unwrap();
         std::fs::write(current_app_dir.join("old-token.txt"), "remove me").unwrap();
         std::fs::write(current_app_dir.join("temp").join("old.log"), "remove dir").unwrap();
+        write_runtime_identity(&current_app_dir, app_id, "1.0.0", "settings.json", "");
 
         let rid = current_rid();
         let full_filename = format!("{app_id}-1.1.0-{rid}-full.tar.zst");
@@ -1985,7 +2347,7 @@ echo started > new-child-started
             "finalize should start a watch supervisor and write its pid file"
         );
         let exe_state = crate::supervisor::state::read_supervisor_exe_path(&install_root, "demo-supervisor");
-        assert_eq!(exe_state, Some(install_root.join("app").join(app_id)));
+        assert_eq!(exe_state, Some(manager.install_dir.join("app").join(app_id)));
 
         let final_record = status::read_update_status(&install_root).unwrap().unwrap();
         assert_eq!(final_record.state, status::UpdateConvergenceState::PendingRestart);
@@ -2536,7 +2898,7 @@ echo started > new-child-started
         std::fs::write(active_app_dir.join("payload.txt"), "v2 payload").unwrap();
         std::fs::write(
             active_app_dir.join(crate::install::RUNTIME_MANIFEST_RELATIVE_PATH),
-            format!("id: {app_id}\nversion: 1.1.0\n"),
+            format!("id: {app_id}\nversion: 1.1.0\nmainExe: payload.txt\n"),
         )
         .unwrap();
 
@@ -2941,12 +3303,12 @@ echo started > new-child-started
         std::fs::write(active_app_dir.join("payload.txt"), "v2 payload").unwrap();
         std::fs::write(
             active_app_dir.join(crate::install::RUNTIME_MANIFEST_RELATIVE_PATH),
-            format!("id: {app_id}\nversion: 1.1.0\n"),
+            format!("id: {app_id}\nversion: 1.1.0\nmainExe: payload.txt\n"),
         )
         .unwrap();
         std::fs::write(
             active_app_dir.join(crate::install::LEGACY_RUNTIME_MANIFEST_RELATIVE_PATH),
-            format!("id: {app_id}\nversion: 1.1.0\n"),
+            format!("id: {app_id}\nversion: 1.1.0\nmainExe: payload.txt\n"),
         )
         .unwrap();
 
@@ -3146,12 +3508,12 @@ echo started > new-child-started
         std::fs::write(active_app_dir.join("stable.txt"), "locally drifted stable payload").unwrap();
         std::fs::write(
             active_app_dir.join(crate::install::RUNTIME_MANIFEST_RELATIVE_PATH),
-            format!("id: {app_id}\nversion: 1.1.0\n"),
+            format!("id: {app_id}\nversion: 1.1.0\nmainExe: payload.txt\n"),
         )
         .unwrap();
         std::fs::write(
             active_app_dir.join(crate::install::LEGACY_RUNTIME_MANIFEST_RELATIVE_PATH),
-            format!("id: {app_id}\nversion: 1.1.0\n"),
+            format!("id: {app_id}\nversion: 1.1.0\nmainExe: payload.txt\n"),
         )
         .unwrap();
 
@@ -3361,12 +3723,12 @@ echo started > new-child-started
         std::fs::write(active_app_dir.join("bin").join("large.bin"), installed_blob).unwrap();
         std::fs::write(
             active_app_dir.join(crate::install::RUNTIME_MANIFEST_RELATIVE_PATH),
-            format!("id: {app_id}\nversion: 1.0.0\n"),
+            format!("id: {app_id}\nversion: 1.0.0\nmainExe: payload.txt\n"),
         )
         .unwrap();
         std::fs::write(
             active_app_dir.join(crate::install::LEGACY_RUNTIME_MANIFEST_RELATIVE_PATH),
-            format!("id: {app_id}\nversion: 1.0.0\n"),
+            format!("id: {app_id}\nversion: 1.0.0\nmainExe: payload.txt\n"),
         )
         .unwrap();
 
@@ -3493,12 +3855,12 @@ echo started > new-child-started
         std::fs::write(active_app_dir.join("payload.txt"), "v1 payload").unwrap();
         std::fs::write(
             active_app_dir.join(crate::install::RUNTIME_MANIFEST_RELATIVE_PATH),
-            format!("id: {app_id}\nversion: 1.0.0\n"),
+            format!("id: {app_id}\nversion: 1.0.0\nmainExe: payload.txt\n"),
         )
         .unwrap();
         std::fs::write(
             active_app_dir.join(crate::install::LEGACY_RUNTIME_MANIFEST_RELATIVE_PATH),
-            format!("id: {app_id}\nversion: 1.0.0\n"),
+            format!("id: {app_id}\nversion: 1.0.0\nmainExe: payload.txt\n"),
         )
         .unwrap();
 
@@ -3668,12 +4030,12 @@ echo started > new-child-started
         std::fs::write(active_app_dir.join("extra.txt"), "drift").unwrap();
         std::fs::write(
             active_app_dir.join(crate::install::RUNTIME_MANIFEST_RELATIVE_PATH),
-            format!("id: {app_id}\nversion: 1.0.0\n"),
+            format!("id: {app_id}\nversion: 1.0.0\nmainExe: payload.txt\n"),
         )
         .unwrap();
         std::fs::write(
             active_app_dir.join(crate::install::LEGACY_RUNTIME_MANIFEST_RELATIVE_PATH),
-            format!("id: {app_id}\nversion: 1.0.0\n"),
+            format!("id: {app_id}\nversion: 1.0.0\nmainExe: payload.txt\n"),
         )
         .unwrap();
 
@@ -3856,12 +4218,12 @@ echo started > new-child-started
         .unwrap();
         std::fs::write(
             active_app_dir.join(crate::install::RUNTIME_MANIFEST_RELATIVE_PATH),
-            format!("id: {app_id}\nversion: 1.1.0\n"),
+            format!("id: {app_id}\nversion: 1.1.0\nmainExe: payload.txt\n"),
         )
         .unwrap();
         std::fs::write(
             active_app_dir.join(crate::install::LEGACY_RUNTIME_MANIFEST_RELATIVE_PATH),
-            format!("id: {app_id}\nversion: 1.1.0\n"),
+            format!("id: {app_id}\nversion: 1.1.0\nmainExe: payload.txt\n"),
         )
         .unwrap();
 
@@ -3904,6 +4266,7 @@ echo started > new-child-started
         let current_app_dir = install_root.join("app");
         std::fs::create_dir_all(&current_app_dir).unwrap();
         std::fs::write(current_app_dir.join("payload.txt"), "old payload").unwrap();
+        write_runtime_identity(&current_app_dir, app_id, "1.0.0", "payload.txt", "");
 
         let rid = current_rid();
         let full_filename = format!("{app_id}-1.1.0-{rid}-full.tar.zst");
@@ -3988,6 +4351,7 @@ echo started > new-child-started
         let current_app_dir = install_root.join("app");
         std::fs::create_dir_all(&current_app_dir).unwrap();
         std::fs::write(current_app_dir.join("payload.txt"), "old payload").unwrap();
+        write_runtime_identity(&current_app_dir, app_id, "1.0.0", "payload.txt", "");
         std::fs::create_dir_all(install_root.join("app-0.9.0")).unwrap();
         std::fs::create_dir_all(install_root.join("app-0.8.0")).unwrap();
         std::fs::create_dir_all(install_root.join("app-backup")).unwrap();
@@ -4074,6 +4438,7 @@ echo started > new-child-started
         let current_app_dir = install_root.join("app");
         std::fs::create_dir_all(&current_app_dir).unwrap();
         std::fs::write(current_app_dir.join("payload.txt"), "old payload").unwrap();
+        write_runtime_identity(&current_app_dir, app_id, "1.0.0", "payload.txt", "");
         std::fs::create_dir_all(install_root.join("app-0.9.0")).unwrap();
 
         let rid = current_rid();
@@ -4156,6 +4521,7 @@ echo started > new-child-started
         let current_app_dir = install_root.join("app");
         std::fs::create_dir_all(&current_app_dir).unwrap();
         std::fs::write(current_app_dir.join("payload.txt"), "old payload").unwrap();
+        write_runtime_identity(&current_app_dir, app_id, "1.0.0", "payload.txt", "");
 
         let artifact_cache = install_root.join(".surge-cache").join("artifacts");
         std::fs::create_dir_all(&artifact_cache).unwrap();
@@ -4249,6 +4615,7 @@ echo started > new-child-started
         let current_app_dir = install_root.join("app");
         std::fs::create_dir_all(&current_app_dir).unwrap();
         std::fs::write(current_app_dir.join("payload.txt"), "old payload").unwrap();
+        write_runtime_identity(&current_app_dir, app_id, "1.0.0", "payload.txt", "");
 
         let rid = current_rid();
         let old_full_filename = format!("{app_id}-1.0.0-{rid}-full.tar.zst");

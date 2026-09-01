@@ -308,9 +308,14 @@ fn normalize_proc_exe_path(path: PathBuf) -> PathBuf {
     normalized.unwrap_or(path)
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn is_active_app_exe(active_exe: &Path, exe: &Path) -> bool {
     exe == active_exe
+}
+
+#[cfg(target_os = "macos")]
+fn is_active_app_exe(active_exe: &Path, exe: &Path) -> bool {
+    exe == active_exe || std::fs::canonicalize(exe).is_ok_and(|resolved| resolved == active_exe)
 }
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]

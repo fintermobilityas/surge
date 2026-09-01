@@ -301,11 +301,17 @@ where
 
 #[cfg(target_os = "linux")]
 fn normalize_proc_exe_path(path: PathBuf) -> PathBuf {
-    let normalized = {
-        let path_text = path.to_string_lossy();
-        path_text.strip_suffix(" (deleted)").map(PathBuf::from)
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    match path.try_exists() {
+        Ok(false) => {}
+        Ok(true) | Err(_) => return path,
+    }
+
+    let Some(path_bytes) = path.as_os_str().as_bytes().strip_suffix(b" (deleted)") else {
+        return path;
     };
-    normalized.unwrap_or(path)
+    PathBuf::from(OsString::from_vec(path_bytes.to_vec()))
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -579,5 +585,15 @@ mod tests {
             normalize_proc_exe_path(PathBuf::from("/opt/demo/app-1.0.0/demo (deleted)")),
             PathBuf::from("/opt/demo/app-1.0.0/demo")
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_exe_path_preserves_existing_filename_with_deleted_suffix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let executable = tmp.path().join("demo (deleted)");
+        std::fs::write(&executable, "fixture").unwrap();
+
+        assert_eq!(normalize_proc_exe_path(executable.clone()), executable);
     }
 }

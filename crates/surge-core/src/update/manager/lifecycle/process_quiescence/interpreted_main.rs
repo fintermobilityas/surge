@@ -93,6 +93,18 @@ fn paths_resolve_to_same_executable(actual: &Path, expected: &Path) -> bool {
         .ok()
         .zip(std::fs::metadata(expected).ok())
         .is_some_and(|(actual, expected)| actual.dev() == expected.dev() && actual.ino() == expected.ino())
+        || macos_system_shell_identity_matches(actual, expected)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_system_shell_identity_matches(actual: &Path, expected: &Path) -> bool {
+    // macOS reports a stable /bin/sh script process as /bin/bash while retaining /bin/sh as argv[0].
+    actual == Path::new("/bin/bash") && expected == Path::new("/bin/sh")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_system_shell_identity_matches(_actual: &Path, _expected: &Path) -> bool {
+    false
 }
 
 fn resolve_env_command(command: &EnvCommand) -> Result<PathBuf> {
@@ -480,6 +492,19 @@ mod tests {
             macos_direct_interpreter_argument_count(r"-e 'two words' plain\ value"),
             5
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_system_sh_matches_reported_bash_process_identity() {
+        assert!(paths_resolve_to_same_executable(
+            Path::new("/bin/bash"),
+            Path::new("/bin/sh")
+        ));
+        assert!(!paths_resolve_to_same_executable(
+            Path::new("/bin/sleep"),
+            Path::new("/bin/sh")
+        ));
     }
 
     #[test]

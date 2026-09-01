@@ -69,9 +69,7 @@ impl Identity {
                     return Ok(true);
                 }
                 let program = Path::new(&expected.program);
-                Ok(matches!(expected.search_path, EnvSearchPath::Inherited)
-                    && program.components().count() == 1
-                    && executable.file_name() == program.file_name())
+                Ok(matches!(expected.search_path, EnvSearchPath::Inherited) && program.components().count() == 1)
             }
         }
     }
@@ -274,6 +272,7 @@ fn env_command_index(words: &[String]) -> Result<(usize, EnvSearchPath)> {
     let mut index = 0;
     let mut options = true;
     let mut search_path = None;
+    let mut path_unset = false;
     let mut ignore_environment = false;
 
     while let Some(word) = words.get(index) {
@@ -294,24 +293,40 @@ fn env_command_index(words: &[String]) -> Result<(usize, EnvSearchPath)> {
                     continue;
                 }
                 "-u" | "--unset" | "-C" | "--chdir" | "-P" => {
-                    if words.get(index + 1).is_none() {
+                    let Some(value) = words.get(index + 1) else {
                         return Err(SurgeError::Platform(format!(
                             "Active application env shebang option '{word}' has no value"
                         )));
-                    }
+                    };
                     if word == "-P" {
-                        search_path = words.get(index + 1).cloned();
+                        search_path = Some(value.clone());
+                        path_unset = false;
+                    } else if matches!(word.as_str(), "-u" | "--unset") && value == "PATH" {
+                        search_path = None;
+                        path_unset = true;
                     }
                     index += 2;
                     continue;
                 }
-                _ if word.starts_with("--unset=") || word.starts_with("--chdir=") => {
+                _ if word.starts_with("--unset=") => {
+                    if word.strip_prefix("--unset=") == Some("PATH") {
+                        search_path = None;
+                        path_unset = true;
+                    }
+                    index += 1;
+                    continue;
+                }
+                _ if word.starts_with("--chdir=") => {
                     index += 1;
                     continue;
                 }
                 _ if (word.starts_with("-u") || word.starts_with("-C") || word.starts_with("-P")) && word.len() > 2 => {
                     if let Some(path) = word.strip_prefix("-P") {
                         search_path = Some(path.to_string());
+                        path_unset = false;
+                    } else if word.strip_prefix("-u") == Some("PATH") {
+                        search_path = None;
+                        path_unset = true;
                     }
                     index += 1;
                     continue;
@@ -329,6 +344,7 @@ fn env_command_index(words: &[String]) -> Result<(usize, EnvSearchPath)> {
             options = false;
             if let Some(search_path_assignment) = word.strip_prefix("PATH=") {
                 search_path = Some(search_path_assignment.to_string());
+                path_unset = false;
             }
             index += 1;
             continue;
@@ -336,7 +352,7 @@ fn env_command_index(words: &[String]) -> Result<(usize, EnvSearchPath)> {
 
         let search_path = match search_path {
             Some(search_path) => EnvSearchPath::Explicit(OsString::from(search_path)),
-            None if ignore_environment => EnvSearchPath::Default,
+            None if ignore_environment || path_unset => EnvSearchPath::Default,
             None => EnvSearchPath::Inherited,
         };
         return Ok((index, search_path));
@@ -348,14 +364,7 @@ fn env_command_index(words: &[String]) -> Result<(usize, EnvSearchPath)> {
 }
 
 fn is_env_assignment(word: &str) -> bool {
-    let Some((name, _)) = word.split_once('=') else {
-        return false;
-    };
-    let mut characters = name.chars();
-    characters
-        .next()
-        .is_some_and(|character| character == '_' || character.is_ascii_alphabetic())
-        && characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
+    word.contains('=')
 }
 
 fn resolve_direct_interpreter_path(interpreter: &str) -> Result<PathBuf> {
@@ -516,6 +525,36 @@ mod tests {
     }
 
     #[test]
+    fn env_command_accepts_non_shell_assignment_names() {
+        let command = parse_env_command("-S A-B=value /bin/sh").unwrap();
+
+        assert_eq!(command.program, OsString::from("/bin/sh"));
+        assert_eq!(command.fixed_argument_count, 0);
+        assert_eq!(command.search_path, EnvSearchPath::Inherited);
+    }
+
+    #[test]
+    fn env_path_unset_uses_the_default_search_path() {
+        for argument in ["-S -u PATH sh", "-S --unset=PATH sh", "-S -uPATH sh"] {
+            let command = parse_env_command(argument).unwrap();
+
+            assert_eq!(command.search_path, EnvSearchPath::Default);
+        }
+
+        let command = parse_env_command("-S -u PATH PATH=/opt/interpreters sh").unwrap();
+        assert_eq!(
+            command.search_path,
+            EnvSearchPath::Explicit(OsString::from("/opt/interpreters"))
+        );
+
+        let command = parse_env_command("-S -u PATH -P /opt/interpreters sh").unwrap();
+        assert_eq!(
+            command.search_path,
+            EnvSearchPath::Explicit(OsString::from("/opt/interpreters"))
+        );
+    }
+
+    #[test]
     fn env_command_preserves_explicit_search_path() {
         let command = parse_env_command("-S -i -P /opt/interpreters demo-interpreter -e").unwrap();
 
@@ -626,6 +665,20 @@ mod tests {
         };
 
         assert!(identity.executable_may_match(&interpreter).unwrap());
+    }
+
+    #[test]
+    fn inherited_env_path_retains_symlink_target_uncertainty() {
+        let identity = Identity {
+            interpreter: Interpreter::EnvCommand(EnvCommand {
+                program: OsString::from("sh"),
+                fixed_argument_count: 0,
+                search_path: EnvSearchPath::Inherited,
+            }),
+            script_argument_index: 1,
+        };
+
+        assert!(identity.executable_may_match(Path::new("/bin/sleep")).unwrap());
     }
 
     #[test]

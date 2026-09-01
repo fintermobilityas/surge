@@ -326,12 +326,12 @@ fn is_active_app_process(
     let Some(identity) = interpreted_main else {
         return Ok(false);
     };
+    if process.command.iter().all(|argument| argument.is_empty()) && identity.executable_may_match(&process.exe)? {
+        return Err(SurgeError::Platform(
+            "Cannot inspect the command line of the active application interpreter before swap".to_string(),
+        ));
+    }
     let Some(argument) = process.command.get(identity.script_argument_index) else {
-        if process.command.iter().all(|argument| argument.is_empty()) && identity.executable_may_match(&process.exe)? {
-            return Err(SurgeError::Platform(
-                "Cannot inspect the command line of the active application interpreter before swap".to_string(),
-            ));
-        }
         return Ok(false);
     };
     if !active_entrypoint.matches_argument(argument, process.cwd.as_deref())? {
@@ -580,6 +580,30 @@ mod tests {
         let process = AppProcess {
             exe: std::fs::canonicalize("/bin/sh").unwrap(),
             command: vec![OsString::new()],
+            command_inspected: true,
+            cwd: None,
+        };
+
+        let error = is_active_app_process(&active_entrypoint, Some(&interpreted_main), &process).unwrap_err();
+
+        assert!(error.to_string().contains("Cannot inspect the command line"));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn all_empty_interpreter_command_line_refuses_swap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let active_app_dir = tmp.path().join("app");
+        std::fs::create_dir_all(&active_app_dir).unwrap();
+        let app_path = active_app_dir.join("demo-script");
+        std::fs::write(&app_path, "#!/bin/sh\n").unwrap();
+        let active_entrypoint = active_entrypoint::Identity::resolve(&active_app_dir, "demo-script")
+            .unwrap()
+            .unwrap();
+        let interpreted_main = interpreted_main::resolve(&active_entrypoint.resolved).unwrap().unwrap();
+        let process = AppProcess {
+            exe: std::fs::canonicalize("/bin/sh").unwrap(),
+            command: vec![OsString::new(), OsString::new()],
             command_inspected: true,
             cwd: None,
         };

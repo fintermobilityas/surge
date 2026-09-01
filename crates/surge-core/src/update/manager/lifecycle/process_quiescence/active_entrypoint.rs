@@ -93,7 +93,7 @@ fn argument_resolves_to(argument: &OsStr, cwd: Option<&Path>, expected: &Path) -
         ArgumentPath::Missing => Ok(false),
         ArgumentPath::Ambiguous => ambiguous_relative_argument(argument, expected),
         ArgumentPath::Absolute(candidate) => {
-            if std::fs::canonicalize(candidate).is_ok_and(|resolved| resolved == expected) {
+            if candidate == expected || std::fs::canonicalize(candidate).is_ok_and(|resolved| resolved == expected) {
                 Ok(true)
             } else {
                 ambiguous_relative_argument(argument, expected)

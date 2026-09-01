@@ -69,7 +69,10 @@ impl Identity {
                     return Ok(true);
                 }
                 let program = Path::new(&expected.program);
-                Ok(matches!(expected.search_path, EnvSearchPath::Inherited) && program.components().count() == 1)
+                Ok(
+                    matches!(expected.search_path, EnvSearchPath::Inherited | EnvSearchPath::Default)
+                        && program.components().count() == 1,
+                )
             }
         }
     }
@@ -674,6 +677,20 @@ mod tests {
                 program: OsString::from("sh"),
                 fixed_argument_count: 0,
                 search_path: EnvSearchPath::Inherited,
+            }),
+            script_argument_index: 1,
+        };
+
+        assert!(identity.executable_may_match(Path::new("/bin/sleep")).unwrap());
+    }
+
+    #[test]
+    fn default_env_path_retains_candidate_uncertainty() {
+        let identity = Identity {
+            interpreter: Interpreter::EnvCommand(EnvCommand {
+                program: OsString::from("sh"),
+                fixed_argument_count: 0,
+                search_path: EnvSearchPath::Default,
             }),
             script_argument_index: 1,
         };

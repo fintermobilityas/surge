@@ -64,7 +64,8 @@ where
     let active_app_dir = manager.install_dir.join("app");
     let next_app_dir = manager.install_dir.join(".surge-app-next");
     let previous_swap_dir = manager.install_dir.join(".surge-app-prev");
-    let fallback_previous_app_dir = if active_app_dir.is_dir() {
+    let active_app_was_present = active_app_dir.is_dir();
+    let fallback_previous_app_dir = if active_app_was_present {
         None
     } else {
         apply::find_previous_app_dir(&manager.install_dir, &manager.current_version)
@@ -123,6 +124,17 @@ where
     }
 
     progress_emitter.emit_substep(6, finalize_phase::QUIESCING_ACTIVE_APP, 92);
+    #[cfg(unix)]
+    let current_quiescence = if let Some(current_app_dir) = current_app_dir {
+        lifecycle::prepare_app_quiescence(current_app_dir, current_main_exe, manager.allow_in_process_swap)?
+    } else {
+        None
+    };
+    #[cfg(unix)]
+    if let Some(current_quiescence) = &current_quiescence {
+        lifecycle::terminate_prepared_app_processes(current_quiescence)?;
+    }
+    #[cfg(not(unix))]
     if let Some(current_app_dir) = current_app_dir {
         lifecycle::terminate_active_app_processes_before_swap(
             current_app_dir,
@@ -131,7 +143,7 @@ where
         )?;
     }
     #[cfg(unix)]
-    if previous_swap_dir.is_dir() {
+    let previous_swap_quiescence = if previous_swap_dir.is_dir() {
         let previous_swap_identity = super::current_install::load_previous_swap(manager, &previous_swap_dir)?
             .ok_or_else(|| {
                 SurgeError::Update(
@@ -140,12 +152,18 @@ where
                 )
             })?;
         lifecycle::request_supervisor_shutdown(&manager.install_dir, &previous_swap_identity.supervisor_id).await?;
-        lifecycle::terminate_active_app_processes_before_swap(
+        let prepared = lifecycle::prepare_app_quiescence(
             &previous_swap_dir,
             &previous_swap_identity.main_exe,
             manager.allow_in_process_swap,
         )?;
-    }
+        if let Some(prepared) = &prepared {
+            lifecycle::terminate_prepared_app_processes(prepared)?;
+        }
+        prepared.map(|prepared| (prepared, previous_swap_identity.main_exe))
+    } else {
+        None
+    };
 
     progress_emitter.emit_substep(6, finalize_phase::PREPARING_SWAP, 92);
     if next_app_dir.exists() {
@@ -154,12 +172,28 @@ where
     if previous_swap_dir.exists() {
         tokio::fs::remove_dir_all(&previous_swap_dir).await?;
     }
+    #[cfg(unix)]
+    if let Some((previous_swap_quiescence, previous_main_exe)) = &previous_swap_quiescence {
+        lifecycle::terminate_prepared_app_processes(previous_swap_quiescence)?;
+        lifecycle::terminate_superseded_app_processes(&manager.install_dir, &active_app_dir, previous_main_exe)?;
+    }
 
     progress_emitter.emit_substep(6, finalize_phase::SWAPPING_APP_DIRECTORY, 93);
     atomic_rename(extracted_final_dir, &next_app_dir)?;
 
-    if active_app_dir.is_dir() {
+    if active_app_was_present {
         atomic_rename(&active_app_dir, &previous_swap_dir)?;
+        #[cfg(unix)]
+        if let Err(error) = (|| {
+            if let Some(current_quiescence) = &current_quiescence {
+                lifecycle::terminate_prepared_app_processes(current_quiescence)?;
+            }
+            lifecycle::terminate_superseded_app_processes(&manager.install_dir, &active_app_dir, current_main_exe)?;
+            Ok::<(), SurgeError>(())
+        })() {
+            let _ = atomic_rename(&previous_swap_dir, &active_app_dir);
+            return Err(error);
+        }
     }
     if let Err(err) = atomic_rename(&next_app_dir, &active_app_dir) {
         // Best effort rollback to previous active content.
@@ -167,6 +201,13 @@ where
             let _ = atomic_rename(&previous_swap_dir, &active_app_dir);
         }
         return Err(err);
+    }
+    #[cfg(unix)]
+    if !active_app_was_present {
+        if let Some(current_quiescence) = &current_quiescence {
+            lifecycle::terminate_prepared_app_processes(current_quiescence)?;
+        }
+        lifecycle::terminate_superseded_app_processes(&manager.install_dir, &active_app_dir, current_main_exe)?;
     }
 
     let previous_app_dir_for_assets = if previous_swap_dir.is_dir() {

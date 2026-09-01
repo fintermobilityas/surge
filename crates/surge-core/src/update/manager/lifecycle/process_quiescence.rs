@@ -22,6 +22,14 @@ use crate::platform::process::current_pid;
 mod active_entrypoint;
 #[cfg(unix)]
 mod interpreted_main;
+
+#[cfg(unix)]
+pub(in crate::update::manager) struct PreparedAppQuiescence {
+    main_exe: String,
+    active_entrypoint: active_entrypoint::Identity,
+    interpreted_main: Option<interpreted_main::Identity>,
+}
+
 pub(in crate::update::manager) fn terminate_superseded_app_processes(
     install_dir: &Path,
     active_app_dir: &Path,
@@ -30,12 +38,55 @@ pub(in crate::update::manager) fn terminate_superseded_app_processes(
     terminate_superseded_app_processes_except(install_dir, active_app_dir, main_exe, current_pid())
 }
 
+#[cfg(not(unix))]
 pub(in crate::update::manager) fn terminate_active_app_processes_before_swap(
     active_app_dir: &Path,
     main_exe: &str,
     allow_in_process_swap: bool,
 ) -> Result<usize> {
     terminate_active_app_processes_except(active_app_dir, main_exe, current_pid(), allow_in_process_swap)
+}
+
+#[cfg(unix)]
+pub(in crate::update::manager) fn prepare_app_quiescence(
+    active_app_dir: &Path,
+    main_exe: &str,
+    allow_in_process_swap: bool,
+) -> Result<Option<PreparedAppQuiescence>> {
+    prepare_app_quiescence_except(active_app_dir, main_exe, current_pid(), allow_in_process_swap)
+}
+
+#[cfg(unix)]
+fn prepare_app_quiescence_except(
+    active_app_dir: &Path,
+    main_exe: &str,
+    protected_pid: u32,
+    allow_in_process_swap: bool,
+) -> Result<Option<PreparedAppQuiescence>> {
+    let main_exe = main_exe.trim();
+    if main_exe.is_empty() {
+        return Ok(None);
+    }
+
+    let active_entrypoint = active_entrypoint::Identity::resolve(active_app_dir, main_exe)?.ok_or_else(|| {
+        SurgeError::Platform("Failed to resolve active application executable before swap".to_string())
+    })?;
+    let interpreted_main = interpreted_main::resolve(&active_entrypoint.resolved)?;
+    if allow_in_process_swap {
+        info!("In-process swap explicitly allowed, quiescing other active application processes only");
+    } else {
+        refuse_in_process_swap(&active_entrypoint, interpreted_main.as_ref(), protected_pid)?;
+    }
+    Ok(Some(PreparedAppQuiescence {
+        main_exe: main_exe.to_string(),
+        active_entrypoint,
+        interpreted_main,
+    }))
+}
+
+#[cfg(unix)]
+pub(in crate::update::manager) fn terminate_prepared_app_processes(prepared: &PreparedAppQuiescence) -> Result<usize> {
+    terminate_prepared_app_processes_except(prepared, current_pid())
 }
 
 #[cfg(unix)]
@@ -55,29 +106,25 @@ fn terminate_superseded_app_processes_except(
     })
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 fn terminate_active_app_processes_except(
     active_app_dir: &Path,
     main_exe: &str,
     protected_pid: u32,
     allow_in_process_swap: bool,
 ) -> Result<usize> {
-    let main_exe = main_exe.trim();
-    if main_exe.is_empty() {
+    let Some(prepared) = prepare_app_quiescence_except(active_app_dir, main_exe, protected_pid, allow_in_process_swap)?
+    else {
         return Ok(0);
-    }
+    };
 
-    let active_entrypoint = active_entrypoint::Identity::resolve(active_app_dir, main_exe)?.ok_or_else(|| {
-        SurgeError::Platform("Failed to resolve active application executable before swap".to_string())
-    })?;
-    let interpreted_main = interpreted_main::resolve(&active_entrypoint.resolved)?;
-    if allow_in_process_swap {
-        info!("In-process swap explicitly allowed, quiescing other active application processes only");
-    } else {
-        refuse_in_process_swap(&active_entrypoint, interpreted_main.as_ref(), protected_pid)?;
-    }
-    terminate_matching_app_processes(main_exe, protected_pid, "active", |process| {
-        is_active_app_process(&active_entrypoint, interpreted_main.as_ref(), process)
+    terminate_prepared_app_processes_except(&prepared, protected_pid)
+}
+
+#[cfg(unix)]
+fn terminate_prepared_app_processes_except(prepared: &PreparedAppQuiescence, protected_pid: u32) -> Result<usize> {
+    terminate_matching_app_processes(&prepared.main_exe, protected_pid, "active", |process| {
+        is_active_app_process(&prepared.active_entrypoint, prepared.interpreted_main.as_ref(), process)
     })
 }
 
@@ -789,6 +836,58 @@ mod tests {
     #[test]
     fn interpreted_active_app_process_is_terminated_before_swap() {
         assert_interpreted_active_app_process_is_terminated_before_swap("#!/bin/sh");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn prepared_interpreted_identity_catches_process_started_before_path_withdrawal() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::{Command, Stdio};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let active_app_dir = tmp.path().join("app");
+        let previous_app_dir = tmp.path().join(".surge-app-prev");
+        std::fs::create_dir_all(&active_app_dir).unwrap();
+        let app_path = active_app_dir.join("demo-script");
+        let ready_path = tmp.path().join("ready");
+        std::fs::write(&app_path, "#!/bin/sh\nprintf ready > \"$1\"\nread _\n").unwrap();
+        let mut permissions = std::fs::metadata(&app_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&app_path, permissions).unwrap();
+
+        let prepared = prepare_app_quiescence_except(&active_app_dir, "demo-script", u32::MAX, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminate_prepared_app_processes_except(&prepared, u32::MAX).unwrap(), 0);
+
+        let mut child = Command::new(&app_path)
+            .arg(&ready_path)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let child_pid = child.id();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !ready_path.is_file() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "test child did not finish loading the interpreted app"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            app_process_pids(u32::MAX, &|process| {
+                is_active_app_process(&prepared.active_entrypoint, prepared.interpreted_main.as_ref(), process)
+            })
+            .unwrap()
+            .contains(&child_pid)
+        );
+
+        std::fs::rename(&active_app_dir, &previous_app_dir).unwrap();
+        let terminated = terminate_prepared_app_processes_except(&prepared, u32::MAX).unwrap();
+        let status = child.wait().unwrap();
+
+        assert_eq!(terminated, 1);
+        assert!(!status.success());
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

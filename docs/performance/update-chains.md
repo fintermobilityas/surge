@@ -31,10 +31,10 @@ Large anonymized profile, `sdk_only`, `100` deltas, `sparse-file-ops`
 (48-core/251 GB host, seed 42):
 
 - client download: `510 KiB` (archive-chunked: `15.6 MiB` — ~30x less)
-- client apply, full 100-delta walk: ~`160 s` (session history:
-  `657 s` → `489 s` → `221 s` → `157 s` → ~`160 s`; archive-chunked:
-  ~`18 s`; load regimes differ between sessions — compare within a
-  session)
+- client apply, full 100-delta walk: ~`154 s` (session history:
+  `657 s` → `489 s` → `221 s` → `157 s` → ~`160 s` → ~`154 s`;
+  archive-chunked: ~`18 s`; load regimes differ between sessions —
+  compare within a session)
 - per-delta apply cost is **flat in chain depth**: with per-step
   instrumentation, every step took a constant ~`6.4 s` originally,
   ~`4.8 s` after the carried-tree apply, ~`2.2 s` after identity-chunk
@@ -89,6 +89,18 @@ Large anonymized profile, `sdk_only`, `100` deltas, `sparse-file-ops`
   the shared-host wall-clock noise floor, so the phase-level evidence
   carries the claim. Payload and verification are unchanged (tamper
   test still fail-closed)
+- **In-place sparse patching (landed)**: a same-size format v2 patch
+  (identity-chunk bitset) now rewrites only the changed chunks at
+  their existing offsets instead of reading the whole source and
+  writing a full temp copy; chunk boundaries align 1:1 at equal
+  sizes, so the reconstructed file is byte-identical to the
+  write-to-temp flow. The target SHA-256 is one full read of the
+  patched file afterwards (keeps the step fail-closed). Size-changing
+  and format v1 patches fall back to the temp-file flow. Phase-
+  instrumented 10-step A/B (same session, 3 pairs): bspatch phase
+  ~`870-1,180 ms` → ~`590-650 ms`/step; 100-delta same-session runs:
+  `147.0/161.5 s` vs `163.1/170.1 s` (−7.4%, new < base in all 4
+  pairings), install tree byte-identical
 
 Meaning:
 
@@ -98,10 +110,12 @@ Meaning:
   walk; production caps the client walk at `max_chain_length` (8)
   with checkpoint fulls every `checkpoint_every` (10), so real client
   applies are bounded far below this figure
-- the remaining per-step cost (~`1.6 s` at scale 1.0) is: one full
-  read + one full write of the changed file for the bspatch, one
-  full-file target SHA-256, and the per-step repack (variable
-  `0.6-3.0 s` under host load)
+- the remaining per-step cost (~`1.5 s` at scale 1.0) is: one full
+  read of the changed file for the in-place target SHA-256 (+ a
+  64 MiB chunk read/rewrite for the bspatch), and the per-step repack
+  (the zstd-3 encode of the ~1.2 GB tree, ~`0.5 s` stable — measured
+  equal to the publisher-side pack, i.e. at the compressor floor;
+  variable `0.6-3.0 s` under host load)
 
 ### Broad churn is now bounded by file-aware deltas and full fallback
 
@@ -134,13 +148,16 @@ Meaning:
 
 ## What Is Not Solved Yet
 
-- the per-step bspatch still pays a full read + full write of the
-  changed file even for a 4 KiB change (the target SHA-256 is now
-  streamed into the write, so no extra read). Anything deeper
-  (range-scoped ops) needs a new sparse op kind
+- the per-step bspatch still pays one full read of the changed file
+  (the in-place target SHA-256) even for a 4 KiB change. Anything
+  deeper (range-scoped ops, hash-carry across the full file) needs a
+  new sparse op kind
 - the per-step **repack** is the most load-variable component
   (`0.6-3.0 s`): zstd over ~1.2 GB per step, re-encoding unchanged
-  files even though only one file changed
+  files even though only one file changed. Phase measurement shows
+  it is at the zstd-3 MT-48 floor for this payload (publisher-side
+  pack costs the same); reusing encoded frames for unchanged entries
+  would require a per-entry archive format change
 - retained full checkpoints still need long-history tuning in real feeds
 - broad-churn chains can still justify a fresh full checkpoint
 - local checkpoint retention policy may need calibration for very long-lived installs

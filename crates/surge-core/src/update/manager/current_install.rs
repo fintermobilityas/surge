@@ -36,6 +36,7 @@ pub(super) fn load(manager: &UpdateManager) -> Result<Option<ReleaseIdentity>> {
     load_from_app_dir(manager, &active_app_dir, Some(&manager.current_version))
 }
 
+#[cfg(unix)]
 pub(super) fn load_previous_swap(manager: &UpdateManager, app_dir: &Path) -> Result<Option<ReleaseIdentity>> {
     load_from_app_dir(manager, app_dir, None)
 }

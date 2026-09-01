@@ -18,6 +18,7 @@ use super::{ApplyStrategy, UpdateInfo, UpdateManager};
 
 mod base;
 mod delta;
+pub(in crate::update::manager) mod full_fallback;
 mod installed_app;
 
 use self::base::{BaseFullArchiveSource, restore_base_full_archive, restore_release_graph_base_full_archive};
@@ -266,15 +267,37 @@ where
         );
     };
 
-    fetch_or_reuse_file(
+    let fetched = fetch_or_reuse_file(
         manager.storage.as_ref(),
         &latest.full_filename,
         &cache_path,
         &latest.full_sha256,
         Some(&download_progress),
     )
-    .await
-    .map_err(|fallback_error| {
+    .await;
+    // Publishers skip the full upload for non-checkpoint releases (see checkpoint retention), so the
+    // release's own full object may legitimately be absent. Rebuild it from the newest available full
+    // and the delta chain instead of failing the update.
+    let fetched = match fetched {
+        Err(SurgeError::NotFound(missing)) => {
+            warn!(
+                version = %latest.version,
+                key = %latest.full_filename,
+                "Full package is not in storage ({missing}); rebuilding it from the release graph"
+            );
+            full_fallback::restore_full_into_cache(manager, latest, &cache_path)
+                .await
+                .map(|()| ())
+                .map_err(|restore_error| {
+                    SurgeError::Update(format!(
+                        "Delta materialization failed: {delta_error}; full package fallback failed: {missing}; \
+                         rebuilding the full package from the release graph failed: {restore_error}"
+                    ))
+                })
+        }
+        other => other.map(|_| ()),
+    };
+    fetched.map_err(|fallback_error| {
         if is_verification_failure(&fallback_error) {
             // Terminal path: if this verification failure exhausts the
             // budget, surface the bounded-abort error instead of the raw

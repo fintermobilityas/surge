@@ -3212,6 +3212,116 @@ echo started > new-child-started
     }
 
     #[tokio::test]
+    async fn test_download_and_apply_full_strategy_rebuilds_missing_full_from_release_graph() {
+        // The publisher skipped the newest release's full upload (non-checkpoint release). A client
+        // that has to take the full-package path must rebuild that full from the newest available
+        // full plus the delta chain instead of failing with "blob not found".
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("store");
+        let install_root = tmp.path().join("install");
+        let app_id = "test-app";
+        std::fs::create_dir_all(&store_root).unwrap();
+        std::fs::create_dir_all(&install_root).unwrap();
+        let app_store = app_scoped_store_root(&store_root, app_id);
+
+        let rid = current_rid();
+        let os = current_os_label_for_tests();
+
+        let mut packer_v2 = ArchivePacker::new(3).unwrap();
+        packer_v2.add_buffer("payload.txt", b"v2 payload", 0o644).unwrap();
+        let full_v2 = packer_v2.finalize().unwrap();
+
+        let mut packer_v3 = ArchivePacker::new(3).unwrap();
+        packer_v3.add_buffer("payload.txt", b"v3 payload", 0o644).unwrap();
+        let full_v3 = packer_v3.finalize().unwrap();
+
+        let delta_v3 = zstd::encode_all(bsdiff_buffers(&full_v2, &full_v3).unwrap().as_slice(), 3).unwrap();
+
+        let full_v1_name = format!("{app_id}-1.0.0-{rid}-full.tar.zst");
+        let full_v2_name = format!("{app_id}-1.1.0-{rid}-full.tar.zst");
+        let full_v3_name = format!("{app_id}-1.2.0-{rid}-full.tar.zst");
+        let delta_v3_name = format!("{app_id}-1.2.0-{rid}-delta.tar.zst");
+
+        // v1 has no artifacts at all (the installed version), v2's full and v3's delta exist,
+        // v3's full was never uploaded.
+        std::fs::write(app_store.join(&full_v2_name), &full_v2).unwrap();
+        std::fs::write(app_store.join(&delta_v3_name), &delta_v3).unwrap();
+
+        let base_release = |version: &str, full_name: &str, full: &[u8]| ReleaseEntry {
+            version: version.to_string(),
+            channels: vec!["stable".to_string()],
+            os: os.clone(),
+            rid: rid.clone(),
+            is_genesis: false,
+            full_filename: full_name.to_string(),
+            full_size: full.len() as i64,
+            full_sha256: sha256_hex(full),
+            full_compression_level: 0,
+            full_zstd_workers: 0,
+            deltas: Vec::new(),
+            preferred_delta_id: String::new(),
+            created_utc: chrono::Utc::now().to_rfc3339(),
+            release_notes: String::new(),
+            name: String::new(),
+            main_exe: app_id.to_string(),
+            install_directory: app_id.to_string(),
+            supervisor_id: String::new(),
+            icon: String::new(),
+            shortcuts: Vec::new(),
+            persistent_assets: Vec::new(),
+            installers: Vec::new(),
+            environment: std::collections::BTreeMap::new(),
+        };
+        let mut v1 = base_release("1.0.0", &full_v1_name, b"v1 payload archive never uploaded");
+        v1.is_genesis = true;
+        let v2 = base_release("1.1.0", &full_v2_name, &full_v2);
+        let mut v3 = base_release("1.2.0", &full_v3_name, &full_v3);
+        v3.deltas = vec![DeltaArtifact::bsdiff_zstd(
+            "primary",
+            "1.1.0",
+            &delta_v3_name,
+            delta_v3.len() as i64,
+            &sha256_hex(&delta_v3),
+        )];
+        v3.preferred_delta_id = "primary".to_string();
+
+        let index = ReleaseIndex {
+            app_id: app_id.to_string(),
+            releases: vec![v1, v2, v3],
+            ..ReleaseIndex::default()
+        };
+        write_app_scoped_release_index(&store_root, app_id, &index);
+
+        let ctx = Arc::new(Context::new());
+        ctx.set_storage(
+            StorageProvider::Filesystem,
+            store_root.to_str().unwrap(),
+            "",
+            "",
+            "",
+            "",
+        );
+
+        let mut manager = UpdateManager::new(ctx, app_id, "1.0.0", "stable", install_root.to_str().unwrap()).unwrap();
+        let info = manager.check_for_updates().await.unwrap().unwrap();
+        assert_eq!(
+            info.apply_strategy,
+            ApplyStrategy::Full,
+            "no delta path exists from 1.0.0"
+        );
+        manager
+            .download_and_apply(&info, None::<fn(ProgressInfo)>)
+            .await
+            .expect("the missing full must be rebuilt from v2 full + v3 delta");
+
+        let installed = std::fs::read_to_string(install_root.join("app").join("payload.txt")).unwrap();
+        assert_eq!(installed, "v3 payload");
+        let status = status::read_update_status(&install_root).unwrap().unwrap();
+        assert_eq!(status.state, status::UpdateConvergenceState::Converged);
+        assert_eq!(status.installed_version, "1.2.0");
+    }
+
+    #[tokio::test]
     async fn test_download_and_apply_delta_rebuilds_current_full_from_installed_app_when_cache_chain_is_missing() {
         let tmp = tempfile::tempdir().unwrap();
         let store_root = tmp.path().join("store");

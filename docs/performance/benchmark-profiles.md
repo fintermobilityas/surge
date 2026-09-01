@@ -111,6 +111,26 @@ Broad churn chain:
 cargo run -p surge-bench --release -- --update-only --scale 1.0 --scenario full-release --num-deltas 10 --pack-zstd-level 3 --pack-memory-mb 256 --json
 ```
 
+### Sparse delta build (publisher side)
+
+The sparse `file-ops` delta builder compares the two packed archives
+in memory: both zstd frames are decoded (concurrently, two threads),
+entry contents are borrowed as zero-copy slices of the decoded tar
+buffer, and the changed-file basis SHA-256 runs on a worker thread
+while the chunked diff executes. No archive is extracted to disk.
+
+- The in-memory build is byte-identical to the previous disk-based
+  build; `in_memory_sparse_patch_is_byte_identical_to_disk_build`
+  pins that equivalence and round-trips the patch against the next
+  tree.
+- Same-session A/B (10 deltas, `sdk_only` scale 1.0, seed 42):
+  `Delta pack build (avg)` 4,163→2,187 ms/version (−47%); the 11-release
+  publish total drops 93.3s→61.2s (−34%).
+- Remaining per-version costs are the single-threaded zstd decode of
+  both archives and the full-file SHA-256 passes; cross-step decoded-tree
+  reuse (older tree of step N+1 = newer tree of step N) is the next
+  candidate for the `auto/delta/` surface.
+
 ## CI Tracking Guidance
 
 Recommended CI benchmark coverage:

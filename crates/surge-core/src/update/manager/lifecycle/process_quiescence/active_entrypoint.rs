@@ -48,7 +48,7 @@ impl Identity {
                 && std::fs::canonicalize(executable).is_ok_and(|resolved| resolved == self.resolved)
     }
 
-    pub(super) fn matches_argument(&self, argument: &OsStr, cwd: Option<&Path>) -> bool {
+    pub(super) fn matches_argument(&self, argument: &OsStr, cwd: Option<&Path>) -> Result<bool> {
         if self.require_entrypoint_argument {
             argument_preserves_entrypoint(argument, cwd, &self.path)
         } else {
@@ -62,29 +62,63 @@ impl Identity {
     }
 }
 
-fn argument_preserves_entrypoint(argument: &OsStr, cwd: Option<&Path>, expected: &Path) -> bool {
-    let Some(candidate) = absolute_argument(argument, cwd) else {
-        return false;
-    };
-    candidate == expected
+fn argument_preserves_entrypoint(argument: &OsStr, cwd: Option<&Path>, expected: &Path) -> Result<bool> {
+    match absolute_argument(argument, cwd) {
+        ArgumentPath::Missing => return Ok(false),
+        ArgumentPath::Ambiguous => return ambiguous_relative_argument(argument, expected),
+        ArgumentPath::Absolute(candidate) => {
+            if candidate == expected {
+                return Ok(true);
+            }
+        }
+    }
+
+    ambiguous_relative_argument(argument, expected)
 }
 
-fn argument_resolves_to(argument: &OsStr, cwd: Option<&Path>, expected: &Path) -> bool {
-    let Some(candidate) = absolute_argument(argument, cwd) else {
-        return false;
-    };
-    std::fs::canonicalize(candidate).is_ok_and(|resolved| resolved == expected)
+fn argument_resolves_to(argument: &OsStr, cwd: Option<&Path>, expected: &Path) -> Result<bool> {
+    match absolute_argument(argument, cwd) {
+        ArgumentPath::Missing => Ok(false),
+        ArgumentPath::Ambiguous => ambiguous_relative_argument(argument, expected),
+        ArgumentPath::Absolute(candidate) => {
+            if std::fs::canonicalize(candidate).is_ok_and(|resolved| resolved == expected) {
+                Ok(true)
+            } else {
+                ambiguous_relative_argument(argument, expected)
+            }
+        }
+    }
 }
 
-fn absolute_argument(argument: &OsStr, cwd: Option<&Path>) -> Option<PathBuf> {
+fn ambiguous_relative_argument(argument: &OsStr, expected: &Path) -> Result<bool> {
+    let argument = Path::new(argument);
+    if argument.is_relative() && argument.file_name() == expected.file_name() {
+        return Err(SurgeError::Platform(format!(
+            "Cannot establish the launch directory for relative active application argument '{}'; refusing to swap while its process identity is ambiguous",
+            argument.display()
+        )));
+    }
+
+    Ok(false)
+}
+
+enum ArgumentPath {
+    Missing,
+    Absolute(PathBuf),
+    Ambiguous,
+}
+
+fn absolute_argument(argument: &OsStr, cwd: Option<&Path>) -> ArgumentPath {
     let argument = Path::new(argument);
     if argument.as_os_str().is_empty() {
-        return None;
+        return ArgumentPath::Missing;
     }
     if argument.is_absolute() {
-        Some(argument.to_path_buf())
+        ArgumentPath::Absolute(argument.to_path_buf())
+    } else if let Some(cwd) = cwd {
+        ArgumentPath::Absolute(cwd.join(argument))
     } else {
-        cwd.map(|cwd| cwd.join(argument))
+        ArgumentPath::Ambiguous
     }
 }
 
@@ -107,8 +141,16 @@ mod tests {
         let identity = Identity::resolve(&active_app_dir, "bin/demo").unwrap().unwrap();
 
         assert!(identity.requires_argument());
-        assert!(identity.matches_argument(active_app_dir.join("bin/demo").as_os_str(), None));
-        assert!(!identity.matches_argument(shared_dir.join("demo").as_os_str(), None));
+        assert!(
+            identity
+                .matches_argument(active_app_dir.join("bin/demo").as_os_str(), None)
+                .unwrap()
+        );
+        assert!(
+            !identity
+                .matches_argument(shared_dir.join("demo").as_os_str(), None)
+                .unwrap()
+        );
     }
 
     #[test]
@@ -123,7 +165,15 @@ mod tests {
         let identity = Identity::resolve(&active_app_dir, "demo").unwrap().unwrap();
 
         assert!(identity.requires_argument());
-        assert!(identity.matches_argument(active_app_dir.join("demo").as_os_str(), None));
-        assert!(!identity.matches_argument(shared_dir.join("demo").as_os_str(), None));
+        assert!(
+            identity
+                .matches_argument(active_app_dir.join("demo").as_os_str(), None)
+                .unwrap()
+        );
+        assert!(
+            !identity
+                .matches_argument(shared_dir.join("demo").as_os_str(), None)
+                .unwrap()
+        );
     }
 }

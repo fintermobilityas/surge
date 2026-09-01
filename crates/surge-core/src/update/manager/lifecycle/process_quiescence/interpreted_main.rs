@@ -11,28 +11,96 @@ pub(super) struct Identity {
 
 enum Interpreter {
     Resolved(PathBuf),
-    EnvCommand(OsString),
+    EnvCommand(EnvCommand),
 }
 
 struct EnvCommand {
     program: OsString,
     fixed_argument_count: usize,
+    search_path: Option<OsString>,
 }
 
 impl Identity {
-    pub(super) fn matches_interpreter(&self, executable: &Path, argv0: Option<&OsStr>) -> bool {
+    pub(super) fn matches_interpreter(&self, executable: &Path, argv0: Option<&OsStr>) -> Result<bool> {
         match &self.interpreter {
-            Interpreter::Resolved(expected) => {
-                executable == expected
-                    || argv0.is_some_and(|argument| {
-                        let argument = Path::new(argument);
-                        argument.is_absolute()
-                            && std::fs::canonicalize(argument).is_ok_and(|resolved| resolved == *expected)
-                    })
+            Interpreter::Resolved(expected) => Ok(paths_resolve_to_same_executable(executable, expected)),
+            Interpreter::EnvCommand(expected) => {
+                if argv0 != Some(expected.program.as_os_str()) {
+                    return Ok(false);
+                }
+                let resolved = resolve_env_command(expected)?;
+                if paths_resolve_to_same_executable(executable, &resolved) {
+                    Ok(true)
+                } else {
+                    Err(SurgeError::Platform(format!(
+                        "Cannot verify env interpreter '{}' from the updater environment; refusing to swap while its process identity is ambiguous",
+                        expected.program.to_string_lossy()
+                    )))
+                }
             }
-            Interpreter::EnvCommand(expected) => argv0 == Some(expected.as_os_str()),
         }
     }
+
+    pub(super) fn executable_may_match(&self, executable: &Path) -> Result<bool> {
+        match &self.interpreter {
+            Interpreter::Resolved(expected) => Ok(paths_resolve_to_same_executable(executable, expected)),
+            Interpreter::EnvCommand(expected) => {
+                let resolved = resolve_env_command(expected)?;
+                Ok(paths_resolve_to_same_executable(executable, &resolved))
+            }
+        }
+    }
+}
+
+fn paths_resolve_to_same_executable(actual: &Path, expected: &Path) -> bool {
+    if actual == expected {
+        return true;
+    }
+    let Ok(actual) = std::fs::canonicalize(actual) else {
+        return false;
+    };
+    std::fs::canonicalize(expected).is_ok_and(|expected| actual == expected)
+}
+
+fn resolve_env_command(command: &EnvCommand) -> Result<PathBuf> {
+    let program = Path::new(&command.program);
+    if program.is_absolute() {
+        return std::fs::canonicalize(program).map_err(|e| {
+            SurgeError::Platform(format!(
+                "Failed to resolve active application env interpreter '{}': {e}",
+                program.display()
+            ))
+        });
+    }
+    if program.components().count() != 1 {
+        return Err(SurgeError::Platform(format!(
+            "Cannot safely resolve relative env interpreter '{}' before swap",
+            program.display()
+        )));
+    }
+
+    let search_path = command
+        .search_path
+        .clone()
+        .or_else(|| std::env::var_os("PATH"))
+        .unwrap_or_else(|| OsString::from("/usr/bin:/bin"));
+    for directory in std::env::split_paths(&search_path) {
+        if directory.as_os_str().is_empty() || directory.is_relative() {
+            return Err(SurgeError::Platform(format!(
+                "Cannot safely resolve env interpreter '{}' through a relative PATH entry before swap",
+                program.display()
+            )));
+        }
+        let candidate = directory.join(program);
+        if let Ok(candidate) = std::fs::canonicalize(candidate) {
+            return Ok(candidate);
+        }
+    }
+
+    Err(SurgeError::Platform(format!(
+        "Failed to resolve active application env interpreter '{}' from the updater PATH",
+        program.display()
+    )))
 }
 
 pub(super) fn resolve(active_exe: &Path) -> Result<Option<Identity>> {
@@ -57,6 +125,11 @@ pub(super) fn resolve(active_exe: &Path) -> Result<Option<Identity>> {
             "Active application shebang exceeds the supported 4096-byte limit".to_string(),
         ));
     }
+    if prefix[2..line_end].contains(&0) {
+        return Err(SurgeError::Platform(
+            "Active application shebang contains an embedded NUL byte".to_string(),
+        ));
+    }
     let shebang = std::str::from_utf8(&prefix[2..line_end])
         .map_err(|e| SurgeError::Platform(format!("Active application shebang is not valid UTF-8: {e}")))?
         .trim();
@@ -72,7 +145,8 @@ pub(super) fn resolve(active_exe: &Path) -> Result<Option<Identity>> {
     let (interpreter, fixed_argument_count) =
         if Path::new(interpreter).file_name().and_then(|name| name.to_str()) == Some("env") {
             let command = parse_env_command(argument)?;
-            (Interpreter::EnvCommand(command.program), command.fixed_argument_count)
+            let fixed_argument_count = command.fixed_argument_count;
+            (Interpreter::EnvCommand(command), fixed_argument_count)
         } else {
             (
                 Interpreter::Resolved(resolve_direct_interpreter_path(interpreter)?),
@@ -101,10 +175,11 @@ fn parse_env_command(argument: &str) -> Result<EnvCommand> {
         ));
     }
 
-    let command_index = env_command_index(&words)?;
+    let (command_index, search_path) = env_command_index(&words)?;
     Ok(EnvCommand {
         program: OsString::from(&words[command_index]),
         fixed_argument_count: words.len() - command_index - 1,
+        search_path: search_path.map(OsString::from),
     })
 }
 
@@ -122,9 +197,10 @@ fn split_env_command_words(command: &str) -> Result<Vec<String>> {
     Ok(command.split_whitespace().map(ToString::to_string).collect())
 }
 
-fn env_command_index(words: &[String]) -> Result<usize> {
+fn env_command_index(words: &[String]) -> Result<(usize, Option<String>)> {
     let mut index = 0;
     let mut options = true;
+    let mut search_path = None;
 
     while let Some(word) = words.get(index) {
         if options {
@@ -144,6 +220,9 @@ fn env_command_index(words: &[String]) -> Result<usize> {
                             "Active application env shebang option '{word}' has no value"
                         )));
                     }
+                    if word == "-P" {
+                        search_path = words.get(index + 1).cloned();
+                    }
                     index += 2;
                     continue;
                 }
@@ -152,6 +231,9 @@ fn env_command_index(words: &[String]) -> Result<usize> {
                     continue;
                 }
                 _ if (word.starts_with("-u") || word.starts_with("-C") || word.starts_with("-P")) && word.len() > 2 => {
+                    if let Some(path) = word.strip_prefix("-P") {
+                        search_path = Some(path.to_string());
+                    }
                     index += 1;
                     continue;
                 }
@@ -170,7 +252,7 @@ fn env_command_index(words: &[String]) -> Result<usize> {
             continue;
         }
 
-        return Ok(index);
+        return Ok((index, search_path));
     }
 
     Err(SurgeError::Platform(
@@ -301,6 +383,14 @@ mod tests {
     }
 
     #[test]
+    fn env_command_preserves_explicit_search_path() {
+        let command = parse_env_command("-S -P /opt/interpreters demo-interpreter -e").unwrap();
+
+        assert_eq!(command.program, OsString::from("demo-interpreter"));
+        assert_eq!(command.search_path, Some(OsString::from("/opt/interpreters")));
+    }
+
+    #[test]
     fn env_command_rejects_unknown_options_instead_of_treating_them_as_the_interpreter() {
         let error = parse_env_command("-S --argv0 app /bin/sh").err().unwrap();
         assert!(error.to_string().contains("unsupported option '--argv0'"));
@@ -327,5 +417,16 @@ mod tests {
         let error = resolve_direct_interpreter_path(interpreter.to_str().unwrap()).unwrap_err();
 
         assert!(error.to_string().contains("nested interpreters are unsupported"));
+    }
+
+    #[test]
+    fn shebang_with_embedded_nul_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = tmp.path().join("app");
+        std::fs::write(&app, b"#!/usr/bin/env sh\0 -e\n").unwrap();
+
+        let error = resolve(&app).err().unwrap();
+
+        assert!(error.to_string().contains("embedded NUL"));
     }
 }

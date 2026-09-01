@@ -16,13 +16,14 @@ use crate::error::Result;
 pub(super) struct AppProcess {
     pub(super) exe: PathBuf,
     pub(super) command: Vec<OsString>,
+    pub(super) command_inspected: bool,
     pub(super) cwd: Option<PathBuf>,
 }
 
 #[cfg(target_os = "linux")]
 pub(super) fn app_process_pids<F>(protected_pid: u32, matches_exe: &F) -> Result<Vec<u32>>
 where
-    F: Fn(&AppProcess) -> bool,
+    F: Fn(&AppProcess) -> Result<bool>,
 {
     use std::os::unix::ffi::OsStringExt;
 
@@ -31,65 +32,79 @@ where
     let entries = std::fs::read_dir("/proc")
         .map_err(|e| SurgeError::Platform(format!("Failed to enumerate processes from /proc: {e}")))?;
 
-    Ok(entries
-        .filter_map(std::result::Result::ok)
-        .filter_map(|entry| entry.file_name().to_string_lossy().parse::<u32>().ok())
-        .filter(|pid| *pid != protected_pid)
-        .filter_map(|pid| {
-            let exe = std::fs::read_link(format!("/proc/{pid}/exe"))
-                .map(normalize_proc_exe_path)
-                .ok()?;
-            let command = std::fs::read(format!("/proc/{pid}/cmdline")).map_or_else(
-                |_| Vec::new(),
-                |bytes| {
-                    bytes
-                        .split(|byte| *byte == 0)
-                        .filter(|argument| !argument.is_empty())
-                        .map(|argument| OsString::from_vec(argument.to_vec()))
-                        .collect()
-                },
-            );
-            let process = AppProcess {
-                exe,
-                command,
-                cwd: std::fs::read_link(format!("/proc/{pid}/cwd")).ok(),
-            };
-            matches_exe(&process).then_some(pid)
-        })
-        .collect())
+    let mut pids = Vec::new();
+    for entry in entries.filter_map(std::result::Result::ok) {
+        let Some(pid) = entry.file_name().to_string_lossy().parse::<u32>().ok() else {
+            continue;
+        };
+        if pid == protected_pid {
+            continue;
+        }
+        let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe")).map(normalize_proc_exe_path) else {
+            continue;
+        };
+        let command = std::fs::read(format!("/proc/{pid}/cmdline"));
+        let command_inspected = command.is_ok();
+        let command = command.map_or_else(
+            |_| Vec::new(),
+            |bytes| {
+                bytes
+                    .split(|byte| *byte == 0)
+                    .filter(|argument| !argument.is_empty())
+                    .map(|argument| OsString::from_vec(argument.to_vec()))
+                    .collect()
+            },
+        );
+        let process = AppProcess {
+            exe,
+            command,
+            command_inspected,
+            cwd: std::fs::read_link(format!("/proc/{pid}/cwd")).ok(),
+        };
+        if matches_exe(&process)? {
+            pids.push(pid);
+        }
+    }
+
+    Ok(pids)
 }
 
 #[cfg(target_os = "macos")]
 pub(super) fn app_process_pids<F>(protected_pid: u32, matches_exe: &F) -> Result<Vec<u32>>
 where
-    F: Fn(&AppProcess) -> bool,
+    F: Fn(&AppProcess) -> Result<bool>,
 {
     use sysinfo::{ProcessesToUpdate, System};
 
     let mut system = System::new();
     let _ = system.refresh_processes(ProcessesToUpdate::All, true);
-    Ok(system
-        .processes()
-        .iter()
-        .filter_map(|(pid, process)| {
-            let pid = pid.as_u32();
-            if pid == protected_pid {
-                return None;
-            }
-            let app_process = AppProcess {
-                exe: process.exe()?.to_path_buf(),
-                command: process.cmd().to_vec(),
-                cwd: process.cwd().map(Path::to_path_buf),
-            };
-            matches_exe(&app_process).then_some(pid)
-        })
-        .collect())
+    let mut pids = Vec::new();
+    for (pid, process) in system.processes() {
+        let pid = pid.as_u32();
+        if pid == protected_pid {
+            continue;
+        }
+        let Some(exe) = process.exe() else {
+            continue;
+        };
+        let app_process = AppProcess {
+            exe: exe.to_path_buf(),
+            command: process.cmd().to_vec(),
+            command_inspected: !process.cmd().is_empty(),
+            cwd: process.cwd().map(Path::to_path_buf),
+        };
+        if matches_exe(&app_process)? {
+            pids.push(pid);
+        }
+    }
+
+    Ok(pids)
 }
 
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 pub(super) fn app_process_pids<F>(_protected_pid: u32, _matches_exe: &F) -> Result<Vec<u32>>
 where
-    F: Fn(&AppProcess) -> bool,
+    F: Fn(&AppProcess) -> Result<bool>,
 {
     use crate::error::SurgeError;
 

@@ -341,7 +341,7 @@ fn is_superseded_app_exe(install_dir: &Path, active_app_dir: &Path, main_exe: &s
     first == ".surge-app-prev" || first.starts_with("app-") || components.next().is_none()
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

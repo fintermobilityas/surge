@@ -9,8 +9,8 @@
 //!   restart could not be confirmed within the post-update window. The runtime
 //!   process may still be running an older binary even though `installed_version`
 //!   already reflects the new release.
-//! - **`Failed`** — the most recent attempt failed before the install swap could
-//!   complete. The `installed_version` field reflects the pre-attempt state.
+//! - **`Failed`** — the most recent attempt failed. The `installed_version`
+//!   field reflects the generation retained in the active app directory.
 //!
 //! This record is persisted at `{install_dir}/.surge-update-status.json` so it
 //! survives the active app directory swap that happens on every successful update.
@@ -70,8 +70,9 @@ impl std::fmt::Display for UpdateConvergenceState {
 /// directory at the time the record was written. `target_version` is the
 /// version the most recent update attempt was trying to reach. For `Converged`
 /// records the two are equal; for `Failed` records `installed_version` is the
-/// pre-attempt version; for `PendingRestart` records `installed_version` is
-/// already the new release even though the runtime process may not yet be.
+/// generation retained after recovery; for `PendingRestart` records
+/// `installed_version` is already the new release even though the runtime
+/// process may not yet be.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UpdateStatusRecord {
     pub state: UpdateConvergenceState,

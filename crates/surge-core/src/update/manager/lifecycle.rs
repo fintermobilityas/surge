@@ -33,8 +33,8 @@ pub(in crate::update::manager) use self::process_quiescence::{spawn_native_test_
 
 #[derive(Debug, Clone)]
 pub(super) enum SupervisorRestartOutcome {
-    /// No supervisor was configured for this release (or wasn't running before
-    /// the update) so there is no post-update restart to confirm.
+    /// No supervisor was configured for this release, so there is no
+    /// post-update restart to confirm.
     NotApplicable,
     /// The target package is installed, but restart handoff is still pending.
     /// The supervisor writes the converged record only after the old child exits
@@ -197,7 +197,7 @@ pub(super) fn restore_previous_supervisor_after_failed_quiescence(
         install_dir,
         active_app_dir,
         &previous,
-        watched_pid,
+        Some(watched_pid),
         None,
         SUPERVISOR_RESTART_CONFIRM_TIMEOUT,
         SUPERVISOR_RESTART_MAX_ATTEMPTS,
@@ -215,8 +215,26 @@ pub(super) fn restart_supervisor_after_update_with_pid(
         install_dir,
         active_app_dir,
         latest,
-        watched_pid,
+        Some(watched_pid),
         Some(&latest.version),
+        SUPERVISOR_RESTART_CONFIRM_TIMEOUT,
+        SUPERVISOR_RESTART_MAX_ATTEMPTS,
+        SUPERVISOR_RESTART_RETRY_DELAY,
+    )
+}
+
+#[cfg(unix)]
+pub(super) fn restart_supervisor_immediately(
+    install_dir: &Path,
+    active_app_dir: &Path,
+    release: &ReleaseEntry,
+) -> SupervisorRestartOutcome {
+    restart_supervisor_after_update_with_config(
+        install_dir,
+        active_app_dir,
+        release,
+        None,
+        None,
         SUPERVISOR_RESTART_CONFIRM_TIMEOUT,
         SUPERVISOR_RESTART_MAX_ATTEMPTS,
         SUPERVISOR_RESTART_RETRY_DELAY,
@@ -227,7 +245,7 @@ fn restart_supervisor_after_update_with_config(
     install_dir: &Path,
     active_app_dir: &Path,
     latest: &ReleaseEntry,
-    watched_pid: u32,
+    watched_pid: Option<u32>,
     handoff_version: Option<&str>,
     confirm_timeout: Duration,
     max_attempts: u32,
@@ -286,7 +304,7 @@ fn restart_supervisor_after_update_with_config(
         }
     };
 
-    let args = supervisor_watch_args(supervisor_id, install_dir, watched_pid, handoff_version, &restart_args);
+    let args = supervisor_restart_args(supervisor_id, install_dir, watched_pid, handoff_version, &restart_args);
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
 
     let mut last_failure: Option<(String, &'static str)> = None;
@@ -300,13 +318,23 @@ fn restart_supervisor_after_update_with_config(
                 if confirm_supervisor_restart(install_dir, supervisor_id, confirm_timeout) {
                     let reason = handoff_version.map_or_else(
                         || {
-                            format!(
-                                "previous supervisor restoration accepted; waiting for process pid {watched_pid} to exit"
+                            watched_pid.map_or_else(
+                                || "previous supervisor restoration accepted".to_string(),
+                                |watched_pid| {
+                                    format!(
+                                        "previous supervisor restoration accepted; waiting for process pid {watched_pid} to exit"
+                                    )
+                                },
                             )
                         },
                         |version| {
-                            format!(
-                                "supervisor handoff accepted; waiting for previous child pid {watched_pid} to exit and target version {version} to start"
+                            watched_pid.map_or_else(
+                                || format!("supervisor restart accepted; waiting for target version {version} to start"),
+                                |watched_pid| {
+                                    format!(
+                                        "supervisor handoff accepted; waiting for previous child pid {watched_pid} to exit and target version {version} to start"
+                                    )
+                                },
                             )
                         },
                     );
@@ -351,23 +379,27 @@ fn restart_supervisor_after_update_with_config(
     SupervisorRestartOutcome::PendingRestart { reason, failure_phase }
 }
 
-fn supervisor_watch_args(
+fn supervisor_restart_args(
     supervisor_id: &str,
     install_dir: &Path,
-    watched_pid: u32,
+    watched_pid: Option<u32>,
     handoff_version: Option<&str>,
     restart_args: &[String],
 ) -> Vec<String> {
     let mut args = vec![
-        "watch".to_string(),
+        if watched_pid.is_some() { "watch" } else { "run" }.to_string(),
         "--id".to_string(),
         supervisor_id.to_string(),
         "--dir".to_string(),
         install_dir.to_string_lossy().into_owned(),
-        "--pid".to_string(),
-        watched_pid.to_string(),
     ];
-    if let Some(handoff_version) = handoff_version {
+    if let Some(watched_pid) = watched_pid {
+        args.push("--pid".to_string());
+        args.push(watched_pid.to_string());
+    }
+    if watched_pid.is_some()
+        && let Some(handoff_version) = handoff_version
+    {
         args.push("--handoff-version".to_string());
         args.push(handoff_version.to_string());
     }
@@ -388,10 +420,10 @@ mod tests {
     fn supervisor_watch_args_include_handoff_version_before_child_args() {
         let restart_args = vec!["--app-mode".to_string(), "service".to_string()];
 
-        let args = supervisor_watch_args(
+        let args = supervisor_restart_args(
             "demo-supervisor",
             Path::new("/opt/demo"),
-            42,
+            Some(42),
             Some("2.0.0"),
             &restart_args,
         );
@@ -421,9 +453,17 @@ mod tests {
 
     #[test]
     fn previous_supervisor_restoration_omits_update_handoff_version() {
-        let args = supervisor_watch_args("demo-supervisor", Path::new("/opt/demo"), 42, None, &[]);
+        let args = supervisor_restart_args("demo-supervisor", Path::new("/opt/demo"), Some(42), None, &[]);
 
         assert!(!args.iter().any(|argument| argument == "--handoff-version"));
+    }
+
+    #[test]
+    fn previous_supervisor_without_surviving_child_starts_immediately() {
+        let args = supervisor_restart_args("demo-supervisor", Path::new("/opt/demo"), None, None, &[]);
+
+        assert_eq!(args[0], "run");
+        assert!(!args.iter().any(|argument| argument == "--pid"));
     }
 
     #[cfg(unix)]
@@ -464,7 +504,7 @@ mod tests {
             install_dir,
             &active_app_dir,
             &latest,
-            std::process::id(),
+            Some(std::process::id()),
             Some(&latest.version),
             Duration::from_millis(200),
             2,

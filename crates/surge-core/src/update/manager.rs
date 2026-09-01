@@ -6,6 +6,8 @@ mod current_install;
 mod finalize;
 #[cfg(unix)]
 mod finalize_quiescence;
+#[cfg(unix)]
+mod finalize_recovery;
 mod lifecycle;
 mod progress;
 mod progress_substep;
@@ -26,7 +28,7 @@ use crate::update::status::{self, FailureContext, UpdateStatusRecord, UpdateWork
 
 use self::apply::materialize_update_payload;
 use self::artifacts::prepare_update_artifacts;
-use self::finalize::finalize_update;
+use self::finalize::{FinalizeFailure, finalize_update};
 use self::lifecycle::SupervisorRestartOutcome;
 pub use self::progress::ProgressInfo;
 use self::progress::emit_progress;
@@ -77,6 +79,37 @@ pub struct UpdateCheckState {
 const DEFAULT_RELEASE_RETENTION_LIMIT: usize = 1;
 pub(super) const RELEASE_GRAPH_CHECKPOINT_FULLS: usize = 3;
 const ABANDONED_IN_PROGRESS_TIMEOUT: Duration = Duration::from_mins(5);
+
+#[derive(Debug)]
+struct UpdateAttemptFailure {
+    error: SurgeError,
+    installed_version: Option<String>,
+}
+
+impl From<SurgeError> for UpdateAttemptFailure {
+    fn from(error: SurgeError) -> Self {
+        Self {
+            error,
+            installed_version: None,
+        }
+    }
+}
+
+impl From<std::io::Error> for UpdateAttemptFailure {
+    fn from(error: std::io::Error) -> Self {
+        SurgeError::from(error).into()
+    }
+}
+
+impl From<FinalizeFailure> for UpdateAttemptFailure {
+    fn from(failure: FinalizeFailure) -> Self {
+        let (error, installed_version) = failure.into_parts();
+        Self {
+            error,
+            installed_version,
+        }
+    }
+}
 
 fn bind_install_dir(install_dir: &str) -> Result<PathBuf> {
     let absolute = std::path::absolute(install_dir)?;
@@ -410,20 +443,25 @@ impl UpdateManager {
                 }
                 Ok(())
             }
-            Err(e) => {
+            Err(failure) => {
+                let UpdateAttemptFailure {
+                    error,
+                    installed_version,
+                } = failure;
                 let status_context = status::read_update_status(&self.install_dir).ok().flatten();
+                let installed_version = installed_version.as_deref().unwrap_or(&pre_attempt_version);
                 let mut record = UpdateStatusRecord::failed_with_context(
                     &self.app_id,
-                    &pre_attempt_version,
+                    installed_version,
                     &target_version,
                     &self.channel,
                     attempted_at_utc,
-                    &e.to_string(),
+                    &error.to_string(),
                     FailureContext::from_record(status_context.as_ref(), true),
                 );
                 // A user-initiated cancellation is not a failure to back off
                 // from; the next attempt may start immediately.
-                if !matches!(e, SurgeError::Cancelled) {
+                if !matches!(error, SurgeError::Cancelled) {
                     let schedule = status::retry_schedule(previous_attempt_status.as_ref(), &target_version);
                     record = record
                         .with_retry_schedule_at(&schedule, status::next_retry_timestamp(chrono::Utc::now(), &schedule));
@@ -431,7 +469,7 @@ impl UpdateManager {
                 if let Err(write_err) = status::write_update_status(&self.install_dir, &record) {
                     warn!(error = %write_err, "Failed to persist failed-update status (continuing)");
                 }
-                Err(e)
+                Err(error)
             }
         }
     }
@@ -441,7 +479,7 @@ impl UpdateManager {
         info: &UpdateInfo,
         progress: Option<Arc<F>>,
         in_progress_template: UpdateStatusRecord,
-    ) -> Result<SupervisorRestartOutcome>
+    ) -> std::result::Result<SupervisorRestartOutcome, UpdateAttemptFailure>
     where
         F: Fn(ProgressInfo) + Send + Sync,
     {
@@ -464,7 +502,7 @@ impl UpdateManager {
         progress_emitter.emit_substep(1, update_phase::RELEASE_RESOLVED, 1);
 
         if info.apply_releases.is_empty() {
-            return Err(SurgeError::Update("No releases to apply".to_string()));
+            return Err(SurgeError::Update("No releases to apply".to_string()).into());
         }
 
         let staging_dir = self.install_dir.join(".surge-staging");

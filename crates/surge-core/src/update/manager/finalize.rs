@@ -42,6 +42,41 @@ use super::{RELEASE_GRAPH_CHECKPOINT_FULLS, SupervisorRestartOutcome, UpdateInfo
 /// backend must not stall the rest of finalize indefinitely.
 const PRUNE_INDEX_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[derive(Debug)]
+pub(super) struct FinalizeFailure {
+    error: SurgeError,
+    active_version: Option<String>,
+}
+
+impl FinalizeFailure {
+    #[cfg(unix)]
+    fn with_active_target(error: SurgeError, version: &str) -> Self {
+        Self {
+            error,
+            active_version: Some(version.to_string()),
+        }
+    }
+
+    pub(super) fn into_parts(self) -> (SurgeError, Option<String>) {
+        (self.error, self.active_version)
+    }
+}
+
+impl From<SurgeError> for FinalizeFailure {
+    fn from(error: SurgeError) -> Self {
+        Self {
+            error,
+            active_version: None,
+        }
+    }
+}
+
+impl From<std::io::Error> for FinalizeFailure {
+    fn from(error: std::io::Error) -> Self {
+        SurgeError::from(error).into()
+    }
+}
+
 #[cfg(unix)]
 const PREVIOUS_SWAP_QUARANTINE_DIR: &str = ".surge-app-prev-quiescing";
 
@@ -82,7 +117,7 @@ pub(super) async fn finalize_update<F>(
     staging_dir: &Path,
     artifact_cache_dir: &Path,
     progress_emitter: &PhaseProgressEmitter<'_, F>,
-) -> Result<SupervisorRestartOutcome>
+) -> std::result::Result<SupervisorRestartOutcome, FinalizeFailure>
 where
     F: Fn(ProgressInfo) + Send + Sync,
 {
@@ -121,7 +156,8 @@ where
         return Err(SurgeError::Update(
             "Installed application directory disappeared after the update check; refusing to swap the active application"
                 .to_string(),
-        ));
+        )
+        .into());
     }
     #[cfg(unix)]
     let (current_version, current_main_exe, current_supervisor_id, current_environment) = if current_app_dir.is_some() {
@@ -130,7 +166,8 @@ where
             return Err(SurgeError::Update(
                 "Installed application identity changed after the update check; refusing to swap the active application"
                     .to_string(),
-            ));
+            )
+            .into());
         }
         let current = manager.current_release_identity.as_ref().ok_or_else(|| {
             SurgeError::Update(format!(
@@ -250,7 +287,8 @@ where
                 supervisor_requires_restoration,
                 supervised_child_pid,
                 error,
-            ));
+            )
+            .into());
         }
         if let Err(error) = tokio::fs::remove_dir_all(&previous_swap_quarantine_dir).await {
             let error =
@@ -265,7 +303,8 @@ where
                 supervisor_requires_restoration,
                 supervised_child_pid,
                 error,
-            ));
+            )
+            .into());
         }
     }
     #[cfg(not(unix))]
@@ -273,118 +312,126 @@ where
         tokio::fs::remove_dir_all(&previous_swap_dir).await?;
     }
 
-    progress_emitter.emit_substep(6, finalize_phase::SWAPPING_APP_DIRECTORY, 93);
-    atomic_rename(extracted_final_dir, &next_app_dir)?;
-
-    if active_app_was_present {
-        atomic_rename(&active_app_dir, &previous_swap_dir)?;
-        #[cfg(unix)]
-        if let Err(error) = (|| {
-            if let Some(current_quiescence) = &current_quiescence {
-                lifecycle::terminate_prepared_app_processes(current_quiescence)?;
-            }
-            lifecycle::terminate_superseded_app_processes(&manager.install_dir, &active_app_dir, current_main_exe)?;
-            Ok::<(), SurgeError>(())
-        })() {
-            let _ = atomic_rename(&previous_swap_dir, &active_app_dir);
-            return Err(restore_previous_supervisor_after_quiescence_failure(
-                &manager.install_dir,
-                Some(&active_app_dir),
-                current_version,
-                current_main_exe,
-                current_supervisor_id,
-                current_environment,
-                supervisor_requires_restoration,
-                supervised_child_pid,
-                error,
-            ));
-        }
-    }
     #[cfg(unix)]
-    if !active_app_was_present
-        && let Err(error) = (|| {
-            if let Some(current_quiescence) = &current_quiescence {
-                lifecycle::terminate_prepared_app_processes(current_quiescence)?;
+    let mut finalize_recovery = super::finalize_recovery::Guard::new(
+        &manager.install_dir,
+        current_app_dir,
+        &active_app_dir,
+        &next_app_dir,
+        &previous_swap_dir,
+        current_version,
+        current_main_exe,
+        current_supervisor_id,
+        current_environment,
+        latest,
+    );
+
+    let swap_result: Result<SupervisorRestartOutcome> = (|| {
+        progress_emitter.emit_substep(6, finalize_phase::SWAPPING_APP_DIRECTORY, 93);
+        atomic_rename(extracted_final_dir, &next_app_dir)?;
+        #[cfg(unix)]
+        finalize_recovery.mark_target_staged();
+
+        if active_app_was_present {
+            atomic_rename(&active_app_dir, &previous_swap_dir)?;
+            #[cfg(unix)]
+            finalize_recovery.mark_previous_moved();
+            #[cfg(unix)]
+            (|| {
+                if let Some(current_quiescence) = &current_quiescence {
+                    lifecycle::terminate_prepared_app_processes(current_quiescence)?;
+                }
+                lifecycle::terminate_superseded_app_processes(&manager.install_dir, &active_app_dir, current_main_exe)?;
+                Ok::<(), SurgeError>(())
+            })()?;
+        }
+        #[cfg(unix)]
+        if !active_app_was_present {
+            (|| {
+                if let Some(current_quiescence) = &current_quiescence {
+                    lifecycle::terminate_prepared_app_processes(current_quiescence)?;
+                }
+                lifecycle::terminate_superseded_app_processes(&manager.install_dir, &active_app_dir, current_main_exe)?;
+                Ok::<(), SurgeError>(())
+            })()?;
+        }
+        atomic_rename(&next_app_dir, &active_app_dir)?;
+        #[cfg(unix)]
+        finalize_recovery.mark_target_active();
+
+        let previous_app_dir_for_assets = if previous_swap_dir.is_dir() {
+            Some(previous_swap_dir.as_path())
+        } else {
+            fallback_previous_app_dir.as_deref()
+        };
+
+        if !latest.persistent_assets.is_empty() && previous_app_dir_for_assets.is_some() {
+            progress_emitter.emit_substep(6, finalize_phase::COPYING_PERSISTENT_ASSETS, 94);
+            if let Some(previous) = previous_app_dir_for_assets {
+                copy_persistent_assets(previous, &active_app_dir, &latest.persistent_assets)?;
             }
-            lifecycle::terminate_superseded_app_processes(&manager.install_dir, &active_app_dir, current_main_exe)?;
-            Ok::<(), SurgeError>(())
-        })()
-    {
-        return Err(restore_previous_supervisor_after_quiescence_failure(
-            &manager.install_dir,
-            current_app_dir,
-            current_version,
-            current_main_exe,
-            current_supervisor_id,
-            current_environment,
-            supervisor_requires_restoration,
-            supervised_child_pid,
-            error,
-        ));
-    }
-    if let Err(err) = atomic_rename(&next_app_dir, &active_app_dir) {
-        // Best effort rollback to previous active content.
-        if previous_swap_dir.is_dir() && !active_app_dir.exists() {
-            let _ = atomic_rename(&previous_swap_dir, &active_app_dir);
+        } else if !latest.persistent_assets.is_empty() {
+            debug!(
+                version = %latest.version,
+                "No previous app directory found; skipping persistent asset carry-over"
+            );
         }
-        return Err(err);
-    }
 
-    let previous_app_dir_for_assets = if previous_swap_dir.is_dir() {
-        Some(previous_swap_dir.as_path())
-    } else {
-        fallback_previous_app_dir.as_deref()
-    };
-
-    if !latest.persistent_assets.is_empty() && previous_app_dir_for_assets.is_some() {
-        progress_emitter.emit_substep(6, finalize_phase::COPYING_PERSISTENT_ASSETS, 94);
-        if let Some(previous) = previous_app_dir_for_assets {
-            copy_persistent_assets(previous, &active_app_dir, &latest.persistent_assets)?;
-        }
-    } else if !latest.persistent_assets.is_empty() {
-        debug!(
-            version = %latest.version,
-            "No previous app directory found; skipping persistent asset carry-over"
+        progress_emitter.emit_substep(6, finalize_phase::WRITING_RUNTIME_MANIFEST, 95);
+        let storage_cfg = manager.ctx.storage_config();
+        let runtime_manifest_profile = InstallProfile::new(
+            &manager.app_id,
+            latest.display_name(&manager.app_id),
+            &latest.main_exe,
+            &latest.install_directory,
+            &latest.supervisor_id,
+            &latest.icon,
+            &latest.shortcuts,
+            &latest.persistent_assets,
+            &latest.environment,
         );
-    }
+        let runtime_manifest_metadata = RuntimeManifestMetadata::new(
+            &latest.version,
+            &manager.channel,
+            storage_provider_manifest_name(storage_cfg.provider),
+            &storage_cfg.bucket,
+            &storage_cfg.region,
+            &storage_cfg.endpoint,
+        );
+        write_runtime_manifest(&active_app_dir, &runtime_manifest_profile, &runtime_manifest_metadata)?;
 
-    progress_emitter.emit_substep(6, finalize_phase::WRITING_RUNTIME_MANIFEST, 95);
-    let storage_cfg = manager.ctx.storage_config();
-    let runtime_manifest_profile = InstallProfile::new(
-        &manager.app_id,
-        latest.display_name(&manager.app_id),
-        &latest.main_exe,
-        &latest.install_directory,
-        &latest.supervisor_id,
-        &latest.icon,
-        &latest.shortcuts,
-        &latest.persistent_assets,
-        &latest.environment,
-    );
-    let runtime_manifest_metadata = RuntimeManifestMetadata::new(
-        &latest.version,
-        &manager.channel,
-        storage_provider_manifest_name(storage_cfg.provider),
-        &storage_cfg.bucket,
-        &storage_cfg.region,
-        &storage_cfg.endpoint,
-    );
-    write_runtime_manifest(&active_app_dir, &runtime_manifest_profile, &runtime_manifest_metadata)?;
+        // Start the replacement watch-supervisor as soon as the swapped app is
+        // usable (directory swapped, persistent assets carried over, runtime
+        // manifest written), before the best-effort shortcut/prune/hook steps that
+        // can block for many seconds. This shrinks the window in which no
+        // supervisor is watching the app. The start no longer depends on a
+        // supervisor having been running before the update: if the release
+        // configures supervision, a fresh watch supervisor is always started so a
+        // supervisor that died before the update is recovered here.
+        let restart_outcome = if latest.supervisor_id.trim().is_empty() {
+            SupervisorRestartOutcome::NotApplicable
+        } else {
+            progress_emitter.emit_substep(6, finalize_phase::RESTARTING_SUPERVISOR, 96);
+            lifecycle::restart_supervisor_after_update(&manager.install_dir, &active_app_dir, latest)
+        };
+        Ok(restart_outcome)
+    })();
 
-    // Start the replacement watch-supervisor as soon as the swapped app is
-    // usable (directory swapped, persistent assets carried over, runtime
-    // manifest written), before the best-effort shortcut/prune/hook steps that
-    // can block for many seconds. This shrinks the window in which no
-    // supervisor is watching the app. The start no longer depends on a
-    // supervisor having been running before the update: if the release
-    // configures supervision, a fresh watch supervisor is always started so a
-    // supervisor that died before the update is recovered here.
-    let restart_outcome = if latest.supervisor_id.trim().is_empty() {
-        SupervisorRestartOutcome::NotApplicable
-    } else {
-        progress_emitter.emit_substep(6, finalize_phase::RESTARTING_SUPERVISOR, 96);
-        lifecycle::restart_supervisor_after_update(&manager.install_dir, &active_app_dir, latest)
+    #[cfg(unix)]
+    let restart_outcome = match swap_result {
+        Ok(restart_outcome) => {
+            finalize_recovery.complete_supervisor_restart();
+            restart_outcome
+        }
+        Err(error) => match finalize_recovery.recover() {
+            Some(super::finalize_recovery::RecoveredGeneration::Target) => {
+                return Err(FinalizeFailure::with_active_target(error, &latest.version));
+            }
+            Some(super::finalize_recovery::RecoveredGeneration::Previous) | None => return Err(error.into()),
+        },
     };
+    #[cfg(not(unix))]
+    let restart_outcome = swap_result?;
 
     if !latest.shortcuts.is_empty() {
         progress_emitter.emit_substep(6, finalize_phase::INSTALLING_SHORTCUTS, 97);
@@ -459,9 +506,18 @@ where
         )
         .await
         {
-            Ok(Ok(data)) => Some(decompress_release_index(&data)?),
+            Ok(Ok(data)) => match decompress_release_index(&data) {
+                Ok(index) => Some(index),
+                Err(error) => {
+                    warn!(%error, "Failed to decode release index for artifact pruning; skipping prune step");
+                    None
+                }
+            },
             Ok(Err(SurgeError::NotFound(_))) => None,
-            Ok(Err(e)) => return Err(e),
+            Ok(Err(error)) => {
+                warn!(%error, "Failed to fetch release index for artifact pruning; skipping prune step");
+                None
+            }
             Err(_) => {
                 warn!(
                     timeout_secs = PRUNE_INDEX_FETCH_TIMEOUT.as_secs(),
@@ -509,7 +565,9 @@ where
                 "Terminated stale app processes from superseded install directories"
             );
         }
-        Err(e) => return Err(e),
+        Err(error) => {
+            warn!(%error, "Failed to finish superseded application cleanup after the target became active");
+        }
     }
 
     emit_progress(

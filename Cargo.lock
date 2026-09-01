@@ -3247,6 +3247,7 @@ dependencies = [
  "fs2",
  "futures-util",
  "hex",
+ "libc",
  "nix",
  "percent-encoding",
  "quick-xml 0.42.0",

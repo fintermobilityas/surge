@@ -313,6 +313,53 @@ fn is_active_app_exe(active_exe: &Path, exe: &Path) -> bool {
     exe == active_exe
 }
 
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+const NATIVE_TEST_APP_FILTER: &str =
+    "update::manager::lifecycle::process_quiescence::tests::native_app_process_fixture";
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(in crate::update::manager) fn spawn_native_test_app(app_path: &Path) -> std::process::Child {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::{Command, Stdio};
+
+    std::fs::copy(std::env::current_exe().unwrap(), app_path).unwrap();
+    let mut permissions = std::fs::metadata(app_path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(app_path, permissions).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        match Command::new(app_path)
+            .args(["--exact", NATIVE_TEST_APP_FILTER, "--nocapture"])
+            .env("SURGE_NATIVE_TEST_APP", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => break child,
+            Err(error) if error.raw_os_error() == Some(nix::libc::ETXTBSY) && std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("failed to start native test app: {error}"),
+        }
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(in crate::update::manager) fn wait_for_native_test_app(app_path: &Path, child_pid: u32) {
+    let resolved_app_path = std::fs::canonicalize(app_path).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !app_process_pids(u32::MAX, &|process| is_active_app_exe(&resolved_app_path, &process.exe))
+        .unwrap()
+        .contains(&child_pid)
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "test child did not enter the active app path"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[cfg(unix)]
 fn is_interpreted_main(active_exe: &Path) -> Result<bool> {
     let mut file = std::fs::File::open(active_exe).map_err(|e| {
@@ -426,40 +473,32 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn active_app_process_is_terminated_before_swap() {
-        use std::os::unix::fs::{PermissionsExt, symlink};
-        use std::process::Command;
+        use std::os::unix::fs::symlink;
 
         let tmp = tempfile::tempdir().unwrap();
         let active_app_dir = tmp.path().join("app");
         std::fs::create_dir_all(&active_app_dir).unwrap();
         let app_path = active_app_dir.join("demo");
-        std::fs::copy("/bin/sleep", &app_path).unwrap();
-        let mut permissions = std::fs::metadata(&app_path).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&app_path, permissions).unwrap();
         let linked_active_app_dir = tmp.path().join("linked-app");
         symlink(&active_app_dir, &linked_active_app_dir).unwrap();
-        let resolved_app_path = std::fs::canonicalize(&app_path).unwrap();
 
-        let mut child = Command::new(&app_path).arg("30").spawn().unwrap();
+        let mut child = spawn_native_test_app(&app_path);
         let child_pid = child.id();
-        let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        while !app_process_pids(u32::MAX, &|process| is_active_app_exe(&resolved_app_path, &process.exe))
-            .unwrap()
-            .contains(&child_pid)
-        {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "test child did not enter the active app path"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        wait_for_native_test_app(&app_path, child_pid);
 
         let terminated = terminate_active_app_processes_except(&linked_active_app_dir, "demo", u32::MAX).unwrap();
         let status = child.wait().unwrap();
 
         assert_eq!(terminated, 1);
         assert!(!status.success());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn native_app_process_fixture() {
+        if std::env::var_os("SURGE_NATIVE_TEST_APP").is_some() {
+            std::thread::sleep(Duration::from_secs(30));
+        }
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

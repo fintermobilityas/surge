@@ -19,6 +19,8 @@ const SUPERVISOR_RESTART_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 mod process_quiescence;
 
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(in crate::update::manager) use self::process_quiescence::{spawn_native_test_app, wait_for_native_test_app};
 pub(super) use self::process_quiescence::{
     terminate_active_app_processes_before_swap, terminate_superseded_app_processes,
 };

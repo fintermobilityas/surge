@@ -4356,9 +4356,6 @@ echo started > new-child-started
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn test_download_and_apply_quiesces_installed_executable_when_target_name_changes() {
-        use std::os::unix::fs::PermissionsExt;
-        use std::process::Command;
-
         let tmp = tempfile::tempdir().unwrap();
         let store_root = tmp.path().join("store");
         let install_root = tmp.path().join("install");
@@ -4370,12 +4367,9 @@ echo started > new-child-started
         let current_app_dir = install_root.join("app");
         std::fs::create_dir_all(&current_app_dir).unwrap();
         let current_exe = current_app_dir.join("old-app");
-        std::fs::copy("/bin/sleep", &current_exe).unwrap();
-        let mut permissions = std::fs::metadata(&current_exe).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&current_exe, permissions).unwrap();
         write_runtime_identity(&current_app_dir, app_id, "1.0.0", "old-app", "");
-        let mut current_process = Command::new(&current_exe).arg("30").spawn().unwrap();
+        let mut current_process = lifecycle::spawn_native_test_app(&current_exe);
+        lifecycle::wait_for_native_test_app(&current_exe, current_process.id());
 
         let rid = current_rid();
         let full_filename = format!("{app_id}-1.1.0-{rid}-full.tar.zst");

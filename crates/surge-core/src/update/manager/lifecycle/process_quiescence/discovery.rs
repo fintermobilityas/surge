@@ -40,10 +40,10 @@ where
         if pid == protected_pid {
             continue;
         }
-        let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe")).map(normalize_proc_exe_path) else {
+        let Ok(mut exe) = std::fs::read_link(format!("/proc/{pid}/exe")).map(normalize_proc_exe_path) else {
             continue;
         };
-        let Some((command, command_inspected)) = inspect_linux_process_command(pid)? else {
+        let Some((command, command_inspected)) = inspect_linux_process_command(pid, &mut exe)? else {
             continue;
         };
         let process = AppProcess {
@@ -108,25 +108,41 @@ pub(super) fn parse_proc_cmdline(bytes: &[u8]) -> Vec<OsString> {
 }
 
 #[cfg(target_os = "linux")]
-fn inspect_linux_process_command(pid: u32) -> Result<Option<(Vec<OsString>, bool)>> {
+fn inspect_linux_process_command(pid: u32, executable: &mut PathBuf) -> Result<Option<(Vec<OsString>, bool)>> {
+    let deadline = std::time::Instant::now() + Duration::from_millis(100);
     let mut command = Vec::new();
     let mut command_inspected = false;
-    for attempt in 0..3 {
-        if attempt > 0 {
-            std::thread::sleep(Duration::from_millis(1));
-        }
+    loop {
         if let Ok(bytes) = std::fs::read(format!("/proc/{pid}/cmdline")) {
             command = parse_proc_cmdline(&bytes);
             command_inspected = true;
         }
-        if command.iter().any(|argument| !argument.is_empty()) {
+
+        let executable_changed = std::fs::read_link(format!("/proc/{pid}/exe"))
+            .map(normalize_proc_exe_path)
+            .is_ok_and(|observed| {
+                if observed == *executable {
+                    false
+                } else {
+                    *executable = observed;
+                    true
+                }
+            });
+        if executable_changed {
+            command.clear();
+            command_inspected = false;
+        }
+        if !executable_changed && command.iter().any(|argument| !argument.is_empty()) {
             return Ok(Some((command, command_inspected)));
         }
         if linux_process_is_gone_or_zombie(pid)? {
             return Ok(None);
         }
+        if std::time::Instant::now() >= deadline {
+            return Ok(Some((command, command_inspected)));
+        }
+        std::thread::sleep(Duration::from_millis(1));
     }
-    Ok(Some((command, command_inspected)))
 }
 
 #[cfg(target_os = "linux")]

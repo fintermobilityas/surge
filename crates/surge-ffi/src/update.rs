@@ -67,6 +67,7 @@ pub unsafe extern "C" fn surge_update_manager_create(
             channel: channel_s,
             release_retention_limit: 1,
             artifact_retention_policy: InstallArtifactCachePolicy::default(),
+            allow_in_process_swap: false,
             install_dir: install_s,
         });
 
@@ -172,6 +173,38 @@ pub unsafe extern "C" fn surge_update_manager_set_release_retention_limit(
     }))
 }
 
+/// Allow the running application to swap its own active directory during apply.
+///
+/// `allow` is treated as a boolean: zero disables (the default), non-zero
+/// enables. When disabled, an updater running from the active application
+/// executable refuses the swap and expects an external Surge updater. A
+/// self-hosted application that updates in-process (calling
+/// `surge_update_download_and_apply` from inside the installed app) must
+/// enable this to keep self-updating; other processes running the active
+/// executable are still quiesced before the swap.
+///
+/// # Safety
+///
+/// `mgr` must be a valid update manager handle or NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn surge_update_manager_set_allow_in_process_swap(
+    mgr: *mut SurgeUpdateManagerHandle,
+    allow: c_int,
+) -> i32 {
+    if mgr.is_null() {
+        return SURGE_ERROR;
+    }
+
+    catch_ffi(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: `mgr` is checked non-null above.
+        let mgr_ref = unsafe { &mut *mgr };
+        clear_shared_error(&mgr_ref.ctx, &mgr_ref.last_error);
+
+        mgr_ref.allow_in_process_swap = allow != 0;
+        SURGE_OK
+    }))
+}
+
 /// Change local artifact cache retention applied after successful updates.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn surge_update_manager_set_artifact_retention_policy(
@@ -261,6 +294,7 @@ pub unsafe extern "C" fn surge_update_check(
             Err(e) => return set_shared_error(&mgr_ref.ctx, &mgr_ref.last_error, &e),
         };
         update_mgr.set_release_retention_limit(mgr_ref.release_retention_limit);
+        update_mgr.set_allow_in_process_swap(mgr_ref.allow_in_process_swap);
         if let Err(e) = update_mgr.set_artifact_retention_policy(mgr_ref.artifact_retention_policy) {
             return set_shared_error(&mgr_ref.ctx, &mgr_ref.last_error, &e);
         }
@@ -372,6 +406,7 @@ pub unsafe extern "C" fn surge_update_download_and_apply(
             Err(e) => return set_shared_error(&mgr_ref.ctx, &mgr_ref.last_error, &e),
         };
         update_mgr.set_release_retention_limit(mgr_ref.release_retention_limit);
+        update_mgr.set_allow_in_process_swap(mgr_ref.allow_in_process_swap);
         if let Err(e) = update_mgr.set_artifact_retention_policy(mgr_ref.artifact_retention_policy) {
             return set_shared_error(&mgr_ref.ctx, &mgr_ref.last_error, &e);
         }

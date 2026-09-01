@@ -117,6 +117,7 @@ pub struct SurgeUpdateManagerHandle {
     pub channel: String,
     pub release_retention_limit: usize,
     pub artifact_retention_policy: InstallArtifactCachePolicy,
+    pub allow_in_process_swap: bool,
     pub install_dir: String,
 }
 

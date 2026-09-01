@@ -1,27 +1,22 @@
 #[cfg(unix)]
-use std::ffi::OsString;
-#[cfg(unix)]
 use std::io::Read;
 use std::path::Path;
-#[cfg(unix)]
-use std::path::PathBuf;
 #[cfg(unix)]
 use std::time::Duration;
 
 #[cfg(unix)]
 use tracing::{info, warn};
 
+mod discovery;
+
+#[cfg(unix)]
+use self::discovery::AppProcess;
+#[cfg(unix)]
+use self::discovery::app_process_pids;
 use crate::error::Result;
 #[cfg(unix)]
 use crate::error::SurgeError;
 use crate::platform::process::current_pid;
-
-#[cfg(unix)]
-struct AppProcess {
-    exe: PathBuf,
-    command: Vec<OsString>,
-    cwd: Option<PathBuf>,
-}
 
 pub(in crate::update::manager) fn terminate_superseded_app_processes(
     install_dir: &Path,
@@ -34,8 +29,9 @@ pub(in crate::update::manager) fn terminate_superseded_app_processes(
 pub(in crate::update::manager) fn terminate_active_app_processes_before_swap(
     active_app_dir: &Path,
     main_exe: &str,
+    allow_in_process_swap: bool,
 ) -> Result<usize> {
-    terminate_active_app_processes_except(active_app_dir, main_exe, current_pid())
+    terminate_active_app_processes_except(active_app_dir, main_exe, current_pid(), allow_in_process_swap)
 }
 
 #[cfg(unix)]
@@ -51,7 +47,12 @@ fn terminate_superseded_app_processes_except(
 }
 
 #[cfg(unix)]
-fn terminate_active_app_processes_except(active_app_dir: &Path, main_exe: &str, protected_pid: u32) -> Result<usize> {
+fn terminate_active_app_processes_except(
+    active_app_dir: &Path,
+    main_exe: &str,
+    protected_pid: u32,
+    allow_in_process_swap: bool,
+) -> Result<usize> {
     let main_exe = main_exe.trim();
     if main_exe.is_empty() {
         return Ok(0);
@@ -73,7 +74,17 @@ fn terminate_active_app_processes_except(active_app_dir: &Path, main_exe: &str, 
             active_app_root.join(main_exe).display()
         )));
     }
-    refuse_in_process_swap(&active_exe, protected_pid)?;
+    if updater_runs_from_active_exe(&active_exe, protected_pid)? {
+        if !allow_in_process_swap {
+            return Err(SurgeError::Platform(
+                "The updater is running from the active application executable; refusing an in-process directory swap. Apply the update from an external Surge updater."
+                    .to_string(),
+            ));
+        }
+        info!(
+            "The updater is running from the active application executable; in-process swap explicitly allowed, quiescing other active application processes only"
+        );
+    }
     let interpreted_main = is_interpreted_main(&active_exe)?;
     if interpreted_main {
         return Err(SurgeError::Platform(
@@ -86,11 +97,11 @@ fn terminate_active_app_processes_except(active_app_dir: &Path, main_exe: &str, 
 }
 
 #[cfg(unix)]
-fn refuse_in_process_swap(active_exe: &Path, protected_pid: u32) -> Result<()> {
+fn updater_runs_from_active_exe(active_exe: &Path, protected_pid: u32) -> Result<bool> {
     use std::os::unix::fs::MetadataExt;
 
     if protected_pid != current_pid() {
-        return Ok(());
+        return Ok(false);
     }
 
     let updater_exe = std::env::current_exe().map_err(|e| {
@@ -108,14 +119,7 @@ fn refuse_in_process_swap(active_exe: &Path, protected_pid: u32) -> Result<()> {
             "Failed to inspect updater process identity before application swap: {e}"
         ))
     })?;
-    if active_metadata.dev() == updater_metadata.dev() && active_metadata.ino() == updater_metadata.ino() {
-        return Err(SurgeError::Platform(
-            "The updater is running from the active application executable; refusing an in-process directory swap. Apply the update from an external Surge updater."
-                .to_string(),
-        ));
-    }
-
-    Ok(())
+    Ok(active_metadata.dev() == updater_metadata.dev() && active_metadata.ino() == updater_metadata.ino())
 }
 
 #[cfg(unix)]
@@ -203,6 +207,7 @@ fn terminate_active_app_processes_except(
     _active_app_dir: &Path,
     _main_exe: &str,
     _protected_pid: u32,
+    _allow_in_process_swap: bool,
 ) -> Result<usize> {
     Ok(0)
 }
@@ -222,96 +227,6 @@ where
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-}
-
-#[cfg(target_os = "linux")]
-fn app_process_pids<F>(protected_pid: u32, matches_exe: &F) -> Result<Vec<u32>>
-where
-    F: Fn(&AppProcess) -> bool,
-{
-    use std::os::unix::ffi::OsStringExt;
-
-    let entries = std::fs::read_dir("/proc")
-        .map_err(|e| SurgeError::Platform(format!("Failed to enumerate processes from /proc: {e}")))?;
-
-    Ok(entries
-        .filter_map(std::result::Result::ok)
-        .filter_map(|entry| entry.file_name().to_string_lossy().parse::<u32>().ok())
-        .filter(|pid| *pid != protected_pid)
-        .filter_map(|pid| {
-            let exe = std::fs::read_link(format!("/proc/{pid}/exe"))
-                .map(normalize_proc_exe_path)
-                .ok()?;
-            let command = std::fs::read(format!("/proc/{pid}/cmdline")).map_or_else(
-                |_| Vec::new(),
-                |bytes| {
-                    bytes
-                        .split(|byte| *byte == 0)
-                        .filter(|argument| !argument.is_empty())
-                        .map(|argument| OsString::from_vec(argument.to_vec()))
-                        .collect()
-                },
-            );
-            let process = AppProcess {
-                exe,
-                command,
-                cwd: std::fs::read_link(format!("/proc/{pid}/cwd")).ok(),
-            };
-            matches_exe(&process).then_some(pid)
-        })
-        .collect())
-}
-
-#[cfg(target_os = "macos")]
-fn app_process_pids<F>(protected_pid: u32, matches_exe: &F) -> Result<Vec<u32>>
-where
-    F: Fn(&AppProcess) -> bool,
-{
-    use sysinfo::{ProcessesToUpdate, System};
-
-    let mut system = System::new();
-    let _ = system.refresh_processes(ProcessesToUpdate::All, true);
-    Ok(system
-        .processes()
-        .iter()
-        .filter_map(|(pid, process)| {
-            let pid = pid.as_u32();
-            if pid == protected_pid {
-                return None;
-            }
-            let app_process = AppProcess {
-                exe: process.exe()?.to_path_buf(),
-                command: process.cmd().to_vec(),
-                cwd: process.cwd().map(Path::to_path_buf),
-            };
-            matches_exe(&app_process).then_some(pid)
-        })
-        .collect())
-}
-
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-fn app_process_pids<F>(_protected_pid: u32, _matches_exe: &F) -> Result<Vec<u32>>
-where
-    F: Fn(&AppProcess) -> bool,
-{
-    Err(SurgeError::Platform(
-        "Active application process discovery is unsupported on this Unix platform".to_string(),
-    ))
-}
-
-#[cfg(target_os = "linux")]
-fn normalize_proc_exe_path(path: PathBuf) -> PathBuf {
-    use std::os::unix::ffi::{OsStrExt, OsStringExt};
-
-    match path.try_exists() {
-        Ok(false) => {}
-        Ok(true) | Err(_) => return path,
-    }
-
-    let Some(path_bytes) = path.as_os_str().as_bytes().strip_suffix(b" (deleted)") else {
-        return path;
-    };
-    PathBuf::from(OsString::from_vec(path_bytes.to_vec()))
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -497,7 +412,8 @@ mod tests {
         let child_pid = child.id();
         wait_for_native_test_app(&app_path, child_pid);
 
-        let terminated = terminate_active_app_processes_except(&linked_active_app_dir, "demo", u32::MAX).unwrap();
+        let terminated =
+            terminate_active_app_processes_except(&linked_active_app_dir, "demo", u32::MAX, false).unwrap();
         let status = child.wait().unwrap();
 
         assert_eq!(terminated, 1);
@@ -520,9 +436,22 @@ mod tests {
         std::fs::create_dir_all(&active_app_dir).unwrap();
         std::fs::hard_link(std::env::current_exe().unwrap(), active_app_dir.join("demo")).unwrap();
 
-        let error = terminate_active_app_processes_except(&active_app_dir, "demo", current_pid()).unwrap_err();
+        let error = terminate_active_app_processes_except(&active_app_dir, "demo", current_pid(), false).unwrap_err();
 
         assert!(error.to_string().contains("refusing an in-process directory swap"));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn in_process_updater_swaps_without_signalling_itself_when_explicitly_allowed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let active_app_dir = tmp.path().join("app");
+        std::fs::create_dir_all(&active_app_dir).unwrap();
+        std::fs::hard_link(std::env::current_exe().unwrap(), active_app_dir.join("demo")).unwrap();
+
+        let terminated = terminate_active_app_processes_except(&active_app_dir, "demo", current_pid(), true).unwrap();
+
+        assert_eq!(terminated, 0);
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -540,7 +469,7 @@ mod tests {
         permissions.set_mode(0o755);
         std::fs::set_permissions(&app_path, permissions).unwrap();
         let mut child = Command::new(&app_path).spawn().unwrap();
-        let error = terminate_active_app_processes_except(&active_app_dir, "demo-script", u32::MAX).unwrap_err();
+        let error = terminate_active_app_processes_except(&active_app_dir, "demo-script", u32::MAX, false).unwrap_err();
         let child_still_running = child.try_wait().unwrap().is_none();
         if child_still_running {
             child.kill().unwrap();
@@ -563,7 +492,7 @@ mod tests {
         symlink("/bin/sleep", active_app_dir.join("demo")).unwrap();
 
         let mut unrelated_child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
-        let error = terminate_active_app_processes_except(&active_app_dir, "demo", u32::MAX).unwrap_err();
+        let error = terminate_active_app_processes_except(&active_app_dir, "demo", u32::MAX, false).unwrap_err();
         let unrelated_still_running = unrelated_child.try_wait().unwrap().is_none();
         if unrelated_still_running {
             unrelated_child.kill().unwrap();
@@ -576,24 +505,5 @@ mod tests {
                 .contains("resolves outside the active application directory")
         );
         assert!(unrelated_still_running);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn proc_exe_deleted_suffix_is_ignored_for_matching() {
-        assert_eq!(
-            normalize_proc_exe_path(PathBuf::from("/opt/demo/app-1.0.0/demo (deleted)")),
-            PathBuf::from("/opt/demo/app-1.0.0/demo")
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn proc_exe_path_preserves_existing_filename_with_deleted_suffix() {
-        let tmp = tempfile::tempdir().unwrap();
-        let executable = tmp.path().join("demo (deleted)");
-        std::fs::write(&executable, "fixture").unwrap();
-
-        assert_eq!(normalize_proc_exe_path(executable.clone()), executable);
     }
 }

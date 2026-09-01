@@ -121,6 +121,7 @@ pub struct UpdateManager {
     pub(super) release_retention_limit: usize,
     pub(super) artifact_retention_policy: InstallArtifactCachePolicy,
     pub(super) install_dir: PathBuf,
+    pub(super) allow_in_process_swap: bool,
     pub(super) storage: Box<dyn StorageBackend>,
     pub(super) cached_index: Option<ReleaseIndex>,
     pub(in crate::update::manager) current_release_identity: Option<current_install::ReleaseIdentity>,
@@ -164,6 +165,7 @@ impl UpdateManager {
             release_retention_limit: DEFAULT_RELEASE_RETENTION_LIMIT,
             artifact_retention_policy: InstallArtifactCachePolicy::default(),
             install_dir,
+            allow_in_process_swap: false,
             storage,
             cached_index: None,
             current_release_identity: None,
@@ -260,6 +262,18 @@ impl UpdateManager {
     /// Update the number of old app snapshots retained after successful updates.
     pub fn set_release_retention_limit(&mut self, limit: usize) {
         self.release_retention_limit = limit;
+    }
+
+    /// Allow the running application to swap its own active directory during apply.
+    ///
+    /// Defaults to `false`, matching the fail-closed pre-swap quiescence contract: an
+    /// updater running from the active application executable refuses the swap and
+    /// expects an external Surge updater. A self-hosted application that updates
+    /// in-process can opt back in to the legacy in-place swap; other processes running
+    /// the active executable are still quiesced before the swap, and the
+    /// interpreted-entrypoint and shared-executable checks remain fail-closed.
+    pub fn set_allow_in_process_swap(&mut self, allow: bool) {
+        self.allow_in_process_swap = allow;
     }
 
     /// Update the local artifact cache retention policy applied after successful updates.

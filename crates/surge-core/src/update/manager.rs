@@ -730,6 +730,7 @@ mod tests {
         assert!(error.to_string().contains("does not match"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn restore_check_state_rejects_changed_installed_identity() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1474,7 +1475,10 @@ echo started > new-child-started
 
         std::fs::remove_file(app_store.join(&full_filename)).unwrap();
         manager.set_current_version("1.1.0").unwrap();
-        manager.current_release_identity = current_install::load(&manager).unwrap();
+        #[cfg(unix)]
+        {
+            manager.current_release_identity = current_install::load(&manager).unwrap();
+        }
         manager
             .download_and_apply(&info, None::<fn(ProgressInfo)>)
             .await

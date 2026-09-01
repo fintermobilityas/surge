@@ -73,6 +73,7 @@ pub(crate) struct RuntimeManifestIdentity {
     pub(crate) main_exe: String,
     #[serde(rename = "supervisorId", default)]
     pub(crate) supervisor_id: String,
+    #[cfg(unix)]
     #[serde(default)]
     pub(crate) environment: BTreeMap<String, String>,
 }
@@ -252,9 +253,16 @@ mod tests {
         );
         let metadata = RuntimeManifestMetadata::new("1.0.0", "stable", "filesystem", ".", "", "");
 
-        write_runtime_manifest(tmp.path(), &profile, &metadata).unwrap();
-        let identity = read_runtime_manifest_identity(tmp.path()).unwrap().unwrap();
+        let manifest_path = write_runtime_manifest(tmp.path(), &profile, &metadata).unwrap();
+        let manifest = std::fs::read_to_string(manifest_path).unwrap();
 
-        assert_eq!(identity.environment, environment);
+        assert!(manifest.contains("DEMO_MODE: recovery"));
+        assert!(manifest.contains("PATH: /opt/demo/bin:/usr/bin:/bin"));
+
+        #[cfg(unix)]
+        {
+            let identity = read_runtime_manifest_identity(tmp.path()).unwrap().unwrap();
+            assert_eq!(identity.environment, environment);
+        }
     }
 }

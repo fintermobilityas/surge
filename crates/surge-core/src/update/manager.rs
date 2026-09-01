@@ -4697,6 +4697,123 @@ echo started > new-child-started
         );
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn test_download_and_apply_quarantines_previous_swap_before_relative_script_rescan() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::{Command, Stdio};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("store");
+        let install_root = tmp.path().join("install");
+        let app_id = "test-app";
+        std::fs::create_dir_all(&store_root).unwrap();
+        std::fs::create_dir_all(&install_root).unwrap();
+        let app_store = app_scoped_store_root(&store_root, app_id);
+
+        let current_app_dir = install_root.join("app");
+        std::fs::create_dir_all(&current_app_dir).unwrap();
+        std::fs::write(current_app_dir.join("payload.txt"), "old payload").unwrap();
+        write_runtime_identity(&current_app_dir, app_id, "1.0.0", "payload.txt", "");
+
+        let previous_swap_dir = install_root.join(".surge-app-prev");
+        std::fs::create_dir_all(&previous_swap_dir).unwrap();
+        write_runtime_identity(&previous_swap_dir, app_id, "0.9.0", "stale-script", "");
+        let stale_script = previous_swap_dir.join("stale-script");
+        std::fs::write(&stale_script, "#!/bin/sh\nprintf ready > \"$1\"\nread _\n").unwrap();
+        let mut permissions = std::fs::metadata(&stale_script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&stale_script, permissions).unwrap();
+
+        let rid = current_rid();
+        let full_filename = format!("{app_id}-1.1.0-{rid}-full.tar.zst");
+        let full_path = app_store.join(&full_filename);
+        let mut packer = ArchivePacker::new(3).unwrap();
+        packer.add_buffer("payload.txt", b"new payload", 0o644).unwrap();
+        packer.finalize_to_file(&full_path).unwrap();
+
+        let mut latest = make_entry("1.1.0", "stable", &current_os_label_for_tests(), &rid);
+        latest.is_genesis = true;
+        latest.main_exe = "payload.txt".to_string();
+        latest.full_filename = full_filename;
+        latest.full_size = std::fs::metadata(&full_path).unwrap().len() as i64;
+        latest.full_sha256 = sha256_hex_file(&full_path).unwrap();
+        latest.deltas.clear();
+        latest.preferred_delta_id.clear();
+        write_app_scoped_release_index(
+            &store_root,
+            app_id,
+            &ReleaseIndex {
+                app_id: app_id.to_string(),
+                releases: vec![latest],
+                ..ReleaseIndex::default()
+            },
+        );
+
+        let ctx = Arc::new(Context::new());
+        ctx.set_storage(
+            StorageProvider::Filesystem,
+            store_root.to_str().unwrap(),
+            "",
+            "",
+            "",
+            "",
+        );
+        let mut manager = UpdateManager::new(ctx, app_id, "1.0.0", "stable", install_root.to_str().unwrap()).unwrap();
+        let info = manager.check_for_updates().await.unwrap().unwrap();
+        let ready_path = install_root.join("late-relative-script-ready");
+        let late_process = Arc::new(Mutex::new(None));
+        let late_process_for_progress = Arc::clone(&late_process);
+        let previous_swap_dir_for_progress = previous_swap_dir.clone();
+        let ready_path_for_progress = ready_path.clone();
+
+        manager
+            .download_and_apply(
+                &info,
+                Some(move |progress: ProgressInfo| {
+                    if progress.phase_label != finalize_phase::PREPARING_SWAP {
+                        return;
+                    }
+                    let mut late_process = late_process_for_progress
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if late_process.is_some() {
+                        return;
+                    }
+                    let child = Command::new("./stale-script")
+                        .current_dir(&previous_swap_dir_for_progress)
+                        .arg(&ready_path_for_progress)
+                        .stdin(Stdio::piped())
+                        .spawn()
+                        .unwrap();
+                    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+                    while !ready_path_for_progress.is_file() {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "late relative script did not finish loading"
+                        );
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    *late_process = Some(child);
+                }),
+            )
+            .await
+            .unwrap();
+
+        let mut late_process = late_process
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .expect("preparing-swap callback should launch the late relative script");
+        let status = late_process.wait().unwrap();
+        assert!(!status.success());
+        assert!(!install_root.join(".surge-app-prev-quiescing").exists());
+        assert_eq!(
+            std::fs::read_to_string(install_root.join("app").join("payload.txt")).unwrap(),
+            "new payload"
+        );
+    }
+
     #[tokio::test]
     async fn test_download_and_apply_prunes_old_version_snapshots_to_retention_limit() {
         let tmp = tempfile::tempdir().unwrap();

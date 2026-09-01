@@ -37,6 +37,38 @@ use super::{RELEASE_GRAPH_CHECKPOINT_FULLS, SupervisorRestartOutcome, UpdateInfo
 /// backend must not stall the rest of finalize indefinitely.
 const PRUNE_INDEX_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[cfg(unix)]
+const PREVIOUS_SWAP_QUARANTINE_DIR: &str = ".surge-app-prev-quiescing";
+
+#[cfg(unix)]
+fn restore_interrupted_previous_swap_quarantine(previous_swap_dir: &Path, quarantine_dir: &Path) -> Result<()> {
+    let previous_exists = previous_swap_dir.try_exists()?;
+    let quarantine_exists = quarantine_dir.try_exists()?;
+    if previous_exists && quarantine_exists {
+        return Err(SurgeError::Update(
+            "Both the previous swap directory and its quiescence quarantine exist; refusing to choose one".to_string(),
+        ));
+    }
+    if quarantine_exists {
+        atomic_rename(quarantine_dir, previous_swap_dir).map_err(|error| {
+            SurgeError::Update(format!(
+                "Failed to restore the interrupted previous swap quarantine: {error}"
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn restore_previous_swap_after_error(previous_swap_dir: &Path, quarantine_dir: &Path, error: SurgeError) -> SurgeError {
+    match atomic_rename(quarantine_dir, previous_swap_dir) {
+        Ok(()) => error,
+        Err(restore_error) => SurgeError::Update(format!(
+            "{error}; failed to restore the previous swap directory from its quiescence quarantine: {restore_error}"
+        )),
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 pub(super) async fn finalize_update<F>(
     manager: &UpdateManager,
@@ -64,6 +96,10 @@ where
     let active_app_dir = manager.install_dir.join("app");
     let next_app_dir = manager.install_dir.join(".surge-app-next");
     let previous_swap_dir = manager.install_dir.join(".surge-app-prev");
+    #[cfg(unix)]
+    let previous_swap_quarantine_dir = manager.install_dir.join(PREVIOUS_SWAP_QUARANTINE_DIR);
+    #[cfg(unix)]
+    restore_interrupted_previous_swap_quarantine(&previous_swap_dir, &previous_swap_quarantine_dir)?;
     let active_app_was_present = active_app_dir.is_dir();
     let fallback_previous_app_dir = if active_app_was_present {
         None
@@ -160,7 +196,12 @@ where
         if let Some(prepared) = &prepared {
             lifecycle::terminate_prepared_app_processes(prepared)?;
         }
-        prepared.map(|prepared| (prepared, previous_swap_identity.main_exe))
+        let prepared = prepared.ok_or_else(|| {
+            SurgeError::Update(
+                "Previous swap application entrypoint disappeared before it could be quiesced".to_string(),
+            )
+        })?;
+        Some((prepared, previous_swap_identity.main_exe))
     } else {
         None
     };
@@ -169,13 +210,43 @@ where
     if next_app_dir.exists() {
         tokio::fs::remove_dir_all(&next_app_dir).await?;
     }
-    if previous_swap_dir.exists() {
-        tokio::fs::remove_dir_all(&previous_swap_dir).await?;
-    }
     #[cfg(unix)]
     if let Some((previous_swap_quiescence, previous_main_exe)) = &previous_swap_quiescence {
-        lifecycle::terminate_prepared_app_processes(previous_swap_quiescence)?;
-        lifecycle::terminate_superseded_app_processes(&manager.install_dir, &active_app_dir, previous_main_exe)?;
+        atomic_rename(&previous_swap_dir, &previous_swap_quarantine_dir)?;
+        let quarantine_result = (|| {
+            let quarantined_quiescence = lifecycle::prepare_app_quiescence(
+                &previous_swap_quarantine_dir,
+                previous_main_exe,
+                manager.allow_in_process_swap,
+            )?
+            .ok_or_else(|| {
+                SurgeError::Update(
+                    "Previous swap application entrypoint disappeared while entering quiescence quarantine".to_string(),
+                )
+            })?;
+            lifecycle::terminate_prepared_app_processes(&quarantined_quiescence)?;
+            lifecycle::terminate_prepared_app_processes(previous_swap_quiescence)?;
+            lifecycle::terminate_superseded_app_processes(&manager.install_dir, &active_app_dir, previous_main_exe)?;
+            Ok::<(), SurgeError>(())
+        })();
+        if let Err(error) = quarantine_result {
+            return Err(restore_previous_swap_after_error(
+                &previous_swap_dir,
+                &previous_swap_quarantine_dir,
+                error,
+            ));
+        }
+        if let Err(error) = tokio::fs::remove_dir_all(&previous_swap_quarantine_dir).await {
+            return Err(restore_previous_swap_after_error(
+                &previous_swap_dir,
+                &previous_swap_quarantine_dir,
+                error.into(),
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    if previous_swap_dir.exists() {
+        tokio::fs::remove_dir_all(&previous_swap_dir).await?;
     }
 
     progress_emitter.emit_substep(6, finalize_phase::SWAPPING_APP_DIRECTORY, 93);

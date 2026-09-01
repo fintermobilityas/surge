@@ -75,6 +75,23 @@ pub fn take_supervisor_takeover_pid(install_dir: &Path, supervisor_id: &str) -> 
 }
 
 #[cfg(unix)]
+pub fn read_supervisor_takeover_pid(install_dir: &Path, supervisor_id: &str) -> Result<Option<u32>> {
+    let path = supervisor_takeover_pid_file(install_dir, supervisor_id);
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let pid = contents
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|pid| *pid != 0)
+        .ok_or_else(|| SurgeError::Update(format!("Invalid legacy supervisor takeover PID in {}", path.display())))?;
+    Ok(Some(pid))
+}
+
+#[cfg(unix)]
 pub fn clear_supervisor_takeover_pid(install_dir: &Path, supervisor_id: &str) {
     if let Err(error) = try_clear_supervisor_takeover_pid(install_dir, supervisor_id) {
         tracing::warn!(supervisor_id, %error, "Failed to clean up legacy supervisor takeover PID");
@@ -204,6 +221,20 @@ mod tests {
 
         assert_eq!(take_supervisor_takeover_pid(dir.path(), "demo-supervisor"), Some(42));
         assert_eq!(take_supervisor_takeover_pid(dir.path(), "demo-supervisor"), None);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn supervisor_takeover_pid_can_be_inspected_without_consuming_it() {
+        let dir = tempfile::tempdir().unwrap();
+
+        write_supervisor_takeover_pid(dir.path(), "demo-supervisor", 42).unwrap();
+
+        assert_eq!(
+            read_supervisor_takeover_pid(dir.path(), "demo-supervisor").unwrap(),
+            Some(42)
+        );
+        assert_eq!(take_supervisor_takeover_pid(dir.path(), "demo-supervisor"), Some(42));
     }
 
     #[test]

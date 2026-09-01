@@ -6,7 +6,11 @@ use tracing::{debug, info, warn};
 use crate::error::Result;
 #[cfg(not(unix))]
 use crate::error::SurgeError;
-use crate::platform::process::{ProcessHandle, current_pid, spawn_detached, spawn_process, supervisor_binary_name};
+#[cfg(unix)]
+use crate::platform::process::process_identity;
+use crate::platform::process::{
+    ProcessHandle, ProcessIdentity, current_pid, spawn_detached, spawn_process, supervisor_binary_name,
+};
 use crate::releases::manifest::ReleaseEntry;
 use crate::supervisor::state::{read_restart_args, write_supervisor_exe_path};
 #[cfg(not(unix))]
@@ -18,6 +22,52 @@ use crate::update::status::{
 const SUPERVISOR_RESTART_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
 const SUPERVISOR_RESTART_MAX_ATTEMPTS: u32 = 2;
 const SUPERVISOR_RESTART_RETRY_DELAY: Duration = Duration::from_millis(500);
+
+#[derive(Debug, Clone, Copy)]
+struct SupervisorWatchTarget {
+    pid: u32,
+    generation: Option<u64>,
+}
+
+impl SupervisorWatchTarget {
+    fn capture(pid: u32) -> Result<Self> {
+        #[cfg(unix)]
+        {
+            let identity = match process_identity(pid) {
+                Ok(identity) => identity,
+                Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
+                    debug!(
+                        pid,
+                        "Process generations are unavailable; using the platform liveness fallback"
+                    );
+                    return Ok(Self { pid, generation: None });
+                }
+                Err(error) => {
+                    return Err(crate::error::SurgeError::Update(format!(
+                        "Failed to capture watched process generation for PID {pid}: {error}"
+                    )));
+                }
+            }
+            .ok_or_else(|| {
+                crate::error::SurgeError::Update(format!(
+                    "Watched process PID {pid} exited before its generation could be captured"
+                ))
+            })?;
+            Ok(Self::from_identity(identity))
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self { pid, generation: None })
+        }
+    }
+
+    fn from_identity(identity: ProcessIdentity) -> Self {
+        Self {
+            pid: identity.pid,
+            generation: Some(identity.generation),
+        }
+    }
+}
 mod process_quiescence;
 #[cfg(unix)]
 mod supervisor_takeover;
@@ -46,7 +96,10 @@ pub(super) enum SupervisorRestartOutcome {
     },
 }
 
-pub(super) async fn request_supervisor_shutdown(install_dir: &Path, supervisor_id: &str) -> Result<Option<u32>> {
+pub(super) async fn request_supervisor_shutdown(
+    install_dir: &Path,
+    supervisor_id: &str,
+) -> Result<Option<ProcessIdentity>> {
     request_supervisor_shutdown_with_timeout(
         install_dir,
         supervisor_id,
@@ -61,7 +114,7 @@ pub(super) async fn request_supervisor_shutdown_with_timeout(
     supervisor_id: &str,
     timeout: Duration,
     poll_interval: Duration,
-) -> Result<Option<u32>> {
+) -> Result<Option<ProcessIdentity>> {
     let supervisor_id = supervisor_id.trim();
     if supervisor_id.is_empty() {
         return Ok(None);
@@ -82,7 +135,7 @@ async fn request_legacy_supervisor_shutdown(
     supervisor_id: &str,
     timeout: Duration,
     poll_interval: Duration,
-) -> Result<Option<u32>> {
+) -> Result<Option<ProcessIdentity>> {
     let pid_file = supervisor_pid_file(install_dir, supervisor_id);
     if !pid_file.is_file() {
         return Ok(None);
@@ -192,7 +245,7 @@ pub(super) fn restore_previous_supervisor_after_failed_quiescence(
     main_exe: &str,
     supervisor_id: &str,
     environment: &std::collections::BTreeMap<String, String>,
-    watched_pid: u32,
+    watched_identity: ProcessIdentity,
 ) -> SupervisorRestartOutcome {
     let previous = ReleaseEntry {
         version: version.to_string(),
@@ -205,7 +258,7 @@ pub(super) fn restore_previous_supervisor_after_failed_quiescence(
         install_dir,
         active_app_dir,
         &previous,
-        Some(watched_pid),
+        Some(SupervisorWatchTarget::from_identity(watched_identity)),
         None,
         SUPERVISOR_RESTART_CONFIRM_TIMEOUT,
         SUPERVISOR_RESTART_MAX_ATTEMPTS,
@@ -219,11 +272,21 @@ pub(super) fn restart_supervisor_after_update_with_pid(
     latest: &ReleaseEntry,
     watched_pid: u32,
 ) -> SupervisorRestartOutcome {
+    let watched_process = match SupervisorWatchTarget::capture(watched_pid) {
+        Ok(watched_process) => watched_process,
+        Err(error) => {
+            warn!(watched_pid, %error, "Cannot restart supervisor without a stable watch target");
+            return SupervisorRestartOutcome::PendingRestart {
+                reason: error.to_string(),
+                failure_phase: RESTART_HANDOFF_FAILED_PHASE,
+            };
+        }
+    };
     restart_supervisor_after_update_with_config(
         install_dir,
         active_app_dir,
         latest,
-        Some(watched_pid),
+        Some(watched_process),
         Some(&latest.version),
         SUPERVISOR_RESTART_CONFIRM_TIMEOUT,
         SUPERVISOR_RESTART_MAX_ATTEMPTS,
@@ -253,7 +316,7 @@ fn restart_supervisor_after_update_with_config(
     install_dir: &Path,
     active_app_dir: &Path,
     latest: &ReleaseEntry,
-    watched_pid: Option<u32>,
+    watched_process: Option<SupervisorWatchTarget>,
     handoff_version: Option<&str>,
     confirm_timeout: Duration,
     max_attempts: u32,
@@ -312,7 +375,13 @@ fn restart_supervisor_after_update_with_config(
         }
     };
 
-    let args = supervisor_restart_args(supervisor_id, install_dir, watched_pid, handoff_version, &restart_args);
+    let args = supervisor_restart_args(
+        supervisor_id,
+        install_dir,
+        watched_process,
+        handoff_version,
+        &restart_args,
+    );
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
 
     let mut last_failure: Option<(String, &'static str)> = None;
@@ -326,21 +395,23 @@ fn restart_supervisor_after_update_with_config(
                 if confirm_supervisor_restart(install_dir, supervisor_id, confirm_timeout) {
                     let reason = handoff_version.map_or_else(
                         || {
-                            watched_pid.map_or_else(
+                            watched_process.map_or_else(
                                 || "previous supervisor restoration accepted".to_string(),
-                                |watched_pid| {
+                                |watched_process| {
                                     format!(
-                                        "previous supervisor restoration accepted; waiting for process pid {watched_pid} to exit"
+                                        "previous supervisor restoration accepted; waiting for process pid {} to exit",
+                                        watched_process.pid
                                     )
                                 },
                             )
                         },
                         |version| {
-                            watched_pid.map_or_else(
+                            watched_process.map_or_else(
                                 || format!("supervisor restart accepted; waiting for target version {version} to start"),
-                                |watched_pid| {
+                                |watched_process| {
                                     format!(
-                                        "supervisor handoff accepted; waiting for previous child pid {watched_pid} to exit and target version {version} to start"
+                                        "supervisor handoff accepted; waiting for previous child pid {} to exit and target version {version} to start",
+                                        watched_process.pid
                                     )
                                 },
                             )
@@ -390,22 +461,26 @@ fn restart_supervisor_after_update_with_config(
 fn supervisor_restart_args(
     supervisor_id: &str,
     install_dir: &Path,
-    watched_pid: Option<u32>,
+    watched_process: Option<SupervisorWatchTarget>,
     handoff_version: Option<&str>,
     restart_args: &[String],
 ) -> Vec<String> {
     let mut args = vec![
-        if watched_pid.is_some() { "watch" } else { "run" }.to_string(),
+        if watched_process.is_some() { "watch" } else { "run" }.to_string(),
         "--id".to_string(),
         supervisor_id.to_string(),
         "--dir".to_string(),
         install_dir.to_string_lossy().into_owned(),
     ];
-    if let Some(watched_pid) = watched_pid {
+    if let Some(watched_process) = watched_process {
         args.push("--pid".to_string());
-        args.push(watched_pid.to_string());
+        args.push(watched_process.pid.to_string());
+        if let Some(generation) = watched_process.generation {
+            args.push("--generation".to_string());
+            args.push(generation.to_string());
+        }
     }
-    if watched_pid.is_some()
+    if watched_process.is_some()
         && let Some(handoff_version) = handoff_version
     {
         args.push("--handoff-version".to_string());
@@ -466,7 +541,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn acknowledged_supervisor_handoff_returns_the_refreshed_child_pid() {
+    async fn acknowledged_supervisor_handoff_returns_the_refreshed_child_identity() {
         let dir = tempfile::tempdir().unwrap();
         let supervisor_id = "demo-supervisor";
         let supervisor_pid = 42;
@@ -497,7 +572,7 @@ mod tests {
             std::fs::remove_file(supervisor_pid_file(&install_dir, supervisor_id)).unwrap();
         });
 
-        let child_pid = request_supervisor_shutdown_with_timeout(
+        let child_identity = request_supervisor_shutdown_with_timeout(
             dir.path(),
             supervisor_id,
             Duration::from_secs(1),
@@ -507,7 +582,7 @@ mod tests {
         .unwrap();
         responder.join().unwrap();
 
-        assert_eq!(child_pid, Some(84));
+        assert_eq!(child_identity, Some(ProcessIdentity { pid: 84, generation: 7 }));
         assert!(
             read_accepted_supervisor_takeover(dir.path(), supervisor_id)
                 .unwrap()
@@ -574,7 +649,10 @@ mod tests {
         let args = supervisor_restart_args(
             "demo-supervisor",
             Path::new("/opt/demo"),
-            Some(42),
+            Some(SupervisorWatchTarget {
+                pid: 42,
+                generation: Some(7),
+            }),
             Some("2.0.0"),
             &restart_args,
         );
@@ -589,6 +667,8 @@ mod tests {
                 "/opt/demo",
                 "--pid",
                 "42",
+                "--generation",
+                "7",
                 "--handoff-version",
                 "2.0.0",
                 "--",
@@ -604,9 +684,19 @@ mod tests {
 
     #[test]
     fn previous_supervisor_restoration_omits_update_handoff_version() {
-        let args = supervisor_restart_args("demo-supervisor", Path::new("/opt/demo"), Some(42), None, &[]);
+        let args = supervisor_restart_args(
+            "demo-supervisor",
+            Path::new("/opt/demo"),
+            Some(SupervisorWatchTarget {
+                pid: 42,
+                generation: Some(7),
+            }),
+            None,
+            &[],
+        );
 
         assert!(!args.iter().any(|argument| argument == "--handoff-version"));
+        assert!(args.windows(2).any(|pair| pair[0] == "--generation" && pair[1] == "7"));
     }
 
     #[test]
@@ -655,7 +745,7 @@ mod tests {
             install_dir,
             &active_app_dir,
             &latest,
-            Some(std::process::id()),
+            Some(SupervisorWatchTarget::capture(std::process::id()).unwrap()),
             Some(&latest.version),
             Duration::from_millis(200),
             2,

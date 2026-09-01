@@ -2,11 +2,12 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::error::{Result, SurgeError};
+use crate::platform::process::ProcessIdentity;
 use crate::supervisor::state::{
     SupervisorTakeoverCancellation, SupervisorTakeoverCommit, SupervisorTakeoverHandoff, SupervisorTakeoverInstance,
     SupervisorTakeoverRequest, cancel_supervisor_takeover_request, clear_supervisor_takeover_exchange,
     read_accepted_supervisor_takeover, read_supervisor_takeover_acknowledgement, read_supervisor_takeover_instance,
-    supervisor_pid_file, take_accepted_supervisor_takeover, take_supervisor_takeover_pid,
+    read_supervisor_takeover_pid, supervisor_pid_file, take_accepted_supervisor_takeover,
     try_clear_supervisor_takeover_pid, write_supervisor_takeover_commit, write_supervisor_takeover_request,
 };
 
@@ -17,13 +18,18 @@ pub(super) async fn request_shutdown(
     supervisor_id: &str,
     timeout: Duration,
     poll_interval: Duration,
-) -> Result<Option<u32>> {
+) -> Result<Option<ProcessIdentity>> {
     let pid_file = supervisor_pid_file(install_dir, supervisor_id);
     let Some(supervisor_pid) = read_supervisor_pid_owner(&pid_file)? else {
         if let Some(handoff) = take_accepted_supervisor_takeover(install_dir, supervisor_id)? {
-            return Ok(handoff.child_identity.map(|identity| identity.pid));
+            return Ok(handoff.child_identity);
         }
-        return Ok(take_supervisor_takeover_pid(install_dir, supervisor_id));
+        if let Some(pid) = read_supervisor_takeover_pid(install_dir, supervisor_id)? {
+            return Err(SurgeError::Update(format!(
+                "Legacy supervisor takeover state for PID {pid} has no process generation; refusing to continue the update"
+            )));
+        }
+        return Ok(None);
     };
 
     let instance = read_supervisor_takeover_instance(install_dir, supervisor_id)?.ok_or_else(|| {
@@ -197,7 +203,7 @@ async fn finish_timed_out_takeover(
     instance: &SupervisorTakeoverInstance,
     request: &SupervisorTakeoverRequest,
     poll_interval: Duration,
-) -> Result<Option<u32>> {
+) -> Result<Option<ProcessIdentity>> {
     match cancel_supervisor_takeover_request(install_dir, supervisor_id, request)? {
         SupervisorTakeoverCancellation::Cancelled => {
             clear_supervisor_takeover_exchange(install_dir, supervisor_id)?;
@@ -232,7 +238,7 @@ async fn finish_accepted_takeover(
     instance: &SupervisorTakeoverInstance,
     request: Option<&SupervisorTakeoverRequest>,
     poll_interval: Duration,
-) -> Result<Option<u32>> {
+) -> Result<Option<ProcessIdentity>> {
     let deadline = tokio::time::Instant::now() + SUPERVISOR_TAKEOVER_EXIT_GRACE;
     while read_supervisor_pid_owner(pid_file)? == Some(instance.supervisor_pid) {
         if tokio::time::Instant::now() >= deadline {
@@ -258,7 +264,7 @@ async fn finish_accepted_takeover(
             ))
         })?;
         ensure_handoff_matches_instance(supervisor_id, &consumed, instance)?;
-        Ok(consumed.child_identity.map(|identity| identity.pid))
+        Ok(consumed.child_identity)
     }
 }
 
@@ -266,7 +272,7 @@ fn take_matching_accepted_handoff(
     install_dir: &Path,
     supervisor_id: &str,
     request: &SupervisorTakeoverRequest,
-) -> Result<Option<u32>> {
+) -> Result<Option<ProcessIdentity>> {
     let handoff = read_accepted_supervisor_takeover(install_dir, supervisor_id)?.ok_or_else(|| {
         SurgeError::Update(format!(
             "Supervisor '{supervisor_id}' accepted takeover record disappeared before it was consumed"
@@ -279,5 +285,5 @@ fn take_matching_accepted_handoff(
         ))
     })?;
     ensure_handoff_matches_request(supervisor_id, &consumed, request)?;
-    Ok(consumed.child_identity.map(|identity| identity.pid))
+    Ok(consumed.child_identity)
 }

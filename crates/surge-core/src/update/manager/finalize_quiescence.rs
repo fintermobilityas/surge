@@ -4,6 +4,7 @@ use std::path::Path;
 use tracing::warn;
 
 use crate::error::{Result, SurgeError};
+use crate::platform::process::ProcessIdentity;
 
 use super::UpdateManager;
 use super::lifecycle::{self, SupervisorRestartOutcome};
@@ -17,7 +18,7 @@ pub(super) fn prepare_and_quiesce_active_app_before_swap(
     current_supervisor_id: &str,
     current_environment: Option<&BTreeMap<String, String>>,
     supervisor_requires_restoration: bool,
-    supervised_child_pid: Option<u32>,
+    supervised_child_identity: Option<ProcessIdentity>,
     allow_in_process_swap: bool,
 ) -> Result<Option<lifecycle::PreparedAppQuiescence>> {
     let result = (|| {
@@ -39,7 +40,7 @@ pub(super) fn prepare_and_quiesce_active_app_before_swap(
         current_supervisor_id,
         current_environment,
         supervisor_requires_restoration,
-        supervised_child_pid,
+        supervised_child_identity,
         error,
     ))
 }
@@ -53,7 +54,7 @@ pub(super) fn restore_previous_supervisor_after_quiescence_failure(
     current_supervisor_id: &str,
     current_environment: Option<&BTreeMap<String, String>>,
     supervisor_requires_restoration: bool,
-    supervised_child_pid: Option<u32>,
+    supervised_child_identity: Option<ProcessIdentity>,
     error: SurgeError,
 ) -> SurgeError {
     if supervisor_requires_restoration
@@ -67,7 +68,7 @@ pub(super) fn restore_previous_supervisor_after_quiescence_failure(
             current_main_exe,
             current_supervisor_id,
             current_environment,
-            supervised_child_pid,
+            supervised_child_identity,
         );
     }
 
@@ -84,7 +85,7 @@ pub(super) async fn prepare_and_quiesce_previous_swap_before_reuse(
     current_supervisor_id: &str,
     current_environment: Option<&BTreeMap<String, String>>,
     supervisor_requires_restoration: bool,
-    supervised_child_pid: Option<u32>,
+    supervised_child_identity: Option<ProcessIdentity>,
 ) -> Result<Option<(lifecycle::PreparedAppQuiescence, String)>> {
     let restore_current = |error| {
         restore_previous_supervisor_after_quiescence_failure(
@@ -95,7 +96,7 @@ pub(super) async fn prepare_and_quiesce_previous_swap_before_reuse(
             current_supervisor_id,
             current_environment,
             supervisor_requires_restoration,
-            supervised_child_pid,
+            supervised_child_identity,
             error,
         )
     };
@@ -108,7 +109,7 @@ pub(super) async fn prepare_and_quiesce_previous_swap_before_reuse(
         }
         Err(error) => return Err(restore_current(error)),
     };
-    let previous_supervised_child_pid =
+    let previous_supervised_child_identity =
         match lifecycle::request_supervisor_shutdown(&manager.install_dir, &previous_swap_identity.supervisor_id).await
         {
             Ok(pid) => pid,
@@ -132,7 +133,7 @@ pub(super) async fn prepare_and_quiesce_previous_swap_before_reuse(
     match result {
         Ok(prepared) => Ok(Some((prepared, previous_swap_identity.main_exe))),
         Err(error) => {
-            if previous_supervised_child_pid.is_some()
+            if previous_supervised_child_identity.is_some()
                 && (!supervisor_requires_restoration || previous_swap_identity.supervisor_id != current_supervisor_id)
             {
                 request_previous_supervisor_restoration(
@@ -142,9 +143,9 @@ pub(super) async fn prepare_and_quiesce_previous_swap_before_reuse(
                     &previous_swap_identity.main_exe,
                     &previous_swap_identity.supervisor_id,
                     &previous_swap_identity.environment,
-                    previous_supervised_child_pid,
+                    previous_supervised_child_identity,
                 );
-            } else if previous_supervised_child_pid.is_some() {
+            } else if previous_supervised_child_identity.is_some() {
                 warn!(
                     supervisor_id = current_supervisor_id,
                     "Cannot restore both current and previous-swap children through the same supervisor identity"
@@ -162,9 +163,9 @@ fn request_previous_supervisor_restoration(
     current_main_exe: &str,
     current_supervisor_id: &str,
     current_environment: &BTreeMap<String, String>,
-    supervised_child_pid: Option<u32>,
+    supervised_child_identity: Option<ProcessIdentity>,
 ) {
-    let Some(supervised_child_pid) = supervised_child_pid else {
+    let Some(supervised_child_identity) = supervised_child_identity else {
         warn!(
             supervisor_id = current_supervisor_id,
             "Cannot safely restore the previous supervisor because it did not provide its surviving child PID"
@@ -178,7 +179,7 @@ fn request_previous_supervisor_restoration(
         current_main_exe,
         current_supervisor_id,
         current_environment,
-        supervised_child_pid,
+        supervised_child_identity,
     );
     match restore_outcome {
         SupervisorRestartOutcome::NotApplicable => {
@@ -203,7 +204,11 @@ mod tests {
     use std::process::{Command, Stdio};
     use std::time::Duration;
 
-    use crate::supervisor::state::{supervisor_pid_file, write_supervisor_takeover_pid};
+    use crate::supervisor::state::{
+        SupervisorTakeoverAcknowledgement, SupervisorTakeoverCommit, SupervisorTakeoverInstance,
+        SupervisorTakeoverRequest, accept_supervisor_takeover_request, supervisor_pid_file,
+        write_supervisor_takeover_acknowledgement, write_supervisor_takeover_commit, write_supervisor_takeover_request,
+    };
 
     use super::*;
 
@@ -245,6 +250,7 @@ mod tests {
 
         let current_environment = BTreeMap::from([("SURGE_TEST_MODE".to_string(), "preserved".to_string())]);
         let child_pid = child.id();
+        let child_identity = crate::platform::process::process_identity(child_pid).unwrap().unwrap();
         let result = prepare_and_quiesce_active_app_before_swap(
             install_dir,
             &active_app_dir,
@@ -253,7 +259,7 @@ mod tests {
             "demo-supervisor",
             Some(&current_environment),
             true,
-            Some(child_pid),
+            Some(child_identity),
             false,
         );
         let child_still_running = child.try_wait().unwrap().is_none();
@@ -279,6 +285,12 @@ mod tests {
                 .unwrap()
                 .trim(),
             child_pid.to_string()
+        );
+        assert_eq!(
+            std::fs::read_to_string(install_dir.join("restored-watched.generation"))
+                .unwrap()
+                .trim(),
+            child_identity.generation.to_string()
         );
     }
 
@@ -319,7 +331,10 @@ mod tests {
             "demo-supervisor",
             Some(&current_environment),
             true,
-            Some(4242),
+            Some(ProcessIdentity {
+                pid: 4242,
+                generation: 7,
+            }),
         )
         .await
         .err()
@@ -340,6 +355,12 @@ mod tests {
                 .unwrap()
                 .trim(),
             "4242"
+        );
+        assert_eq!(
+            std::fs::read_to_string(install_dir.join("restored-watched.generation"))
+                .unwrap()
+                .trim(),
+            "7"
         );
     }
 
@@ -385,7 +406,8 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "test child did not change cwd");
             std::thread::sleep(Duration::from_millis(10));
         }
-        write_supervisor_takeover_pid(&install_dir, "previous-supervisor", child.id()).unwrap();
+        let child_identity = crate::platform::process::process_identity(child.id()).unwrap().unwrap();
+        write_accepted_takeover(&install_dir, "previous-supervisor", child_identity);
 
         let ctx = std::sync::Arc::new(crate::context::Context::new());
         ctx.set_storage(
@@ -435,6 +457,23 @@ mod tests {
                 .trim(),
             child_pid.to_string()
         );
+        assert_eq!(
+            std::fs::read_to_string(install_dir.join("restored-watched.generation"))
+                .unwrap()
+                .trim(),
+            child_identity.generation.to_string()
+        );
+    }
+
+    fn write_accepted_takeover(install_dir: &Path, supervisor_id: &str, child_identity: ProcessIdentity) {
+        let instance = SupervisorTakeoverInstance::new(42);
+        let request = SupervisorTakeoverRequest::new(&instance, Duration::from_secs(5));
+        let acknowledgement = SupervisorTakeoverAcknowledgement::new(&request, Some(child_identity));
+        let commit = SupervisorTakeoverCommit::new(&acknowledgement);
+        write_supervisor_takeover_request(install_dir, supervisor_id, &request).unwrap();
+        write_supervisor_takeover_acknowledgement(install_dir, supervisor_id, &acknowledgement).unwrap();
+        write_supervisor_takeover_commit(install_dir, supervisor_id, &commit).unwrap();
+        assert!(accept_supervisor_takeover_request(install_dir, supervisor_id, &request).unwrap());
     }
 
     fn write_test_supervisor(active_app_dir: &Path) {
@@ -445,16 +484,19 @@ mod tests {
 id=""
 dir=""
 pid=""
+generation=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --id) id="$2"; shift 2 ;;
     --dir) dir="$2"; shift 2 ;;
     --pid) pid="$2"; shift 2 ;;
+    --generation) generation="$2"; shift 2 ;;
     *) shift ;;
   esac
 done
 printf '%s' "$SURGE_TEST_MODE" > "$dir/restored-environment"
 printf '%s' "$pid" > "$dir/restored-watched.pid"
+printf '%s' "$generation" > "$dir/restored-watched.generation"
 echo $$ > "$dir/.surge-supervisor-$id.pid"
 "#,
         )

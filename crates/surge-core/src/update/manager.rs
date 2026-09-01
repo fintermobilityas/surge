@@ -1205,19 +1205,18 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn test_request_supervisor_shutdown_consumes_existing_takeover_when_pid_file_is_missing() {
+    async fn test_request_supervisor_shutdown_rejects_legacy_takeover_without_generation() {
         let tmp = tempfile::tempdir().unwrap();
         crate::supervisor::state::write_supervisor_takeover_pid(tmp.path(), "test-supervisor", 42).unwrap();
 
-        assert_eq!(
-            lifecycle::request_supervisor_shutdown(tmp.path(), "test-supervisor")
-                .await
-                .unwrap(),
-            Some(42)
-        );
+        let error = lifecycle::request_supervisor_shutdown(tmp.path(), "test-supervisor")
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("has no process generation"));
         assert_eq!(
             crate::supervisor::state::take_supervisor_takeover_pid(tmp.path(), "test-supervisor"),
-            None
+            Some(42)
         );
     }
 

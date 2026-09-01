@@ -192,7 +192,7 @@ where
     let supervisor_was_running = !current_supervisor_id.trim().is_empty()
         && supervisor_pid_file(&manager.install_dir, current_supervisor_id).is_file();
 
-    let supervised_child_pid = if supervisor_was_running {
+    let supervised_child_identity = if supervisor_was_running {
         progress_emitter
             .run_with_heartbeat(
                 6,
@@ -206,7 +206,7 @@ where
         lifecycle::request_supervisor_shutdown(&manager.install_dir, current_supervisor_id).await?
     };
     #[cfg(unix)]
-    let supervisor_requires_restoration = supervisor_was_running || supervised_child_pid.is_some();
+    let supervisor_requires_restoration = supervisor_was_running || supervised_child_identity.is_some();
 
     progress_emitter.emit_substep(6, finalize_phase::QUIESCING_ACTIVE_APP, 92);
     #[cfg(unix)]
@@ -219,7 +219,7 @@ where
             current_supervisor_id,
             current_environment,
             supervisor_requires_restoration,
-            supervised_child_pid,
+            supervised_child_identity,
             manager.allow_in_process_swap,
         )?
     } else {
@@ -227,7 +227,7 @@ where
     };
     #[cfg(not(unix))]
     if let Some(current_app_dir) = current_app_dir {
-        let _ = supervised_child_pid;
+        let _ = supervised_child_identity;
         lifecycle::terminate_active_app_processes_before_swap(
             current_app_dir,
             current_main_exe,
@@ -245,7 +245,7 @@ where
             current_supervisor_id,
             current_environment,
             supervisor_requires_restoration,
-            supervised_child_pid,
+            supervised_child_identity,
         )
         .await?
     } else {
@@ -285,7 +285,7 @@ where
                 current_supervisor_id,
                 current_environment,
                 supervisor_requires_restoration,
-                supervised_child_pid,
+                supervised_child_identity,
                 error,
             )
             .into());
@@ -301,7 +301,7 @@ where
                 current_supervisor_id,
                 current_environment,
                 supervisor_requires_restoration,
-                supervised_child_pid,
+                supervised_child_identity,
                 error,
             )
             .into());

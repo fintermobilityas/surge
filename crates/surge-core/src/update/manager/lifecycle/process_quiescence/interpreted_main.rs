@@ -104,6 +104,12 @@ fn resolve_env_command(command: &EnvCommand) -> Result<PathBuf> {
                 program.display()
             ))
         })?;
+        if !is_executable_file(&resolved) {
+            return Err(SurgeError::Platform(format!(
+                "Active application env interpreter '{}' is not executable",
+                program.display()
+            )));
+        }
         return validate_resolved_interpreter(resolved);
     }
     if program.components().count() != 1 {
@@ -126,9 +132,13 @@ fn resolve_env_command(command: &EnvCommand) -> Result<PathBuf> {
             )));
         }
         let candidate = directory.join(program);
-        if let Ok(candidate) = std::fs::canonicalize(candidate) {
-            return validate_resolved_interpreter(candidate);
+        let Ok(candidate) = std::fs::canonicalize(candidate) else {
+            continue;
+        };
+        if !is_executable_file(&candidate) {
+            continue;
         }
+        return validate_resolved_interpreter(candidate);
     }
 
     Err(SurgeError::Platform(format!(
@@ -336,49 +346,6 @@ fn is_env_assignment(word: &str) -> bool {
         && characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
 }
 
-#[cfg(any(target_os = "macos", test))]
-fn split_command_words(command: &str) -> Result<Vec<String>> {
-    let mut words = Vec::new();
-    let mut word = String::new();
-    let mut quote = None;
-    let mut escaped = false;
-    let mut started = false;
-
-    for character in command.chars() {
-        if escaped {
-            word.push(character);
-            escaped = false;
-            started = true;
-        } else if character == '\\' && quote != Some('\'') {
-            escaped = true;
-            started = true;
-        } else if matches!(character, '\'' | '"') && quote == Some(character) {
-            quote = None;
-        } else if matches!(character, '\'' | '"') && quote.is_none() {
-            quote = Some(character);
-            started = true;
-        } else if character.is_whitespace() && quote.is_none() {
-            if started {
-                words.push(std::mem::take(&mut word));
-                started = false;
-            }
-        } else {
-            word.push(character);
-            started = true;
-        }
-    }
-
-    if escaped || quote.is_some() {
-        return Err(SurgeError::Platform(
-            "Active application env shebang contains an unterminated escape or quote".to_string(),
-        ));
-    }
-    if started {
-        words.push(word);
-    }
-    Ok(words)
-}
-
 fn resolve_direct_interpreter_path(interpreter: &str) -> Result<PathBuf> {
     let interpreter = Path::new(interpreter);
     if !interpreter.is_absolute() {
@@ -403,22 +370,58 @@ fn validate_resolved_interpreter(resolved: PathBuf) -> Result<PathBuf> {
             resolved.display()
         ))
     })?;
-    let mut prefix = [0_u8; 2];
-    if file.read(&mut prefix).map_err(|e| {
+    let mut prefix = [0_u8; 4];
+    let prefix_len = file.read(&mut prefix).map_err(|e| {
         SurgeError::Platform(format!(
             "Failed to inspect active application interpreter '{}': {e}",
             resolved.display()
         ))
-    })? == prefix.len()
-        && prefix == *b"#!"
-    {
+    })?;
+    if prefix[..prefix_len].starts_with(b"#!") {
         return Err(SurgeError::Platform(format!(
             "Active application interpreter '{}' is itself a shebang script; nested interpreters are unsupported",
             resolved.display()
         )));
     }
+    if prefix_len < prefix.len() || !is_supported_native_executable(prefix) {
+        return Err(SurgeError::Platform(format!(
+            "Active application interpreter '{}' is not a supported native executable; shell fallback interpreters are unsupported",
+            resolved.display()
+        )));
+    }
 
     Ok(resolved)
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    use nix::unistd::{AccessFlags, access};
+
+    path.is_file() && access(path, AccessFlags::X_OK).is_ok()
+}
+
+#[cfg(target_os = "linux")]
+fn is_supported_native_executable(prefix: [u8; 4]) -> bool {
+    prefix == *b"\x7fELF"
+}
+
+#[cfg(target_os = "macos")]
+fn is_supported_native_executable(prefix: [u8; 4]) -> bool {
+    matches!(
+        prefix,
+        [0xfe, 0xed, 0xfa, 0xce]
+            | [0xfe, 0xed, 0xfa, 0xcf]
+            | [0xce, 0xfa, 0xed, 0xfe]
+            | [0xcf, 0xfa, 0xed, 0xfe]
+            | [0xca, 0xfe, 0xba, 0xbe]
+            | [0xca, 0xfe, 0xba, 0xbf]
+            | [0xbe, 0xba, 0xfe, 0xca]
+            | [0xbf, 0xba, 0xfe, 0xca]
+    )
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn is_supported_native_executable(_prefix: [u8; 4]) -> bool {
+    true
 }
 
 fn ensure_supported_env_interpreter(interpreter: &str) -> Result<()> {
@@ -463,12 +466,12 @@ fn direct_interpreter_argument_count(argument: &str) -> usize {
 mod tests {
     use super::*;
 
-    #[test]
-    fn split_command_words_preserves_quoted_and_escaped_arguments() {
-        assert_eq!(
-            split_command_words("/bin/sh '-e value' plain\\ value").unwrap(),
-            vec!["/bin/sh", "-e value", "plain value"]
-        );
+    fn make_executable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).unwrap();
     }
 
     #[test]
@@ -500,9 +503,11 @@ mod tests {
 
     #[test]
     fn env_path_assignment_preserves_launch_resolution() {
+        use std::os::unix::fs::symlink;
+
         let tmp = tempfile::tempdir().unwrap();
         let interpreter = tmp.path().join("demo-interpreter");
-        std::fs::write(&interpreter, "fixture").unwrap();
+        symlink("/bin/sh", &interpreter).unwrap();
         let command = parse_env_command(&format!("-S PATH={} demo-interpreter -e", tmp.path().display())).unwrap();
         let identity = Identity {
             interpreter: Interpreter::EnvCommand(command),
@@ -513,10 +518,54 @@ mod tests {
     }
 
     #[test]
+    fn env_path_lookup_skips_non_executable_candidates() {
+        use std::os::unix::fs::symlink;
+
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        std::fs::write(first.path().join("demo-interpreter"), "not executable").unwrap();
+        let expected = second.path().join("demo-interpreter");
+        symlink("/bin/sh", &expected).unwrap();
+        let search_path = std::env::join_paths([first.path(), second.path()]).unwrap();
+        let command = EnvCommand {
+            program: OsString::from("demo-interpreter"),
+            fixed_argument_count: 0,
+            search_path: EnvSearchPath::Explicit(search_path),
+        };
+
+        assert!(paths_resolve_to_same_executable(
+            &resolve_env_command(&command).unwrap(),
+            &expected
+        ));
+    }
+
+    #[test]
+    fn env_command_rejects_executable_shell_fallback_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let interpreter = tmp.path().join("demo-interpreter");
+        std::fs::write(&interpreter, "echo fallback\n").unwrap();
+        make_executable(&interpreter);
+        let command = EnvCommand {
+            program: interpreter.into_os_string(),
+            fixed_argument_count: 0,
+            search_path: EnvSearchPath::Inherited,
+        };
+
+        let error = resolve_env_command(&command).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("shell fallback interpreters are unsupported")
+        );
+    }
+
+    #[test]
     fn absolute_env_command_rejects_nested_interpreter() {
         let tmp = tempfile::tempdir().unwrap();
         let interpreter = tmp.path().join("demo-interpreter");
         std::fs::write(&interpreter, "#!/bin/sh\n").unwrap();
+        make_executable(&interpreter);
         let command = parse_env_command(interpreter.to_str().unwrap()).unwrap();
 
         let error = resolve_env_command(&command).unwrap_err();
@@ -529,6 +578,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let interpreter = tmp.path().join("demo-interpreter");
         std::fs::write(&interpreter, "#!/bin/sh\n").unwrap();
+        make_executable(&interpreter);
         let command = parse_env_command(&format!("-S -P {} demo-interpreter", tmp.path().display())).unwrap();
 
         let error = resolve_env_command(&command).unwrap_err();

@@ -6,8 +6,8 @@ use crate::archive::extractor::extract_to;
 use crate::crypto::sha256::sha256_hex;
 use crate::error::{Result, SurgeError};
 use crate::releases::delta::{
-    DeltaApplyProgress, apply_delta_patch_with_progress, apply_sparse_step_in_place, decode_delta_patch,
-    is_supported_delta, sparse_step_units_for,
+    DeltaApplyProgress, VerifiedFileHashes, apply_delta_patch_with_progress, apply_sparse_step_in_place,
+    decode_delta_patch, is_supported_delta, sparse_step_units_for,
 };
 use crate::releases::manifest::{DIFF_ALGORITHM_FILE_OPS, DeltaArtifact, PATCH_FORMAT_SPARSE_FILE_OPS_V1};
 
@@ -51,6 +51,10 @@ where
     // skipping the per-step re-extract. Per-step repack and the full
     // SHA-256 check below are unchanged.
     let mut chain_workdir: Option<tempfile::TempDir> = None;
+    // Hashes verified by this walk; lets consecutive sparse steps skip the
+    // redundant full-file basis re-hash (the target hash of step N is the
+    // basis hash of step N+1).
+    let mut verified_hashes = VerifiedFileHashes::new();
 
     progress_emitter.emit_substep(5, apply_phase::APPLYING_TARGET_DELTAS, 60);
     for release in &info.apply_releases {
@@ -127,7 +131,7 @@ where
             // The closure returns Result so every failure in this arm flows
             // through the shared error handler below (filename context +
             // VerifyFailureBudget), like the archive path.
-            let apply_sparse_carry = |workdir_slot: &mut Option<tempfile::TempDir>| -> Result<Vec<u8>> {
+            let mut apply_sparse_carry = |workdir_slot: &mut Option<tempfile::TempDir>| -> Result<Vec<u8>> {
                 let (existing, needs_extract) = match workdir_slot.take() {
                     Some(wd) => (Some(wd), false),
                     None => (None, true),
@@ -169,7 +173,13 @@ where
                         wd
                     }
                 };
-                let applied = apply_sparse_step_in_place(workdir.path(), &patch, extract_units, Some(&delta_progress))?;
+                let applied = apply_sparse_step_in_place(
+                    workdir.path(),
+                    &patch,
+                    extract_units,
+                    Some(&delta_progress),
+                    &mut verified_hashes,
+                )?;
                 *workdir_slot = Some(workdir);
                 Ok(applied)
             };

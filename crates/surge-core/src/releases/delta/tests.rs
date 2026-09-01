@@ -390,8 +390,71 @@ fn test_in_place_chain_steps_match_single_shot_apply() {
     let chain_dir = dir.path().join("chain");
     std::fs::create_dir_all(&chain_dir).unwrap();
     extract_to(&full_v1, &chain_dir, None).unwrap();
-    let chain_step1 = apply_sparse_step_in_place(&chain_dir, &patch_12, 0, None).unwrap();
+    // The shared verified-hash cache is what production chain walks use:
+    // step 2's basis check for config.json is answered from step 1's
+    // target verification instead of a full re-hash.
+    let mut verified = VerifiedFileHashes::new();
+    let chain_step1 = apply_sparse_step_in_place(&chain_dir, &patch_12, 0, None, &mut verified).unwrap();
     assert_eq!(chain_step1, single_step1);
-    let chain_step2 = apply_sparse_step_in_place(&chain_dir, &patch_23, 0, None).unwrap();
+    let chain_step2 = apply_sparse_step_in_place(&chain_dir, &patch_23, 0, None, &mut verified).unwrap();
     assert_eq!(chain_step2, single_step2);
+}
+
+#[test]
+fn test_in_place_chain_with_verified_cache_detects_external_modification() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let v1_dir = dir.path().join("v1");
+    let v2_dir = dir.path().join("v2");
+    let v3_dir = dir.path().join("v3");
+    for v in [&v1_dir, &v2_dir, &v3_dir] {
+        std::fs::create_dir_all(v).unwrap();
+        let payload = (0..(256 * 1024)).map(|i| (i % 251) as u8).collect::<Vec<u8>>();
+        std::fs::write(v.join("payload.bin"), &payload).unwrap();
+    }
+    for (v, tag) in [
+        (v1_dir.as_path(), 1u8),
+        (v2_dir.as_path(), 2u8),
+        (v3_dir.as_path(), 3u8),
+    ] {
+        let mut p = std::fs::read(v.join("payload.bin")).unwrap();
+        p[0] = tag;
+        std::fs::write(v.join("payload.bin"), p).unwrap();
+    }
+
+    let pack = |d: &std::path::Path| -> Vec<u8> {
+        let mut packer = ArchivePacker::new(7).unwrap();
+        packer.add_directory(d, "").unwrap();
+        packer.finalize().unwrap()
+    };
+    let full_v1 = pack(&v1_dir);
+    let full_v2 = pack(&v2_dir);
+    let full_v3 = pack(&v3_dir);
+
+    let opts = ChunkedDiffOptions {
+        chunk_size: 128 * 1024,
+        max_threads: 1,
+    };
+    let patch_12 = build_sparse_file_patch(&full_v1, &full_v2, 7, 0, &opts).unwrap();
+    let patch_23 = build_sparse_file_patch(&full_v2, &full_v3, 7, 0, &opts).unwrap();
+
+    let chain_dir = dir.path().join("chain");
+    extract_to(&full_v1, &chain_dir, None).unwrap();
+    let mut verified = VerifiedFileHashes::new();
+    let step1 = apply_sparse_step_in_place(&chain_dir, &patch_12, 0, None, &mut verified).unwrap();
+    assert_eq!(step1, full_v2);
+    // The cache now believes payload.bin holds the v2 content.
+
+    // Simulate external corruption between steps (bypasses the cache).
+    let mut corrupted = std::fs::read(chain_dir.join("payload.bin")).unwrap();
+    corrupted[1] = 0xFF;
+    std::fs::write(chain_dir.join("payload.bin"), corrupted).unwrap();
+
+    // Step 2 skips the basis re-hash via the cache, but the post-patch
+    // target hash must still catch the corrupted source.
+    let err = apply_sparse_step_in_place(&chain_dir, &patch_23, 0, None, &mut verified).unwrap_err();
+    assert!(
+        err.to_string().contains("hash mismatch"),
+        "expected a hash mismatch, got: {err}"
+    );
 }

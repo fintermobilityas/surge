@@ -209,6 +209,8 @@ pub(super) fn apply_sparse_file_patch_with_progress(
     )?;
     emit_progress(progress, extract_units, total_units);
 
+    // Single-shot apply: no cross-step state, so a fresh (empty) cache.
+    let mut verified = super::fs_apply::VerifiedFileHashes::new();
     sparse_ops_and_repack(
         working_dir.path(),
         &manifest,
@@ -216,6 +218,7 @@ pub(super) fn apply_sparse_file_patch_with_progress(
         extract_units,
         total_units,
         progress,
+        &mut verified,
     )
 }
 
@@ -247,11 +250,12 @@ pub(crate) fn apply_sparse_step_in_place(
     patch: &[u8],
     unit_offset: u64,
     progress: Option<&DeltaApplyProgressCallback<'_>>,
+    verified: &mut super::fs_apply::VerifiedFileHashes,
 ) -> Result<Vec<u8>> {
     let (manifest, payloads) = decode_sparse_file_ops_payload(patch)?;
     let step_units = sparse_step_units(&manifest, payloads, unit_offset);
     let total_units = unit_offset.saturating_add(step_units);
-    sparse_ops_and_repack(dir, &manifest, payloads, unit_offset, total_units, progress)
+    sparse_ops_and_repack(dir, &manifest, payloads, unit_offset, total_units, progress, verified)
 }
 
 fn sparse_ops_and_repack(
@@ -261,6 +265,7 @@ fn sparse_ops_and_repack(
     segment_base: u64,
     total_units: u64,
     progress: Option<&DeltaApplyProgressCallback<'_>>,
+    verified: &mut super::fs_apply::VerifiedFileHashes,
 ) -> Result<Vec<u8>> {
     let ops_units = sparse_file_ops_work_units(&manifest.ops);
     emit_progress(progress, segment_base, total_units);
@@ -277,6 +282,7 @@ fn sparse_ops_and_repack(
         &manifest.ops,
         payloads,
         progress.map(|_| &ops_progress as &super::fs_apply::SparseOpProgress<'_>),
+        verified,
     )?;
     let repack_start_units = segment_base.saturating_add(ops_units);
     let repack_units = total_units.saturating_sub(repack_start_units);

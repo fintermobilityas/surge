@@ -2,13 +2,14 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use futures_util::stream::{self, StreamExt};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::crypto::sha256::sha256_hex_file;
 use crate::error::{Result, SurgeError};
 use crate::releases::artifact_cache::{CacheFetchOutcome, cache_path_for_key, fetch_or_reuse_file};
 use crate::releases::manifest::ReleaseEntry;
 
+use super::apply::full_fallback;
 use super::progress::{
     ArtifactDownload, DownloadProgressState, ProgressInfo, average_speed_bytes_per_sec, emit_progress,
 };
@@ -64,14 +65,43 @@ where
                     };
                     emit_progress(progress.as_ref(), snapshot);
                 };
-                let outcome = fetch_or_reuse_file(
+                let outcome = match fetch_or_reuse_file(
                     storage,
                     &artifact.key,
                     &cache_path,
                     &artifact.sha256,
                     Some(&progress_callback),
                 )
-                .await?;
+                .await
+                {
+                    Ok(outcome) => outcome,
+                    // Publishers skip the full upload for non-checkpoint releases, so a release's full
+                    // object can legitimately be absent: rebuild it from the release graph instead.
+                    Err(SurgeError::NotFound(missing)) => {
+                        let Some(release) = info
+                            .apply_releases
+                            .iter()
+                            .find(|release| release.full_filename.trim() == artifact.key.trim())
+                        else {
+                            return Err(SurgeError::NotFound(missing));
+                        };
+                        warn!(
+                            version = %release.version,
+                            key = %artifact.key,
+                            "Full package is not in storage ({missing}); rebuilding it from the release graph"
+                        );
+                        full_fallback::restore_full_into_cache(manager, release, &cache_path)
+                            .await
+                            .map_err(|restore_error| {
+                                SurgeError::Update(format!(
+                                    "Full package {} is missing ({missing}) and could not be rebuilt from the release graph: {restore_error}",
+                                    artifact.key
+                                ))
+                            })?;
+                        CacheFetchOutcome::DownloadedFresh
+                    }
+                    Err(other) => return Err(other),
+                };
 
                 let stage_path = staging_dir.join(&artifact.key);
                 if let Some(parent) = stage_path.parent() {

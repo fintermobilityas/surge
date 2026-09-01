@@ -695,6 +695,7 @@ mod tests {
             &ChunkedDiffOptions {
                 chunk_size: 256 * 1024,
                 max_threads: 1,
+                format: ChunkedPatchFormat::IdentityChunks,
             },
         )
         .expect("build patch");

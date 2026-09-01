@@ -535,7 +535,7 @@ mod tests {
     use crate::config::manifest::ShortcutLocation;
     use crate::context::StorageProvider;
     use crate::crypto::sha256::{sha256_hex, sha256_hex_file};
-    use crate::diff::chunked::ChunkedDiffOptions;
+    use crate::diff::chunked::{ChunkedDiffOptions, ChunkedPatchFormat};
     use crate::diff::wrapper::bsdiff_buffers;
     use crate::platform::detect::current_rid;
     #[cfg(target_os = "linux")]
@@ -2637,6 +2637,7 @@ echo started > new-child-started
             &ChunkedDiffOptions {
                 chunk_size: 128 * 1024,
                 max_threads: 1,
+                format: ChunkedPatchFormat::Legacy,
             },
         )
         .unwrap();

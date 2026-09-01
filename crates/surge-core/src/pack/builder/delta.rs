@@ -2,7 +2,7 @@ use crate::config::constants::RELEASES_FILE_COMPRESSED;
 use crate::config::manifest::PackDeltaStrategy;
 use crate::context::ResourceBudget;
 use crate::crypto::sha256::sha256_hex;
-use crate::diff::chunked::{ChunkedDiffOptions, DEFAULT_CHUNK_SIZE};
+use crate::diff::chunked::{ChunkedDiffOptions, ChunkedPatchFormat, DEFAULT_CHUNK_SIZE};
 use crate::error::{Result, SurgeError};
 use crate::releases::delta::{build_archive_bsdiff_patch, build_archive_chunked_patch, build_sparse_file_patch};
 use crate::releases::manifest::{
@@ -54,7 +54,12 @@ impl PackBuilder {
             );
         }
         let n_workers = budget.effective_zstd_workers();
-        let diff_options = chunked_diff_options(&budget, prev_data.len(), new_data.len());
+        let diff_options = chunked_diff_options(
+            &budget,
+            prev_data.len(),
+            new_data.len(),
+            self.pack_policy.chunked_patch_format.into(),
+        );
 
         let (patch, patch_format) = match self.pack_policy.delta_strategy {
             PackDeltaStrategy::SparseFileOps => (
@@ -143,7 +148,12 @@ fn should_fallback_to_full(delta_size: i64, full_size: i64) -> bool {
     delta_size >= full_size
 }
 
-fn chunked_diff_options(budget: &ResourceBudget, older_len: usize, newer_len: usize) -> ChunkedDiffOptions {
+fn chunked_diff_options(
+    budget: &ResourceBudget,
+    older_len: usize,
+    newer_len: usize,
+    format: ChunkedPatchFormat,
+) -> ChunkedDiffOptions {
     const MIN_CHUNK_SIZE: usize = 4 * 1024 * 1024;
     const BYTES_PER_THREAD_FACTOR: usize = 12;
 
@@ -174,6 +184,7 @@ fn chunked_diff_options(budget: &ResourceBudget, older_len: usize, newer_len: us
         } else {
             requested_threads.min(chunk_count)
         },
+        format,
     }
 }
 

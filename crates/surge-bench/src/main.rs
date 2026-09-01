@@ -300,6 +300,7 @@ fn main() {
             let chunked_opts = surge_core::diff::chunked::ChunkedDiffOptions {
                 chunk_size: (args.chunk_mb.saturating_mul(1024 * 1024)).max(1) as usize,
                 max_threads: args.diff_threads,
+                format: surge_core::diff::chunked::ChunkedPatchFormat::IdentityChunks,
             };
             // Use the archives for diffing (more realistic than raw files)
             let mut packer_v2 = surge_core::archive::packer::ArchivePacker::new(3).expect("packer v2");

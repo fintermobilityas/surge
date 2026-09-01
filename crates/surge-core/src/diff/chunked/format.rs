@@ -16,6 +16,7 @@
 //!   For each chunk:
 //!     patch_len (8 bytes LE)
 //!     patch_data (patch_len bytes; empty for identity chunks)
+use super::ChunkedPatchFormat;
 use crate::error::{Result, SurgeError};
 
 /// Magic bytes identifying the chunked patch format.
@@ -68,11 +69,20 @@ pub(super) fn serialize_patch(
     new_size: usize,
     chunk_size: usize,
     chunks: &[(usize, Vec<u8>, bool)],
+    format: ChunkedPatchFormat,
 ) -> Result<Vec<u8>> {
     let num_chunks = chunks.len();
-    let mut bitset = vec![0u8; identity_bitset_len(num_chunks)];
+    let (version, mut bitset) = match format {
+        ChunkedPatchFormat::Legacy => (LEGACY_VERSION, Vec::new()),
+        ChunkedPatchFormat::IdentityChunks => (VERSION, vec![0u8; identity_bitset_len(num_chunks)]),
+    };
     for (idx, _, identity) in chunks {
         if *identity {
+            if format == ChunkedPatchFormat::Legacy {
+                return Err(SurgeError::Diff(
+                    "identity chunk cannot be encoded in the legacy chunked patch format".into(),
+                ));
+            }
             set_identity_bit(&mut bitset, *idx);
         }
     }
@@ -82,7 +92,7 @@ pub(super) fn serialize_patch(
     let mut buf = Vec::with_capacity(header_size + bitset.len() + data_size);
 
     buf.extend_from_slice(MAGIC);
-    buf.push(VERSION);
+    buf.push(version);
     buf.extend_from_slice(
         &u64::try_from(chunk_size)
             .map_err(|_| SurgeError::Diff("chunk size exceeds supported patch format".into()))?
@@ -216,7 +226,7 @@ mod tests {
 
     #[test]
     fn test_chunked_v2_identity_chunks_carry_no_payload() {
-        // 4 chunks, middle two identical to the old file.
+        // 4 chunks, middle two identical to the old file; identity chunks are opt-in.
         let chunk = 256usize;
         let old: Vec<u8> = (0..(4 * chunk)).map(|i| (i % 251) as u8).collect();
         let mut new = old.clone();
@@ -227,6 +237,7 @@ mod tests {
         let opts = ChunkedDiffOptions {
             chunk_size: chunk,
             max_threads: 2,
+            format: ChunkedPatchFormat::IdentityChunks,
         };
         let patch = chunked_bsdiff(&old, &new, &opts).expect("bsdiff");
 
@@ -282,9 +293,48 @@ mod tests {
         let opts = ChunkedDiffOptions {
             chunk_size: chunk,
             max_threads: 1,
+            format: ChunkedPatchFormat::Legacy,
         };
         let reconstructed = chunked_bspatch(&old, &patch, &opts).expect("bspatch v1");
         assert_eq!(reconstructed, new);
+    }
+
+    #[test]
+    fn test_chunked_default_format_is_legacy_and_carries_identity_payloads() {
+        // Default options must produce a patch every fielded reader accepts: version byte 1,
+        // no identity bitset, and a real bsdiff payload for the unchanged chunks.
+        let chunk = 256usize;
+        let old: Vec<u8> = (0..(4 * chunk))
+            .map(|i| u8::try_from(i % 251).unwrap_or_default())
+            .collect();
+        let mut new = old.clone();
+        new[10] ^= 0xff;
+        let opts = ChunkedDiffOptions {
+            chunk_size: chunk,
+            max_threads: 1,
+            ..ChunkedDiffOptions::default()
+        };
+        let patch = chunked_bsdiff(&old, &new, &opts).unwrap();
+
+        assert_eq!(patch[4], LEGACY_VERSION);
+        let decoded = deserialize_patch(&patch).unwrap();
+        assert_eq!(decoded.chunks.len(), 4);
+        assert!(
+            decoded.identity.iter().all(|flag| !flag),
+            "legacy patches never carry identity flags"
+        );
+        assert!(
+            decoded.chunks.iter().all(|c| !c.is_empty()),
+            "every legacy chunk carries a payload"
+        );
+        assert_eq!(chunked_bspatch(&old, &patch, &opts).unwrap(), new);
+    }
+
+    #[test]
+    fn test_chunked_legacy_format_rejects_identity_flags() {
+        let chunks = vec![(0usize, vec![1u8, 2, 3], true)];
+        let err = serialize_patch(3, 3, 3, &chunks, ChunkedPatchFormat::Legacy).unwrap_err();
+        assert!(err.to_string().contains("legacy chunked patch format"), "{err}");
     }
 
     #[test]
@@ -295,6 +345,7 @@ mod tests {
         let opts = ChunkedDiffOptions {
             chunk_size: chunk,
             max_threads: 1,
+            format: ChunkedPatchFormat::Legacy,
         };
         let mut patch = chunked_bsdiff(&old, &new, &opts).expect("bsdiff");
         patch[4] = 3;

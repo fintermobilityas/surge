@@ -7,7 +7,7 @@ use super::*;
 use crate::archive::extractor::extract_to;
 use crate::archive::packer::ArchivePacker;
 use crate::crypto::sha256::sha256_hex;
-use crate::diff::chunked::ChunkedDiffOptions;
+use crate::diff::chunked::{ChunkedDiffOptions, ChunkedPatchFormat};
 use crate::releases::manifest::{
     DeltaArtifact, PATCH_FORMAT_BSDIFF4_ARCHIVE_V3, PATCH_FORMAT_CHUNKED_BSDIFF_ARCHIVE_V3,
 };
@@ -183,6 +183,7 @@ fn test_sparse_file_patch_roundtrip_rebuilds_full_archive_bytes() {
         &ChunkedDiffOptions {
             chunk_size: 128 * 1024,
             max_threads: 1,
+            format: ChunkedPatchFormat::Legacy,
         },
     )
     .unwrap();
@@ -233,6 +234,7 @@ fn test_sparse_file_patch_reports_incremental_apply_progress() {
         &ChunkedDiffOptions {
             chunk_size: 128 * 1024,
             max_threads: 1,
+            format: ChunkedPatchFormat::Legacy,
         },
     )
     .unwrap();
@@ -376,6 +378,7 @@ fn test_in_place_chain_steps_match_single_shot_apply() {
     let opts = ChunkedDiffOptions {
         chunk_size: 128 * 1024,
         max_threads: 1,
+        format: ChunkedPatchFormat::Legacy,
     };
     let patch_12 = build_sparse_file_patch(&full_v1, &full_v2, 7, 0, &opts).unwrap();
     let patch_23 = build_sparse_file_patch(&full_v2, &full_v3, 7, 0, &opts).unwrap();
@@ -434,6 +437,7 @@ fn test_in_place_chain_with_verified_cache_detects_external_modification() {
     let opts = ChunkedDiffOptions {
         chunk_size: 128 * 1024,
         max_threads: 1,
+        format: ChunkedPatchFormat::Legacy,
     };
     let patch_12 = build_sparse_file_patch(&full_v1, &full_v2, 7, 0, &opts).unwrap();
     let patch_23 = build_sparse_file_patch(&full_v2, &full_v3, 7, 0, &opts).unwrap();

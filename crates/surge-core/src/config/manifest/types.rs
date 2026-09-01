@@ -43,6 +43,10 @@ pub struct PackDeltaManifestConfig {
     pub strategy: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_chain_length: Option<u32>,
+    /// Chunked patch format version to publish: `1` (default, readable by every client) or `2`
+    /// (identity-chunk bitset; requires clients that understand format version 2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunked_patch_format: Option<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -361,6 +365,36 @@ impl PackCompressionFormat {
     }
 }
 
+/// Chunked patch format version a publisher writes. Readers accept both versions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PackChunkedPatchFormat {
+    /// Format version 1: readable by every client; every chunk carries a bsdiff payload.
+    #[default]
+    V1,
+    /// Format version 2: identity-chunk bitset; rejected by clients that predate it.
+    V2,
+}
+
+impl PackChunkedPatchFormat {
+    #[must_use]
+    pub fn parse(raw: u8) -> Option<Self> {
+        match raw {
+            1 => Some(Self::V1),
+            2 => Some(Self::V2),
+            _ => None,
+        }
+    }
+}
+
+impl From<PackChunkedPatchFormat> for crate::diff::chunked::ChunkedPatchFormat {
+    fn from(format: PackChunkedPatchFormat) -> Self {
+        match format {
+            PackChunkedPatchFormat::V1 => Self::Legacy,
+            PackChunkedPatchFormat::V2 => Self::IdentityChunks,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PackPolicy {
     pub delta_strategy: PackDeltaStrategy,
@@ -369,6 +403,7 @@ pub struct PackPolicy {
     pub max_chain_length: u32,
     pub keep_latest_fulls: u32,
     pub checkpoint_every: u32,
+    pub chunked_patch_format: PackChunkedPatchFormat,
 }
 
 impl Default for PackPolicy {
@@ -380,6 +415,7 @@ impl Default for PackPolicy {
             max_chain_length: PACK_DEFAULT_MAX_CHAIN_LENGTH,
             keep_latest_fulls: PACK_DEFAULT_KEEP_LATEST_FULLS,
             checkpoint_every: PACK_DEFAULT_CHECKPOINT_EVERY,
+            chunked_patch_format: PackChunkedPatchFormat::default(),
         }
     }
 }

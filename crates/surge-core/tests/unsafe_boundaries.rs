@@ -33,6 +33,7 @@ fn unsafe_is_confined_to_boundary_modules() {
                 | "src/diff/wrapper.rs"
                 | "src/diff/mod.rs"
                 | "src/platform/process/descriptors.rs"
+                | "src/platform/process/identity/macos.rs"
         );
 
         let content = fs::read_to_string(&file).expect("failed to read rust source file");

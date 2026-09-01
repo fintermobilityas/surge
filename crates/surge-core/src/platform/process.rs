@@ -5,6 +5,11 @@ use std::process::{Child, Command, Stdio};
 use crate::error::{Result, SurgeError};
 
 mod descriptors;
+mod identity;
+
+pub use identity::{
+    ProcessIdentity, ProcessSignalOutcome, StableProcessHandle, process_identity, process_identity_matches,
+};
 
 pub struct ProcessHandle {
     child: Child,

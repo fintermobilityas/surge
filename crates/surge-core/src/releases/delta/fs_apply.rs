@@ -4,7 +4,7 @@ use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
 use crate::crypto::sha256::sha256_hex_file;
-use crate::diff::chunked::chunked_bspatch_file_with_progress_and_sha256;
+use crate::diff::chunked::chunked_bspatch_file_with_progress_and_sha256_in_place;
 use crate::error::{Result, SurgeError};
 
 use super::sparse_ops::SparseFileOp;
@@ -117,9 +117,11 @@ pub(super) fn apply_sparse_file_ops_with_progress(
                 if temp_path.exists() {
                     fs::remove_file(&temp_path)?;
                 }
-                // The target hash is computed while the patched file is
-                // written, removing a full re-read of the output.
-                let target_hash = chunked_bspatch_file_with_progress_and_sha256(
+                // Same-size format v2 patches are applied in place (only the
+                // changed chunks are rewritten; the target hash is one full
+                // read afterwards). Everything else is written to a temp
+                // file whose hash is computed while writing, then renamed.
+                let result = chunked_bspatch_file_with_progress_and_sha256_in_place(
                     &target,
                     patch_bytes,
                     &temp_path,
@@ -127,12 +129,15 @@ pub(super) fn apply_sparse_file_ops_with_progress(
                         report_op_progress(progress, completed_units, op_units, done, total, total_units);
                     }),
                 )?;
-                fs::remove_file(&target)?;
-                fs::rename(&temp_path, &target)?;
+                if !result.applied_in_place {
+                    fs::remove_file(&target)?;
+                    fs::rename(&temp_path, &target)?;
+                }
                 set_mode(&target, *mode)?;
-                if target_hash != sha256.trim() {
+                if result.target_hash != sha256.trim() {
                     return Err(SurgeError::Update(format!(
-                        "Sparse delta file hash mismatch for '{path}': expected {sha256}, got {target_hash}"
+                        "Sparse delta file hash mismatch for '{path}': expected {sha256}, got {}",
+                        result.target_hash
                     )));
                 }
                 verified.record(path, sha256);

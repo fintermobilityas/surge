@@ -166,17 +166,28 @@ Ranked by expected value; read `results.tsv` and
    gain sits near the shared-host wall-clock noise floor, which is
    why the phase-level evidence carries the claim. Payload and
    verification unchanged (tamper test still fail-closed).
-4. **Per-step repack variance.** The repack is the most load-variable
-   component (0.6-3.0 s): zstd over ~1.2 GB per step, re-encoding
-   unchanged files even though one file changed. Candidate: measure
-   whether the repack can reuse the previous archive's encoded
-   blocks (zstd frame splicing) — likely a format-level change,
-   validate with a same-session A/B before investing.
-5. **Verification cost (general).** SHA-256 over the full payload on
+4. **MEASURED / EXHAUSTED — Per-step repack variance.** Phase
+   measurement (2026-09-01): the repack is the publisher-side pack and
+   the client-side repack cost the same (~500-550 ms stable at
+   zstd-3 MT-48 for the 1.2 GB bench tree; 0.6-3.0 s is host-load
+   variance, not algorithmic waste). Reusing encoded frames for
+   unchanged entries needs a per-entry archive format change (the
+   archive is one tar + zstd stream, and client repack bytes must hash
+   equal to publisher bytes) — a design change, not an experiment.
+5. **KEPT — In-place sparse patching (same-size format v2).** A
+   same-size format v2 patch rewrites only the changed chunks at their
+   existing offsets; the target SHA-256 is one full read of the
+   patched file (keeps the step fail-closed). Size-changing and
+   format v1 patches use the temp-file flow. 10-step phase A/B:
+   bspatch phase ~870-1,180 ms -> ~590-650 ms/step; 100-delta
+   same-session: 147.0/161.5 s vs 163.1/170.1 s (-7.4%), install tree
+   byte-identical.
+6. **Verification cost (general).** SHA-256 over the full payload on
    the client is measured in the microbench (`SHA-256 (file)`).
    Sweep: verify-then-apply vs apply-then-verify ordering, streaming
    hashes during download, and whether the delta's embedded hashes
-   let us skip re-hashing untouched files in sparse ops.
+   let us skip re-hashing untouched files in sparse ops (the in-place
+   target hash is now a full read — the next target).
 3. **Checkpoint reuse.** Local cache retention (`keepFullCount: 1`)
    decides whether a chain walk rebuilds fulls from deltas or reuses a
    cached checkpoint. Measure the apply-time knee as a function of
@@ -189,7 +200,7 @@ Ranked by expected value; read `results.tsv` and
    whether patch application parallelizes safely across files (it may
    already) and whether the 256 MiB budget is the binding constraint on
    apply throughput for broad-churn deltas.
-6. **Download overlap.** Whether verify can start before the full
+7. **Download overlap.** Whether verify can start before the full
    download lands (streaming hash) on the common delta path.
 
 ## Dead Ends to Respect

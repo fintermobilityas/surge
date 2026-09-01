@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -5,8 +6,10 @@ use std::time::{Duration, Instant};
 
 use surge_core::archive::extractor;
 use surge_core::config::constants::RELEASES_FILE_COMPRESSED;
+use surge_core::config::manifest::ShortcutLocation;
 use surge_core::context::{Context, StorageProvider};
 use surge_core::error::{Result, SurgeError};
+use surge_core::install::{InstallProfile, RuntimeManifestMetadata, write_runtime_manifest};
 use surge_core::pack::builder::{PackBuilder, TimedArtifact};
 use surge_core::platform::detect::current_rid;
 use surge_core::update::manager::{ApplyStrategy, ProgressInfo, UpdateManager};
@@ -290,6 +293,34 @@ pub async fn run_update_scenario(
     let baseline_bytes = fs::read(&baseline_full)?;
     let baseline_app_dir = install_dir.join("app");
     extractor::extract_to(&baseline_bytes, &baseline_app_dir, None)?;
+    // The update manager refuses to swap an active application without its
+    // locally persisted process identity (surge-core #255); persist the
+    // baseline runtime manifest the way a real install would.
+    let install_dir_str = install_dir
+        .to_str()
+        .ok_or_else(|| SurgeError::Config(format!("Install path is not valid UTF-8: {}", install_dir.display())))?;
+    let no_env: BTreeMap<String, String> = BTreeMap::new();
+    let no_shortcuts: [ShortcutLocation; 0] = [];
+    let no_assets: [String; 0] = [];
+    let profile = InstallProfile::new(
+        app_id,
+        "Benchmark App",
+        "app.main.dll",
+        install_dir_str,
+        "bench-supervisor",
+        "",
+        &no_shortcuts,
+        &no_assets,
+        &no_env,
+    );
+    let store_dir_str = store_dir
+        .to_str()
+        .ok_or_else(|| SurgeError::Config(format!("Store path is not valid UTF-8: {}", store_dir.display())))?;
+    write_runtime_manifest(
+        &baseline_app_dir,
+        &profile,
+        &RuntimeManifestMetadata::new(&baseline_version, "stable", "filesystem", store_dir_str, "", ""),
+    )?;
 
     let mut update_manager = UpdateManager::new(
         Arc::clone(&ctx),

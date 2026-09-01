@@ -86,8 +86,7 @@ mod tests {
             shortcuts: Vec::new(),
             persistent_assets: Vec::new(),
             installers: Vec::new(),
-            environment: Default::default(),
-            ..Default::default()
+            environment: std::collections::BTreeMap::new(),
         }
     }
 

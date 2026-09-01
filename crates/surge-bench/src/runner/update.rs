@@ -6,9 +6,9 @@ use std::time::{Duration, Instant};
 
 use surge_core::archive::extractor;
 use surge_core::config::constants::RELEASES_FILE_COMPRESSED;
+use surge_core::config::manifest::ShortcutLocation;
 use surge_core::context::{Context, StorageProvider};
 use surge_core::error::{Result, SurgeError};
-use surge_core::config::manifest::ShortcutLocation;
 use surge_core::install::{InstallProfile, RuntimeManifestMetadata, write_runtime_manifest};
 use surge_core::pack::builder::{PackBuilder, TimedArtifact};
 use surge_core::platform::detect::current_rid;

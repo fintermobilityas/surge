@@ -6,6 +6,12 @@
 
 mod format;
 
+mod bspatch;
+
+pub use bspatch::{
+    ChunkedBspatchResult, chunked_bspatch_file, chunked_bspatch_file_with_progress,
+    chunked_bspatch_file_with_progress_and_sha256, chunked_bspatch_file_with_progress_and_sha256_in_place,
+};
 pub use format::has_magic_prefix;
 use format::{ChunkedPatchData, deserialize_patch, serialize_patch};
 use std::sync::Mutex;
@@ -13,11 +19,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::{
     fs,
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Read, Seek, SeekFrom},
     path::Path,
 };
-
-use sha2::{Digest, Sha256};
 
 use crate::error::{Result, SurgeError};
 
@@ -405,112 +409,11 @@ pub fn chunked_bsdiff_files(older_path: &Path, newer_path: &Path, opts: &Chunked
     serialize_patch(old_size, new_size, chunk_size, &chunks, opts.format)
 }
 
-/// Apply a chunked binary diff patch directly against a file, writing the
-/// reconstructed file to `output_path` without materializing the entire output
-/// in memory.
-pub fn chunked_bspatch_file(older_path: &Path, patch: &[u8], output_path: &Path) -> Result<()> {
-    chunked_bspatch_file_with_progress(older_path, patch, output_path, None)
-}
-
-/// Apply a chunked binary diff patch directly against a file and report output
-/// bytes as chunks are reconstructed.
-pub fn chunked_bspatch_file_with_progress(
-    older_path: &Path,
-    patch: &[u8],
-    output_path: &Path,
-    progress: Option<&ByteProgress<'_>>,
-) -> Result<()> {
-    bspatch_file(older_path, patch, output_path, progress, None)
-}
-
-/// Like `chunked_bspatch_file_with_progress`, but also returns the SHA-256
-/// (hex) of the reconstructed file, computed while writing so the caller can
-/// verify the result without re-reading it.
-pub fn chunked_bspatch_file_with_progress_and_sha256(
-    older_path: &Path,
-    patch: &[u8],
-    output_path: &Path,
-    progress: Option<&ByteProgress<'_>>,
-) -> Result<String> {
-    let mut hasher = Sha256::new();
-    bspatch_file(older_path, patch, output_path, progress, Some(&mut hasher))?;
-    Ok(hex::encode(hasher.finalize()))
-}
-
-fn bspatch_file(
-    older_path: &Path,
-    patch: &[u8],
-    output_path: &Path,
-    progress: Option<&ByteProgress<'_>>,
-    mut hasher: Option<&mut Sha256>,
-) -> Result<()> {
-    let decoded = deserialize_patch(patch)?;
-    let ChunkedPatchData {
-        old_size,
-        new_size,
-        chunk_size,
-        chunks: chunk_patches,
-        identity,
-    } = decoded;
-    let actual_old_size = usize::try_from(fs::metadata(older_path)?.len())
-        .map_err(|_| SurgeError::Diff("old file exceeds platform limits".into()))?;
-    if actual_old_size != old_size {
-        return Err(SurgeError::Diff(format!(
-            "old file size mismatch: expected {old_size}, got {actual_old_size}"
-        )));
-    }
-
-    if let Some(parent) = output_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    let mut old_file = fs::File::open(older_path)?;
-    let mut output = fs::File::create(output_path)?;
-    let mut bytes_written = 0usize;
-
-    for (idx, chunk_patch) in chunk_patches.iter().enumerate() {
-        let old_chunk_len = chunk_len_for_index(old_size, idx, chunk_size);
-        let old_chunk = read_exact_chunk(&mut old_file, old_chunk_len)?;
-        let new_chunk = if identity[idx] {
-            if old_chunk.is_empty() {
-                return Err(SurgeError::Diff("identity chunk has no old content".into()));
-            }
-            old_chunk
-        } else if old_chunk.is_empty() {
-            (*chunk_patch).to_vec()
-        } else if chunk_patch.is_empty() {
-            Vec::new()
-        } else {
-            wrapper::bspatch_buffers(&old_chunk, chunk_patch)?
-        };
-        output.write_all(&new_chunk)?;
-        if let Some(h) = hasher.as_mut() {
-            h.update(&new_chunk);
-        }
-        bytes_written = bytes_written.saturating_add(new_chunk.len());
-        if let Some(cb) = progress {
-            cb(
-                usize_to_u64_saturating(bytes_written),
-                usize_to_u64_saturating(new_size),
-            );
-        }
-    }
-    output.flush()?;
-
-    if bytes_written != new_size {
-        return Err(SurgeError::Diff(format!(
-            "reconstructed size mismatch: expected {new_size}, got {bytes_written}"
-        )));
-    }
-
-    Ok(())
-}
-
-fn usize_to_u64_saturating(value: usize) -> u64 {
+pub(super) fn usize_to_u64_saturating(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
 
-fn chunk_len_for_index(total_len: usize, chunk_idx: usize, chunk_size: usize) -> usize {
+pub(super) fn chunk_len_for_index(total_len: usize, chunk_idx: usize, chunk_size: usize) -> usize {
     let start = chunk_idx.saturating_mul(chunk_size);
     if start >= total_len {
         0
@@ -519,7 +422,7 @@ fn chunk_len_for_index(total_len: usize, chunk_idx: usize, chunk_size: usize) ->
     }
 }
 
-fn read_exact_chunk(file: &mut fs::File, chunk_len: usize) -> Result<Vec<u8>> {
+pub(super) fn read_exact_chunk(file: &mut fs::File, chunk_len: usize) -> Result<Vec<u8>> {
     let mut chunk = vec![0u8; chunk_len];
     if chunk_len == 0 {
         return Ok(chunk);
@@ -704,5 +607,136 @@ mod tests {
 
         assert_eq!(hash, sha256_hex(&new));
         assert_eq!(std::fs::read(&rebuilt_path).expect("read rebuilt"), new);
+    }
+
+    #[test]
+    fn in_place_bspatch_same_size_format2_patches_target_directly() {
+        use crate::crypto::sha256::sha256_hex;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let old_path = tmp.path().join("target.bin");
+        let new_path = tmp.path().join("new.bin");
+        let unused_output = tmp.path().join("unused.bin");
+
+        let old = vec![11u8; 1024 * 1024];
+        let mut new = old.clone();
+        new[70_000] = 200; // inside the second 256 KiB chunk
+        std::fs::write(&old_path, &old).expect("write target");
+        std::fs::write(&new_path, &new).expect("write new");
+
+        let patch = chunked_bsdiff_files(
+            &old_path,
+            &new_path,
+            &ChunkedDiffOptions {
+                chunk_size: 256 * 1024,
+                max_threads: 1,
+                format: ChunkedPatchFormat::IdentityChunks,
+            },
+        )
+        .expect("build patch");
+
+        let result = chunked_bspatch_file_with_progress_and_sha256_in_place(&old_path, &patch, &unused_output, None)
+            .expect("apply patch");
+        assert!(result.applied_in_place);
+        assert!(!unused_output.exists(), "in-place patch must not write the output path");
+        assert_eq!(result.target_hash, sha256_hex(&new));
+        assert_eq!(std::fs::read(&old_path).expect("read target"), new);
+    }
+
+    #[test]
+    fn in_place_bspatch_all_identity_is_a_noop() {
+        use crate::crypto::sha256::sha256_hex;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let old_path = tmp.path().join("target.bin");
+        let new_path = tmp.path().join("new.bin");
+        let unused_output = tmp.path().join("unused.bin");
+
+        let old = vec![42u8; 700 * 1024];
+        let new = old.clone();
+        std::fs::write(&old_path, &old).expect("write target");
+        std::fs::write(&new_path, &new).expect("write new");
+
+        let patch = chunked_bsdiff_files(
+            &old_path,
+            &new_path,
+            &ChunkedDiffOptions {
+                chunk_size: 256 * 1024,
+                max_threads: 1,
+                format: ChunkedPatchFormat::IdentityChunks,
+            },
+        )
+        .expect("build patch");
+
+        let result = chunked_bspatch_file_with_progress_and_sha256_in_place(&old_path, &patch, &unused_output, None)
+            .expect("apply patch");
+        assert!(result.applied_in_place);
+        assert_eq!(result.target_hash, sha256_hex(&old));
+        assert_eq!(std::fs::read(&old_path).expect("read target"), old);
+    }
+
+    #[test]
+    fn in_place_bspatch_falls_back_when_sizes_differ() {
+        use crate::crypto::sha256::sha256_hex;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let old_path = tmp.path().join("target.bin");
+        let new_path = tmp.path().join("new.bin");
+        let output = tmp.path().join("rebuilt.bin");
+
+        let old = vec![5u8; 300 * 1024];
+        let mut new = old.clone();
+        new[1000] = 9;
+        new.extend_from_slice(&[1u8; 1000]); // file grows
+        std::fs::write(&old_path, &old).expect("write target");
+        std::fs::write(&new_path, &new).expect("write new");
+
+        let patch = chunked_bsdiff_files(
+            &old_path,
+            &new_path,
+            &ChunkedDiffOptions {
+                chunk_size: 256 * 1024,
+                max_threads: 1,
+                format: ChunkedPatchFormat::IdentityChunks,
+            },
+        )
+        .expect("build patch");
+
+        let result = chunked_bspatch_file_with_progress_and_sha256_in_place(&old_path, &patch, &output, None)
+            .expect("apply patch");
+        assert!(!result.applied_in_place);
+        assert_eq!(result.target_hash, sha256_hex(&new));
+        assert_eq!(std::fs::read(&output).expect("read rebuilt"), new);
+        assert_eq!(std::fs::read(&old_path).expect("read target"), old);
+    }
+
+    #[test]
+    fn in_place_bspatch_falls_back_for_legacy_format() {
+        use crate::crypto::sha256::sha256_hex;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let old_path = tmp.path().join("target.bin");
+        let new_path = tmp.path().join("new.bin");
+        let output = tmp.path().join("rebuilt.bin");
+
+        let old = vec![33u8; 600 * 1024];
+        let mut new = old.clone();
+        new[123_456] = 77;
+        std::fs::write(&old_path, &old).expect("write target");
+        std::fs::write(&new_path, &new).expect("write new");
+
+        let patch = chunked_bsdiff_files(
+            &old_path,
+            &new_path,
+            &ChunkedDiffOptions {
+                chunk_size: 256 * 1024,
+                max_threads: 1,
+                format: ChunkedPatchFormat::Legacy,
+            },
+        )
+        .expect("build patch");
+
+        let result = chunked_bspatch_file_with_progress_and_sha256_in_place(&old_path, &patch, &output, None)
+            .expect("apply patch");
+        assert!(!result.applied_in_place);
+        assert_eq!(result.target_hash, sha256_hex(&new));
+        assert_eq!(std::fs::read(&output).expect("read rebuilt"), new);
+        assert_eq!(std::fs::read(&old_path).expect("read target"), old);
     }
 }

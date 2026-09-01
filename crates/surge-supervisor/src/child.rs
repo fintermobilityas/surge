@@ -42,7 +42,7 @@ pub(crate) fn wait_for_supervised_child(
     own_pid: u32,
     install_dir: &Path,
     pending_handoff_version: &mut Option<String>,
-) -> Result<Option<ExitStatus>, SupervisorError> {
+) -> Result<SupervisedChildOutcome, SupervisorError> {
     let Some(version) = pending_handoff_version.clone() else {
         return wait_for_child_exit_status(child, shutdown, stop_file, pid_file, own_pid);
     };
@@ -62,17 +62,17 @@ pub(crate) fn wait_for_supervised_child(
         }
         StartupOutcome::Exited(status) => {
             handoff::record_restart_handoff_child_exited(install_dir, &version, status);
-            Ok(Some(status))
+            Ok(SupervisedChildOutcome::Exited(status))
         }
         StartupOutcome::StopRequested => {
             tracing::info!("Stop requested, exiting supervisor loop and leaving child running");
-            Ok(None)
+            Ok(SupervisedChildOutcome::StopRequested)
         }
         StartupOutcome::ShutdownRequested => {
             tracing::info!("Shutdown signal received, child terminated and supervisor loop is exiting");
-            Ok(None)
+            Ok(SupervisedChildOutcome::ShutdownRequested)
         }
-        StartupOutcome::Superseded => Ok(None),
+        StartupOutcome::Superseded => Ok(SupervisedChildOutcome::Superseded),
     }
 }
 
@@ -82,25 +82,41 @@ fn wait_for_child_exit_status(
     stop_file: &Path,
     pid_file: &Path,
     own_pid: u32,
-) -> Result<Option<ExitStatus>, SupervisorError> {
+) -> Result<SupervisedChildOutcome, SupervisorError> {
     match wait_for_child_or_stop(child, shutdown, stop_file, pid_file, own_pid)? {
-        WaitOutcome::Exited(status) => Ok(Some(status)),
+        WaitOutcome::Exited(status) => Ok(SupervisedChildOutcome::Exited(status)),
         WaitOutcome::ObservedProcessExited => unreachable!(),
         WaitOutcome::StopRequested => {
             tracing::info!("Stop requested, exiting supervisor loop and leaving child running");
-            Ok(None)
+            Ok(SupervisedChildOutcome::StopRequested)
         }
         WaitOutcome::ShutdownRequested => {
             tracing::info!("Shutdown signal received, child terminated and supervisor loop is exiting");
-            Ok(None)
+            Ok(SupervisedChildOutcome::ShutdownRequested)
         }
-        WaitOutcome::Superseded => Ok(None),
+        WaitOutcome::Superseded => Ok(SupervisedChildOutcome::Superseded),
     }
+}
+
+#[derive(Debug)]
+pub(crate) enum SupervisedChildOutcome {
+    Exited(ExitStatus),
+    StopRequested,
+    ShutdownRequested,
+    Superseded,
 }
 
 pub(crate) enum WaitOutcome {
     Exited(std::process::ExitStatus),
     ObservedProcessExited,
+    StopRequested,
+    ShutdownRequested,
+    Superseded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RestartWaitOutcome {
+    DelayElapsed,
     StopRequested,
     ShutdownRequested,
     Superseded,
@@ -212,32 +228,32 @@ pub(crate) fn wait_before_restart(
     pid_file: &Path,
     own_pid: u32,
     delay: std::time::Duration,
-) -> bool {
+) -> RestartWaitOutcome {
     let deadline = std::time::Instant::now() + delay;
     loop {
         if shutdown.load(std::sync::atomic::Ordering::Acquire) {
             tracing::info!("Shutdown signal received during restart delay, not restarting");
-            return false;
+            return RestartWaitOutcome::ShutdownRequested;
         }
 
         if supervisor_was_superseded(pid_file, own_pid) {
-            return false;
+            return RestartWaitOutcome::Superseded;
         }
 
         if stop_file.exists() {
             tracing::info!("Stop requested during restart delay, not restarting");
-            return false;
+            return RestartWaitOutcome::StopRequested;
         }
 
         if std::time::Instant::now() >= deadline {
-            return true;
+            return RestartWaitOutcome::DelayElapsed;
         }
 
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
 
-fn terminate_child_process(child: &mut Child) -> Result<(), SupervisorError> {
+pub(crate) fn terminate_child_process(child: &mut Child) -> Result<(), SupervisorError> {
     if child.try_wait()?.is_some() {
         return Ok(());
     }
@@ -267,6 +283,59 @@ fn terminate_child_process(child: &mut Child) -> Result<(), SupervisorError> {
     let _ = child.kill();
     let _ = child.wait();
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shutdown_wins_when_stop_and_shutdown_are_simultaneous() {
+        let dir = tempfile::tempdir().unwrap();
+        let stop_file = dir.path().join("stop");
+        let pid_file = dir.path().join("pid");
+        let own_pid = std::process::id();
+        std::fs::write(&stop_file, "stop").unwrap();
+        std::fs::write(&pid_file, own_pid.to_string()).unwrap();
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let mut pending_handoff = None;
+
+        let outcome = wait_for_supervised_child(
+            &mut child,
+            &shutdown,
+            &stop_file,
+            &pid_file,
+            own_pid,
+            dir.path(),
+            &mut pending_handoff,
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, SupervisedChildOutcome::ShutdownRequested));
+        assert!(child.try_wait().unwrap().is_some());
+    }
+
+    #[test]
+    fn restart_delay_reports_stop_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let stop_file = dir.path().join("stop");
+        let pid_file = dir.path().join("pid");
+        let own_pid = std::process::id();
+        std::fs::write(&stop_file, "stop").unwrap();
+        std::fs::write(&pid_file, own_pid.to_string()).unwrap();
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let outcome = wait_before_restart(
+            &shutdown,
+            &stop_file,
+            &pid_file,
+            own_pid,
+            std::time::Duration::from_secs(1),
+        );
+
+        assert_eq!(outcome, RestartWaitOutcome::StopRequested);
+    }
 }
 
 #[cfg(unix)]

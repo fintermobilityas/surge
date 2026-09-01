@@ -15,7 +15,8 @@ mod handoff;
 mod ownership;
 
 use child::{
-    WaitOutcome, spawn_supervised_child, wait_before_restart, wait_for_pid_or_stop, wait_for_supervised_child,
+    RestartWaitOutcome, SupervisedChildOutcome, WaitOutcome, spawn_supervised_child, wait_before_restart,
+    wait_for_pid_or_stop, wait_for_supervised_child,
 };
 #[cfg(unix)]
 use ownership::current_supervisor_owns_pid_file;
@@ -295,7 +296,7 @@ fn run_supervisor(
         #[cfg(unix)]
         let child_pid = child.id();
 
-        let Some(status) = wait_for_supervised_child(
+        let status = match wait_for_supervised_child(
             &mut child,
             &shutdown,
             &stop_file,
@@ -303,13 +304,14 @@ fn run_supervisor(
             own_pid,
             install_dir,
             &mut pending_handoff_version,
-        )?
-        else {
-            #[cfg(unix)]
-            if stop_file.exists() {
+        )? {
+            SupervisedChildOutcome::Exited(status) => status,
+            SupervisedChildOutcome::StopRequested => {
+                #[cfg(unix)]
                 record_supervisor_takeover_pid_if_owned(install_dir, supervisor_id, &pid_file, own_pid, child_pid);
+                break;
             }
-            break;
+            SupervisedChildOutcome::ShutdownRequested | SupervisedChildOutcome::Superseded => break,
         };
 
         if supervisor_was_superseded(&pid_file, own_pid) {
@@ -333,8 +335,11 @@ fn run_supervisor(
             );
         }
 
-        if !wait_before_restart(&shutdown, &stop_file, &pid_file, own_pid, CHILD_RESTART_BACKOFF) {
-            break;
+        match wait_before_restart(&shutdown, &stop_file, &pid_file, own_pid, CHILD_RESTART_BACKOFF) {
+            RestartWaitOutcome::DelayElapsed => {}
+            RestartWaitOutcome::StopRequested
+            | RestartWaitOutcome::ShutdownRequested
+            | RestartWaitOutcome::Superseded => break,
         }
     }
 

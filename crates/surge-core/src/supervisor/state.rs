@@ -2,6 +2,20 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Result, SurgeError};
 
+#[cfg(unix)]
+mod takeover;
+#[cfg(unix)]
+pub use takeover::{
+    SupervisorTakeoverAcknowledgement, SupervisorTakeoverCancellation, SupervisorTakeoverCommit,
+    SupervisorTakeoverHandoff, SupervisorTakeoverInstance, SupervisorTakeoverRequest,
+    accept_supervisor_takeover_request, cancel_supervisor_takeover_request, clear_supervisor_takeover_exchange,
+    clear_supervisor_takeover_instance_if_owned, clear_supervisor_takeover_request, read_accepted_supervisor_takeover,
+    read_supervisor_takeover_acknowledgement, read_supervisor_takeover_commit, read_supervisor_takeover_instance,
+    read_supervisor_takeover_request, supervisor_takeover_request_file, take_accepted_supervisor_takeover,
+    write_supervisor_takeover_acknowledgement, write_supervisor_takeover_commit, write_supervisor_takeover_instance,
+    write_supervisor_takeover_request,
+};
+
 fn normalized_supervisor_id(supervisor_id: &str) -> &str {
     supervisor_id.trim()
 }

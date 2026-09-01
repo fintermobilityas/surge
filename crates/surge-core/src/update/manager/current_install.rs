@@ -82,6 +82,7 @@ fn legacy_main_exe(
         let versioned_app_dir = manager.install_dir.join(format!("app-{}", manager.current_version));
         for root in [active_app_dir, stable_app_dir.as_path(), versioned_app_dir.as_path()] {
             if let Ok(relative) = bound_supervisor_exe.strip_prefix(root)
+                && is_executable_entry(&bound_supervisor_exe)
                 && let Some(main_exe) = safe_relative_path(relative)
             {
                 return Some(main_exe);
@@ -91,7 +92,7 @@ fn legacy_main_exe(
         if supervisor_exe.is_relative() {
             for root in [active_app_dir, stable_app_dir.as_path(), versioned_app_dir.as_path()] {
                 let candidate = root.join(&supervisor_exe);
-                if candidate.exists()
+                if is_executable_entry(&candidate)
                     && let Some(main_exe) = safe_relative_path(&supervisor_exe)
                 {
                     return Some(main_exe);
@@ -103,9 +104,12 @@ fn legacy_main_exe(
     let app_id_path = Path::new(app_id);
     safe_relative_path(app_id_path).filter(|main_exe| {
         let candidate = active_app_dir.join(main_exe);
-        candidate.is_file()
-            || std::fs::symlink_metadata(candidate).is_ok_and(|metadata| metadata.file_type().is_symlink())
+        is_executable_entry(&candidate)
     })
+}
+
+fn is_executable_entry(path: &Path) -> bool {
+    path.is_file() || std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
 }
 
 fn bind_absolute_parent(path: &Path) -> PathBuf {
@@ -173,12 +177,14 @@ mod tests {
         symlink(&physical_parent, &aliased_parent).unwrap();
 
         let bound = bind_absolute_parent(&aliased_parent.join("entrypoint"));
+        let bound_physical_parent = std::fs::canonicalize(&physical_parent).unwrap();
 
-        assert_eq!(bound, physical_parent.join("entrypoint"));
+        assert_eq!(bound, bound_physical_parent.join("entrypoint"));
         assert_ne!(
             bound,
             std::fs::canonicalize(physical_parent.join("entrypoint")).unwrap()
         );
+        assert!(is_executable_entry(&bound));
     }
 
     #[test]
@@ -257,5 +263,42 @@ mod tests {
                 .to_string()
                 .contains("no local executable identity could be inferred")
         );
+    }
+
+    #[test]
+    fn legacy_manifest_rejects_non_executable_supervisor_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_dir = tmp.path().join("store");
+        let install_dir = tmp.path().join("install");
+        let active_app_dir = install_dir.join("app");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        std::fs::create_dir_all(active_app_dir.join("directory-entrypoint")).unwrap();
+        std::fs::create_dir_all(active_app_dir.join(".surge")).unwrap();
+        std::fs::write(
+            active_app_dir.join(crate::install::RUNTIME_MANIFEST_RELATIVE_PATH),
+            "id: demo\nversion: 1.0.0\nsupervisorId: demo-supervisor\n",
+        )
+        .unwrap();
+
+        let ctx = Arc::new(Context::new());
+        ctx.set_storage(StorageProvider::Filesystem, store_dir.to_str().unwrap(), "", "", "", "");
+        let manager = UpdateManager::new(ctx, "demo", "1.0.0", "stable", install_dir.to_str().unwrap()).unwrap();
+
+        for supervisor_exe in [
+            active_app_dir.join("missing-entrypoint"),
+            PathBuf::from("directory-entrypoint"),
+        ] {
+            write_supervisor_exe_path(&install_dir, "demo-supervisor", &supervisor_exe).unwrap();
+
+            let error = load(&manager).unwrap_err();
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("no local executable identity could be inferred"),
+                "unexpected result for {}",
+                supervisor_exe.display()
+            );
+        }
     }
 }

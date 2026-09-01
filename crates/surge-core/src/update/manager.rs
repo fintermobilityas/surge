@@ -625,7 +625,6 @@ mod tests {
         app_store
     }
 
-    #[cfg(not(unix))]
     fn write_app_scoped_release_index_with_current(
         store_root: &Path,
         app_id: &str,

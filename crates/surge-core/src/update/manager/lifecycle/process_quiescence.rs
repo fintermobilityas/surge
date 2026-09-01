@@ -73,6 +73,7 @@ fn terminate_active_app_processes_except(active_app_dir: &Path, main_exe: &str, 
             active_app_root.join(main_exe).display()
         )));
     }
+    refuse_in_process_swap(&active_exe, protected_pid)?;
     let interpreted_main = is_interpreted_main(&active_exe)?;
     if interpreted_main {
         return Err(SurgeError::Platform(
@@ -82,6 +83,39 @@ fn terminate_active_app_processes_except(active_app_dir: &Path, main_exe: &str, 
     terminate_matching_app_processes(main_exe, protected_pid, "active", |process| {
         is_active_app_process(&active_exe, interpreted_main, process)
     })
+}
+
+#[cfg(unix)]
+fn refuse_in_process_swap(active_exe: &Path, protected_pid: u32) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    if protected_pid != current_pid() {
+        return Ok(());
+    }
+
+    let updater_exe = std::env::current_exe().map_err(|e| {
+        SurgeError::Platform(format!(
+            "Failed to resolve updater process identity before application swap: {e}"
+        ))
+    })?;
+    let active_metadata = std::fs::metadata(active_exe).map_err(|e| {
+        SurgeError::Platform(format!(
+            "Failed to inspect active application identity before swap: {e}"
+        ))
+    })?;
+    let updater_metadata = std::fs::metadata(&updater_exe).map_err(|e| {
+        SurgeError::Platform(format!(
+            "Failed to inspect updater process identity before application swap: {e}"
+        ))
+    })?;
+    if active_metadata.dev() == updater_metadata.dev() && active_metadata.ino() == updater_metadata.ino() {
+        return Err(SurgeError::Platform(
+            "The updater is running from the active application executable; refusing an in-process directory swap. Apply the update from an external Surge updater."
+                .to_string(),
+        ));
+    }
+
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -426,6 +460,19 @@ mod tests {
 
         assert_eq!(terminated, 1);
         assert!(!status.success());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn in_process_updater_refuses_swap_without_signalling_itself() {
+        let tmp = tempfile::tempdir().unwrap();
+        let active_app_dir = tmp.path().join("app");
+        std::fs::create_dir_all(&active_app_dir).unwrap();
+        std::fs::hard_link(std::env::current_exe().unwrap(), active_app_dir.join("demo")).unwrap();
+
+        let error = terminate_active_app_processes_except(&active_app_dir, "demo", current_pid()).unwrap_err();
+
+        assert!(error.to_string().contains("refusing an in-process directory swap"));
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

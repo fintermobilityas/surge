@@ -9,9 +9,11 @@ use surge_core::config::constants::{DEFAULT_ZSTD_LEVEL, RELEASES_FILE_COMPRESSED
 use surge_core::config::manifest::SurgeManifest;
 use surge_core::error::{Result, SurgeError};
 use surge_core::releases::manifest::{compress_release_index, decompress_release_index};
+use surge_core::releases::restore::plan_full_archive_restore;
 use surge_core::releases::restore::required_artifacts_for_index;
 use surge_core::releases::version::compare_versions;
 use surge_core::storage;
+use surge_core::storage::StorageBackend;
 
 /// Compact a channel to a single latest full release and prune stale artifacts.
 ///
@@ -184,11 +186,29 @@ async fn compact_single(
             release.channels.retain(|existing| existing != channel_name);
         }
     }
-    index
+    // Releases that stay published on any channel must remain restorable. Their delta chains can
+    // run through releases that were only ever on the compacted channel, so keep every release row
+    // (and artifact) a remaining release depends on, even when it no longer belongs to a channel.
+    let chain_required = chain_artifacts_for_published_releases(&*backend, &index, rid).await?;
+    let chain_versions: BTreeSet<String> = index
         .releases
-        .retain(|release| release.rid != rid || !release.channels.is_empty());
+        .iter()
+        .filter(|release| release.rid == rid)
+        .filter(|release| {
+            chain_required.contains(release.full_filename.trim())
+                || release
+                    .all_deltas()
+                    .iter()
+                    .any(|delta| chain_required.contains(delta.filename.trim()))
+        })
+        .map(|release| release.version.clone())
+        .collect();
+    index.releases.retain(|release| {
+        release.rid != rid || !release.channels.is_empty() || chain_versions.contains(&release.version)
+    });
 
-    let required = required_artifacts_for_index(&index);
+    let mut required = required_artifacts_for_index(&index);
+    required.extend(chain_required);
 
     let mut deleted = 0usize;
     for key in &stale_filenames {
@@ -299,6 +319,24 @@ fn print_stage(theme: UiTheme, stage: usize, total: usize, text: &str) {
 fn print_stage_done(theme: UiTheme, stage: usize, total: usize, text: &str) {
     let _ = theme;
     logline::success(&format!("[{stage}/{total}] {text}"));
+}
+
+/// Artifacts needed to restore every release of `rid` that still belongs to a channel: for each such
+/// release the restore planner yields the newest available full plus the delta chain up to it.
+async fn chain_artifacts_for_published_releases(
+    backend: &dyn StorageBackend,
+    index: &surge_core::releases::manifest::ReleaseIndex,
+    rid: &str,
+) -> Result<BTreeSet<String>> {
+    let mut required = BTreeSet::new();
+    for release in &index.releases {
+        if release.rid != rid || release.channels.is_empty() {
+            continue;
+        }
+        let specs = plan_full_archive_restore(backend, index, rid, &release.version).await?;
+        required.extend(specs.into_iter().map(|spec| spec.key));
+    }
+    Ok(required)
 }
 
 fn referenced_artifacts(index: &surge_core::releases::manifest::ReleaseIndex) -> BTreeSet<String> {
@@ -531,6 +569,103 @@ apps:
         assert!(!store_dir.join(&v3_delta_key).exists());
         assert!(!store_dir.join(&v4.full_filename).exists());
         assert!(!store_dir.join(&v5_delta_key).exists());
+    }
+
+    #[tokio::test]
+    async fn compact_keeps_releases_that_other_channels_still_restore_through() {
+        // v1 (full) was only ever on `test`; v2 (delta from v1) is on `production`; v3 (delta from v2)
+        // is the newest `test` release. Compacting `test` must keep v1's row and full artifact and
+        // v2's delta, otherwise production's v2 can no longer be restored (and later promoted from).
+        let tmp = tempfile::tempdir().unwrap();
+        let store_dir = tmp.path().join("store");
+        let manifest_path = tmp.path().join("surge.yml");
+        let rid = current_rid();
+        let app_id = "compact-app";
+        std::fs::create_dir_all(&store_dir).unwrap();
+        write_manifest(&manifest_path, &store_dir, app_id, &rid);
+
+        let full_v1 = b"release-1".to_vec();
+        let full_v2 = b"release-2-delta".to_vec();
+        let full_v3 = b"release-3-delta".to_vec();
+        let delta_v2 = zstd::encode_all(bsdiff_buffers(&full_v1, &full_v2).unwrap().as_slice(), 3).unwrap();
+        let delta_v3 = zstd::encode_all(bsdiff_buffers(&full_v2, &full_v3).unwrap().as_slice(), 3).unwrap();
+
+        let mut v1 = make_release("1.0.0", &rid, &full_v1);
+        v1.set_primary_delta(None);
+        v1.channels = vec!["test".to_string()];
+
+        let mut v2 = make_release("1.1.0", &rid, &full_v2);
+        let v2_delta_key = format!("{app_id}-1.1.0-{rid}-delta.tar.zst");
+        v2.set_primary_delta(Some(DeltaArtifact::bsdiff_zstd(
+            "primary",
+            "1.0.0",
+            &v2_delta_key,
+            i64::try_from(delta_v2.len()).unwrap(),
+            &sha256_hex(&delta_v2),
+        )));
+        v2.channels = vec!["production".to_string()];
+
+        let mut v3 = make_release("1.2.0", &rid, &full_v3);
+        let v3_delta_key = format!("{app_id}-1.2.0-{rid}-delta.tar.zst");
+        v3.set_primary_delta(Some(DeltaArtifact::bsdiff_zstd(
+            "primary",
+            "1.1.0",
+            &v3_delta_key,
+            i64::try_from(delta_v3.len()).unwrap(),
+            &sha256_hex(&delta_v3),
+        )));
+        v3.channels = vec!["test".to_string()];
+
+        std::fs::write(store_dir.join(&v1.full_filename), &full_v1).unwrap();
+        std::fs::write(store_dir.join(&v2_delta_key), &delta_v2).unwrap();
+        std::fs::write(store_dir.join(&v3_delta_key), &delta_v3).unwrap();
+        write_index(
+            &store_dir.join(RELEASES_FILE_COMPRESSED),
+            vec![v1.clone(), v2.clone(), v3.clone()],
+        );
+
+        execute(&manifest_path, Some(app_id), Some(&rid), Some("test"))
+            .await
+            .unwrap();
+
+        let compacted =
+            decompress_release_index(&std::fs::read(store_dir.join(RELEASES_FILE_COMPRESSED)).unwrap()).unwrap();
+        let versions: Vec<&str> = compacted
+            .releases
+            .iter()
+            .map(|release| release.version.as_str())
+            .collect();
+        assert!(
+            versions.contains(&"1.0.0"),
+            "v1 is production's restore base and must stay: {versions:?}"
+        );
+        assert!(versions.contains(&"1.1.0"), "v2 stays on production: {versions:?}");
+        assert!(versions.contains(&"1.2.0"), "compacted test head stays: {versions:?}");
+        let kept_v1 = compacted
+            .releases
+            .iter()
+            .find(|release| release.version == "1.0.0")
+            .unwrap();
+        assert!(
+            kept_v1.channels.is_empty(),
+            "v1 left the test channel but its row is retained"
+        );
+        assert!(
+            store_dir.join(&v1.full_filename).exists(),
+            "v1 full is still needed to restore v2"
+        );
+        assert!(
+            store_dir.join(&v2_delta_key).exists(),
+            "v2 delta is still needed to restore v2"
+        );
+        assert_eq!(std::fs::read(store_dir.join(&v3.full_filename)).unwrap(), full_v3);
+
+        let backend = surge_core::storage::filesystem::FilesystemBackend::new(store_dir.to_str().unwrap(), "");
+        let restored_v2 =
+            surge_core::releases::restore::restore_full_archive_for_version(&backend, &compacted, &rid, "1.1.0")
+                .await
+                .expect("production release must still be restorable after compacting test");
+        assert_eq!(restored_v2, full_v2);
     }
 
     #[tokio::test]

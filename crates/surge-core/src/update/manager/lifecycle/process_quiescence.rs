@@ -34,8 +34,9 @@ pub(in crate::update::manager) fn terminate_superseded_app_processes(
 pub(in crate::update::manager) fn terminate_active_app_processes_before_swap(
     active_app_dir: &Path,
     main_exe: &str,
+    allow_in_process_swap: bool,
 ) -> Result<usize> {
-    terminate_active_app_processes_except(active_app_dir, main_exe, current_pid())
+    terminate_active_app_processes_except(active_app_dir, main_exe, current_pid(), allow_in_process_swap)
 }
 
 #[cfg(unix)]
@@ -51,7 +52,12 @@ fn terminate_superseded_app_processes_except(
 }
 
 #[cfg(unix)]
-fn terminate_active_app_processes_except(active_app_dir: &Path, main_exe: &str, protected_pid: u32) -> Result<usize> {
+fn terminate_active_app_processes_except(
+    active_app_dir: &Path,
+    main_exe: &str,
+    protected_pid: u32,
+    allow_in_process_swap: bool,
+) -> Result<usize> {
     let main_exe = main_exe.trim();
     if main_exe.is_empty() {
         return Ok(0);
@@ -73,7 +79,17 @@ fn terminate_active_app_processes_except(active_app_dir: &Path, main_exe: &str, 
             active_app_root.join(main_exe).display()
         )));
     }
-    refuse_in_process_swap(&active_exe, protected_pid)?;
+    if updater_runs_from_active_exe(&active_exe, protected_pid)? {
+        if !allow_in_process_swap {
+            return Err(SurgeError::Platform(
+                "The updater is running from the active application executable; refusing an in-process directory swap. Apply the update from an external Surge updater."
+                    .to_string(),
+            ));
+        }
+        info!(
+            "The updater is running from the active application executable; in-process swap explicitly allowed, quiescing other active application processes only"
+        );
+    }
     let interpreted_main = is_interpreted_main(&active_exe)?;
     if interpreted_main {
         return Err(SurgeError::Platform(
@@ -86,11 +102,11 @@ fn terminate_active_app_processes_except(active_app_dir: &Path, main_exe: &str, 
 }
 
 #[cfg(unix)]
-fn refuse_in_process_swap(active_exe: &Path, protected_pid: u32) -> Result<()> {
+fn updater_runs_from_active_exe(active_exe: &Path, protected_pid: u32) -> Result<bool> {
     use std::os::unix::fs::MetadataExt;
 
     if protected_pid != current_pid() {
-        return Ok(());
+        return Ok(false);
     }
 
     let updater_exe = std::env::current_exe().map_err(|e| {
@@ -108,14 +124,7 @@ fn refuse_in_process_swap(active_exe: &Path, protected_pid: u32) -> Result<()> {
             "Failed to inspect updater process identity before application swap: {e}"
         ))
     })?;
-    if active_metadata.dev() == updater_metadata.dev() && active_metadata.ino() == updater_metadata.ino() {
-        return Err(SurgeError::Platform(
-            "The updater is running from the active application executable; refusing an in-process directory swap. Apply the update from an external Surge updater."
-                .to_string(),
-        ));
-    }
-
-    Ok(())
+    Ok(active_metadata.dev() == updater_metadata.dev() && active_metadata.ino() == updater_metadata.ino())
 }
 
 #[cfg(unix)]
@@ -203,6 +212,7 @@ fn terminate_active_app_processes_except(
     _active_app_dir: &Path,
     _main_exe: &str,
     _protected_pid: u32,
+    _allow_in_process_swap: bool,
 ) -> Result<usize> {
     Ok(0)
 }
@@ -497,7 +507,8 @@ mod tests {
         let child_pid = child.id();
         wait_for_native_test_app(&app_path, child_pid);
 
-        let terminated = terminate_active_app_processes_except(&linked_active_app_dir, "demo", u32::MAX).unwrap();
+        let terminated =
+            terminate_active_app_processes_except(&linked_active_app_dir, "demo", u32::MAX, false).unwrap();
         let status = child.wait().unwrap();
 
         assert_eq!(terminated, 1);
@@ -520,9 +531,22 @@ mod tests {
         std::fs::create_dir_all(&active_app_dir).unwrap();
         std::fs::hard_link(std::env::current_exe().unwrap(), active_app_dir.join("demo")).unwrap();
 
-        let error = terminate_active_app_processes_except(&active_app_dir, "demo", current_pid()).unwrap_err();
+        let error = terminate_active_app_processes_except(&active_app_dir, "demo", current_pid(), false).unwrap_err();
 
         assert!(error.to_string().contains("refusing an in-process directory swap"));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn in_process_updater_swaps_without_signalling_itself_when_explicitly_allowed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let active_app_dir = tmp.path().join("app");
+        std::fs::create_dir_all(&active_app_dir).unwrap();
+        std::fs::hard_link(std::env::current_exe().unwrap(), active_app_dir.join("demo")).unwrap();
+
+        let terminated = terminate_active_app_processes_except(&active_app_dir, "demo", current_pid(), true).unwrap();
+
+        assert_eq!(terminated, 0);
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -540,7 +564,7 @@ mod tests {
         permissions.set_mode(0o755);
         std::fs::set_permissions(&app_path, permissions).unwrap();
         let mut child = Command::new(&app_path).spawn().unwrap();
-        let error = terminate_active_app_processes_except(&active_app_dir, "demo-script", u32::MAX).unwrap_err();
+        let error = terminate_active_app_processes_except(&active_app_dir, "demo-script", u32::MAX, false).unwrap_err();
         let child_still_running = child.try_wait().unwrap().is_none();
         if child_still_running {
             child.kill().unwrap();
@@ -563,7 +587,7 @@ mod tests {
         symlink("/bin/sleep", active_app_dir.join("demo")).unwrap();
 
         let mut unrelated_child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
-        let error = terminate_active_app_processes_except(&active_app_dir, "demo", u32::MAX).unwrap_err();
+        let error = terminate_active_app_processes_except(&active_app_dir, "demo", u32::MAX, false).unwrap_err();
         let unrelated_still_running = unrelated_child.try_wait().unwrap().is_none();
         if unrelated_still_running {
             unrelated_child.kill().unwrap();

@@ -114,6 +114,9 @@ namespace Surge
         [LibraryImport(LibName, EntryPoint = "surge_update_manager_set_artifact_retention_policy")]
         internal static partial int UpdateManagerSetArtifactRetentionPolicy(IntPtr mgr, int retention, int keepFullCount);
 
+        [LibraryImport(LibName, EntryPoint = "surge_update_manager_set_allow_in_process_swap")]
+        internal static partial int UpdateManagerSetAllowInProcessSwap(IntPtr mgr, int allow);
+
         [LibraryImport(LibName, EntryPoint = "surge_update_check")]
         internal static partial int UpdateCheck(IntPtr mgr, out IntPtr info);
 
@@ -287,6 +290,9 @@ namespace Surge
 
         [DllImport(LibName, EntryPoint = "surge_update_manager_set_artifact_retention_policy", CallingConvention = CallingConvention.Cdecl)]
         internal static extern int UpdateManagerSetArtifactRetentionPolicy(IntPtr mgr, int retention, int keepFullCount);
+
+        [DllImport(LibName, EntryPoint = "surge_update_manager_set_allow_in_process_swap", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int UpdateManagerSetAllowInProcessSwap(IntPtr mgr, int allow);
 
         [DllImport(LibName, EntryPoint = "surge_update_check", CallingConvention = CallingConvention.Cdecl)]
         internal static extern int UpdateCheck(IntPtr mgr, out IntPtr info);

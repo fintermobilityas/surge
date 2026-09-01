@@ -124,7 +124,11 @@ where
 
     progress_emitter.emit_substep(6, finalize_phase::QUIESCING_ACTIVE_APP, 92);
     if let Some(current_app_dir) = current_app_dir {
-        lifecycle::terminate_active_app_processes_before_swap(current_app_dir, current_main_exe)?;
+        lifecycle::terminate_active_app_processes_before_swap(
+            current_app_dir,
+            current_main_exe,
+            manager.allow_in_process_swap,
+        )?;
     }
     #[cfg(unix)]
     if previous_swap_dir.is_dir() {
@@ -136,7 +140,11 @@ where
                 )
             })?;
         lifecycle::request_supervisor_shutdown(&manager.install_dir, &previous_swap_identity.supervisor_id).await?;
-        lifecycle::terminate_active_app_processes_before_swap(&previous_swap_dir, &previous_swap_identity.main_exe)?;
+        lifecycle::terminate_active_app_processes_before_swap(
+            &previous_swap_dir,
+            &previous_swap_identity.main_exe,
+            manager.allow_in_process_swap,
+        )?;
     }
 
     progress_emitter.emit_substep(6, finalize_phase::PREPARING_SWAP, 92);

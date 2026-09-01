@@ -65,6 +65,15 @@ namespace Surge
         /// <summary>
         /// Maximum number of old installed versions to retain on disk after updating.
         /// </summary>
+        /// <summary>
+        /// Allow this process to swap its own active application directory during an update.
+        /// Defaults to <c>false</c>, in which case an updater running from the active application
+        /// executable refuses the swap and expects an external Surge updater. A self-hosted
+        /// application that updates in-process must enable this to keep self-updating; other
+        /// processes running the active executable are still stopped before the swap.
+        /// </summary>
+        public bool AllowInProcessSwap { get; set; }
+
         public int ReleaseRetentionLimit
         {
             get => _releaseRetentionLimit;
@@ -523,7 +532,14 @@ namespace Surge
 
         private void ApplyRetentionSettings()
         {
-            int result = NativeMethods.UpdateManagerSetReleaseRetentionLimit(_nativeMgr, _releaseRetentionLimit);
+            int result = NativeMethods.UpdateManagerSetAllowInProcessSwap(_nativeMgr, AllowInProcessSwap ? 1 : 0);
+            if (result != 0)
+            {
+                var errorMsg = GetLastError();
+                throw new SurgeException(result, errorMsg ?? "Failed to set the in-process swap policy.");
+            }
+
+            result = NativeMethods.UpdateManagerSetReleaseRetentionLimit(_nativeMgr, _releaseRetentionLimit);
             if (result != 0)
             {
                 var errorMsg = GetLastError();

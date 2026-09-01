@@ -90,12 +90,13 @@ fn paths_resolve_to_same_executable(actual: &Path, expected: &Path) -> bool {
 fn resolve_env_command(command: &EnvCommand) -> Result<PathBuf> {
     let program = Path::new(&command.program);
     if program.is_absolute() {
-        return std::fs::canonicalize(program).map_err(|e| {
+        let resolved = std::fs::canonicalize(program).map_err(|e| {
             SurgeError::Platform(format!(
                 "Failed to resolve active application env interpreter '{}': {e}",
                 program.display()
             ))
-        });
+        })?;
+        return validate_resolved_interpreter(resolved);
     }
     if program.components().count() != 1 {
         return Err(SurgeError::Platform(format!(
@@ -118,7 +119,7 @@ fn resolve_env_command(command: &EnvCommand) -> Result<PathBuf> {
         }
         let candidate = directory.join(program);
         if let Ok(candidate) = std::fs::canonicalize(candidate) {
-            return Ok(candidate);
+            return validate_resolved_interpreter(candidate);
         }
     }
 
@@ -365,6 +366,10 @@ fn resolve_direct_interpreter_path(interpreter: &str) -> Result<PathBuf> {
             interpreter.display()
         ))
     })?;
+    validate_resolved_interpreter(resolved)
+}
+
+fn validate_resolved_interpreter(resolved: PathBuf) -> Result<PathBuf> {
     let mut file = std::fs::File::open(&resolved).map_err(|e| {
         SurgeError::Platform(format!(
             "Failed to inspect active application interpreter '{}': {e}",
@@ -466,6 +471,30 @@ mod tests {
         };
 
         assert!(identity.executable_may_match(&interpreter).unwrap());
+    }
+
+    #[test]
+    fn absolute_env_command_rejects_nested_interpreter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let interpreter = tmp.path().join("demo-interpreter");
+        std::fs::write(&interpreter, "#!/bin/sh\n").unwrap();
+        let command = parse_env_command(interpreter.to_str().unwrap()).unwrap();
+
+        let error = resolve_env_command(&command).unwrap_err();
+
+        assert!(error.to_string().contains("nested interpreters are unsupported"));
+    }
+
+    #[test]
+    fn search_path_env_command_rejects_nested_interpreter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let interpreter = tmp.path().join("demo-interpreter");
+        std::fs::write(&interpreter, "#!/bin/sh\n").unwrap();
+        let command = parse_env_command(&format!("-S -P {} demo-interpreter", tmp.path().display())).unwrap();
+
+        let error = resolve_env_command(&command).unwrap_err();
+
+        assert!(error.to_string().contains("nested interpreters are unsupported"));
     }
 
     #[test]

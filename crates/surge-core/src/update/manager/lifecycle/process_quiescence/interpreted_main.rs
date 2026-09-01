@@ -1,5 +1,6 @@
 use std::ffi::{OsStr, OsString};
 use std::io::Read;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Result, SurgeError};
@@ -56,10 +57,18 @@ fn paths_resolve_to_same_executable(actual: &Path, expected: &Path) -> bool {
     if actual == expected {
         return true;
     }
-    let Ok(actual) = std::fs::canonicalize(actual) else {
-        return false;
-    };
-    std::fs::canonicalize(expected).is_ok_and(|expected| actual == expected)
+    if std::fs::canonicalize(actual)
+        .ok()
+        .zip(std::fs::canonicalize(expected).ok())
+        .is_some_and(|(actual, expected)| actual == expected)
+    {
+        return true;
+    }
+
+    std::fs::metadata(actual)
+        .ok()
+        .zip(std::fs::metadata(expected).ok())
+        .is_some_and(|(actual, expected)| actual.dev() == expected.dev() && actual.ino() == expected.ino())
 }
 
 fn resolve_env_command(command: &EnvCommand) -> Result<PathBuf> {
@@ -428,5 +437,16 @@ mod tests {
         let error = resolve(&app).err().unwrap();
 
         assert!(error.to_string().contains("embedded NUL"));
+    }
+
+    #[test]
+    fn hard_link_interpreter_aliases_share_executable_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let interpreter = tmp.path().join("interpreter");
+        let alias = tmp.path().join("interpreter-alias");
+        std::fs::write(&interpreter, "fixture").unwrap();
+        std::fs::hard_link(&interpreter, &alias).unwrap();
+
+        assert!(paths_resolve_to_same_executable(&interpreter, &alias));
     }
 }

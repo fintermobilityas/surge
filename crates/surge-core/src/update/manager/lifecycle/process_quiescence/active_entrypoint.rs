@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use crate::error::{Result, SurgeError};
 
 pub(super) struct Identity {
+    configured_launch_path: PathBuf,
     path: PathBuf,
     pub(super) resolved: PathBuf,
     require_entrypoint_argument: bool,
@@ -11,6 +12,11 @@ pub(super) struct Identity {
 
 impl Identity {
     pub(super) fn resolve(active_app_dir: &Path, main_exe: &str) -> Result<Option<Self>> {
+        let configured_launch_path = std::path::absolute(active_app_dir.join(main_exe)).map_err(|e| {
+            SurgeError::Platform(format!(
+                "Failed to resolve configured active application path before swap: {e}"
+            ))
+        })?;
         let active_app_root = match std::fs::canonicalize(active_app_dir) {
             Ok(path) => path,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -32,6 +38,7 @@ impl Identity {
         };
 
         Ok(Some(Self {
+            configured_launch_path,
             require_entrypoint_argument: configured_path != resolved,
             path: configured_path,
             resolved,
@@ -50,7 +57,7 @@ impl Identity {
 
     pub(super) fn matches_argument(&self, argument: &OsStr, cwd: Option<&Path>) -> Result<bool> {
         if self.require_entrypoint_argument {
-            argument_preserves_entrypoint(argument, cwd, &self.path)
+            argument_preserves_entrypoint(argument, cwd, &self.path, &self.configured_launch_path)
         } else {
             argument_resolves_to(argument, cwd, &self.resolved)
         }
@@ -62,12 +69,17 @@ impl Identity {
     }
 }
 
-fn argument_preserves_entrypoint(argument: &OsStr, cwd: Option<&Path>, expected: &Path) -> Result<bool> {
+fn argument_preserves_entrypoint(
+    argument: &OsStr,
+    cwd: Option<&Path>,
+    expected: &Path,
+    configured_launch_path: &Path,
+) -> Result<bool> {
     match absolute_argument(argument, cwd) {
         ArgumentPath::Missing => return Ok(false),
         ArgumentPath::Ambiguous => return ambiguous_relative_argument(argument, expected),
         ArgumentPath::Absolute(candidate) => {
-            if candidate == expected {
+            if candidate == expected || candidate == configured_launch_path {
                 return Ok(true);
             }
         }
@@ -168,6 +180,32 @@ mod tests {
         assert!(
             identity
                 .matches_argument(active_app_dir.join("demo").as_os_str(), None)
+                .unwrap()
+        );
+        assert!(
+            !identity
+                .matches_argument(shared_dir.join("demo").as_os_str(), None)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn active_directory_alias_preserves_configured_launch_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let active_app_dir = tmp.path().join("app");
+        let active_app_alias = tmp.path().join("app-alias");
+        let shared_dir = active_app_dir.join("shared");
+        std::fs::create_dir_all(&shared_dir).unwrap();
+        std::fs::write(shared_dir.join("demo"), "fixture").unwrap();
+        symlink("shared/demo", active_app_dir.join("demo")).unwrap();
+        symlink(&active_app_dir, &active_app_alias).unwrap();
+
+        let identity = Identity::resolve(&active_app_alias, "demo").unwrap().unwrap();
+
+        assert!(identity.requires_argument());
+        assert!(
+            identity
+                .matches_argument(active_app_alias.join("demo").as_os_str(), None)
                 .unwrap()
         );
         assert!(

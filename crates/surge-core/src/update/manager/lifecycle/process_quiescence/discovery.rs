@@ -4,12 +4,9 @@
 #[cfg(unix)]
 use std::ffi::OsString;
 #[cfg(unix)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::time::Duration;
-
-#[cfg(target_os = "macos")]
-use std::path::Path;
 
 #[cfg(unix)]
 use crate::error::Result;
@@ -31,12 +28,27 @@ pub(super) fn app_process_pids<F>(protected_pid: u32, matches_exe: &F) -> Result
 where
     F: Fn(&AppProcess) -> Result<bool>,
 {
-    app_process_identities(protected_pid, matches_exe)
+    app_process_identities(protected_pid, matches_exe, &|_| Ok(true), &|_, _| Ok(true))
         .map(|identities| identities.into_iter().map(|identity| identity.pid).collect())
 }
 
+#[cfg(unix)]
+pub(super) fn app_process_identities<F, E, C>(
+    protected_pid: u32,
+    matches_process: &F,
+    _executable_may_match: &E,
+    _command_may_match: &C,
+) -> Result<Vec<ProcessIdentity>>
+where
+    F: Fn(&AppProcess) -> Result<bool>,
+    E: Fn(&Path) -> Result<bool>,
+    C: Fn(&[OsString], Option<&Path>) -> Result<bool>,
+{
+    app_process_identities_impl(protected_pid, matches_process)
+}
+
 #[cfg(target_os = "linux")]
-pub(super) fn app_process_identities<F>(protected_pid: u32, matches_exe: &F) -> Result<Vec<ProcessIdentity>>
+fn app_process_identities_impl<F>(protected_pid: u32, matches_exe: &F) -> Result<Vec<ProcessIdentity>>
 where
     F: Fn(&AppProcess) -> Result<bool>,
 {
@@ -75,7 +87,7 @@ where
 }
 
 #[cfg(target_os = "macos")]
-pub(super) fn app_process_identities<F>(protected_pid: u32, matches_exe: &F) -> Result<Vec<ProcessIdentity>>
+fn app_process_identities_impl<F>(protected_pid: u32, matches_exe: &F) -> Result<Vec<ProcessIdentity>>
 where
     F: Fn(&AppProcess) -> Result<bool>,
 {
@@ -184,7 +196,7 @@ fn proc_stat_is_zombie(stat: &str) -> Option<bool> {
 }
 
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-pub(super) fn app_process_identities<F>(_protected_pid: u32, _matches_exe: &F) -> Result<Vec<ProcessIdentity>>
+fn app_process_identities_impl<F>(_protected_pid: u32, _matches_exe: &F) -> Result<Vec<ProcessIdentity>>
 where
     F: Fn(&AppProcess) -> Result<bool>,
 {

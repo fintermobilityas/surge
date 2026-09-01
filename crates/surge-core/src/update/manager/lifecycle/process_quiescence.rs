@@ -96,14 +96,21 @@ fn terminate_superseded_app_processes_except(
     main_exe: &str,
     protected_pid: u32,
 ) -> Result<usize> {
-    terminate_matching_app_processes(main_exe, protected_pid, "superseded", |process| {
-        Ok(is_superseded_app_exe(
-            install_dir,
-            active_app_dir,
-            main_exe,
-            &process.exe,
-        ))
-    })
+    terminate_matching_app_processes(
+        main_exe,
+        protected_pid,
+        "superseded",
+        |process| {
+            Ok(is_superseded_app_exe(
+                install_dir,
+                active_app_dir,
+                main_exe,
+                &process.exe,
+            ))
+        },
+        |exe| Ok(is_superseded_app_exe(install_dir, active_app_dir, main_exe, exe)),
+        |command, cwd| Ok(superseded_app_command_may_match(install_dir, main_exe, command, cwd)),
+    )
 }
 
 #[cfg(all(unix, test))]
@@ -123,9 +130,21 @@ fn terminate_active_app_processes_except(
 
 #[cfg(unix)]
 fn terminate_prepared_app_processes_except(prepared: &PreparedAppQuiescence, protected_pid: u32) -> Result<usize> {
-    terminate_matching_app_processes(&prepared.main_exe, protected_pid, "active", |process| {
-        is_active_app_process(&prepared.active_entrypoint, prepared.interpreted_main.as_ref(), process)
-    })
+    terminate_matching_app_processes(
+        &prepared.main_exe,
+        protected_pid,
+        "active",
+        |process| is_active_app_process(&prepared.active_entrypoint, prepared.interpreted_main.as_ref(), process),
+        |exe| active_app_executable_may_match(&prepared.active_entrypoint, prepared.interpreted_main.as_ref(), exe),
+        |command, cwd| {
+            active_app_command_may_match(
+                &prepared.active_entrypoint,
+                prepared.interpreted_main.as_ref(),
+                command,
+                cwd,
+            )
+        },
+    )
 }
 
 #[cfg(unix)]
@@ -186,14 +205,18 @@ fn refuse_process_in_swap(
 }
 
 #[cfg(unix)]
-fn terminate_matching_app_processes<F>(
+fn terminate_matching_app_processes<F, E, C>(
     main_exe: &str,
     protected_pid: u32,
     process_scope: &'static str,
-    matches_exe: F,
+    matches_process: F,
+    executable_may_match: E,
+    command_may_match: C,
 ) -> Result<usize>
 where
     F: Fn(&AppProcess) -> Result<bool>,
+    E: Fn(&Path) -> Result<bool>,
+    C: Fn(&[OsString], Option<&Path>) -> Result<bool>,
 {
     use nix::errno::Errno;
     use nix::sys::signal::Signal;
@@ -203,7 +226,12 @@ where
         return Ok(0);
     }
 
-    let identities = app_process_identities(protected_pid, &matches_exe)?;
+    let identities = app_process_identities(
+        protected_pid,
+        &matches_process,
+        &executable_may_match,
+        &command_may_match,
+    )?;
     if identities.is_empty() {
         return Ok(0);
     }
@@ -215,12 +243,23 @@ where
         }
     }
 
-    if wait_until_app_processes_exit(protected_pid, &matches_exe, Duration::from_secs(5))? {
+    if wait_until_app_processes_exit(
+        protected_pid,
+        &matches_process,
+        &executable_may_match,
+        &command_may_match,
+        Duration::from_secs(5),
+    )? {
         info!(count = identities.len(), process_scope, "Terminated app processes");
         return Ok(identities.len());
     }
 
-    let remaining = app_process_identities(protected_pid, &matches_exe)?;
+    let remaining = app_process_identities(
+        protected_pid,
+        &matches_process,
+        &executable_may_match,
+        &command_may_match,
+    )?;
     for identity in &remaining {
         match signal_pid(identity.pid, Signal::SIGKILL) {
             Ok(()) | Err(Errno::ESRCH) => {}
@@ -231,7 +270,13 @@ where
         }
     }
 
-    if wait_until_app_processes_exit(protected_pid, &matches_exe, Duration::from_secs(2))? {
+    if wait_until_app_processes_exit(
+        protected_pid,
+        &matches_process,
+        &executable_may_match,
+        &command_may_match,
+        Duration::from_secs(2),
+    )? {
         info!(
             count = identities.len(),
             forced = remaining.len(),
@@ -278,13 +323,21 @@ fn terminate_active_app_processes_except(
 }
 
 #[cfg(unix)]
-fn wait_until_app_processes_exit<F>(protected_pid: u32, matches_exe: &F, timeout: Duration) -> Result<bool>
+fn wait_until_app_processes_exit<F, E, C>(
+    protected_pid: u32,
+    matches_process: &F,
+    executable_may_match: &E,
+    command_may_match: &C,
+    timeout: Duration,
+) -> Result<bool>
 where
     F: Fn(&AppProcess) -> Result<bool>,
+    E: Fn(&Path) -> Result<bool>,
+    C: Fn(&[OsString], Option<&Path>) -> Result<bool>,
 {
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        if app_process_identities(protected_pid, matches_exe)?.is_empty() {
+        if app_process_identities(protected_pid, matches_process, executable_may_match, command_may_match)?.is_empty() {
             return Ok(true);
         }
         if std::time::Instant::now() >= deadline {
@@ -343,6 +396,61 @@ pub(in crate::update::manager) fn wait_for_native_test_app(app_path: &Path, chil
         );
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[cfg(unix)]
+fn active_app_executable_may_match(
+    active_entrypoint: &active_entrypoint::Identity,
+    interpreted_main: Option<&interpreted_main::Identity>,
+    executable: &Path,
+) -> Result<bool> {
+    if active_entrypoint.matches_resolved_executable(executable) {
+        return Ok(true);
+    }
+    match interpreted_main {
+        Some(identity) => identity.executable_may_match(executable),
+        None => Ok(false),
+    }
+}
+
+#[cfg(unix)]
+fn active_app_command_may_match(
+    active_entrypoint: &active_entrypoint::Identity,
+    interpreted_main: Option<&interpreted_main::Identity>,
+    command: &[OsString],
+    cwd: Option<&Path>,
+) -> Result<bool> {
+    if command.iter().all(|argument| argument.is_empty()) {
+        return Ok(true);
+    }
+    let Some(first_argument) = command.first() else {
+        return Ok(true);
+    };
+    if active_entrypoint.matches_argument(first_argument, cwd)? {
+        return Ok(true);
+    }
+    let Some(script_argument) = interpreted_main.and_then(|identity| command.get(identity.script_argument_index))
+    else {
+        return Ok(false);
+    };
+    active_entrypoint.matches_argument(script_argument, cwd)
+}
+
+#[cfg(unix)]
+fn superseded_app_command_may_match(
+    install_dir: &Path,
+    main_exe: &str,
+    command: &[OsString],
+    _cwd: Option<&Path>,
+) -> bool {
+    let Some(argument) = command.first() else {
+        return true;
+    };
+    let argument = Path::new(argument);
+    if argument.file_name().and_then(|name| name.to_str()) != Some(main_exe) {
+        return false;
+    }
+    argument.is_relative() || argument.starts_with(install_dir)
 }
 
 #[cfg(unix)]

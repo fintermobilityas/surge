@@ -86,16 +86,35 @@ pub(super) async fn prepare_and_quiesce_previous_swap_before_reuse(
     supervisor_requires_restoration: bool,
     supervised_child_pid: Option<u32>,
 ) -> Result<Option<(lifecycle::PreparedAppQuiescence, String)>> {
-    let result: Result<Option<(lifecycle::PreparedAppQuiescence, String)>> = async {
-        let previous_swap_identity = super::current_install::load_previous_swap(manager, previous_swap_dir)?
-            .ok_or_else(|| {
-                SurgeError::Update(
-                    "Previous swap directory has no persisted process identity; refusing to delete or reuse it"
-                        .to_string(),
-                )
-            })?;
-        let _ =
-            lifecycle::request_supervisor_shutdown(&manager.install_dir, &previous_swap_identity.supervisor_id).await?;
+    let restore_current = |error| {
+        restore_previous_supervisor_after_quiescence_failure(
+            &manager.install_dir,
+            current_app_dir,
+            current_version,
+            current_main_exe,
+            current_supervisor_id,
+            current_environment,
+            supervisor_requires_restoration,
+            supervised_child_pid,
+            error,
+        )
+    };
+    let previous_swap_identity = match super::current_install::load_previous_swap(manager, previous_swap_dir) {
+        Ok(Some(identity)) => identity,
+        Ok(None) => {
+            return Err(restore_current(SurgeError::Update(
+                "Previous swap directory has no persisted process identity; refusing to delete or reuse it".to_string(),
+            )));
+        }
+        Err(error) => return Err(restore_current(error)),
+    };
+    let previous_supervised_child_pid =
+        match lifecycle::request_supervisor_shutdown(&manager.install_dir, &previous_swap_identity.supervisor_id).await
+        {
+            Ok(pid) => pid,
+            Err(error) => return Err(restore_current(error)),
+        };
+    let result = (|| {
         let prepared = lifecycle::prepare_app_quiescence(
             previous_swap_dir,
             &previous_swap_identity.main_exe,
@@ -107,24 +126,33 @@ pub(super) async fn prepare_and_quiesce_previous_swap_before_reuse(
             )
         })?;
         lifecycle::terminate_prepared_app_processes(&prepared)?;
-        Ok(Some((prepared, previous_swap_identity.main_exe)))
-    }
-    .await;
+        Ok::<_, SurgeError>(prepared)
+    })();
 
-    let Err(error) = result else {
-        return result;
-    };
-    Err(restore_previous_supervisor_after_quiescence_failure(
-        &manager.install_dir,
-        current_app_dir,
-        current_version,
-        current_main_exe,
-        current_supervisor_id,
-        current_environment,
-        supervisor_requires_restoration,
-        supervised_child_pid,
-        error,
-    ))
+    match result {
+        Ok(prepared) => Ok(Some((prepared, previous_swap_identity.main_exe))),
+        Err(error) => {
+            if previous_supervised_child_pid.is_some()
+                && (!supervisor_requires_restoration || previous_swap_identity.supervisor_id != current_supervisor_id)
+            {
+                request_previous_supervisor_restoration(
+                    &manager.install_dir,
+                    previous_swap_dir,
+                    &previous_swap_identity.version,
+                    &previous_swap_identity.main_exe,
+                    &previous_swap_identity.supervisor_id,
+                    &previous_swap_identity.environment,
+                    previous_supervised_child_pid,
+                );
+            } else if previous_supervised_child_pid.is_some() {
+                warn!(
+                    supervisor_id = current_supervisor_id,
+                    "Cannot restore both current and previous-swap children through the same supervisor identity"
+                );
+            }
+            Err(restore_current(error))
+        }
+    }
 }
 
 fn request_previous_supervisor_restoration(
@@ -175,7 +203,7 @@ mod tests {
     use std::process::{Command, Stdio};
     use std::time::Duration;
 
-    use crate::supervisor::state::supervisor_pid_file;
+    use crate::supervisor::state::{supervisor_pid_file, write_supervisor_takeover_pid};
 
     use super::*;
 
@@ -312,6 +340,100 @@ mod tests {
                 .unwrap()
                 .trim(),
             "4242"
+        );
+    }
+
+    #[tokio::test]
+    async fn previous_swap_quiescence_failure_restores_its_supervisor_handoff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install_dir = tmp.path().join("install");
+        let store_dir = tmp.path().join("store");
+        let previous_swap_dir = install_dir.join(".surge-app-prev");
+        std::fs::create_dir_all(previous_swap_dir.join(".surge")).unwrap();
+        std::fs::create_dir_all(&store_dir).unwrap();
+
+        let app_path = previous_swap_dir.join("cwd-changing-demo-script");
+        std::fs::write(&app_path, "#!/bin/sh\ncd /\nread _\n").unwrap();
+        make_executable(&app_path);
+        write_test_supervisor(&previous_swap_dir);
+        std::fs::write(
+            previous_swap_dir.join(crate::install::RUNTIME_MANIFEST_RELATIVE_PATH),
+            "id: test-app\nversion: 0.9.0\nmainExe: cwd-changing-demo-script\nsupervisorId: previous-supervisor\nenvironment:\n  SURGE_TEST_MODE: previous-preserved\n",
+        )
+        .unwrap();
+
+        let spawn_deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let mut child = loop {
+            match Command::new("./cwd-changing-demo-script")
+                .current_dir(&previous_swap_dir)
+                .stdin(Stdio::piped())
+                .spawn()
+            {
+                Ok(child) => break child,
+                Err(error)
+                    if error.raw_os_error() == Some(nix::errno::Errno::ETXTBSY as i32)
+                        && std::time::Instant::now() < spawn_deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("failed to launch previous-swap fixture: {error}"),
+            }
+        };
+        let cwd_path = PathBuf::from(format!("/proc/{}/cwd", child.id()));
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::fs::read_link(&cwd_path).ok().as_deref() != Some(Path::new("/")) {
+            assert!(std::time::Instant::now() < deadline, "test child did not change cwd");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        write_supervisor_takeover_pid(&install_dir, "previous-supervisor", child.id()).unwrap();
+
+        let ctx = std::sync::Arc::new(crate::context::Context::new());
+        ctx.set_storage(
+            crate::context::StorageProvider::Filesystem,
+            store_dir.to_str().unwrap(),
+            "",
+            "",
+            "",
+            "",
+        );
+        let manager = UpdateManager::new(ctx, "test-app", "1.0.0", "stable", install_dir.to_str().unwrap()).unwrap();
+
+        let child_pid = child.id();
+        let result = prepare_and_quiesce_previous_swap_before_reuse(
+            &manager,
+            &previous_swap_dir,
+            None,
+            "",
+            "",
+            "",
+            None,
+            false,
+            None,
+        )
+        .await;
+        let child_still_running = child.try_wait().unwrap().is_none();
+        if child_still_running {
+            child.kill().unwrap();
+        }
+        let _ = child.wait();
+
+        let error = result.err().unwrap();
+        assert!(error.to_string().contains("process identity is ambiguous"));
+        assert!(child_still_running);
+        assert!(supervisor_pid_file(&install_dir, "previous-supervisor").is_file());
+        assert_eq!(
+            crate::supervisor::state::read_supervisor_exe_path(&install_dir, "previous-supervisor").as_deref(),
+            Some(app_path.as_path())
+        );
+        assert_eq!(
+            std::fs::read_to_string(install_dir.join("restored-environment")).unwrap(),
+            "previous-preserved"
+        );
+        assert_eq!(
+            std::fs::read_to_string(install_dir.join("restored-watched.pid"))
+                .unwrap()
+                .trim(),
+            child_pid.to_string()
         );
     }
 

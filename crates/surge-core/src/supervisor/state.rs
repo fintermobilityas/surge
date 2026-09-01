@@ -11,9 +11,9 @@ pub use takeover::{
     accept_supervisor_takeover_request, cancel_supervisor_takeover_request, clear_supervisor_takeover_exchange,
     clear_supervisor_takeover_instance_if_owned, clear_supervisor_takeover_request, read_accepted_supervisor_takeover,
     read_supervisor_takeover_acknowledgement, read_supervisor_takeover_commit, read_supervisor_takeover_instance,
-    read_supervisor_takeover_request, supervisor_takeover_request_file, take_accepted_supervisor_takeover,
-    write_supervisor_takeover_acknowledgement, write_supervisor_takeover_commit, write_supervisor_takeover_instance,
-    write_supervisor_takeover_request,
+    read_supervisor_takeover_request, supervisor_takeover_acknowledgement_file, supervisor_takeover_request_file,
+    take_accepted_supervisor_takeover, write_supervisor_takeover_acknowledgement, write_supervisor_takeover_commit,
+    write_supervisor_takeover_instance, write_supervisor_takeover_request,
 };
 
 fn normalized_supervisor_id(supervisor_id: &str) -> &str {
@@ -76,7 +76,18 @@ pub fn take_supervisor_takeover_pid(install_dir: &Path, supervisor_id: &str) -> 
 
 #[cfg(unix)]
 pub fn clear_supervisor_takeover_pid(install_dir: &Path, supervisor_id: &str) {
-    let _ = std::fs::remove_file(supervisor_takeover_pid_file(install_dir, supervisor_id));
+    if let Err(error) = try_clear_supervisor_takeover_pid(install_dir, supervisor_id) {
+        tracing::warn!(supervisor_id, %error, "Failed to clean up legacy supervisor takeover PID");
+    }
+}
+
+#[cfg(unix)]
+pub fn try_clear_supervisor_takeover_pid(install_dir: &Path, supervisor_id: &str) -> Result<()> {
+    match std::fs::remove_file(supervisor_takeover_pid_file(install_dir, supervisor_id)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Persist the supervised executable path so the spawning side can omit it from
@@ -193,5 +204,14 @@ mod tests {
 
         assert_eq!(take_supervisor_takeover_pid(dir.path(), "demo-supervisor"), Some(42));
         assert_eq!(take_supervisor_takeover_pid(dir.path(), "demo-supervisor"), None);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn supervisor_takeover_pid_cleanup_reports_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(supervisor_takeover_pid_file(dir.path(), "demo-supervisor")).unwrap();
+
+        assert!(try_clear_supervisor_takeover_pid(dir.path(), "demo-supervisor").is_err());
     }
 }

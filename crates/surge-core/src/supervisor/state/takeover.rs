@@ -186,6 +186,11 @@ pub fn supervisor_takeover_request_file(install_dir: &Path, supervisor_id: &str)
     takeover_request_file(install_dir, supervisor_id)
 }
 
+#[must_use]
+pub fn supervisor_takeover_acknowledgement_file(install_dir: &Path, supervisor_id: &str) -> PathBuf {
+    takeover_acknowledgement_file(install_dir, supervisor_id)
+}
+
 pub fn write_supervisor_takeover_instance(
     install_dir: &Path,
     supervisor_id: &str,

@@ -6,21 +6,30 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 #[cfg(unix)]
-use surge_core::supervisor::state::{clear_supervisor_takeover_pid, write_supervisor_takeover_pid};
+use surge_core::supervisor::state::{
+    SupervisorTakeoverInstance, clear_supervisor_takeover_instance_if_owned, supervisor_takeover_request_file,
+    try_clear_supervisor_takeover_pid, write_supervisor_takeover_instance, write_supervisor_takeover_pid,
+};
 use surge_core::supervisor::state::{read_supervisor_exe_path, supervisor_pid_file, supervisor_stop_file};
 use thiserror::Error;
 
 mod child;
 mod handoff;
 mod ownership;
+#[cfg(unix)]
+mod takeover;
 
 use child::{
-    RestartWaitOutcome, SupervisedChildOutcome, WaitOutcome, spawn_supervised_child, wait_before_restart,
+    RestartWaitOutcome, StopTriggers, SupervisedChildOutcome, WaitOutcome, spawn_supervised_child, wait_before_restart,
     wait_for_pid_or_stop, wait_for_supervised_child,
 };
 #[cfg(unix)]
+use child::{is_process_running, terminate_child_process};
+#[cfg(unix)]
 use ownership::current_supervisor_owns_pid_file;
 use ownership::{remove_owned_supervisor_state, supervisor_was_superseded};
+#[cfg(unix)]
+use takeover::{TakeoverResolution, complete_supervisor_takeover};
 
 /// Delay before relaunching a supervised child that has exited. Applied to both
 /// crash exits and clean (code 0) exits so a child that exits immediately cannot
@@ -114,6 +123,10 @@ enum SupervisorError {
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[cfg(unix)]
+    #[error("Surge state error: {0}")]
+    Surge(#[from] surge_core::error::SurgeError),
 }
 
 fn resolve_exe_path(
@@ -225,12 +238,27 @@ fn run_supervisor(
     let stop_file = supervisor_stop_file(install_dir, supervisor_id);
 
     #[cfg(unix)]
-    clear_supervisor_takeover_pid(install_dir, supervisor_id);
+    try_clear_supervisor_takeover_pid(install_dir, supervisor_id)?;
     if stop_file.exists() {
         let _ = std::fs::remove_file(&stop_file);
     }
     let own_pid = std::process::id();
     write_pid_file(&pid_file, own_pid)?;
+    #[cfg(unix)]
+    let takeover_instance = {
+        let takeover_instance = SupervisorTakeoverInstance::new(own_pid);
+        if let Err(error) = write_supervisor_takeover_instance(install_dir, supervisor_id, &takeover_instance) {
+            remove_owned_supervisor_state(&pid_file, &stop_file, own_pid);
+            return Err(error.into());
+        }
+        takeover_instance
+    };
+    #[cfg(unix)]
+    let takeover_request_file = supervisor_takeover_request_file(install_dir, supervisor_id);
+    #[cfg(unix)]
+    let stop_triggers = StopTriggers::new(&stop_file, Some(&takeover_request_file));
+    #[cfg(not(unix))]
+    let stop_triggers = StopTriggers::new(&stop_file, None);
 
     let shutdown = install_signal_handlers();
 
@@ -243,17 +271,9 @@ fn run_supervisor(
     let mut pending_handoff_version = handoff::pending_restart_handoff_version(watched_pid, handoff_version, args);
     let mut watched_pid = watched_pid;
 
-    loop {
+    'supervision: loop {
         if shutdown.load(std::sync::atomic::Ordering::Acquire) {
             tracing::info!("Shutdown signal received, exiting supervisor loop");
-            break;
-        }
-        if stop_file.exists() {
-            #[cfg(unix)]
-            if let Some(pid) = watched_pid {
-                record_supervisor_takeover_pid_if_owned(install_dir, supervisor_id, &pid_file, own_pid, pid);
-            }
-            tracing::info!("Stop requested, exiting supervisor loop");
             break;
         }
 
@@ -261,29 +281,90 @@ fn run_supervisor(
             break;
         }
 
+        if stop_triggers.requested() {
+            #[cfg(unix)]
+            match complete_supervisor_takeover(
+                install_dir,
+                supervisor_id,
+                &takeover_instance,
+                &stop_triggers,
+                &shutdown,
+                &pid_file,
+                own_pid,
+                || Ok(watched_pid.filter(|pid| is_process_running(*pid))),
+            )? {
+                TakeoverResolution::Cancelled => continue,
+                TakeoverResolution::LegacyStop(child_pid) => {
+                    if let Some(child_pid) = child_pid {
+                        record_supervisor_takeover_pid_if_owned(
+                            install_dir,
+                            supervisor_id,
+                            &pid_file,
+                            own_pid,
+                            child_pid,
+                        );
+                    }
+                    break;
+                }
+                TakeoverResolution::Accepted
+                | TakeoverResolution::ShutdownRequested
+                | TakeoverResolution::Superseded => break,
+            }
+            #[cfg(not(unix))]
+            break;
+        }
+
         if let Some(pid) = watched_pid.take() {
             tracing::info!("Watching running process PID {pid} before relaunch");
-            match wait_for_pid_or_stop(pid, &shutdown, &stop_file, &pid_file, own_pid) {
-                WaitOutcome::ObservedProcessExited => {
-                    if supervisor_was_superseded(&pid_file, own_pid) {
+            loop {
+                match wait_for_pid_or_stop(pid, &shutdown, &stop_triggers, &pid_file, own_pid) {
+                    WaitOutcome::ObservedProcessExited => {
+                        if supervisor_was_superseded(&pid_file, own_pid) {
+                            break 'supervision;
+                        }
+                        tracing::info!("Observed process PID {pid} exited, starting replacement child");
                         break;
                     }
-                    tracing::info!("Observed process PID {pid} exited, starting replacement child");
+                    WaitOutcome::StopRequested => {
+                        #[cfg(unix)]
+                        match complete_supervisor_takeover(
+                            install_dir,
+                            supervisor_id,
+                            &takeover_instance,
+                            &stop_triggers,
+                            &shutdown,
+                            &pid_file,
+                            own_pid,
+                            || Ok(is_process_running(pid).then_some(pid)),
+                        )? {
+                            TakeoverResolution::Accepted => break 'supervision,
+                            TakeoverResolution::Cancelled => continue,
+                            TakeoverResolution::LegacyStop(child_pid) => {
+                                if let Some(child_pid) = child_pid {
+                                    record_supervisor_takeover_pid_if_owned(
+                                        install_dir,
+                                        supervisor_id,
+                                        &pid_file,
+                                        own_pid,
+                                        child_pid,
+                                    );
+                                }
+                                break 'supervision;
+                            }
+                            TakeoverResolution::ShutdownRequested | TakeoverResolution::Superseded => {
+                                break 'supervision;
+                            }
+                        }
+                        #[cfg(not(unix))]
+                        break 'supervision;
+                    }
+                    WaitOutcome::ShutdownRequested => {
+                        tracing::info!("Shutdown signal received, supervisor loop is exiting");
+                        break 'supervision;
+                    }
+                    WaitOutcome::Superseded => break 'supervision,
+                    WaitOutcome::Exited(_) => unreachable!(),
                 }
-                WaitOutcome::StopRequested => {
-                    #[cfg(unix)]
-                    record_supervisor_takeover_pid_if_owned(install_dir, supervisor_id, &pid_file, own_pid, pid);
-                    tracing::info!("Stop requested, exiting supervisor loop and leaving watched process running");
-                    break;
-                }
-                WaitOutcome::ShutdownRequested => {
-                    tracing::info!("Shutdown signal received, supervisor loop is exiting");
-                    break;
-                }
-                WaitOutcome::Superseded => {
-                    break;
-                }
-                WaitOutcome::Exited(_) => unreachable!(),
             }
         }
 
@@ -296,31 +377,67 @@ fn run_supervisor(
         #[cfg(unix)]
         let child_pid = child.id();
 
-        let status = match wait_for_supervised_child(
-            &mut child,
-            &shutdown,
-            &stop_file,
-            &pid_file,
-            own_pid,
-            install_dir,
-            &mut pending_handoff_version,
-        )? {
-            SupervisedChildOutcome::Exited(status) => status,
-            SupervisedChildOutcome::StopRequested => {
-                #[cfg(unix)]
-                record_supervisor_takeover_pid_if_owned(install_dir, supervisor_id, &pid_file, own_pid, child_pid);
-                break;
+        let status = loop {
+            match wait_for_supervised_child(
+                &mut child,
+                &shutdown,
+                &stop_triggers,
+                &pid_file,
+                own_pid,
+                install_dir,
+                &mut pending_handoff_version,
+            )? {
+                SupervisedChildOutcome::Exited(status) => break status,
+                SupervisedChildOutcome::StopRequested => {
+                    #[cfg(unix)]
+                    match complete_supervisor_takeover(
+                        install_dir,
+                        supervisor_id,
+                        &takeover_instance,
+                        &stop_triggers,
+                        &shutdown,
+                        &pid_file,
+                        own_pid,
+                        || Ok(child.try_wait()?.is_none().then_some(child_pid)),
+                    )? {
+                        TakeoverResolution::Cancelled => continue,
+                        TakeoverResolution::LegacyStop(running_child_pid) => {
+                            if let Some(running_child_pid) = running_child_pid {
+                                record_supervisor_takeover_pid_if_owned(
+                                    install_dir,
+                                    supervisor_id,
+                                    &pid_file,
+                                    own_pid,
+                                    running_child_pid,
+                                );
+                            }
+                            break 'supervision;
+                        }
+                        TakeoverResolution::ShutdownRequested => {
+                            terminate_child_process(&mut child)?;
+                            break 'supervision;
+                        }
+                        TakeoverResolution::Accepted | TakeoverResolution::Superseded => break 'supervision,
+                    }
+                    #[cfg(not(unix))]
+                    break 'supervision;
+                }
+                SupervisedChildOutcome::ShutdownRequested | SupervisedChildOutcome::Superseded => {
+                    break 'supervision;
+                }
             }
-            SupervisedChildOutcome::ShutdownRequested | SupervisedChildOutcome::Superseded => break,
         };
 
         if supervisor_was_superseded(&pid_file, own_pid) {
             break;
         }
 
-        if shutdown.load(std::sync::atomic::Ordering::Acquire) || stop_file.exists() {
+        if shutdown.load(std::sync::atomic::Ordering::Acquire) {
             tracing::info!("Child exited with {status} after shutdown signal, not restarting");
             break;
+        }
+        if stop_triggers.requested() {
+            continue;
         }
 
         if status.success() {
@@ -335,14 +452,39 @@ fn run_supervisor(
             );
         }
 
-        match wait_before_restart(&shutdown, &stop_file, &pid_file, own_pid, CHILD_RESTART_BACKOFF) {
-            RestartWaitOutcome::DelayElapsed => {}
-            RestartWaitOutcome::StopRequested
-            | RestartWaitOutcome::ShutdownRequested
-            | RestartWaitOutcome::Superseded => break,
+        loop {
+            match wait_before_restart(&shutdown, &stop_triggers, &pid_file, own_pid, CHILD_RESTART_BACKOFF) {
+                RestartWaitOutcome::DelayElapsed => break,
+                RestartWaitOutcome::StopRequested => {
+                    #[cfg(unix)]
+                    match complete_supervisor_takeover(
+                        install_dir,
+                        supervisor_id,
+                        &takeover_instance,
+                        &stop_triggers,
+                        &shutdown,
+                        &pid_file,
+                        own_pid,
+                        || Ok(None),
+                    )? {
+                        TakeoverResolution::Accepted | TakeoverResolution::LegacyStop(_) => break 'supervision,
+                        TakeoverResolution::Cancelled => continue,
+                        TakeoverResolution::ShutdownRequested | TakeoverResolution::Superseded => {
+                            break 'supervision;
+                        }
+                    }
+                    #[cfg(not(unix))]
+                    break 'supervision;
+                }
+                RestartWaitOutcome::ShutdownRequested | RestartWaitOutcome::Superseded => break 'supervision,
+            }
         }
     }
 
+    #[cfg(unix)]
+    if let Err(error) = clear_supervisor_takeover_instance_if_owned(install_dir, supervisor_id, &takeover_instance) {
+        tracing::warn!(supervisor_id, %error, "Failed to clean up supervisor takeover instance");
+    }
     remove_owned_supervisor_state(&pid_file, &stop_file, own_pid);
 
     tracing::info!("Supervisor '{supervisor_id}' exiting");
@@ -417,6 +559,13 @@ mod tests {
     use std::process::Command;
 
     use super::*;
+    #[cfg(unix)]
+    use surge_core::supervisor::state::{
+        SupervisorTakeoverAcknowledgement, SupervisorTakeoverCommit, SupervisorTakeoverRequest,
+        read_accepted_supervisor_takeover, read_supervisor_takeover_acknowledgement, read_supervisor_takeover_instance,
+        supervisor_takeover_acknowledgement_file, take_accepted_supervisor_takeover, write_supervisor_takeover_commit,
+        write_supervisor_takeover_request,
+    };
 
     #[cfg(unix)]
     struct TestInstallDir {
@@ -461,6 +610,27 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         predicate()
+    }
+
+    #[cfg(unix)]
+    fn wait_for_takeover_acknowledgement(
+        install_dir: &Path,
+        supervisor_id: &str,
+        request: &SupervisorTakeoverRequest,
+    ) -> SupervisorTakeoverAcknowledgement {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            if let Some(acknowledgement) = read_supervisor_takeover_acknowledgement(install_dir, supervisor_id).unwrap()
+                && acknowledgement.matches_request(request)
+            {
+                return acknowledgement;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "takeover acknowledgement did not appear before the test deadline"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     #[test]
@@ -739,6 +909,104 @@ mod tests {
             .expect("supervisor did not exit after stop file")
             .unwrap();
         assert_eq!(takeover_pid, Some(child_pid));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn takeover_acknowledgement_storage_failure_keeps_supervisor_and_child_running() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TestInstallDir::new("surge-supervisor-ack-storage-retry");
+        let install_dir = tmp.path();
+        let supervisor_id = "demo-supervisor";
+        let child_pid_path = install_dir.join("child.pid");
+        let exe_path = install_dir.join("target-child");
+        std::fs::write(
+            &exe_path,
+            format!("#!/bin/sh\necho $$ > '{}'\nexec sleep 30\n", child_pid_path.display()),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&exe_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&exe_path, permissions).unwrap();
+
+        let install_dir_for_thread = install_dir.to_path_buf();
+        let exe_path_for_thread = exe_path.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let supervisor = std::thread::spawn(move || {
+            tx.send(run_supervisor(
+                supervisor_id,
+                &install_dir_for_thread,
+                &exe_path_for_thread,
+                &[],
+                None,
+                None,
+            ))
+            .unwrap();
+        });
+
+        assert!(
+            wait_until(std::time::Duration::from_secs(5), || {
+                child_pid_path.is_file()
+                    && read_supervisor_takeover_instance(install_dir, supervisor_id)
+                        .unwrap()
+                        .is_some()
+            }),
+            "supervisor and child did not start"
+        );
+        let child_pid = std::fs::read_to_string(&child_pid_path)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        let instance = read_supervisor_takeover_instance(install_dir, supervisor_id)
+            .unwrap()
+            .unwrap();
+        let acknowledgement_path = supervisor_takeover_acknowledgement_file(install_dir, supervisor_id);
+        std::fs::create_dir(&acknowledgement_path).unwrap();
+        let request = SupervisorTakeoverRequest::new(&instance, std::time::Duration::from_secs(5));
+        write_supervisor_takeover_request(install_dir, supervisor_id, &request).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        assert!(
+            matches!(rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
+            "supervisor must not exit when acknowledgement persistence fails"
+        );
+        assert!(is_process_running(child_pid), "supervised child must remain running");
+        assert!(supervisor_pid_file(install_dir, supervisor_id).exists());
+
+        std::fs::remove_dir(&acknowledgement_path).unwrap();
+        let acknowledgement = wait_for_takeover_acknowledgement(install_dir, supervisor_id, &request);
+        write_supervisor_takeover_commit(
+            install_dir,
+            supervisor_id,
+            &SupervisorTakeoverCommit::new(&acknowledgement),
+        )
+        .unwrap();
+        assert!(
+            wait_until(std::time::Duration::from_secs(5), || {
+                read_accepted_supervisor_takeover(install_dir, supervisor_id)
+                    .unwrap()
+                    .is_some()
+                    && !supervisor_pid_file(install_dir, supervisor_id).exists()
+            }),
+            "supervisor did not accept the recovered takeover handshake"
+        );
+
+        let supervisor_result = rx.recv_timeout(std::time::Duration::from_secs(5));
+        supervisor.join().unwrap();
+        let handoff = take_accepted_supervisor_takeover(install_dir, supervisor_id)
+            .unwrap()
+            .unwrap();
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(i32::try_from(child_pid).unwrap()),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+
+        supervisor_result
+            .expect("supervisor did not exit after acknowledged takeover")
+            .unwrap();
+        assert_eq!(handoff.child_pid, Some(child_pid));
     }
 
     #[cfg(unix)]

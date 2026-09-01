@@ -10,6 +10,32 @@ use crate::ownership::supervisor_was_superseded;
 
 const RESTART_HANDOFF_STABILITY_WINDOW: std::time::Duration = std::time::Duration::from_secs(4);
 
+pub(crate) struct StopTriggers<'a> {
+    legacy_stop_file: &'a Path,
+    takeover_request_file: Option<&'a Path>,
+}
+
+impl<'a> StopTriggers<'a> {
+    pub(crate) fn new(legacy_stop_file: &'a Path, takeover_request_file: Option<&'a Path>) -> Self {
+        Self {
+            legacy_stop_file,
+            takeover_request_file,
+        }
+    }
+
+    pub(crate) fn requested(&self) -> bool {
+        self.legacy_requested() || self.takeover_requested()
+    }
+
+    pub(crate) fn legacy_requested(&self) -> bool {
+        self.legacy_stop_file.exists()
+    }
+
+    pub(crate) fn takeover_requested(&self) -> bool {
+        self.takeover_request_file.is_some_and(Path::exists)
+    }
+}
+
 pub(crate) fn spawn_supervised_child(
     exe_path: &Path,
     install_dir: &Path,
@@ -37,20 +63,20 @@ pub(crate) fn spawn_supervised_child(
 pub(crate) fn wait_for_supervised_child(
     child: &mut Child,
     shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-    stop_file: &Path,
+    stop_triggers: &StopTriggers<'_>,
     pid_file: &Path,
     own_pid: u32,
     install_dir: &Path,
     pending_handoff_version: &mut Option<String>,
 ) -> Result<SupervisedChildOutcome, SupervisorError> {
     let Some(version) = pending_handoff_version.clone() else {
-        return wait_for_child_exit_status(child, shutdown, stop_file, pid_file, own_pid);
+        return wait_for_child_exit_status(child, shutdown, stop_triggers, pid_file, own_pid);
     };
 
     match wait_for_child_startup_or_stop(
         child,
         shutdown,
-        stop_file,
+        stop_triggers,
         pid_file,
         own_pid,
         RESTART_HANDOFF_STABILITY_WINDOW,
@@ -58,7 +84,7 @@ pub(crate) fn wait_for_supervised_child(
         StartupOutcome::Running => {
             handoff::record_restart_handoff_converged(install_dir, &version);
             *pending_handoff_version = None;
-            wait_for_child_exit_status(child, shutdown, stop_file, pid_file, own_pid)
+            wait_for_child_exit_status(child, shutdown, stop_triggers, pid_file, own_pid)
         }
         StartupOutcome::Exited(status) => {
             handoff::record_restart_handoff_child_exited(install_dir, &version, status);
@@ -79,11 +105,11 @@ pub(crate) fn wait_for_supervised_child(
 fn wait_for_child_exit_status(
     child: &mut Child,
     shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-    stop_file: &Path,
+    stop_triggers: &StopTriggers<'_>,
     pid_file: &Path,
     own_pid: u32,
 ) -> Result<SupervisedChildOutcome, SupervisorError> {
-    match wait_for_child_or_stop(child, shutdown, stop_file, pid_file, own_pid)? {
+    match wait_for_child_or_stop(child, shutdown, stop_triggers, pid_file, own_pid)? {
         WaitOutcome::Exited(status) => Ok(SupervisedChildOutcome::Exited(status)),
         WaitOutcome::ObservedProcessExited => unreachable!(),
         WaitOutcome::StopRequested => {
@@ -133,7 +159,7 @@ enum StartupOutcome {
 fn wait_for_child_startup_or_stop(
     child: &mut Child,
     shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-    stop_file: &Path,
+    stop_triggers: &StopTriggers<'_>,
     pid_file: &Path,
     own_pid: u32,
     stable_for: std::time::Duration,
@@ -149,7 +175,7 @@ fn wait_for_child_startup_or_stop(
             return Ok(StartupOutcome::Superseded);
         }
 
-        if stop_file.exists() {
+        if stop_triggers.requested() {
             return Ok(StartupOutcome::StopRequested);
         }
 
@@ -168,7 +194,7 @@ fn wait_for_child_startup_or_stop(
 pub(crate) fn wait_for_pid_or_stop(
     pid: u32,
     shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-    stop_file: &Path,
+    stop_triggers: &StopTriggers<'_>,
     pid_file: &Path,
     own_pid: u32,
 ) -> WaitOutcome {
@@ -181,7 +207,7 @@ pub(crate) fn wait_for_pid_or_stop(
             return WaitOutcome::Superseded;
         }
 
-        if stop_file.exists() {
+        if stop_triggers.requested() {
             return WaitOutcome::StopRequested;
         }
 
@@ -196,7 +222,7 @@ pub(crate) fn wait_for_pid_or_stop(
 fn wait_for_child_or_stop(
     child: &mut Child,
     shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-    stop_file: &Path,
+    stop_triggers: &StopTriggers<'_>,
     pid_file: &Path,
     own_pid: u32,
 ) -> Result<WaitOutcome, SupervisorError> {
@@ -210,7 +236,7 @@ fn wait_for_child_or_stop(
             return Ok(WaitOutcome::Superseded);
         }
 
-        if stop_file.exists() {
+        if stop_triggers.requested() {
             return Ok(WaitOutcome::StopRequested);
         }
 
@@ -224,7 +250,7 @@ fn wait_for_child_or_stop(
 
 pub(crate) fn wait_before_restart(
     shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-    stop_file: &Path,
+    stop_triggers: &StopTriggers<'_>,
     pid_file: &Path,
     own_pid: u32,
     delay: std::time::Duration,
@@ -240,7 +266,7 @@ pub(crate) fn wait_before_restart(
             return RestartWaitOutcome::Superseded;
         }
 
-        if stop_file.exists() {
+        if stop_triggers.requested() {
             tracing::info!("Stop requested during restart delay, not restarting");
             return RestartWaitOutcome::StopRequested;
         }
@@ -300,11 +326,12 @@ mod tests {
         let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let mut child = Command::new("sleep").arg("30").spawn().unwrap();
         let mut pending_handoff = None;
+        let stop_triggers = StopTriggers::new(&stop_file, None);
 
         let outcome = wait_for_supervised_child(
             &mut child,
             &shutdown,
-            &stop_file,
+            &stop_triggers,
             &pid_file,
             own_pid,
             dir.path(),
@@ -325,10 +352,11 @@ mod tests {
         std::fs::write(&stop_file, "stop").unwrap();
         std::fs::write(&pid_file, own_pid.to_string()).unwrap();
         let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_triggers = StopTriggers::new(&stop_file, None);
 
         let outcome = wait_before_restart(
             &shutdown,
-            &stop_file,
+            &stop_triggers,
             &pid_file,
             own_pid,
             std::time::Duration::from_secs(1),
@@ -339,7 +367,7 @@ mod tests {
 }
 
 #[cfg(unix)]
-fn is_process_running(pid: u32) -> bool {
+pub(crate) fn is_process_running(pid: u32) -> bool {
     use nix::errno::Errno;
     use nix::sys::signal::kill;
     use nix::unistd::Pid;
@@ -352,7 +380,7 @@ fn is_process_running(pid: u32) -> bool {
 }
 
 #[cfg(windows)]
-fn is_process_running(pid: u32) -> bool {
+pub(crate) fn is_process_running(pid: u32) -> bool {
     let watched_pid = Pid::from_u32(pid);
     let mut system = System::new();
     let _ = system.refresh_processes(ProcessesToUpdate::Some(&[watched_pid]), true);

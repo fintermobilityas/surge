@@ -32,17 +32,20 @@ impl Identity {
         };
 
         Ok(Some(Self {
-            require_entrypoint_argument: !resolved.starts_with(&active_app_root),
+            require_entrypoint_argument: configured_path != resolved,
             path: configured_path,
             resolved,
         }))
     }
 
     pub(super) fn matches_executable(&self, executable: &Path) -> bool {
-        !self.require_entrypoint_argument
-            && (executable == self.resolved
-                || cfg!(target_os = "macos")
-                    && std::fs::canonicalize(executable).is_ok_and(|resolved| resolved == self.resolved))
+        !self.require_entrypoint_argument && self.matches_resolved_executable(executable)
+    }
+
+    pub(super) fn matches_resolved_executable(&self, executable: &Path) -> bool {
+        executable == self.resolved
+            || cfg!(target_os = "macos")
+                && std::fs::canonicalize(executable).is_ok_and(|resolved| resolved == self.resolved)
     }
 
     pub(super) fn matches_argument(&self, argument: &OsStr, cwd: Option<&Path>) -> bool {
@@ -105,6 +108,22 @@ mod tests {
 
         assert!(identity.requires_argument());
         assert!(identity.matches_argument(active_app_dir.join("bin/demo").as_os_str(), None));
+        assert!(!identity.matches_argument(shared_dir.join("demo").as_os_str(), None));
+    }
+
+    #[test]
+    fn entrypoint_symlink_within_app_preserves_configured_launch_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let active_app_dir = tmp.path().join("app");
+        let shared_dir = active_app_dir.join("shared");
+        std::fs::create_dir_all(&shared_dir).unwrap();
+        std::fs::write(shared_dir.join("demo"), "fixture").unwrap();
+        symlink("shared/demo", active_app_dir.join("demo")).unwrap();
+
+        let identity = Identity::resolve(&active_app_dir, "demo").unwrap().unwrap();
+
+        assert!(identity.requires_argument());
+        assert!(identity.matches_argument(active_app_dir.join("demo").as_os_str(), None));
         assert!(!identity.matches_argument(shared_dir.join("demo").as_os_str(), None));
     }
 }

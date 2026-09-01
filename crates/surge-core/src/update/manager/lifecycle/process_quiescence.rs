@@ -65,47 +65,71 @@ fn terminate_active_app_processes_except(
     let active_entrypoint = active_entrypoint::Identity::resolve(active_app_dir, main_exe)?.ok_or_else(|| {
         SurgeError::Platform("Failed to resolve active application executable before swap".to_string())
     })?;
-    if updater_runs_from_active_exe(&active_entrypoint.resolved, protected_pid)? {
-        if !allow_in_process_swap {
-            return Err(SurgeError::Platform(
-                "The updater is running from the active application executable; refusing an in-process directory swap. Apply the update from an external Surge updater."
-                    .to_string(),
-            ));
-        }
-        info!(
-            "The updater is running from the active application executable; in-process swap explicitly allowed, quiescing other active application processes only"
-        );
-    }
     let interpreted_main = interpreted_main::resolve(&active_entrypoint.resolved)?;
+    if allow_in_process_swap {
+        info!("In-process swap explicitly allowed, quiescing other active application processes only");
+    } else {
+        refuse_in_process_swap(&active_entrypoint, interpreted_main.as_ref(), protected_pid)?;
+    }
     terminate_matching_app_processes(main_exe, protected_pid, "active", |process| {
         is_active_app_process(&active_entrypoint, interpreted_main.as_ref(), process)
     })
 }
 
 #[cfg(unix)]
-fn updater_runs_from_active_exe(active_exe: &Path, protected_pid: u32) -> Result<bool> {
-    use std::os::unix::fs::MetadataExt;
-
+fn refuse_in_process_swap(
+    active_entrypoint: &active_entrypoint::Identity,
+    interpreted_main: Option<&interpreted_main::Identity>,
+    protected_pid: u32,
+) -> Result<()> {
     if protected_pid != current_pid() {
-        return Ok(false);
+        return Ok(());
     }
 
-    let updater_exe = std::env::current_exe().map_err(|e| {
-        SurgeError::Platform(format!(
-            "Failed to resolve updater process identity before application swap: {e}"
-        ))
-    })?;
-    let active_metadata = std::fs::metadata(active_exe).map_err(|e| {
+    let process = AppProcess {
+        exe: std::env::current_exe().map_err(|e| {
+            SurgeError::Platform(format!(
+                "Failed to resolve updater process identity before application swap: {e}"
+            ))
+        })?,
+        command: std::env::args_os().collect(),
+        cwd: Some(std::env::current_dir().map_err(|e| {
+            SurgeError::Platform(format!(
+                "Failed to resolve updater working directory before application swap: {e}"
+            ))
+        })?),
+    };
+    refuse_process_in_swap(active_entrypoint, interpreted_main, &process)
+}
+
+#[cfg(unix)]
+fn refuse_process_in_swap(
+    active_entrypoint: &active_entrypoint::Identity,
+    interpreted_main: Option<&interpreted_main::Identity>,
+    process: &AppProcess,
+) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let active_metadata = std::fs::metadata(&active_entrypoint.resolved).map_err(|e| {
         SurgeError::Platform(format!(
             "Failed to inspect active application identity before swap: {e}"
         ))
     })?;
-    let updater_metadata = std::fs::metadata(&updater_exe).map_err(|e| {
+    let updater_metadata = std::fs::metadata(&process.exe).map_err(|e| {
         SurgeError::Platform(format!(
             "Failed to inspect updater process identity before application swap: {e}"
         ))
     })?;
-    Ok(active_metadata.dev() == updater_metadata.dev() && active_metadata.ino() == updater_metadata.ino())
+    let same_executable =
+        active_metadata.dev() == updater_metadata.dev() && active_metadata.ino() == updater_metadata.ino();
+    if same_executable || is_active_app_process(active_entrypoint, interpreted_main, process) {
+        return Err(SurgeError::Platform(
+            "The updater is running as the active application process; refusing an in-process directory swap. Apply the update from an external Surge updater."
+                .to_string(),
+        ));
+    }
+
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -274,18 +298,25 @@ fn is_active_app_process(
     interpreted_main: Option<&interpreted_main::Identity>,
     process: &AppProcess,
 ) -> bool {
-    active_entrypoint.matches_executable(&process.exe)
-        || process
+    if active_entrypoint.matches_executable(&process.exe) {
+        return true;
+    }
+    if active_entrypoint.matches_resolved_executable(&process.exe)
+        && process
             .command
             .first()
             .is_some_and(|argument| active_entrypoint.matches_argument(argument, process.cwd.as_deref()))
-        || interpreted_main.is_some_and(|identity| {
-            identity.matches_interpreter(&process.exe, process.command.first().map(OsString::as_os_str))
-                && process
-                    .command
-                    .get(identity.script_argument_index)
-                    .is_some_and(|argument| active_entrypoint.matches_argument(argument, process.cwd.as_deref()))
-        })
+    {
+        return true;
+    }
+
+    interpreted_main.is_some_and(|identity| {
+        identity.matches_interpreter(&process.exe, process.command.first().map(OsString::as_os_str))
+            && process
+                .command
+                .get(identity.script_argument_index)
+                .is_some_and(|argument| active_entrypoint.matches_argument(argument, process.cwd.as_deref()))
+    })
 }
 
 #[cfg(unix)]
@@ -411,6 +442,49 @@ mod tests {
         let terminated = terminate_active_app_processes_except(&active_app_dir, "demo", current_pid(), true).unwrap();
 
         assert_eq!(terminated, 0);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn interpreted_in_process_updater_refuses_swap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let active_app_dir = tmp.path().join("app");
+        std::fs::create_dir_all(&active_app_dir).unwrap();
+        let app_path = active_app_dir.join("demo-script");
+        std::fs::write(&app_path, "#!/bin/sh\n").unwrap();
+        let active_entrypoint = active_entrypoint::Identity::resolve(&active_app_dir, "demo-script")
+            .unwrap()
+            .unwrap();
+        let interpreted_main = interpreted_main::resolve(&active_entrypoint.resolved).unwrap().unwrap();
+        let process = AppProcess {
+            exe: std::fs::canonicalize("/bin/sh").unwrap(),
+            command: vec![OsString::from("/bin/sh"), app_path.into_os_string()],
+            cwd: Some(active_app_dir),
+        };
+
+        let error = refuse_process_in_swap(&active_entrypoint, Some(&interpreted_main), &process).unwrap_err();
+
+        assert!(error.to_string().contains("refusing an in-process directory swap"));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn configured_argv0_does_not_match_an_unrelated_executable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let active_app_dir = tmp.path().join("app");
+        std::fs::create_dir_all(&active_app_dir).unwrap();
+        let app_path = active_app_dir.join("demo");
+        std::fs::write(&app_path, "fixture").unwrap();
+        let active_entrypoint = active_entrypoint::Identity::resolve(&active_app_dir, "demo")
+            .unwrap()
+            .unwrap();
+        let process = AppProcess {
+            exe: std::fs::canonicalize("/bin/sleep").unwrap(),
+            command: vec![app_path.into_os_string()],
+            cwd: Some(active_app_dir),
+        };
+
+        assert!(!is_active_app_process(&active_entrypoint, None, &process));
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

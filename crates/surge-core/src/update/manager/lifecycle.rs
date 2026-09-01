@@ -3,14 +3,14 @@ use std::time::Duration;
 
 use tracing::{debug, info, warn};
 
-use crate::error::{Result, SurgeError};
+use crate::error::Result;
+#[cfg(not(unix))]
+use crate::error::SurgeError;
 use crate::platform::process::{ProcessHandle, current_pid, spawn_detached, spawn_process, supervisor_binary_name};
 use crate::releases::manifest::ReleaseEntry;
-#[cfg(unix)]
-use crate::supervisor::state::{clear_supervisor_takeover_pid, take_supervisor_takeover_pid};
-use crate::supervisor::state::{
-    read_restart_args, supervisor_pid_file, supervisor_stop_file, write_supervisor_exe_path,
-};
+use crate::supervisor::state::{read_restart_args, write_supervisor_exe_path};
+#[cfg(not(unix))]
+use crate::supervisor::state::{supervisor_pid_file, supervisor_stop_file};
 use crate::update::status::{
     RESTART_HANDOFF_FAILED_PHASE, RESTART_HANDOFF_WAITING_FOR_OLD_CHILD_PHASE, confirm_supervisor_restart,
 };
@@ -18,8 +18,9 @@ use crate::update::status::{
 const SUPERVISOR_RESTART_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
 const SUPERVISOR_RESTART_MAX_ATTEMPTS: u32 = 2;
 const SUPERVISOR_RESTART_RETRY_DELAY: Duration = Duration::from_millis(500);
-
 mod process_quiescence;
+#[cfg(unix)]
+mod supervisor_takeover;
 
 #[cfg(not(unix))]
 pub(super) use self::process_quiescence::terminate_active_app_processes_before_swap;
@@ -66,15 +67,26 @@ pub(super) async fn request_supervisor_shutdown_with_timeout(
         return Ok(None);
     }
 
+    #[cfg(unix)]
+    return supervisor_takeover::request_shutdown(install_dir, supervisor_id, timeout, poll_interval).await;
+
+    #[cfg(not(unix))]
+    {
+        request_legacy_supervisor_shutdown(install_dir, supervisor_id, timeout, poll_interval).await
+    }
+}
+
+#[cfg(not(unix))]
+async fn request_legacy_supervisor_shutdown(
+    install_dir: &Path,
+    supervisor_id: &str,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> Result<Option<u32>> {
     let pid_file = supervisor_pid_file(install_dir, supervisor_id);
     if !pid_file.is_file() {
-        #[cfg(unix)]
-        return Ok(take_supervisor_takeover_pid(install_dir, supervisor_id));
-        #[cfg(not(unix))]
         return Ok(None);
     }
-    #[cfg(unix)]
-    clear_supervisor_takeover_pid(install_dir, supervisor_id);
 
     let stop_file = supervisor_stop_file(install_dir, supervisor_id);
     tokio::fs::write(&stop_file, b"surge-update").await?;
@@ -90,11 +102,7 @@ pub(super) async fn request_supervisor_shutdown_with_timeout(
     }
 
     let _ = tokio::fs::remove_file(&stop_file).await;
-    #[cfg(unix)]
-    let takeover_pid = take_supervisor_takeover_pid(install_dir, supervisor_id);
-    #[cfg(not(unix))]
-    let takeover_pid = None;
-    Ok(takeover_pid)
+    Ok(None)
 }
 
 pub(super) fn invoke_post_update_hook(install_dir: &Path, active_app_dir: &Path, latest: &ReleaseEntry) {
@@ -415,6 +423,146 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+    #[cfg(unix)]
+    use crate::supervisor::state::{
+        SupervisorTakeoverAcknowledgement, SupervisorTakeoverInstance, SupervisorTakeoverRequest,
+        accept_supervisor_takeover_request, read_accepted_supervisor_takeover, read_supervisor_takeover_commit,
+        read_supervisor_takeover_request, supervisor_pid_file, supervisor_stop_file, supervisor_takeover_request_file,
+        write_supervisor_takeover_acknowledgement, write_supervisor_takeover_instance,
+    };
+
+    #[cfg(unix)]
+    fn wait_for_takeover_request(install_dir: &Path, supervisor_id: &str) -> SupervisorTakeoverRequest {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(request) = read_supervisor_takeover_request(install_dir, supervisor_id).unwrap() {
+                return request;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "takeover request did not appear before the test deadline"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(unix)]
+    fn prepare_supervisor_instance(
+        install_dir: &Path,
+        supervisor_id: &str,
+        supervisor_pid: u32,
+    ) -> SupervisorTakeoverInstance {
+        std::fs::write(
+            supervisor_pid_file(install_dir, supervisor_id),
+            supervisor_pid.to_string(),
+        )
+        .unwrap();
+        let instance = SupervisorTakeoverInstance::new(supervisor_pid);
+        write_supervisor_takeover_instance(install_dir, supervisor_id, &instance).unwrap();
+        instance
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn acknowledged_supervisor_handoff_returns_the_refreshed_child_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let supervisor_id = "demo-supervisor";
+        let supervisor_pid = 42;
+        prepare_supervisor_instance(dir.path(), supervisor_id, supervisor_pid);
+        let install_dir = dir.path().to_path_buf();
+        let responder = std::thread::spawn(move || {
+            let request = wait_for_takeover_request(&install_dir, supervisor_id);
+            let acknowledgement = SupervisorTakeoverAcknowledgement::new(&request, Some(84));
+            write_supervisor_takeover_acknowledgement(&install_dir, supervisor_id, &acknowledgement).unwrap();
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                if read_supervisor_takeover_commit(&install_dir, supervisor_id)
+                    .unwrap()
+                    .is_some_and(|commit| commit.matches_acknowledgement(&acknowledgement))
+                {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "takeover commit did not appear before the test deadline"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+
+            assert!(accept_supervisor_takeover_request(&install_dir, supervisor_id, &request).unwrap());
+            std::fs::remove_file(supervisor_pid_file(&install_dir, supervisor_id)).unwrap();
+        });
+
+        let child_pid = request_supervisor_shutdown_with_timeout(
+            dir.path(),
+            supervisor_id,
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+        )
+        .await
+        .unwrap();
+        responder.join().unwrap();
+
+        assert_eq!(child_pid, Some(84));
+        assert!(
+            read_accepted_supervisor_takeover(dir.path(), supervisor_id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_supervisor_is_not_stopped_without_acknowledgement_support() {
+        let dir = tempfile::tempdir().unwrap();
+        let supervisor_id = "demo-supervisor";
+        std::fs::write(supervisor_pid_file(dir.path(), supervisor_id), "42").unwrap();
+
+        let error = request_supervisor_shutdown_with_timeout(
+            dir.path(),
+            supervisor_id,
+            Duration::from_millis(50),
+            Duration::from_millis(5),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("does not advertise acknowledged takeover"));
+        assert!(!supervisor_stop_file(dir.path(), supervisor_id).exists());
+        assert!(!supervisor_takeover_request_file(dir.path(), supervisor_id).exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_out_takeover_is_cancelled_before_a_late_acceptance() {
+        let dir = tempfile::tempdir().unwrap();
+        let supervisor_id = "demo-supervisor";
+        prepare_supervisor_instance(dir.path(), supervisor_id, 42);
+        let install_dir = dir.path().to_path_buf();
+        let late_responder = std::thread::spawn(move || {
+            let request = wait_for_takeover_request(&install_dir, supervisor_id);
+            std::thread::sleep(Duration::from_millis(150));
+            accept_supervisor_takeover_request(&install_dir, supervisor_id, &request).unwrap()
+        });
+
+        let error = request_supervisor_shutdown_with_timeout(
+            dir.path(),
+            supervisor_id,
+            Duration::from_millis(50),
+            Duration::from_millis(5),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("Timed out waiting"));
+        assert!(
+            !late_responder.join().unwrap(),
+            "a cancelled request must not be accepted later"
+        );
+        assert!(!supervisor_takeover_request_file(dir.path(), supervisor_id).exists());
+        assert!(supervisor_pid_file(dir.path(), supervisor_id).exists());
+    }
 
     #[test]
     fn supervisor_watch_args_include_handoff_version_before_child_args() {

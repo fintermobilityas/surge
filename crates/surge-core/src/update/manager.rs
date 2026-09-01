@@ -1164,6 +1164,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(unix))]
     #[tokio::test]
     async fn test_request_supervisor_shutdown_waits_for_pid_file_to_disappear() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1220,6 +1221,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(unix))]
     #[tokio::test]
     async fn test_request_supervisor_shutdown_times_out_when_supervisor_does_not_exit() {
         let tmp = tempfile::tempdir().unwrap();

@@ -1,9 +1,15 @@
+#[cfg(test)]
 use std::collections::BTreeMap;
+#[cfg(test)]
 use std::fs;
+#[cfg(test)]
 use std::io::Read;
+#[cfg(test)]
 use std::path::{Component, Path, PathBuf};
 
+#[cfg(test)]
 use crate::config::constants::IO_CHUNK_SIZE;
+#[cfg(test)]
 use crate::error::{Result, SurgeError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,6 +19,7 @@ pub(super) enum TreeEntryKind {
     Symlink,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub(super) struct TreeEntry {
     pub(super) source_path: PathBuf,
@@ -21,12 +28,14 @@ pub(super) struct TreeEntry {
     pub(super) symlink_target: Option<String>,
 }
 
+#[cfg(test)]
 pub(super) fn collect_tree_entries(root: &Path) -> Result<BTreeMap<String, TreeEntry>> {
     let mut entries = BTreeMap::new();
     collect_tree_entries_recursive(root, root, &mut entries)?;
     Ok(entries)
 }
 
+#[cfg(test)]
 fn collect_tree_entries_recursive(
     root: &Path,
     current: &Path,
@@ -78,6 +87,7 @@ fn collect_tree_entries_recursive(
     Ok(())
 }
 
+#[cfg(test)]
 fn normalize_relative_path(root: &Path, path: &Path) -> Result<String> {
     let relative = path
         .strip_prefix(root)
@@ -97,6 +107,7 @@ fn normalize_relative_path(root: &Path, path: &Path) -> Result<String> {
     Ok(normalized.to_string_lossy().replace('\\', "/"))
 }
 
+#[cfg(test)]
 pub(super) fn files_identical(left: &Path, right: &Path) -> Result<bool> {
     let left_len = fs::metadata(left)?.len();
     let right_len = fs::metadata(right)?.len();
@@ -124,7 +135,7 @@ pub(super) fn files_identical(left: &Path, right: &Path) -> Result<bool> {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn normalized_mode(metadata: &fs::Metadata, is_dir: bool) -> u32 {
     use std::os::unix::fs::PermissionsExt;
 
@@ -136,7 +147,7 @@ fn normalized_mode(metadata: &fs::Metadata, is_dir: bool) -> u32 {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(all(test, not(unix)))]
 fn normalized_mode(_metadata: &fs::Metadata, is_dir: bool) -> u32 {
     if is_dir { 0o755 } else { 0o644 }
 }

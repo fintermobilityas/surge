@@ -31,17 +31,20 @@ Large anonymized profile, `sdk_only`, `100` deltas, `sparse-file-ops`
 (48-core/251 GB host, seed 42):
 
 - client download: `510 KiB` (archive-chunked: `15.6 MiB` — ~30x less)
-- client apply, full 100-delta walk: `489 s` (before the carried-tree
-  apply below: `657 s`; archive-chunked: ~`18 s`)
+- client apply, full 100-delta walk: ~`157 s` (history below: `657 s`
+  → `489 s` → `221 s` → `157 s`; archive-chunked: ~`18 s`)
 - per-delta apply cost is **flat in chain depth**: with per-step
-  progress instrumentation, every step took a constant ~`6.4 s` before
-  the carried-tree apply and ~`4.8 s` after. Per-step cost is
-  CPU/IO-bound and varies ~3x with host load — an earlier 20-delta run
-  on an idle host measured ~`2.2 s`/delta, which is the same per-step
-  cost, not a depth effect
-- per-step cost breakdown (loaded host, scale 1.0): applying the
-  file ops ~`4.3 s` (materializing the changed files — the dominant,
-  unavoidable cost), extract ~`1.0 s`, repack ~`0.6 s`, hash ~`0.07 s`
+  instrumentation, every step took a constant ~`6.4 s` originally,
+  ~`4.8 s` after the carried-tree apply, ~`2.2 s` after identity-chunk
+  patches, and ~`1.6 s` after the verified-hash carry. Per-step cost
+  is CPU/IO-bound and varies ~3x with host load
+- per-step cost breakdown (loaded host, scale 1.0, phase-instrumented):
+  chunked `bspatch` over the 1 GB file ~`3.5-5.0 s` **before** the
+  identity-chunk fix (15 of 16 unchanged 64 MiB chunks re-derived),
+  basis + target SHA-256 ~`0.55 s` each, repack ~`0.6-3.0 s`
+  (load-dependent). An earlier breakdown attributed ~`4.3 s` to
+  "materializing the changed files" — that was mislabeled bspatch
+  work, not the 4 KiB of actual change
 - **Carried-tree chain apply (landed)**: the chain walker now extracts
   the starting archive once and applies consecutive sparse deltas in
   place, repacking + SHA-256-verifying per step as before. This drops
@@ -49,18 +52,40 @@ Large anonymized profile, `sdk_only`, `100` deltas, `sparse-file-ops`
   20-delta apply `128.7 s` → `100.7 s` (−22%), download bytes and the
   applied payload unchanged (install-tree assertion + byte-identical
   unit equivalence)
+- **Identity-chunk chunked patches (landed)**: chunked bsdiff format
+  v2 (`CSDF`) marks unchanged chunks in a per-chunk bitset instead of
+  carrying a whole-chunk identity bsdiff. The diff side skips the
+  per-chunk bsdiff for identical chunks (memcmp instead of a suffix
+  array over 64 MiB) and the apply side copies unchanged chunks
+  straight through. Version 1 patches still apply; version 2 patches
+  are rejected by version 1 readers via the version check.
+  Same-session 100-delta rerun: apply `480.5 s` → `223.1/218.3 s`
+  (−54%), publish `846.1 s` → `707.8/741.5 s` (−14%), download
+  `522,171 B` → `503,524 B` (−3.6%, deterministic), install tree
+  byte-identical
+- **Verified-hash carry across chain steps (landed)**: the chain
+  walker carries a path → verified-SHA-256 map; each step's target
+  hash is exactly the next step's basis hash for the same file, so the
+  redundant full-file basis re-read + re-hash is skipped when the
+  cache records the expected hash (first step and any mismatch still
+  verify fully; the post-patch target hash and the per-step
+  full-archive SHA-256 are unchanged, so external modification between
+  steps is still caught). Same-session 100-delta A/B: apply
+  `216.8 s` → `156.6/158.1 s` (−27%, 0.9% spread), per step ~`2.2 s`
+  → ~`1.6 s`, download bytes and install tree unchanged
 
 Meaning:
 
 - for field bandwidth, sparse deltas win decisively: a 100-release
   localized chain costs half a MiB on the wire
-- the 489 s apply is a worst-case full-chain bench walk; production
-  caps the client walk at `max_chain_length` (8) with checkpoint
-  fulls every `checkpoint_every` (10), so real client applies are
-  bounded far below this figure
-- the remaining per-step cost is dominated by the file-ops phase
-  itself (materializing changed files), not by the archive
-  rebuild — see the open item below
+- the ~`157 s` full-chain apply is a worst-case full-chain bench
+  walk; production caps the client walk at `max_chain_length` (8)
+  with checkpoint fulls every `checkpoint_every` (10), so real client
+  applies are bounded far below this figure
+- the remaining per-step cost (~`1.6 s` at scale 1.0) is: one full
+  read + one full write of the changed file for the bspatch, one
+  full-file target SHA-256, and the per-step repack (variable
+  `0.6-3.0 s` under host load)
 
 ### Broad churn is now bounded by file-aware deltas and full fallback
 
@@ -80,7 +105,8 @@ Localized `100`-delta chain, `sparse-file-ops`:
 
 - publishing the `101`-release chain took `897 s` (archive-chunked:
   ~`337 s`) — the per-release delta build (~`5.1 s` per delta,
-  per-file diffs) dominates
+  per-file diffs) dominates; after identity-chunk patches the same
+  session measured ~`725 s` (−14%) and ~`4.2 s` per delta
 
 Meaning:
 
@@ -92,13 +118,14 @@ Meaning:
 
 ## What Is Not Solved Yet
 
-- the per-delta **ops phase** still costs ~`2 s` per step at scale
-  1.0 even after the identity-chunk fix: the changed 1 GB file is
-  read once and written once for the bspatch, then hashed twice
-  (basis + target SHA-256). The redundant basis re-hash (the target
-  hash was already verified by the previous step) is the cheapest
-  remaining win; anything deeper (range-scoped ops) needs a new
-  sparse op kind
+- the per-step bspatch still pays a full read + full write of the
+  changed file even for a 4 KiB change, and the target SHA-256 is a
+  separate full read after the write. Streaming the target hash into
+  the bspatch write would remove that second read; anything deeper
+  (range-scoped ops) needs a new sparse op kind
+- the per-step **repack** is the most load-variable component
+  (`0.6-3.0 s`): zstd over ~1.2 GB per step, re-encoding unchanged
+  files even though only one file changed
 - retained full checkpoints still need long-history tuning in real feeds
 - broad-churn chains can still justify a fresh full checkpoint
 - local checkpoint retention policy may need calibration for very long-lived installs

@@ -21,6 +21,7 @@ pub use self::format::{
     has_archive_bsdiff_magic_prefix, has_archive_chunked_magic_prefix, has_sparse_file_ops_magic_prefix,
     is_supported_delta, patch_format_from_magic_prefix,
 };
+pub(crate) use self::fs_apply::VerifiedFileHashes;
 pub use self::sparse_ops::build_sparse_file_patch;
 pub(crate) use self::sparse_ops::{apply_sparse_step_in_place, sparse_step_units_for};
 

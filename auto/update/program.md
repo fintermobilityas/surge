@@ -142,17 +142,29 @@ Ranked by expected value; read `results.tsv` and
    remove the per-step repack + hash (~0.7 s, ~14% of the step), but
    changes the apply flow and verification shape; with
    `max_chain_length` = 8 the absolute win is small.
-2. **Verification cost (top candidate after v2).** The per-step
-   profile now shows the ops phase at ~`2 s`: one full read/write of
-   the changed file plus two full-file SHA-256 passes (basis +
-   target). The target hash of step N is exactly the basis hash of
-   step N+1, so a cross-step verified-hash cache carried through
-   `apply_target_deltas` would remove one full-file hash per step
-   (~0.55 s at scale 1.0) without weakening verification (every file
-   state is still hash-verified before it is used as a basis — just
-   not twice). The in-step target hash can also be streamed into the
-   bspatch write to remove the second full read.
-3. **Verification cost (general).** SHA-256 over the full payload on
+2. **KEPT — Verified-hash carry across sparse chain steps.** The
+   chain walker carries a `VerifiedFileHashes` map (path →
+   verified sha256) through `apply_target_deltas`: the target hash
+   verified at the end of step N is exactly step N+1's basis hash,
+   so the redundant full-file basis re-read + re-hash is skipped
+   (first step / mismatch still verify fully; post-patch target hash
+   + per-step full-archive SHA-256 unchanged — a tamper-between-
+   steps regression test keeps the fail-closed behavior).
+   Same-session 100-delta A/B: apply 216,777 → 156,599/158,057 ms
+   (−27.4%, 0.9% spread), per step ~2.2 s → ~1.6 s, download +
+   install tree identical.
+3. **Stream the target hash into the bspatch write.** The per-step
+   target SHA-256 is a separate full read after the bspatch write;
+   hashing the output as it is written removes that read (~0.3-0.5 s
+   at scale 1.0). Touches `chunked_bspatch_file*` (shared with the
+   archive strategy — keep the API additive).
+4. **Per-step repack variance.** The repack is the most load-variable
+   component (0.6-3.0 s): zstd over ~1.2 GB per step, re-encoding
+   unchanged files even though one file changed. Candidate: measure
+   whether the repack can reuse the previous archive's encoded
+   blocks (zstd frame splicing) — likely a format-level change,
+   validate with a same-session A/B before investing.
+5. **Verification cost (general).** SHA-256 over the full payload on
    the client is measured in the microbench (`SHA-256 (file)`).
    Sweep: verify-then-apply vs apply-then-verify ordering, streaming
    hashes during download, and whether the delta's embedded hashes

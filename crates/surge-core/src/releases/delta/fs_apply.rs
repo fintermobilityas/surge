@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
@@ -10,11 +11,52 @@ use super::sparse_ops::SparseFileOp;
 
 pub(super) type SparseOpProgress<'a> = dyn Fn(u64, u64) + 'a;
 
+/// File hashes this process verified while walking one delta chain.
+///
+/// Every entry records that the file's content was SHA-256-verified right
+/// after this process (re)wrote it, so a later step of the same walk can
+/// treat the content as the delta basis without re-reading and
+/// re-hashing the whole file. Entries are only ever created from
+/// verifications performed in this walk; a mismatching or missing entry
+/// falls back to the full basis verification.
+pub(crate) struct VerifiedFileHashes {
+    map: HashMap<String, String>,
+}
+
+impl VerifiedFileHashes {
+    pub(crate) fn new() -> Self {
+        Self { map: HashMap::new() }
+    }
+
+    /// True when `path` is known to hold exactly `expected_sha256`.
+    #[must_use]
+    pub(super) fn is_verified(&self, path: &str, expected_sha256: &str) -> bool {
+        self.map.get(path).is_some_and(|hash| hash == expected_sha256.trim())
+    }
+
+    /// Record that `path` now holds `sha256` (just verified).
+    pub(super) fn record(&mut self, path: &str, sha256: &str) {
+        self.map.insert(path.to_string(), sha256.trim().to_string());
+    }
+
+    /// Drop the entry for `path` (its content is no longer the recorded one).
+    pub(super) fn forget(&mut self, path: &str) {
+        self.map.remove(path);
+    }
+}
+
+impl Default for VerifiedFileHashes {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub(super) fn apply_sparse_file_ops_with_progress(
     root: &Path,
     ops: &[SparseFileOp],
     payloads: &[u8],
     progress: Option<&SparseOpProgress<'_>>,
+    verified: &mut VerifiedFileHashes,
 ) -> Result<()> {
     let total_units = sparse_file_ops_work_units(ops);
     let mut completed_units = 0u64;
@@ -25,6 +67,7 @@ pub(super) fn apply_sparse_file_ops_with_progress(
             SparseFileOp::Delete { path } => {
                 let target = resolve_relative_path(root, path)?;
                 remove_path_if_exists(&target)?;
+                verified.forget(path);
             }
             SparseFileOp::EnsureDir { path, mode } => {
                 let target = resolve_relative_path(root, path)?;
@@ -53,6 +96,7 @@ pub(super) fn apply_sparse_file_ops_with_progress(
                 })?;
                 set_mode(&target, *mode)?;
                 verify_file_sha256(&target, sha256)?;
+                verified.record(path, sha256);
             }
             SparseFileOp::PatchFile {
                 path,
@@ -63,7 +107,11 @@ pub(super) fn apply_sparse_file_ops_with_progress(
                 sha256,
             } => {
                 let target = resolve_relative_path(root, path)?;
-                verify_file_sha256(&target, basis_sha256)?;
+                // The basis was verified by an earlier step of this walk
+                // (recorded right after it was written); otherwise verify.
+                if !verified.is_verified(path, basis_sha256) {
+                    verify_file_sha256(&target, basis_sha256)?;
+                }
                 let patch_bytes = payload_slice(payloads, *payload_offset, *payload_len)?;
                 let temp_path = patched_temp_path(&target);
                 if temp_path.exists() {
@@ -81,6 +129,7 @@ pub(super) fn apply_sparse_file_ops_with_progress(
                 fs::rename(&temp_path, &target)?;
                 set_mode(&target, *mode)?;
                 verify_file_sha256(&target, sha256)?;
+                verified.record(path, sha256);
             }
             SparseFileOp::WriteSymlink { path, target } => {
                 let link_path = resolve_relative_path(root, path)?;

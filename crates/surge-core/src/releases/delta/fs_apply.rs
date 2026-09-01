@@ -4,7 +4,7 @@ use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
 use crate::crypto::sha256::sha256_hex_file;
-use crate::diff::chunked::chunked_bspatch_file_with_progress;
+use crate::diff::chunked::chunked_bspatch_file_with_progress_and_sha256;
 use crate::error::{Result, SurgeError};
 
 use super::sparse_ops::SparseFileOp;
@@ -117,7 +117,9 @@ pub(super) fn apply_sparse_file_ops_with_progress(
                 if temp_path.exists() {
                     fs::remove_file(&temp_path)?;
                 }
-                chunked_bspatch_file_with_progress(
+                // The target hash is computed while the patched file is
+                // written, removing a full re-read of the output.
+                let target_hash = chunked_bspatch_file_with_progress_and_sha256(
                     &target,
                     patch_bytes,
                     &temp_path,
@@ -128,7 +130,11 @@ pub(super) fn apply_sparse_file_ops_with_progress(
                 fs::remove_file(&target)?;
                 fs::rename(&temp_path, &target)?;
                 set_mode(&target, *mode)?;
-                verify_file_sha256(&target, sha256)?;
+                if target_hash != sha256.trim() {
+                    return Err(SurgeError::Update(format!(
+                        "Sparse delta file hash mismatch for '{path}': expected {sha256}, got {target_hash}"
+                    )));
+                }
                 verified.record(path, sha256);
             }
             SparseFileOp::WriteSymlink { path, target } => {

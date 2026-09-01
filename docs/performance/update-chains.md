@@ -31,13 +31,17 @@ Large anonymized profile, `sdk_only`, `100` deltas, `sparse-file-ops`
 (48-core/251 GB host, seed 42):
 
 - client download: `510 KiB` (archive-chunked: `15.6 MiB` — ~30x less)
-- client apply, full 100-delta walk: ~`157 s` (history below: `657 s`
-  → `489 s` → `221 s` → `157 s`; archive-chunked: ~`18 s`)
+- client apply, full 100-delta walk: ~`160 s` (session history:
+  `657 s` → `489 s` → `221 s` → `157 s` → ~`160 s`; archive-chunked:
+  ~`18 s`; load regimes differ between sessions — compare within a
+  session)
 - per-delta apply cost is **flat in chain depth**: with per-step
   instrumentation, every step took a constant ~`6.4 s` originally,
   ~`4.8 s` after the carried-tree apply, ~`2.2 s` after identity-chunk
-  patches, and ~`1.6 s` after the verified-hash carry. Per-step cost
-  is CPU/IO-bound and varies ~3x with host load
+  patches, ~`1.6 s` after the verified-hash carry, and ~`1.5-2.0 s`
+  after the streamed target hash (the range is host-load variance, not
+  a regression). Per-step cost is CPU/IO-bound and varies ~3x with
+  host load
 - per-step cost breakdown (loaded host, scale 1.0, phase-instrumented):
   chunked `bspatch` over the 1 GB file ~`3.5-5.0 s` **before** the
   identity-chunk fix (15 of 16 unchanged 64 MiB chunks re-derived),
@@ -73,6 +77,18 @@ Large anonymized profile, `sdk_only`, `100` deltas, `sparse-file-ops`
   steps is still caught). Same-session 100-delta A/B: apply
   `216.8 s` → `156.6/158.1 s` (−27%, 0.9% spread), per step ~`2.2 s`
   → ~`1.6 s`, download bytes and install tree unchanged
+- **Streamed target hash (landed)**: the per-step target SHA-256 is
+  computed while the patched file is written (the chunked bspatch
+  write path returns the output hash) instead of a separate full read
+  + hash pass afterwards. Removes one full-file re-read per step
+  (the `0.55 s` target-hash phase at scale 1.0); the hashing CPU is
+  unchanged. Phase-instrumented 10-step A/B (same session, 4 pairs):
+  per step ~`2,270 ms` → ~`1,980-2,060 ms` in 3 of 4 pairs (the 4th
+  was a load-spike window that hit both sides); 100-delta same-session
+  medians ~`167 s` vs ~`172 s` — the ~`0.2-0.3 s`/step gain sits near
+  the shared-host wall-clock noise floor, so the phase-level evidence
+  carries the claim. Payload and verification are unchanged (tamper
+  test still fail-closed)
 
 Meaning:
 
@@ -119,9 +135,8 @@ Meaning:
 ## What Is Not Solved Yet
 
 - the per-step bspatch still pays a full read + full write of the
-  changed file even for a 4 KiB change, and the target SHA-256 is a
-  separate full read after the write. Streaming the target hash into
-  the bspatch write would remove that second read; anything deeper
+  changed file even for a 4 KiB change (the target SHA-256 is now
+  streamed into the write, so no extra read). Anything deeper
   (range-scoped ops) needs a new sparse op kind
 - the per-step **repack** is the most load-variable component
   (`0.6-3.0 s`): zstd over ~1.2 GB per step, re-encoding unchanged

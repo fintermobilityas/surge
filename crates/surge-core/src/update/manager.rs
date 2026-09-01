@@ -68,7 +68,6 @@ pub struct UpdateCheckState {
     app_id: String,
     current_version: String,
     channel: String,
-    #[cfg(unix)]
     current_release_identity: Option<current_install::ReleaseIdentity>,
 }
 
@@ -167,7 +166,6 @@ impl UpdateManager {
             app_id: self.app_id.clone(),
             current_version: self.current_version.clone(),
             channel: self.channel.clone(),
-            #[cfg(unix)]
             current_release_identity: self.current_release_identity.clone(),
         }
     }
@@ -182,21 +180,14 @@ impl UpdateManager {
             ));
         }
 
-        #[cfg(unix)]
-        {
-            let installed_identity = current_install::load(self)?;
-            if installed_identity != state.current_release_identity {
-                return Err(SurgeError::Update(
-                    "Installed application identity changed after the update check".to_string(),
-                ));
-            }
+        let installed_identity = current_install::load(self)?;
+        if installed_identity != state.current_release_identity {
+            return Err(SurgeError::Update(
+                "Installed application identity changed after the update check".to_string(),
+            ));
+        }
 
-            self.current_release_identity = installed_identity;
-        }
-        #[cfg(not(unix))]
-        {
-            self.current_release_identity = None;
-        }
+        self.current_release_identity = installed_identity;
         Ok(())
     }
 
@@ -255,14 +246,7 @@ impl UpdateManager {
             "Checking for updates"
         );
 
-        #[cfg(unix)]
-        {
-            self.current_release_identity = current_install::load(self)?;
-        }
-        #[cfg(not(unix))]
-        {
-            self.current_release_identity = None;
-        }
+        self.current_release_identity = current_install::load(self)?;
         let index = self.load_release_index().await?;
         resolve_update_info(self, index)
     }
@@ -579,15 +563,29 @@ mod tests {
     }
 
     fn write_runtime_identity(active_app_dir: &Path, app_id: &str, version: &str, main_exe: &str, supervisor_id: &str) {
+        write_runtime_identity_with_environment(active_app_dir, app_id, version, main_exe, supervisor_id, &[]);
+    }
+
+    fn write_runtime_identity_with_environment(
+        active_app_dir: &Path,
+        app_id: &str,
+        version: &str,
+        main_exe: &str,
+        supervisor_id: &str,
+        environment: &[(&str, &str)],
+    ) {
         let manifest_path = active_app_dir.join(crate::install::RUNTIME_MANIFEST_RELATIVE_PATH);
         std::fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            manifest_path,
-            format!(
-                "id: {app_id}\nversion: {version}\nchannel: stable\nmainExe: \"{main_exe}\"\nsupervisorId: \"{supervisor_id}\"\n"
-            ),
-        )
-        .unwrap();
+        let mut manifest = format!(
+            "id: {app_id}\nversion: {version}\nchannel: stable\nmainExe: \"{main_exe}\"\nsupervisorId: \"{supervisor_id}\"\n"
+        );
+        if !environment.is_empty() {
+            manifest.push_str("environment:\n");
+            for (key, value) in environment {
+                manifest.push_str(&format!("  {key}: \"{value}\"\n"));
+            }
+        }
+        std::fs::write(manifest_path, manifest).unwrap();
     }
 
     fn pseudo_random_bytes(len: usize) -> Vec<u8> {
@@ -730,16 +728,22 @@ mod tests {
         assert!(error.to_string().contains("does not match"));
     }
 
-    #[cfg(unix)]
     #[test]
-    fn restore_check_state_rejects_changed_installed_identity() {
+    fn restore_check_state_rejects_each_changed_installed_identity_field() {
         let tmp = tempfile::tempdir().unwrap();
         let store_root = tmp.path().join("store");
         let install_root = tmp.path().join("install");
         let active_app_dir = install_root.join("app");
         std::fs::create_dir_all(&store_root).unwrap();
         std::fs::create_dir_all(&active_app_dir).unwrap();
-        write_runtime_identity(&active_app_dir, "app", "1.0.0", "original-app", "supervisor");
+        write_runtime_identity_with_environment(
+            &active_app_dir,
+            "app",
+            "1.0.0",
+            "original-app",
+            "original-supervisor",
+            &[("MODE", "original")],
+        );
 
         let ctx = Arc::new(Context::new());
         ctx.set_storage(
@@ -761,12 +765,32 @@ mod tests {
         checked.current_release_identity = current_install::load(&checked).unwrap();
         let check_state = checked.capture_check_state();
 
-        write_runtime_identity(&active_app_dir, "app", "1.0.0", "changed-app", "supervisor");
-        let mut applying = UpdateManager::new(ctx, "app", "1.0.0", "stable", install_root.to_str().unwrap()).unwrap();
+        for (main_exe, supervisor_id, environment) in [
+            ("changed-app", "original-supervisor", "original"),
+            ("original-app", "changed-supervisor", "original"),
+            ("original-app", "original-supervisor", "changed"),
+        ] {
+            write_runtime_identity_with_environment(
+                &active_app_dir,
+                "app",
+                "1.0.0",
+                main_exe,
+                supervisor_id,
+                &[("MODE", environment)],
+            );
+            let mut applying = UpdateManager::new(
+                Arc::clone(&ctx),
+                "app",
+                "1.0.0",
+                "stable",
+                install_root.to_str().unwrap(),
+            )
+            .unwrap();
 
-        let error = applying.restore_check_state(&check_state).unwrap_err();
+            let error = applying.restore_check_state(&check_state).unwrap_err();
 
-        assert!(error.to_string().contains("identity changed"));
+            assert!(error.to_string().contains("identity changed"));
+        }
     }
 
     #[test]

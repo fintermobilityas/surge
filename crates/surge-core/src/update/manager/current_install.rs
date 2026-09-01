@@ -1,33 +1,33 @@
-#[cfg(unix)]
 use std::cmp::Ordering;
-#[cfg(unix)]
 use std::collections::BTreeMap;
-#[cfg(unix)]
 use std::path::{Component, Path};
 
-#[cfg(unix)]
 use crate::error::{Result, SurgeError};
-#[cfg(unix)]
 use crate::install::read_runtime_manifest_identity;
-#[cfg(unix)]
 use crate::releases::version::compare_versions;
-#[cfg(unix)]
 use crate::supervisor::state::read_supervisor_exe_path;
 
-#[cfg(unix)]
 use super::{UpdateManager, apply};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(super) struct ReleaseIdentity {
-    #[cfg(unix)]
     pub(super) version: String,
     pub(super) main_exe: String,
     pub(super) supervisor_id: String,
-    #[cfg(unix)]
     pub(super) environment: BTreeMap<String, String>,
 }
 
-#[cfg(unix)]
+impl PartialEq for ReleaseIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        self.version == other.version
+            && self.main_exe == other.main_exe
+            && self.supervisor_id == other.supervisor_id
+            && self.environment == other.environment
+    }
+}
+
+impl Eq for ReleaseIdentity {}
+
 pub(super) fn load(manager: &UpdateManager) -> Result<Option<ReleaseIdentity>> {
     let Some(active_app_dir) = apply::find_previous_app_dir(&manager.install_dir, &manager.current_version) else {
         return Ok(None);
@@ -65,7 +65,6 @@ pub(super) fn load(manager: &UpdateManager) -> Result<Option<ReleaseIdentity>> {
     }))
 }
 
-#[cfg(unix)]
 fn legacy_main_exe(
     manager: &UpdateManager,
     active_app_dir: &Path,
@@ -103,7 +102,6 @@ fn legacy_main_exe(
     })
 }
 
-#[cfg(unix)]
 fn safe_relative_path(path: &Path) -> Option<String> {
     if path.as_os_str().is_empty()
         || path
@@ -115,7 +113,7 @@ fn safe_relative_path(path: &Path) -> Option<String> {
     path.to_str().map(ToString::to_string)
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use std::sync::Arc;
 

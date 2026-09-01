@@ -63,9 +63,6 @@ namespace Surge
         private int _updateOperationActive;
 
         /// <summary>
-        /// Maximum number of old installed versions to retain on disk after updating.
-        /// </summary>
-        /// <summary>
         /// Allow this process to swap its own active application directory during an update.
         /// Defaults to <c>false</c>, in which case an updater running from the active application
         /// executable refuses the swap and expects an external Surge updater. A self-hosted
@@ -74,6 +71,9 @@ namespace Surge
         /// </summary>
         public bool AllowInProcessSwap { get; set; }
 
+        /// <summary>
+        /// Maximum number of old installed versions to retain on disk after updating.
+        /// </summary>
         public int ReleaseRetentionLimit
         {
             get => _releaseRetentionLimit;

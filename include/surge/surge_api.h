@@ -275,6 +275,21 @@ SURGE_API surge_result SURGE_CALL surge_update_manager_set_release_retention_lim
                                                                                    int32_t release_retention_limit);
 
 /**
+ * Allow the running application to swap its own active directory during apply.
+ *
+ * `allow` is treated as a boolean: zero disables (the default), non-zero
+ * enables. When disabled, an updater running from the active application
+ * executable refuses the swap and expects an external Surge updater. A
+ * self-hosted application that updates in-process (calling
+ * `surge_update_download_and_apply` from inside the installed app) must
+ * enable this to keep self-updating; other processes running the active
+ * executable are still quiesced before the swap.
+ *
+ * `mgr` must be a valid update manager handle or NULL.
+ */
+SURGE_API surge_result SURGE_CALL surge_update_manager_set_allow_in_process_swap(surge_update_manager* mgr, int32_t allow);
+
+/**
  * Change local package-artifact cache retention after successful updates.
  * @param mgr             Manager handle.
  * @param retention       Cache retention policy.

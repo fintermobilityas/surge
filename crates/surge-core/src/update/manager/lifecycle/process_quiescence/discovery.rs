@@ -6,8 +6,11 @@ use std::ffi::OsString;
 #[cfg(unix)]
 use std::path::PathBuf;
 
+#[cfg(target_os = "macos")]
+use std::path::Path;
+
 #[cfg(unix)]
-use crate::error::{Result, SurgeError};
+use crate::error::Result;
 
 #[cfg(unix)]
 pub(super) struct AppProcess {
@@ -22,6 +25,8 @@ where
     F: Fn(&AppProcess) -> bool,
 {
     use std::os::unix::ffi::OsStringExt;
+
+    use crate::error::SurgeError;
 
     let entries = std::fs::read_dir("/proc")
         .map_err(|e| SurgeError::Platform(format!("Failed to enumerate processes from /proc: {e}")))?;
@@ -86,6 +91,8 @@ pub(super) fn app_process_pids<F>(_protected_pid: u32, _matches_exe: &F) -> Resu
 where
     F: Fn(&AppProcess) -> bool,
 {
+    use crate::error::SurgeError;
+
     Err(SurgeError::Platform(
         "Active application process discovery is unsupported on this Unix platform".to_string(),
     ))

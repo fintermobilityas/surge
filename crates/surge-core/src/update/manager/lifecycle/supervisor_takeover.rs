@@ -21,7 +21,7 @@ pub(super) async fn request_shutdown(
     let pid_file = supervisor_pid_file(install_dir, supervisor_id);
     let Some(supervisor_pid) = read_supervisor_pid_owner(&pid_file)? else {
         if let Some(handoff) = take_accepted_supervisor_takeover(install_dir, supervisor_id)? {
-            return Ok(handoff.child_pid);
+            return Ok(handoff.child_identity.map(|identity| identity.pid));
         }
         return Ok(take_supervisor_takeover_pid(install_dir, supervisor_id));
     };
@@ -258,7 +258,7 @@ async fn finish_accepted_takeover(
             ))
         })?;
         ensure_handoff_matches_instance(supervisor_id, &consumed, instance)?;
-        Ok(consumed.child_pid)
+        Ok(consumed.child_identity.map(|identity| identity.pid))
     }
 }
 
@@ -279,5 +279,5 @@ fn take_matching_accepted_handoff(
         ))
     })?;
     ensure_handoff_matches_request(supervisor_id, &consumed, request)?;
-    Ok(consumed.child_pid)
+    Ok(consumed.child_identity.map(|identity| identity.pid))
 }

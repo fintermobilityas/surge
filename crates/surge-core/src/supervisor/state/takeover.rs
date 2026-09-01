@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use crate::error::{Result, SurgeError};
 use crate::platform::fs::write_file_atomic;
+use crate::platform::process::ProcessIdentity;
 
 use super::supervisor_state_path;
 
@@ -90,18 +91,18 @@ pub struct SupervisorTakeoverAcknowledgement {
     pub instance_token: String,
     pub request_token: String,
     pub acknowledgement_token: String,
-    pub child_pid: Option<u32>,
+    pub child_identity: Option<ProcessIdentity>,
 }
 
 impl SupervisorTakeoverAcknowledgement {
     #[must_use]
-    pub fn new(request: &SupervisorTakeoverRequest, child_pid: Option<u32>) -> Self {
+    pub fn new(request: &SupervisorTakeoverRequest, child_identity: Option<ProcessIdentity>) -> Self {
         Self {
             supervisor_pid: request.supervisor_pid,
             instance_token: request.instance_token.clone(),
             request_token: request.request_token.clone(),
             acknowledgement_token: new_token(),
-            child_pid,
+            child_identity,
         }
     }
 
@@ -117,7 +118,7 @@ impl SupervisorTakeoverAcknowledgement {
             || self.instance_token.trim().is_empty()
             || self.request_token.trim().is_empty()
             || self.acknowledgement_token.trim().is_empty()
-            || self.child_pid == Some(0)
+            || self.child_identity.is_some_and(|identity| identity.pid == 0)
         {
             return Err(invalid_record("takeover acknowledgement"));
         }
@@ -170,7 +171,7 @@ pub struct SupervisorTakeoverHandoff {
     pub supervisor_pid: u32,
     pub instance_token: String,
     pub request_token: String,
-    pub child_pid: Option<u32>,
+    pub child_identity: Option<ProcessIdentity>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -383,7 +384,7 @@ pub fn read_accepted_supervisor_takeover(
         supervisor_pid: accepted.supervisor_pid,
         instance_token: accepted.instance_token,
         request_token: accepted.request_token,
-        child_pid: acknowledgement.child_pid,
+        child_identity: acknowledgement.child_identity,
     }))
 }
 
@@ -473,13 +474,15 @@ fn invalid_record(description: &str) -> SurgeError {
 mod tests {
     use super::*;
 
+    const CHILD_IDENTITY: ProcessIdentity = ProcessIdentity { pid: 84, generation: 7 };
+
     #[test]
     fn request_and_acknowledgement_tokens_are_unique_and_bound() {
         let first_instance = SupervisorTakeoverInstance::new(42);
         let second_instance = SupervisorTakeoverInstance::new(42);
         let first_request = SupervisorTakeoverRequest::new(&first_instance, Duration::from_secs(5));
         let second_request = SupervisorTakeoverRequest::new(&first_instance, Duration::from_secs(5));
-        let acknowledgement = SupervisorTakeoverAcknowledgement::new(&first_request, Some(84));
+        let acknowledgement = SupervisorTakeoverAcknowledgement::new(&first_request, Some(CHILD_IDENTITY));
         let commit = SupervisorTakeoverCommit::new(&acknowledgement);
 
         assert_ne!(first_instance.instance_token, second_instance.instance_token);
@@ -503,6 +506,17 @@ mod tests {
 
         assert!(!request.is_expired_at(999));
         assert!(request.is_expired_at(1_000));
+    }
+
+    #[test]
+    fn acknowledgement_rejects_an_invalid_child_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let instance = SupervisorTakeoverInstance::new(42);
+        let request = SupervisorTakeoverRequest::new(&instance, Duration::from_secs(5));
+        let acknowledgement =
+            SupervisorTakeoverAcknowledgement::new(&request, Some(ProcessIdentity { pid: 0, generation: 7 }));
+
+        assert!(write_supervisor_takeover_acknowledgement(dir.path(), "demo", &acknowledgement).is_err());
     }
 
     #[test]
@@ -538,7 +552,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let instance = SupervisorTakeoverInstance::new(42);
         let request = SupervisorTakeoverRequest::new(&instance, Duration::from_secs(5));
-        let acknowledgement = SupervisorTakeoverAcknowledgement::new(&request, Some(84));
+        let acknowledgement = SupervisorTakeoverAcknowledgement::new(&request, Some(CHILD_IDENTITY));
         let commit = SupervisorTakeoverCommit::new(&acknowledgement);
         write_supervisor_takeover_request(dir.path(), "demo", &request).unwrap();
         write_supervisor_takeover_acknowledgement(dir.path(), "demo", &acknowledgement).unwrap();
@@ -548,7 +562,7 @@ mod tests {
         let handoff = take_accepted_supervisor_takeover(dir.path(), "demo").unwrap().unwrap();
 
         assert_eq!(handoff.supervisor_pid, 42);
-        assert_eq!(handoff.child_pid, Some(84));
+        assert_eq!(handoff.child_identity, Some(CHILD_IDENTITY));
         assert!(read_accepted_supervisor_takeover(dir.path(), "demo").unwrap().is_none());
     }
 

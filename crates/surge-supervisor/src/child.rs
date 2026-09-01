@@ -192,27 +192,27 @@ fn wait_for_child_startup_or_stop(
 }
 
 pub(crate) fn wait_for_pid_or_stop(
-    pid: u32,
+    mut observed_process_is_running: impl FnMut() -> Result<bool, SupervisorError>,
     shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     stop_triggers: &StopTriggers<'_>,
     pid_file: &Path,
     own_pid: u32,
-) -> WaitOutcome {
+) -> Result<WaitOutcome, SupervisorError> {
     loop {
         if shutdown.load(std::sync::atomic::Ordering::Acquire) {
-            return WaitOutcome::ShutdownRequested;
+            return Ok(WaitOutcome::ShutdownRequested);
         }
 
         if supervisor_was_superseded(pid_file, own_pid) {
-            return WaitOutcome::Superseded;
+            return Ok(WaitOutcome::Superseded);
         }
 
         if stop_triggers.requested() {
-            return WaitOutcome::StopRequested;
+            return Ok(WaitOutcome::StopRequested);
         }
 
-        if !is_process_running(pid) {
-            return WaitOutcome::ObservedProcessExited;
+        if !observed_process_is_running()? {
+            return Ok(WaitOutcome::ObservedProcessExited);
         }
 
         std::thread::sleep(std::time::Duration::from_millis(100));

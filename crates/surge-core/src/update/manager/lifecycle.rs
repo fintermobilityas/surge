@@ -424,6 +424,8 @@ mod tests {
 
     use super::*;
     #[cfg(unix)]
+    use crate::platform::process::ProcessIdentity;
+    #[cfg(unix)]
     use crate::supervisor::state::{
         SupervisorTakeoverAcknowledgement, SupervisorTakeoverInstance, SupervisorTakeoverRequest,
         accept_supervisor_takeover_request, read_accepted_supervisor_takeover, read_supervisor_takeover_commit,
@@ -472,7 +474,8 @@ mod tests {
         let install_dir = dir.path().to_path_buf();
         let responder = std::thread::spawn(move || {
             let request = wait_for_takeover_request(&install_dir, supervisor_id);
-            let acknowledgement = SupervisorTakeoverAcknowledgement::new(&request, Some(84));
+            let acknowledgement =
+                SupervisorTakeoverAcknowledgement::new(&request, Some(ProcessIdentity { pid: 84, generation: 7 }));
             write_supervisor_takeover_acknowledgement(&install_dir, supervisor_id, &acknowledgement).unwrap();
 
             let deadline = std::time::Instant::now() + Duration::from_secs(2);

@@ -23,6 +23,17 @@ Surge supports four installer types configured via `installers:` in the manifest
 
 The legacy `web` type has been removed; use `online` instead.
 
+## Issues, PRs and release notes from downstream fleets
+
+Surge is consumed by production fleets. Evidence gathered on those fleets must be anonymized by default before it lands in this repository's issues, pull requests, commit messages or release notes — regardless of how it was gathered (live repair, logs, operator data, screenshots, support reports) and even though the repository is currently private (crates and packages are published, and the history should be publishable as is).
+
+- Never leak customer/site/lot names, hostnames, IPs, org/lot/node/visit ids, license plates, exact affected-node counts, downstream app ids, package paths or filenames that contain app ids, storage account or bucket names, or downstream application version numbers.
+- Use neutral wording: "a downstream production node", "the consuming application", "previous release", "target release", `<app>`, `<rid>`, `<version>`, `<channel>`, `<redacted-package-path>`, and grouped counts like "some nodes". Replace real command values with placeholders, for example `surge promote --app-id <app> --version <version> --channel <channel>`.
+- Keep the technical failure mode precise after redaction: status states and phases, error variants and messages with identifiers replaced, HTTP status behaviour, retry-safety semantics, and the responsible Surge source files, functions, enum variants and plan labels are all appropriate.
+- Reduce every report to the smallest reproducible Surge contract. If the exact fleet context is needed, keep it in the downstream repository's private issue and link it; the Surge issue stays focused on the upstream defect.
+- Never include credentials, API tokens, bearer tokens, passwords, camera or storage URLs with embedded credentials, signed SAS URLs, private keys, or secret-bearing configuration — anywhere, ever.
+- Before publishing, reread the rendered text as if it were public. If it still lets a reader identify the customer, node, fleet size, app package family or downstream release, redact further or ask.
+
 ## Build, Test, and Development Commands
 Initialize submodules first:
 ```bash

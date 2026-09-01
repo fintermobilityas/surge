@@ -474,7 +474,7 @@ mod tests {
     #[test]
     fn macos_direct_interpreter_arguments_are_counted_literally() {
         assert_eq!(
-            macos_direct_interpreter_argument_count(r#"-e 'two words' plain\ value"#),
+            macos_direct_interpreter_argument_count(r"-e 'two words' plain\ value"),
             5
         );
     }

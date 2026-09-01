@@ -325,6 +325,17 @@ fn is_active_app_process(
     let Some(identity) = interpreted_main else {
         return Ok(false);
     };
+    let Some(argument) = process.command.get(identity.script_argument_index) else {
+        if !process.command_inspected && identity.executable_may_match(&process.exe)? {
+            return Err(SurgeError::Platform(
+                "Cannot inspect the command line of the active application interpreter before swap".to_string(),
+            ));
+        }
+        return Ok(false);
+    };
+    if !active_entrypoint.matches_argument(argument, process.cwd.as_deref())? {
+        return Ok(false);
+    }
     if !process.command_inspected && identity.executable_may_match(&process.exe)? {
         return Err(SurgeError::Platform(
             "Cannot inspect the command line of the active application interpreter before swap".to_string(),
@@ -333,11 +344,7 @@ fn is_active_app_process(
     if !identity.matches_interpreter(&process.exe, process.command.first().map(OsString::as_os_str))? {
         return Ok(false);
     }
-    let Some(argument) = process.command.get(identity.script_argument_index) else {
-        return Ok(false);
-    };
-
-    active_entrypoint.matches_argument(argument, process.cwd.as_deref())
+    Ok(true)
 }
 
 #[cfg(unix)]
@@ -746,6 +753,29 @@ mod tests {
         );
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn unrelated_script_operand_does_not_resolve_an_ambiguous_env_interpreter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let active_app_dir = tmp.path().join("app");
+        std::fs::create_dir_all(&active_app_dir).unwrap();
+        let app_path = active_app_dir.join("demo-script");
+        let interpreter_name = "surge-test-unresolvable-env-interpreter";
+        std::fs::write(&app_path, format!("#!/usr/bin/env {interpreter_name}\n")).unwrap();
+        let active_entrypoint = active_entrypoint::Identity::resolve(&active_app_dir, "demo-script")
+            .unwrap()
+            .unwrap();
+        let interpreted_main = interpreted_main::resolve(&active_entrypoint.resolved).unwrap().unwrap();
+        let process = AppProcess {
+            exe: std::fs::canonicalize("/bin/sh").unwrap(),
+            command: vec![OsString::from(interpreter_name), OsString::from("/other/script")],
+            command_inspected: true,
+            cwd: Some(active_app_dir),
+        };
+
+        assert!(!is_active_app_process(&active_entrypoint, Some(&interpreted_main), &process).unwrap());
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn direct_interpreted_app_with_multiple_options_is_terminated_before_swap() {
@@ -755,5 +785,30 @@ mod tests {
     #[test]
     fn env_interpreted_app_with_multiple_options_is_terminated_before_swap() {
         assert_interpreted_active_app_process_is_terminated_before_swap("#!/usr/bin/env /bin/sh -e -u");
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn empty_argv0_does_not_shift_a_symlinked_entrypoint_operand() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let active_app_dir = tmp.path().join("app");
+        std::fs::create_dir_all(&active_app_dir).unwrap();
+        let app_path = active_app_dir.join("demo");
+        symlink("/bin/sleep", &app_path).unwrap();
+        let active_entrypoint = active_entrypoint::Identity::resolve(&active_app_dir, "demo")
+            .unwrap()
+            .unwrap();
+        let mut command = vec![0];
+        command.extend_from_slice(app_path.as_os_str().as_encoded_bytes());
+        command.push(0);
+        let process = AppProcess {
+            exe: std::fs::canonicalize("/bin/sleep").unwrap(),
+            command: discovery::parse_proc_cmdline(&command),
+            command_inspected: true,
+            cwd: Some(active_app_dir),
+        };
+
+        assert!(!is_active_app_process(&active_entrypoint, None, &process).unwrap());
     }
 }

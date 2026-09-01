@@ -14,6 +14,7 @@ const SHEBANG_IDENTITY_LIMIT: usize = 256;
 #[cfg(not(target_os = "macos"))]
 const SHEBANG_READ_LIMIT: u64 = 257;
 const SUPPORTED_ENV_INTERPRETERS: [&str; 2] = ["/usr/bin/env", "/bin/env"];
+const DEFAULT_ENV_SEARCH_PATH: &str = "/usr/bin:/bin";
 
 pub(super) struct Identity {
     interpreter: Interpreter,
@@ -28,7 +29,14 @@ enum Interpreter {
 struct EnvCommand {
     program: OsString,
     fixed_argument_count: usize,
-    search_path: Option<OsString>,
+    search_path: EnvSearchPath,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum EnvSearchPath {
+    Inherited,
+    Default,
+    Explicit(OsString),
 }
 
 impl Identity {
@@ -61,7 +69,7 @@ impl Identity {
                     return Ok(true);
                 }
                 let program = Path::new(&expected.program);
-                Ok(expected.search_path.is_none()
+                Ok(matches!(expected.search_path, EnvSearchPath::Inherited)
                     && program.components().count() == 1
                     && executable.file_name() == program.file_name())
             }
@@ -105,11 +113,11 @@ fn resolve_env_command(command: &EnvCommand) -> Result<PathBuf> {
         )));
     }
 
-    let search_path = command
-        .search_path
-        .clone()
-        .or_else(|| std::env::var_os("PATH"))
-        .unwrap_or_else(|| OsString::from("/usr/bin:/bin"));
+    let search_path = match &command.search_path {
+        EnvSearchPath::Inherited => std::env::var_os("PATH").unwrap_or_else(|| OsString::from(DEFAULT_ENV_SEARCH_PATH)),
+        EnvSearchPath::Default => OsString::from(DEFAULT_ENV_SEARCH_PATH),
+        EnvSearchPath::Explicit(search_path) => search_path.clone(),
+    };
     for directory in std::env::split_paths(&search_path) {
         if directory.as_os_str().is_empty() || directory.is_relative() {
             return Err(SurgeError::Platform(format!(
@@ -162,10 +170,10 @@ pub(super) fn resolve(active_exe: &Path) -> Result<Option<Identity>> {
     }
     let shebang = std::str::from_utf8(&prefix[2..line_end])
         .map_err(|e| SurgeError::Platform(format!("Active application shebang is not valid UTF-8: {e}")))?
-        .trim();
-    let interpreter_end = shebang.find(char::is_whitespace).unwrap_or(shebang.len());
+        .trim_matches(is_shebang_separator);
+    let interpreter_end = shebang.find(is_shebang_separator).unwrap_or(shebang.len());
     let interpreter = &shebang[..interpreter_end];
-    let argument = shebang[interpreter_end..].trim();
+    let argument = shebang[interpreter_end..].trim_matches(is_shebang_separator);
     if interpreter.is_empty() {
         return Err(SurgeError::Platform(
             "Active application shebang has no interpreter".to_string(),
@@ -195,12 +203,16 @@ pub(super) fn resolve(active_exe: &Path) -> Result<Option<Identity>> {
     }))
 }
 
+fn is_shebang_separator(character: char) -> bool {
+    matches!(character, ' ' | '\t')
+}
+
 fn parse_env_command(argument: &str) -> Result<EnvCommand> {
     let split_command = argument
         .strip_prefix("--split-string=")
         .or_else(|| argument.strip_prefix("-S"))
         .or_else(|| argument.strip_prefix("--split-string "))
-        .map(str::trim_start);
+        .map(|command| command.trim_start_matches(|character: char| character.is_ascii_whitespace()));
     let command = split_command.unwrap_or(argument);
     let words = split_env_command_words(command)?;
     #[cfg(not(target_os = "macos"))]
@@ -214,7 +226,7 @@ fn parse_env_command(argument: &str) -> Result<EnvCommand> {
     Ok(EnvCommand {
         program: OsString::from(&words[command_index]),
         fixed_argument_count: words.len() - command_index - 1,
-        search_path: search_path.map(OsString::from),
+        search_path,
     })
 }
 
@@ -229,13 +241,18 @@ fn split_env_command_words(command: &str) -> Result<Vec<String>> {
         ));
     }
 
-    Ok(command.split_whitespace().map(ToString::to_string).collect())
+    Ok(command
+        .split(|character: char| character.is_ascii_whitespace())
+        .filter(|word| !word.is_empty())
+        .map(ToString::to_string)
+        .collect())
 }
 
-fn env_command_index(words: &[String]) -> Result<(usize, Option<String>)> {
+fn env_command_index(words: &[String]) -> Result<(usize, EnvSearchPath)> {
     let mut index = 0;
     let mut options = true;
     let mut search_path = None;
+    let mut ignore_environment = false;
 
     while let Some(word) = words.get(index) {
         if options {
@@ -245,7 +262,12 @@ fn env_command_index(words: &[String]) -> Result<(usize, Option<String>)> {
                     index += 1;
                     continue;
                 }
-                "-i" | "--ignore-environment" | "-0" | "--null" | "-v" | "--debug" | "--list-signal-handling" => {
+                "-i" | "--ignore-environment" => {
+                    ignore_environment = true;
+                    index += 1;
+                    continue;
+                }
+                "-0" | "--null" | "-v" | "--debug" | "--list-signal-handling" => {
                     index += 1;
                     continue;
                 }
@@ -290,6 +312,11 @@ fn env_command_index(words: &[String]) -> Result<(usize, Option<String>)> {
             continue;
         }
 
+        let search_path = match search_path {
+            Some(search_path) => EnvSearchPath::Explicit(OsString::from(search_path)),
+            None if ignore_environment => EnvSearchPath::Default,
+            None => EnvSearchPath::Inherited,
+        };
         return Ok((index, search_path));
     }
 
@@ -449,14 +476,18 @@ mod tests {
         let command = parse_env_command("-S -i -u OLD -- FEATURE=true /bin/sh -e").unwrap();
         assert_eq!(command.program, OsString::from("/bin/sh"));
         assert_eq!(command.fixed_argument_count, 1);
+        assert_eq!(command.search_path, EnvSearchPath::Default);
     }
 
     #[test]
     fn env_command_preserves_explicit_search_path() {
-        let command = parse_env_command("-S -P /opt/interpreters demo-interpreter -e").unwrap();
+        let command = parse_env_command("-S -i -P /opt/interpreters demo-interpreter -e").unwrap();
 
         assert_eq!(command.program, OsString::from("demo-interpreter"));
-        assert_eq!(command.search_path, Some(OsString::from("/opt/interpreters")));
+        assert_eq!(
+            command.search_path,
+            EnvSearchPath::Explicit(OsString::from("/opt/interpreters"))
+        );
     }
 
     #[test]
@@ -506,7 +537,7 @@ mod tests {
             interpreter: Interpreter::EnvCommand(EnvCommand {
                 program: OsString::from("sh"),
                 fixed_argument_count: 0,
-                search_path: None,
+                search_path: EnvSearchPath::Inherited,
             }),
             script_argument_index: 1,
         };
@@ -524,6 +555,17 @@ mod tests {
     fn env_command_rejects_escape_sequences_instead_of_misparsing_operand_boundaries() {
         let error = parse_env_command(r"-S /bin/sh\_-e").err().unwrap();
         assert!(error.to_string().contains("unsupported split-string"));
+    }
+
+    #[test]
+    fn env_split_string_preserves_unicode_whitespace_as_command_data() {
+        let command = parse_env_command("-S /tmp/demo\u{a0}interpreter -e").unwrap();
+
+        assert_eq!(command.program, OsString::from("/tmp/demo\u{a0}interpreter"));
+        assert_eq!(command.fixed_argument_count, 1);
+
+        let attached = parse_env_command("-S\u{a0}/bin/sh").unwrap();
+        assert_eq!(attached.program, OsString::from("\u{a0}/bin/sh"));
     }
 
     #[test]
@@ -579,6 +621,19 @@ mod tests {
         let error = resolve(&app).err().unwrap();
 
         assert!(error.to_string().contains("not a supported system env executable"));
+    }
+
+    #[test]
+    fn unicode_whitespace_in_interpreter_path_is_not_a_shebang_separator() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let interpreter = tmp.path().join("demo\u{a0}interpreter");
+        let app = tmp.path().join("app");
+        symlink("/bin/sh", &interpreter).unwrap();
+        std::fs::write(&app, format!("#!{}\n", interpreter.display())).unwrap();
+
+        assert!(resolve(&app).unwrap().is_some());
     }
 
     #[test]

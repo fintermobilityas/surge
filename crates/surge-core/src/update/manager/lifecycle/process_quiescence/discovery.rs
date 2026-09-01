@@ -25,8 +25,6 @@ pub(super) fn app_process_pids<F>(protected_pid: u32, matches_exe: &F) -> Result
 where
     F: Fn(&AppProcess) -> Result<bool>,
 {
-    use std::os::unix::ffi::OsStringExt;
-
     use crate::error::SurgeError;
 
     let entries = std::fs::read_dir("/proc")
@@ -45,16 +43,7 @@ where
         };
         let command = std::fs::read(format!("/proc/{pid}/cmdline"));
         let command_inspected = command.is_ok();
-        let command = command.map_or_else(
-            |_| Vec::new(),
-            |bytes| {
-                bytes
-                    .split(|byte| *byte == 0)
-                    .filter(|argument| !argument.is_empty())
-                    .map(|argument| OsString::from_vec(argument.to_vec()))
-                    .collect()
-            },
-        );
+        let command = command.map_or_else(|_| Vec::new(), |bytes| parse_proc_cmdline(&bytes));
         let process = AppProcess {
             exe,
             command,
@@ -99,6 +88,21 @@ where
     }
 
     Ok(pids)
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn parse_proc_cmdline(bytes: &[u8]) -> Vec<OsString> {
+    use std::os::unix::ffi::OsStringExt;
+
+    if bytes.is_empty() {
+        return Vec::new();
+    }
+
+    let arguments = bytes.strip_suffix(&[0]).unwrap_or(bytes);
+    arguments
+        .split(|byte| *byte == 0)
+        .map(|argument| OsString::from_vec(argument.to_vec()))
+        .collect()
 }
 
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
@@ -149,5 +153,14 @@ mod tests {
         std::fs::write(&executable, "fixture").unwrap();
 
         assert_eq!(normalize_proc_exe_path(executable.clone()), executable);
+    }
+
+    #[test]
+    fn proc_cmdline_preserves_empty_argument_positions() {
+        assert_eq!(
+            parse_proc_cmdline(b"\0/opt/demo/app/demo\0\0"),
+            vec![OsString::new(), OsString::from("/opt/demo/app/demo"), OsString::new()]
+        );
+        assert!(parse_proc_cmdline(b"").is_empty());
     }
 }

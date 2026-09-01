@@ -121,8 +121,9 @@ fn spawn_impl(
 /// update), and the leaked descriptors keep kernel state alive that belongs to the
 /// application: an exclusive evdev grab, a listening socket, a lock file. The
 /// replacement application then finds its own resources "busy" until every
-/// process in the chain has exited. Closing the inherited descriptors in the child
-/// before `exec` removes that coupling. Unix only; a no-op elsewhere.
+/// process in the chain has exited. Marking the inherited descriptors close-on-exec
+/// in the child before `exec` removes that coupling without disturbing the standard
+/// library's spawn-error reporting. Unix only; a no-op elsewhere.
 pub fn close_inherited_descriptors(command: &mut Command) {
     descriptors::close_inherited_before_exec(command);
 }
@@ -282,6 +283,25 @@ mod tests {
         let result = handle.wait().expect("wait probe shell");
 
         assert_eq!(result.exit_code, 0, "descriptor {inherited} leaked into the child");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawning_a_missing_executable_still_reports_the_error() {
+        use super::spawn_process;
+        use std::collections::BTreeMap;
+
+        let result = spawn_process(
+            std::path::Path::new("/nonexistent/surge-missing-executable"),
+            &[],
+            None,
+            &BTreeMap::new(),
+        );
+
+        assert!(
+            matches!(result, Err(crate::error::SurgeError::Platform(_))),
+            "exec failure must surface through spawn(), not vanish with the error pipe"
+        );
     }
 
     #[cfg(target_os = "linux")]

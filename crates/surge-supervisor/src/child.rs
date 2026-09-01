@@ -19,6 +19,7 @@ pub(crate) fn spawn_supervised_child(
 
     let mut command = Command::new(exe_path);
     command.current_dir(install_dir).args(child_args);
+    surge_core::platform::process::close_inherited_descriptors(&mut command);
 
     // Put the child in its own process group so a group-scoped signal or
     // `pkill -g` aimed at the supervisor cannot also take down the child.

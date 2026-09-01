@@ -4,6 +4,8 @@ use std::process::{Child, Command, Stdio};
 
 use crate::error::{Result, SurgeError};
 
+mod descriptors;
+
 pub struct ProcessHandle {
     child: Child,
 }
@@ -102,12 +104,27 @@ fn spawn_impl(
     }
 
     cmd.envs(envs);
+    close_inherited_descriptors(&mut cmd);
 
     let child = cmd
         .spawn()
         .map_err(|e| SurgeError::Platform(format!("Failed to spawn {}: {e}", exe.display())))?;
 
     Ok(ProcessHandle { child })
+}
+
+/// Configure `command` so the child starts with only stdin, stdout and stderr open.
+///
+/// A spawned child otherwise inherits every descriptor of the spawning process that
+/// is not marked close-on-exec. For Surge that spawning process is often the
+/// supervised application itself (starting its supervisor, or handing off an
+/// update), and the leaked descriptors keep kernel state alive that belongs to the
+/// application: an exclusive evdev grab, a listening socket, a lock file. The
+/// replacement application then finds its own resources "busy" until every
+/// process in the chain has exited. Closing the inherited descriptors in the child
+/// before `exec` removes that coupling. Unix only; a no-op elsewhere.
+pub fn close_inherited_descriptors(command: &mut Command) {
+    descriptors::close_inherited_before_exec(command);
 }
 
 #[must_use]
@@ -244,6 +261,50 @@ pub fn exec_replace(exe: &Path, args: &[&str]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn spawned_child_does_not_inherit_open_descriptors() {
+        use super::spawn_process;
+        use std::collections::BTreeMap;
+        use std::os::fd::AsRawFd;
+
+        use nix::fcntl::{FcntlArg, FdFlag, fcntl};
+
+        // Rust opens files close-on-exec by default; clear the flag so the descriptor
+        // would be inherited by a child spawned without descriptor hygiene.
+        let tmp = tempfile::NamedTempFile::new().expect("temp file");
+        fcntl(tmp.as_file(), FcntlArg::F_SETFD(FdFlag::empty())).expect("clear close-on-exec");
+        let inherited = tmp.as_file().as_raw_fd();
+        let probe = format!("test ! -e /proc/self/fd/{inherited}");
+
+        let mut handle = spawn_process(std::path::Path::new("/bin/sh"), &["-c", &probe], None, &BTreeMap::new())
+            .expect("spawn probe shell");
+        let result = handle.wait().expect("wait probe shell");
+
+        assert_eq!(result.exit_code, 0, "descriptor {inherited} leaked into the child");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn spawned_child_keeps_standard_streams() {
+        use super::spawn_process;
+        use std::collections::BTreeMap;
+
+        let mut handle = spawn_process(
+            std::path::Path::new("/bin/sh"),
+            &[
+                "-c",
+                "test -e /proc/self/fd/0 && test -e /proc/self/fd/1 && test -e /proc/self/fd/2",
+            ],
+            None,
+            &BTreeMap::new(),
+        )
+        .expect("spawn probe shell");
+        let result = handle.wait().expect("wait probe shell");
+
+        assert_eq!(result.exit_code, 0);
+    }
+
     use super::{PidLiveness, is_pid_alive, probe_pid_liveness};
     use std::time::{Duration, Instant};
 

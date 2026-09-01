@@ -188,7 +188,7 @@ pub(super) fn resolve(active_exe: &Path) -> Result<Option<Identity>> {
             (Interpreter::EnvCommand(command), fixed_argument_count)
         } else {
             #[cfg(target_os = "macos")]
-            let fixed_argument_count = direct_interpreter_argument_count(argument)?;
+            let fixed_argument_count = macos_direct_interpreter_argument_count(argument);
             #[cfg(not(target_os = "macos"))]
             let fixed_argument_count = direct_interpreter_argument_count(argument);
             (
@@ -449,9 +449,9 @@ fn ensure_supported_env_interpreter(interpreter: &str) -> Result<()> {
     )))
 }
 
-#[cfg(target_os = "macos")]
-fn direct_interpreter_argument_count(argument: &str) -> Result<usize> {
-    Ok(split_command_words(argument)?.len())
+#[cfg(any(target_os = "macos", test))]
+fn macos_direct_interpreter_argument_count(argument: &str) -> usize {
+    argument.split_ascii_whitespace().count()
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -468,6 +468,14 @@ mod tests {
         assert_eq!(
             split_command_words("/bin/sh '-e value' plain\\ value").unwrap(),
             vec!["/bin/sh", "-e value", "plain value"]
+        );
+    }
+
+    #[test]
+    fn macos_direct_interpreter_arguments_are_counted_literally() {
+        assert_eq!(
+            macos_direct_interpreter_argument_count(r#"-e 'two words' plain\ value"#),
+            5
         );
     }
 

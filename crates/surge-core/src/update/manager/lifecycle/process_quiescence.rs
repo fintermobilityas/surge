@@ -308,14 +308,15 @@ fn is_active_app_process(
         return Ok(true);
     }
     if active_entrypoint.matches_resolved_executable(&process.exe) {
+        if process.command.iter().all(|argument| argument.is_empty()) {
+            return Err(SurgeError::Platform(
+                "Cannot inspect the command line of the active application executable before swap".to_string(),
+            ));
+        }
         let Some(argument) = process.command.first() else {
-            return if process.command_inspected {
-                Ok(false)
-            } else {
-                Err(SurgeError::Platform(
-                    "Cannot inspect the command line of the active application executable before swap".to_string(),
-                ))
-            };
+            return Err(SurgeError::Platform(
+                "Cannot inspect the command line of the active application executable before swap".to_string(),
+            ));
         };
         if active_entrypoint.matches_argument(argument, process.cwd.as_deref())? {
             return Ok(true);
@@ -326,7 +327,7 @@ fn is_active_app_process(
         return Ok(false);
     };
     let Some(argument) = process.command.get(identity.script_argument_index) else {
-        if !process.command_inspected && identity.executable_may_match(&process.exe)? {
+        if process.command.iter().all(|argument| argument.is_empty()) && identity.executable_may_match(&process.exe)? {
             return Err(SurgeError::Platform(
                 "Cannot inspect the command line of the active application interpreter before swap".to_string(),
             ));
@@ -560,6 +561,54 @@ mod tests {
         };
 
         let error = is_active_app_process(&active_entrypoint, Some(&interpreted_main), &process).unwrap_err();
+
+        assert!(error.to_string().contains("Cannot inspect the command line"));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn empty_inspected_interpreter_command_line_refuses_swap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let active_app_dir = tmp.path().join("app");
+        std::fs::create_dir_all(&active_app_dir).unwrap();
+        let app_path = active_app_dir.join("demo-script");
+        std::fs::write(&app_path, "#!/bin/sh\n").unwrap();
+        let active_entrypoint = active_entrypoint::Identity::resolve(&active_app_dir, "demo-script")
+            .unwrap()
+            .unwrap();
+        let interpreted_main = interpreted_main::resolve(&active_entrypoint.resolved).unwrap().unwrap();
+        let process = AppProcess {
+            exe: std::fs::canonicalize("/bin/sh").unwrap(),
+            command: vec![OsString::new()],
+            command_inspected: true,
+            cwd: None,
+        };
+
+        let error = is_active_app_process(&active_entrypoint, Some(&interpreted_main), &process).unwrap_err();
+
+        assert!(error.to_string().contains("Cannot inspect the command line"));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn empty_inspected_symlink_command_line_refuses_swap() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let active_app_dir = tmp.path().join("app");
+        std::fs::create_dir_all(&active_app_dir).unwrap();
+        symlink("/bin/sleep", active_app_dir.join("demo")).unwrap();
+        let active_entrypoint = active_entrypoint::Identity::resolve(&active_app_dir, "demo")
+            .unwrap()
+            .unwrap();
+        let process = AppProcess {
+            exe: std::fs::canonicalize("/bin/sleep").unwrap(),
+            command: vec![OsString::new()],
+            command_inspected: true,
+            cwd: None,
+        };
+
+        let error = is_active_app_process(&active_entrypoint, None, &process).unwrap_err();
 
         assert!(error.to_string().contains("Cannot inspect the command line"));
     }

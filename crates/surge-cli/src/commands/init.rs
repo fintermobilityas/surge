@@ -130,6 +130,7 @@ fn default_pack_manifest_config() -> PackManifestConfig {
         delta: Some(PackDeltaManifestConfig {
             strategy: Some(PACK_DEFAULT_DELTA_STRATEGY.to_string()),
             max_chain_length: Some(PACK_DEFAULT_MAX_CHAIN_LENGTH),
+            chunked_patch_format: None,
         }),
         compression: Some(PackCompressionManifestConfig {
             format: Some(PACK_DEFAULT_COMPRESSION_FORMAT.to_string()),

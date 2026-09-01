@@ -7,7 +7,7 @@
 use std::fs;
 use std::time::Instant;
 
-use surge_core::diff::chunked::{self, ChunkedDiffOptions};
+use surge_core::diff::chunked::{self, ChunkedDiffOptions, ChunkedPatchFormat};
 use surge_core::diff::wrapper;
 
 fn peak_rss_mb() -> f64 {
@@ -127,6 +127,7 @@ fn main() {
             let opts = ChunkedDiffOptions {
                 chunk_size,
                 max_threads: threads,
+                format: ChunkedPatchFormat::IdentityChunks,
             };
             let thread_label = if threads == 0 {
                 "auto".to_string()

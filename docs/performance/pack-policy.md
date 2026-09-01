@@ -80,6 +80,7 @@ Accepted but not yet auto-tuned:
 
 - `pack.delta.max_chain_length`
 - `pack.retention.keep_latest_fulls`
+- `pack.delta.chunked_patch_format` — `1` (default) writes chunked patches every fielded client can read; `2` enables the identity-chunk bitset (unchanged chunks carry no payload — far cheaper for large files with small edits) but clients older than the reader that introduced it reject such patches, so switch only after the whole fleet runs a client that understands version 2.
 - `pack.retention.checkpoint_every`
 
 Not allowed in the manifest:

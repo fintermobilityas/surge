@@ -629,6 +629,7 @@ pack:                             # optional; omitted uses built-in defaults
   delta:
     strategy: sparse-file-ops
     max_chain_length: 8
+    chunked_patch_format: 1       # 1 = readable by every client (default); 2 = identity-chunk bitset, needs clients that know format 2
   compression:
     format: zstd
     level: 3

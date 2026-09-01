@@ -15,6 +15,8 @@ use std::path::Path;
 use crate::error::Result;
 #[cfg(target_os = "linux")]
 use crate::error::SurgeError;
+#[cfg(unix)]
+use crate::platform::process::{ProcessIdentity, process_identity, process_identity_matches};
 
 #[cfg(unix)]
 pub(super) struct AppProcess {
@@ -24,15 +26,24 @@ pub(super) struct AppProcess {
     pub(super) cwd: Option<PathBuf>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(unix, test))]
 pub(super) fn app_process_pids<F>(protected_pid: u32, matches_exe: &F) -> Result<Vec<u32>>
+where
+    F: Fn(&AppProcess) -> Result<bool>,
+{
+    app_process_identities(protected_pid, matches_exe)
+        .map(|identities| identities.into_iter().map(|identity| identity.pid).collect())
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn app_process_identities<F>(protected_pid: u32, matches_exe: &F) -> Result<Vec<ProcessIdentity>>
 where
     F: Fn(&AppProcess) -> Result<bool>,
 {
     let entries = std::fs::read_dir("/proc")
         .map_err(|e| SurgeError::Platform(format!("Failed to enumerate processes from /proc: {e}")))?;
 
-    let mut pids = Vec::new();
+    let mut identities = Vec::new();
     for entry in entries.filter_map(std::result::Result::ok) {
         let Some(pid) = entry.file_name().to_string_lossy().parse::<u32>().ok() else {
             continue;
@@ -40,6 +51,9 @@ where
         if pid == protected_pid {
             continue;
         }
+        let Some(identity) = inspected_process_identity(pid)? else {
+            continue;
+        };
         let Ok(mut exe) = std::fs::read_link(format!("/proc/{pid}/exe")).map(normalize_proc_exe_path) else {
             continue;
         };
@@ -52,16 +66,16 @@ where
             command_inspected,
             cwd: std::fs::read_link(format!("/proc/{pid}/cwd")).ok(),
         };
-        if matches_exe(&process)? {
-            pids.push(pid);
+        if matches_exe(&process)? && inspected_identity_still_matches(identity)? {
+            identities.push(identity);
         }
     }
 
-    Ok(pids)
+    Ok(identities)
 }
 
 #[cfg(target_os = "macos")]
-pub(super) fn app_process_pids<F>(protected_pid: u32, matches_exe: &F) -> Result<Vec<u32>>
+pub(super) fn app_process_identities<F>(protected_pid: u32, matches_exe: &F) -> Result<Vec<ProcessIdentity>>
 where
     F: Fn(&AppProcess) -> Result<bool>,
 {
@@ -69,12 +83,15 @@ where
 
     let mut system = System::new();
     let _ = system.refresh_processes(ProcessesToUpdate::All, true);
-    let mut pids = Vec::new();
+    let mut identities = Vec::new();
     for (pid, process) in system.processes() {
         let pid = pid.as_u32();
         if pid == protected_pid {
             continue;
         }
+        let Some(identity) = inspected_process_identity(pid)? else {
+            continue;
+        };
         let Some(exe) = process.exe() else {
             continue;
         };
@@ -84,12 +101,12 @@ where
             command_inspected: !process.cmd().is_empty(),
             cwd: process.cwd().map(Path::to_path_buf),
         };
-        if matches_exe(&app_process)? {
-            pids.push(pid);
+        if matches_exe(&app_process)? && inspected_identity_still_matches(identity)? {
+            identities.push(identity);
         }
     }
 
-    Ok(pids)
+    Ok(identities)
 }
 
 #[cfg(target_os = "linux")]
@@ -167,7 +184,7 @@ fn proc_stat_is_zombie(stat: &str) -> Option<bool> {
 }
 
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-pub(super) fn app_process_pids<F>(_protected_pid: u32, _matches_exe: &F) -> Result<Vec<u32>>
+pub(super) fn app_process_identities<F>(_protected_pid: u32, _matches_exe: &F) -> Result<Vec<ProcessIdentity>>
 where
     F: Fn(&AppProcess) -> Result<bool>,
 {
@@ -176,6 +193,25 @@ where
     Err(SurgeError::Platform(
         "Active application process discovery is unsupported on this Unix platform".to_string(),
     ))
+}
+
+#[cfg(unix)]
+fn inspected_process_identity(pid: u32) -> Result<Option<ProcessIdentity>> {
+    process_identity(pid).map_err(|error| {
+        crate::error::SurgeError::Platform(format!(
+            "Failed to inspect process {pid} generation before application swap: {error}"
+        ))
+    })
+}
+
+#[cfg(unix)]
+fn inspected_identity_still_matches(identity: ProcessIdentity) -> Result<bool> {
+    process_identity_matches(identity).map_err(|error| {
+        crate::error::SurgeError::Platform(format!(
+            "Failed to revalidate process {} generation before application swap: {error}",
+            identity.pid
+        ))
+    })
 }
 
 #[cfg(target_os = "linux")]

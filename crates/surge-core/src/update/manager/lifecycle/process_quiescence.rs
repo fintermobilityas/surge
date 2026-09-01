@@ -12,6 +12,8 @@ mod discovery;
 #[cfg(unix)]
 use self::discovery::AppProcess;
 #[cfg(unix)]
+use self::discovery::app_process_identities;
+#[cfg(all(unix, test))]
 use self::discovery::app_process_pids;
 use crate::error::Result;
 #[cfg(unix)]
@@ -201,27 +203,29 @@ where
         return Ok(0);
     }
 
-    let pids = app_process_pids(protected_pid, &matches_exe)?;
-    if pids.is_empty() {
+    let identities = app_process_identities(protected_pid, &matches_exe)?;
+    if identities.is_empty() {
         return Ok(0);
     }
 
-    for pid in &pids {
-        if let Err(e) = signal_pid(*pid, Signal::SIGTERM) {
+    for identity in &identities {
+        if let Err(e) = signal_pid(identity.pid, Signal::SIGTERM) {
+            let pid = identity.pid;
             warn!(pid, error = %e, process_scope, "Failed to request app process termination");
         }
     }
 
     if wait_until_app_processes_exit(protected_pid, &matches_exe, Duration::from_secs(5))? {
-        info!(count = pids.len(), process_scope, "Terminated app processes");
-        return Ok(pids.len());
+        info!(count = identities.len(), process_scope, "Terminated app processes");
+        return Ok(identities.len());
     }
 
-    let remaining = app_process_pids(protected_pid, &matches_exe)?;
-    for pid in &remaining {
-        match signal_pid(*pid, Signal::SIGKILL) {
+    let remaining = app_process_identities(protected_pid, &matches_exe)?;
+    for identity in &remaining {
+        match signal_pid(identity.pid, Signal::SIGKILL) {
             Ok(()) | Err(Errno::ESRCH) => {}
             Err(e) => {
+                let pid = identity.pid;
                 warn!(pid, error = %e, process_scope, "Failed to force-kill app process");
             }
         }
@@ -229,12 +233,12 @@ where
 
     if wait_until_app_processes_exit(protected_pid, &matches_exe, Duration::from_secs(2))? {
         info!(
-            count = pids.len(),
+            count = identities.len(),
             forced = remaining.len(),
             process_scope,
             "Force-killed app processes"
         );
-        return Ok(pids.len());
+        return Ok(identities.len());
     }
 
     Err(SurgeError::Platform(format!(
@@ -280,7 +284,7 @@ where
 {
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        if app_process_pids(protected_pid, matches_exe)?.is_empty() {
+        if app_process_identities(protected_pid, matches_exe)?.is_empty() {
             return Ok(true);
         }
         if std::time::Instant::now() >= deadline {

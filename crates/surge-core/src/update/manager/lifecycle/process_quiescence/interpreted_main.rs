@@ -5,6 +5,16 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Result, SurgeError};
 
+#[cfg(target_os = "macos")]
+const SHEBANG_IDENTITY_LIMIT: usize = 512;
+#[cfg(target_os = "macos")]
+const SHEBANG_READ_LIMIT: u64 = 513;
+#[cfg(not(target_os = "macos"))]
+const SHEBANG_IDENTITY_LIMIT: usize = 256;
+#[cfg(not(target_os = "macos"))]
+const SHEBANG_READ_LIMIT: u64 = 257;
+const SUPPORTED_ENV_INTERPRETERS: [&str; 2] = ["/usr/bin/env", "/bin/env"];
+
 pub(super) struct Identity {
     interpreter: Interpreter,
     pub(super) script_argument_index: usize,
@@ -47,7 +57,13 @@ impl Identity {
             Interpreter::Resolved(expected) => Ok(paths_resolve_to_same_executable(executable, expected)),
             Interpreter::EnvCommand(expected) => {
                 let resolved = resolve_env_command(expected)?;
-                Ok(paths_resolve_to_same_executable(executable, &resolved))
+                if paths_resolve_to_same_executable(executable, &resolved) {
+                    return Ok(true);
+                }
+                let program = Path::new(&expected.program);
+                Ok(expected.search_path.is_none()
+                    && program.components().count() == 1
+                    && executable.file_name() == program.file_name())
             }
         }
     }
@@ -119,20 +135,24 @@ pub(super) fn resolve(active_exe: &Path) -> Result<Option<Identity>> {
         ))
     })?;
     let mut prefix = Vec::new();
-    file.by_ref().take(4097).read_to_end(&mut prefix).map_err(|e| {
-        SurgeError::Platform(format!(
-            "Failed to inspect active application executable before swap: {e}"
-        ))
-    })?;
+    file.by_ref()
+        .take(SHEBANG_READ_LIMIT)
+        .read_to_end(&mut prefix)
+        .map_err(|e| {
+            SurgeError::Platform(format!(
+                "Failed to inspect active application executable before swap: {e}"
+            ))
+        })?;
     if !prefix.starts_with(b"#!") {
         return Ok(None);
     }
 
     let line_end = prefix.iter().position(|byte| *byte == b'\n').unwrap_or(prefix.len());
-    if line_end > 4096 {
-        return Err(SurgeError::Platform(
-            "Active application shebang exceeds the supported 4096-byte limit".to_string(),
-        ));
+    if line_end >= SHEBANG_IDENTITY_LIMIT {
+        return Err(SurgeError::Platform(format!(
+            "Active application shebang exceeds the supported {}-byte process identity limit",
+            SHEBANG_IDENTITY_LIMIT - 1
+        )));
     }
     if prefix[2..line_end].contains(&0) {
         return Err(SurgeError::Platform(
@@ -153,13 +173,18 @@ pub(super) fn resolve(active_exe: &Path) -> Result<Option<Identity>> {
 
     let (interpreter, fixed_argument_count) =
         if Path::new(interpreter).file_name().and_then(|name| name.to_str()) == Some("env") {
+            ensure_supported_env_interpreter(interpreter)?;
             let command = parse_env_command(argument)?;
             let fixed_argument_count = command.fixed_argument_count;
             (Interpreter::EnvCommand(command), fixed_argument_count)
         } else {
+            #[cfg(target_os = "macos")]
+            let fixed_argument_count = direct_interpreter_argument_count(argument)?;
+            #[cfg(not(target_os = "macos"))]
+            let fixed_argument_count = direct_interpreter_argument_count(argument);
             (
                 Interpreter::Resolved(resolve_direct_interpreter_path(interpreter)?),
-                direct_interpreter_argument_count(argument)?,
+                fixed_argument_count,
             )
         };
 
@@ -257,6 +282,9 @@ fn env_command_index(words: &[String]) -> Result<(usize, Option<String>)> {
 
         if is_env_assignment(word) {
             options = false;
+            if let Some(search_path_assignment) = word.strip_prefix("PATH=") {
+                search_path = Some(search_path_assignment.to_string());
+            }
             index += 1;
             continue;
         }
@@ -361,15 +389,42 @@ fn resolve_direct_interpreter_path(interpreter: &str) -> Result<PathBuf> {
     Ok(resolved)
 }
 
+fn ensure_supported_env_interpreter(interpreter: &str) -> Result<()> {
+    let interpreter = Path::new(interpreter);
+    if !interpreter.is_absolute() {
+        return Err(SurgeError::Platform(format!(
+            "Active application env interpreter '{}' must be an absolute path",
+            interpreter.display()
+        )));
+    }
+    let resolved = std::fs::canonicalize(interpreter).map_err(|e| {
+        SurgeError::Platform(format!(
+            "Failed to resolve active application env interpreter '{}': {e}",
+            interpreter.display()
+        ))
+    })?;
+    if SUPPORTED_ENV_INTERPRETERS
+        .iter()
+        .map(Path::new)
+        .any(|supported| paths_resolve_to_same_executable(&resolved, supported))
+    {
+        return Ok(());
+    }
+
+    Err(SurgeError::Platform(format!(
+        "Active application env interpreter '{}' is not a supported system env executable",
+        interpreter.display()
+    )))
+}
+
+#[cfg(target_os = "macos")]
 fn direct_interpreter_argument_count(argument: &str) -> Result<usize> {
-    #[cfg(target_os = "macos")]
-    {
-        return Ok(split_command_words(argument)?.len());
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        Ok(usize::from(!argument.is_empty()))
-    }
+    Ok(split_command_words(argument)?.len())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn direct_interpreter_argument_count(argument: &str) -> usize {
+    usize::from(!argument.is_empty())
 }
 
 #[cfg(test)]
@@ -397,6 +452,37 @@ mod tests {
 
         assert_eq!(command.program, OsString::from("demo-interpreter"));
         assert_eq!(command.search_path, Some(OsString::from("/opt/interpreters")));
+    }
+
+    #[test]
+    fn env_path_assignment_preserves_launch_resolution() {
+        let tmp = tempfile::tempdir().unwrap();
+        let interpreter = tmp.path().join("demo-interpreter");
+        std::fs::write(&interpreter, "fixture").unwrap();
+        let command = parse_env_command(&format!("-S PATH={} demo-interpreter -e", tmp.path().display())).unwrap();
+        let identity = Identity {
+            interpreter: Interpreter::EnvCommand(command),
+            script_argument_index: 2,
+        };
+
+        assert!(identity.executable_may_match(&interpreter).unwrap());
+    }
+
+    #[test]
+    fn inherited_env_path_retains_same_named_candidate_uncertainty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let interpreter = tmp.path().join("sh");
+        std::fs::write(&interpreter, "fixture").unwrap();
+        let identity = Identity {
+            interpreter: Interpreter::EnvCommand(EnvCommand {
+                program: OsString::from("sh"),
+                fixed_argument_count: 0,
+                search_path: None,
+            }),
+            script_argument_index: 1,
+        };
+
+        assert!(identity.executable_may_match(&interpreter).unwrap());
     }
 
     #[test]
@@ -437,6 +523,33 @@ mod tests {
         let error = resolve(&app).err().unwrap();
 
         assert!(error.to_string().contains("embedded NUL"));
+    }
+
+    #[test]
+    fn shebang_beyond_process_identity_limit_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = tmp.path().join("app");
+        let mut contents = b"#!/usr/bin/env -S /bin/sh".to_vec();
+        contents.resize(SHEBANG_IDENTITY_LIMIT, b' ');
+        contents.push(b'\n');
+        std::fs::write(&app, contents).unwrap();
+
+        let error = resolve(&app).err().unwrap();
+
+        assert!(error.to_string().contains("process identity limit"));
+    }
+
+    #[test]
+    fn custom_env_interpreter_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let custom_env = tmp.path().join("env");
+        let app = tmp.path().join("app");
+        std::fs::write(&custom_env, "fixture").unwrap();
+        std::fs::write(&app, format!("#!{} /bin/sh\n", custom_env.display())).unwrap();
+
+        let error = resolve(&app).err().unwrap();
+
+        assert!(error.to_string().contains("not a supported system env executable"));
     }
 
     #[test]

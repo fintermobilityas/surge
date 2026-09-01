@@ -287,7 +287,6 @@ where
             );
             full_fallback::restore_full_into_cache(manager, latest, &cache_path)
                 .await
-                .map(|()| ())
                 .map_err(|restore_error| {
                     SurgeError::Update(format!(
                         "Delta materialization failed: {delta_error}; full package fallback failed: {missing}; \

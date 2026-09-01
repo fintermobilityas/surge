@@ -200,7 +200,23 @@ async fn ensure_channel_delta(
         return Ok(format!("delta from v{from_version} already present"));
     }
 
-    let prev_archive = restore_full_archive_for_version(backend, index, rid, from_version).await?;
+    // The previous release on the channel may no longer be restorable: its delta chain can
+    // have lost intermediate releases (for example after compacting another channel). The
+    // target's full artifact has already been ensured by the caller, so instead of failing the
+    // promotion we degrade to a full-only promotion and say so loudly — clients on the channel
+    // then download the full package rather than a delta.
+    let prev_archive = match restore_full_archive_for_version(backend, index, rid, from_version).await {
+        Ok(archive) => archive,
+        Err(err) => {
+            logline::info(&format!(
+                "WARNING: previous release v{from_version} on this channel cannot be restored ({err}); \
+                 promoting v{version} full-only. Clients on the channel will download the full package."
+            ));
+            return Ok(format!(
+                "previous release v{from_version} could not be restored ({err}); promoted full-only, no channel delta"
+            ));
+        }
+    };
     let new_archive = restore_full_archive_for_version(backend, index, rid, version).await?;
     let target = &index.releases[release_idx];
     let (archive_compression_level, archive_zstd_workers) = resolve_target_archive_encoding(backend, target).await?;
@@ -932,6 +948,75 @@ mod tests {
             promoted.delta_from_source("1.0.0").is_none(),
             "legacy full-only promote should use the full package instead of synthesizing an unsafe delta"
         );
+    }
+
+    #[tokio::test]
+    async fn execute_degrades_to_full_only_when_previous_channel_release_chain_is_broken() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store_dir = temp_dir.path().join("store");
+        let manifest_path = temp_dir.path().join("surge.yml");
+        let rid = current_rid();
+
+        std::fs::create_dir_all(&store_dir).expect("store dir");
+        write_manifest(&manifest_path, &store_dir, "demo", &rid);
+
+        // production head 1.1.0 is a delta release whose base (1.0.0) has no artifacts left in
+        // storage, so it cannot be restored; the target 1.2.0 is a delta release (from 1.1.0)
+        // whose full artifact is present.
+        let mut previous = release("1.1.0", &rid, &["production"]);
+        previous.is_genesis = false;
+        previous.upsert_delta(DeltaArtifact::sparse_file_ops_zstd(
+            "from-1.0.0",
+            "1.0.0",
+            &format!("demo-1.1.0-{rid}-delta.tar.zst"),
+            1,
+            "hash",
+        ));
+        let mut target = release("1.2.0", &rid, &["test"]);
+        target.is_genesis = false;
+        target.upsert_delta(DeltaArtifact::sparse_file_ops_zstd(
+            "from-1.1.0",
+            "1.1.0",
+            &format!("demo-1.2.0-{rid}-delta.tar.zst"),
+            1,
+            "hash",
+        ));
+        std::fs::write(store_dir.join(format!("demo-1.2.0-{rid}-full.tar.zst")), b"target-full")
+            .expect("target full artifact should be present");
+
+        write_index(
+            &store_dir,
+            &ReleaseIndex {
+                app_id: "demo".to_string(),
+                releases: vec![release("1.0.0", &rid, &[]), previous, target],
+                ..ReleaseIndex::default()
+            },
+        );
+
+        execute(&manifest_path, Some("demo"), "1.2.0", Some(&rid), "production")
+            .await
+            .expect(
+                "promotion must degrade to full-only instead of failing when the previous release cannot be restored",
+            );
+
+        let index = read_index(&store_dir);
+        let promoted = index
+            .releases
+            .iter()
+            .find(|release| release.version == "1.2.0" && release.rid == rid)
+            .expect("promoted release should exist");
+        assert_eq!(promoted.channels, vec!["production".to_string(), "test".to_string()]);
+        assert!(
+            promoted.delta_from_source("1.1.0").is_some()
+                && promoted
+                    .delta_from_source("1.1.0")
+                    .unwrap()
+                    .filename
+                    .contains("demo-1.2.0"),
+            "the original primary delta stays; no channel delta was added"
+        );
+        assert_eq!(promoted.deltas.len(), 1, "no additional channel delta must be recorded");
+        assert!(store_dir.join(format!("demo-1.2.0-{rid}-full.tar.zst")).exists());
     }
 
     #[tokio::test]

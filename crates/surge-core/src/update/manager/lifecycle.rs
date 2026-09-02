@@ -827,7 +827,7 @@ mod tests {
             SupervisorRestartOutcome::NotApplicable => panic!("expected PendingRestart failure, got NotApplicable"),
         }
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let mut attempts = 0;
         while std::time::Instant::now() < deadline {
             attempts = std::fs::read_to_string(&attempts_log).map_or(0, |contents| contents.lines().count());

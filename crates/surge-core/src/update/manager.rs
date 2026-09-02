@@ -4806,8 +4806,9 @@ echo started > new-child-started
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[tokio::test]
-    async fn test_download_and_apply_quiesces_installed_executable_when_target_name_changes() {
+    async fn assert_download_and_apply_quiesces_current_executable_when_target_name_changes(
+        current_app_dir_name: &str,
+    ) {
         let tmp = tempfile::tempdir().unwrap();
         let store_root = tmp.path().join("store");
         let install_root = tmp.path().join("install");
@@ -4816,12 +4817,15 @@ echo started > new-child-started
         std::fs::create_dir_all(&install_root).unwrap();
         let app_store = app_scoped_store_root(&store_root, app_id);
 
-        let current_app_dir = install_root.join("app");
+        let current_app_dir = install_root.join(current_app_dir_name);
         std::fs::create_dir_all(&current_app_dir).unwrap();
         let current_exe = current_app_dir.join("old-app");
         write_runtime_identity(&current_app_dir, app_id, "1.0.0", "old-app", "");
         let mut current_process = lifecycle::spawn_native_test_app(&current_exe);
         lifecycle::wait_for_native_test_app(&current_exe, current_process.id());
+        let current_process_identity = crate::platform::process::process_identity(current_process.id())
+            .unwrap()
+            .unwrap();
 
         let rid = current_rid();
         let full_filename = format!("{app_id}-1.1.0-{rid}-full.tar.zst");
@@ -4839,6 +4843,7 @@ echo started > new-child-started
 
         let mut current = make_entry("1.0.0", "stable", &current_os_label_for_tests(), &rid);
         current.main_exe = "republished-app".to_string();
+        current.supervisor_id = "republished-supervisor".to_string();
         let mut latest = make_entry("1.1.0", "stable", &current_os_label_for_tests(), &rid);
         latest.is_genesis = true;
         latest.main_exe = "new-app".to_string();
@@ -4874,11 +4879,32 @@ echo started > new-child-started
                 .map(|release| release.main_exe.as_str()),
             Some("old-app")
         );
+        let quiesced_before_swap = Arc::new(Mutex::new(false));
+        let quiesced_before_swap_for_progress = Arc::clone(&quiesced_before_swap);
         manager
-            .download_and_apply(&info, None::<fn(ProgressInfo)>)
+            .download_and_apply(
+                &info,
+                Some(move |progress: ProgressInfo| {
+                    if progress.phase_label == finalize_phase::PREPARING_SWAP {
+                        assert!(
+                            !crate::platform::process::process_identity_matches(current_process_identity).unwrap(),
+                            "current application process was still running when the directory swap was prepared"
+                        );
+                        *quiesced_before_swap_for_progress
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+                    }
+                }),
+            )
             .await
             .unwrap();
 
+        assert!(
+            *quiesced_before_swap
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            "expected preparing-swap progress after application quiescence"
+        );
         let status = current_process.wait().unwrap();
         assert!(!status.success());
         assert!(install_root.join("app").join("new-app").is_file());
@@ -4955,6 +4981,18 @@ echo started > new-child-started
             std::fs::read_to_string(install_root.join("app").join("payload.txt")).unwrap(),
             "new payload"
         );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn test_download_and_apply_quiesces_current_executable_when_target_name_changes() {
+        assert_download_and_apply_quiesces_current_executable_when_target_name_changes("app").await;
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn test_download_and_apply_quiesces_legacy_current_executable_when_target_name_changes() {
+        assert_download_and_apply_quiesces_current_executable_when_target_name_changes("app-1.0.0").await;
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

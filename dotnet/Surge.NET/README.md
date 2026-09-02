@@ -23,6 +23,15 @@ await mgr.UpdateToLatestReleaseAsync(
 
 One call that checks for updates, downloads the smallest available patch, verifies integrity, extracts, and applies — with progress callbacks and cancellation support.
 
+When the running application updates itself, the call returns after a stable
+helper accepts finalization and before the active `app` directory is swapped.
+The returned `SurgeAppInfo` keeps `Version` at the currently installed version,
+sets `IsUpdateFinalizationScheduled`, and exposes the target through
+`PendingUpdateVersion`. Stop new work and exit promptly, then read
+`SurgeApp.LastUpdateStatus` after restart for the terminal `Converged`,
+`PendingRestart`, or `Failed` result. `onAfterApplyUpdate` is not invoked for
+the scheduled handoff.
+
 ## Key Features
 
 - **Zero managed dependencies** — no external NuGet packages are required

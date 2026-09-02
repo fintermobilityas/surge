@@ -197,6 +197,10 @@ At minimum, a green smoke should prove:
 - the update applies successfully
 - the app relaunches successfully after update
 
+For a self-hosted app, an external-finalization result is only an accepted
+handoff. The app must exit promptly, and the smoke must verify a terminal
+persisted status after restart before calling the update successful.
+
 If the app only implements prompt-first UX instead of `download_and_apply()`, the repo should still have one helper that exercises the lower-level apply path during smoke.
 
 If the app ships `online` or `online-gui` installers, include one additional clean-install check:

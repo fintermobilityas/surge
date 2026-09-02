@@ -31,6 +31,18 @@ namespace Surge
         public string SupervisorId { get; init; } = "";
 
         /// <summary>
+        /// Whether an external helper accepted this update and is waiting for
+        /// the current application process to exit before finalizing it.
+        /// </summary>
+        public bool IsUpdateFinalizationScheduled { get; init; }
+
+        /// <summary>
+        /// Target version awaiting external finalization. Empty unless
+        /// <see cref="IsUpdateFinalizationScheduled"/> is true.
+        /// </summary>
+        public string PendingUpdateVersion { get; init; } = "";
+
+        /// <summary>
         /// Storage provider used for updates (filesystem, s3, azure, gcs, github_releases).
         /// </summary>
         public string StorageProvider { get; init; } = "";

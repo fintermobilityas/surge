@@ -176,12 +176,10 @@ pub unsafe extern "C" fn surge_update_manager_set_release_retention_limit(
 /// Allow the running application to swap its own active directory during apply.
 ///
 /// `allow` is treated as a boolean: zero disables (the default), non-zero
-/// enables. When disabled, an updater running from the active application
-/// executable refuses the swap and expects an external Surge updater. A
-/// self-hosted application that updates in-process (calling
-/// `surge_update_download_and_apply` from inside the installed app) must
-/// enable this to keep self-updating; other processes running the active
-/// executable are still quiesced before the swap.
+/// enables. When disabled, an updater running from a supervised stable `app`
+/// directory transfers finalization to an external helper. Other self-hosted
+/// layouts refuse the swap. Enabling this restores the legacy in-process swap;
+/// other processes running the active executable are still quiesced first.
 ///
 /// # Safety
 ///

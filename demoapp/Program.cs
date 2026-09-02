@@ -109,6 +109,13 @@ internal static class Program
 
             Console.WriteLine();
 
+            if (result?.IsUpdateFinalizationScheduled == true)
+            {
+                Console.WriteLine(
+                    $"[Update] Finalization of v{result.PendingUpdateVersion} was handed off; exiting now.");
+                return 0;
+            }
+
             if (result != null)
             {
                 Console.WriteLine($"[Update] Updated to v{result.Version}.");

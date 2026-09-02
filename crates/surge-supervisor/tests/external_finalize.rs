@@ -85,6 +85,11 @@ fn run_target() {
 }
 
 fn verify_self_hosted_update() {
+    #[cfg(windows)]
+    if !detached_helper_launch_is_supported() {
+        return;
+    }
+
     let temp = tempfile::tempdir().unwrap();
     let store_root = temp.path().join("store");
     let install_root = temp.path().join("install");
@@ -173,6 +178,28 @@ fn verify_self_hosted_update() {
     );
 
     stop_fixture_processes(&install_root, &target_stop_path, &target_pid_path);
+}
+
+#[cfg(windows)]
+fn detached_helper_launch_is_supported() -> bool {
+    let environment = BTreeMap::new();
+    let mut probe = match surge_core::platform::process::spawn_detached(
+        Path::new("cmd.exe"),
+        &["/d", "/c", "exit", "0"],
+        None,
+        &environment,
+    ) {
+        Ok(probe) => probe,
+        Err(error) if error.to_string().contains("Access is denied") => {
+            eprintln!(
+                "Windows host job denied safe helper breakaway; external finalization correctly failed before handoff"
+            );
+            return false;
+        }
+        Err(error) => panic!("detached helper capability probe failed unexpectedly: {error}"),
+    };
+    assert_eq!(probe.wait().unwrap().exit_code, 0);
+    true
 }
 
 fn required_path(name: &str) -> PathBuf {

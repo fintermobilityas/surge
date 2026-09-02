@@ -29,9 +29,7 @@ use uuid::Uuid;
 
 use crate::error::{Result, SurgeError};
 use crate::platform::fs::write_file_atomic;
-use crate::platform::process::{
-    PidLiveness, current_pid, probe_pid_liveness, probe_process_identity, process_start_time,
-};
+use crate::platform::process::{PidLiveness, current_pid, probe_process_identity, process_start_time};
 
 use super::{
     FailureContext, UpdateConvergenceState, UpdateStatusRecord, next_retry_timestamp, now_utc_rfc3339,
@@ -48,6 +46,7 @@ const UPDATE_WORKER_LOCK_FILE_NAME: &str = ".surge-update-worker.lock";
 /// window used without a marker, because a live substep may be quiet for a
 /// while without being hung.
 const STALLED_LIVE_WORKER_PROGRESS_DEADLINE: Duration = Duration::from_mins(30);
+const LEGACY_WORKER_MARKER_GRACE: Duration = Duration::from_mins(5);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct UpdateWorkerRecord {
@@ -72,7 +71,7 @@ impl UpdateWorkerGuard {
         let lock_path = update_worker_lock_path(install_dir);
         let _lock = acquire_worker_lock(&lock_path)?;
         if let Some(existing) = read_update_worker(install_dir)?
-            && !matches!(probe_worker_liveness(&existing), PidLiveness::Dead)
+            && worker_blocks_new_attempt(install_dir, &existing)?
         {
             return Err(SurgeError::Update(format!(
                 "Another update worker (pid {}) already owns this installation",
@@ -161,10 +160,30 @@ fn acquire_worker_lock(path: &Path) -> Result<File> {
 }
 
 fn probe_worker_liveness(worker: &UpdateWorkerRecord) -> PidLiveness {
-    worker.process_start_time.map_or_else(
-        || probe_pid_liveness(worker.pid),
-        |start_time| probe_process_identity(worker.pid, start_time),
-    )
+    worker.process_start_time.map_or(PidLiveness::Unknown, |start_time| {
+        probe_process_identity(worker.pid, start_time)
+    })
+}
+
+fn worker_blocks_new_attempt(install_dir: &Path, worker: &UpdateWorkerRecord) -> Result<bool> {
+    if worker.process_start_time.is_some() {
+        return Ok(!matches!(probe_worker_liveness(worker), PidLiveness::Dead));
+    }
+
+    if let Some(status) = read_update_status(install_dir)?
+        && status.app_id == worker.app_id
+        && status.target_version == worker.target_version
+    {
+        return Ok(status.state == UpdateConvergenceState::InProgress);
+    }
+
+    let started_at = chrono::DateTime::parse_from_rfc3339(&worker.started_at_utc)
+        .ok()
+        .map(|timestamp| timestamp.with_timezone(&chrono::Utc));
+    Ok(started_at.is_some_and(|started_at| {
+        let age = chrono::Utc::now().signed_duration_since(started_at);
+        chrono::Duration::from_std(LEGACY_WORKER_MARKER_GRACE).is_ok_and(|grace| age < grace)
+    }))
 }
 
 pub fn fail_abandoned_in_progress_update(
@@ -488,7 +507,8 @@ mod tests {
             "2026-05-15T20:09:45Z".to_string(),
         );
         write_update_status(dir.path(), &record).unwrap();
-        write_worker_file(dir.path(), dead_helper_pid(), "demo-app", "9999.0.0");
+        let (pid, start_time) = dead_helper_identity();
+        write_worker_file_with_start_time(dir.path(), pid, "demo-app", "9999.0.0", Some(start_time));
 
         let failed = fail_abandoned_in_progress_update_at(
             dir.path(),
@@ -638,28 +658,39 @@ mod tests {
     }
 
     fn write_worker_file(dir: &Path, pid: u32, app_id: &str, target_version: &str) {
+        write_worker_file_with_start_time(dir, pid, app_id, target_version, process_start_time(pid));
+    }
+
+    fn write_worker_file_with_start_time(
+        dir: &Path,
+        pid: u32,
+        app_id: &str,
+        target_version: &str,
+        process_start_time: Option<u64>,
+    ) {
         let record = UpdateWorkerRecord {
             pid,
             app_id: app_id.to_string(),
             target_version: target_version.to_string(),
             started_at_utc: now_utc_rfc3339(),
-            process_start_time: process_start_time(pid),
+            process_start_time,
             owner_id: String::new(),
         };
         let json = serde_json::to_vec_pretty(&record).unwrap();
         write_file_atomic(&update_worker_path(dir), &json).unwrap();
     }
 
-    fn dead_helper_pid() -> u32 {
-        let mut child = spawn_helper(false);
+    fn dead_helper_identity() -> (u32, u64) {
+        let (pid, mut child) = live_helper_pid();
+        let start_time = process_start_time(pid).expect("live helper start time");
+        let _ = child.kill();
         let _ = child.wait();
-        let pid = child.id();
         let deadline = Instant::now() + Duration::from_secs(5);
         while is_pid_alive(pid) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(!is_pid_alive(pid), "helper pid {pid} should be dead before the test");
-        pid
+        (pid, start_time)
     }
 
     fn live_helper_pid() -> (u32, std::process::Child) {
@@ -773,6 +804,56 @@ mod tests {
         assert_eq!(current.pid, pid);
         assert_eq!(current.process_start_time, Some(current_start_time));
         drop(guard);
+    }
+
+    #[test]
+    fn stale_identityless_worker_marker_is_retired_after_status_becomes_terminal() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = UpdateStatusRecord::in_progress(
+            "demo-app",
+            "9998.0.0",
+            "9999.0.0",
+            "stable",
+            "2026-05-15T20:00:00Z".to_string(),
+        )
+        .with_current_phase_at("package apply started", "2026-05-15T20:01:00Z".to_string());
+        write_update_status(dir.path(), &record).unwrap();
+        let (pid, mut child) = live_helper_pid();
+        let legacy = UpdateWorkerRecord {
+            pid,
+            app_id: "demo-app".to_string(),
+            target_version: "9999.0.0".to_string(),
+            started_at_utc: "2026-05-15T20:00:00Z".to_string(),
+            process_start_time: None,
+            owner_id: String::new(),
+        };
+        write_file_atomic(
+            &update_worker_path(dir.path()),
+            &serde_json::to_vec_pretty(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        let now = chrono::DateTime::parse_from_rfc3339("2026-05-15T20:10:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let failed = fail_abandoned_in_progress_update_at(
+            dir.path(),
+            "demo-app",
+            "9999.0.0",
+            "stable",
+            Duration::from_mins(1),
+            now,
+        )
+        .unwrap()
+        .expect("identity-less worker status should become retry-safe after stalling");
+        assert_eq!(failed.state, UpdateConvergenceState::Failed);
+
+        let guard = UpdateWorkerGuard::record(dir.path(), "demo-app", "9999.0.0").unwrap();
+        let replacement = read_update_worker(dir.path()).unwrap().unwrap();
+        assert!(replacement.process_start_time.is_some());
+        drop(guard);
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[test]

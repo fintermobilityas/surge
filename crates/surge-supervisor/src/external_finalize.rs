@@ -2,6 +2,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use surge_core::error::{Result, SurgeError};
+#[cfg(windows)]
+use surge_core::platform::process::{PidLiveness, probe_process_identity};
 use sysinfo::{Pid, ProcessesToUpdate, System};
 
 const UPDATER_EXIT_GRACE: Duration = Duration::from_secs(20);
@@ -194,10 +196,18 @@ fn signal_process(identity: &ProcessIdentity, _force: bool) -> Result<()> {
             identity.pid
         )));
     };
-    if process.start_time() != identity.start_time
-        || !executable_paths_equal(&normalize_executable(executable), &identity.executable)
-    {
+    if !executable_paths_equal(&normalize_executable(executable), &identity.executable) {
         return Ok(());
+    }
+    match probe_process_identity(identity.pid, identity.start_time) {
+        PidLiveness::Dead => return Ok(()),
+        PidLiveness::Unknown => {
+            return Err(SurgeError::Supervisor(format!(
+                "Could not revalidate creation identity for updating process {}",
+                identity.pid
+            )));
+        }
+        PidLiveness::Alive => {}
     }
     if process.kill() || !identity_is_running(identity)? {
         Ok(())

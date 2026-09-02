@@ -2,6 +2,8 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 use crate::error::{Result, SurgeError};
 use crate::install::read_runtime_manifest_identity;
 use crate::releases::version::compare_versions;
@@ -9,24 +11,13 @@ use crate::supervisor::state::read_supervisor_exe_path;
 
 use super::{UpdateManager, apply};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(super) struct ReleaseIdentity {
     pub(super) version: String,
     pub(super) main_exe: String,
     pub(super) supervisor_id: String,
     pub(super) environment: BTreeMap<String, String>,
 }
-
-impl PartialEq for ReleaseIdentity {
-    fn eq(&self, other: &Self) -> bool {
-        self.version == other.version
-            && self.main_exe == other.main_exe
-            && self.supervisor_id == other.supervisor_id
-            && self.environment == other.environment
-    }
-}
-
-impl Eq for ReleaseIdentity {}
 
 pub(super) fn load(manager: &UpdateManager) -> Result<Option<ReleaseIdentity>> {
     let Some(active_app_dir) = apply::find_previous_app_dir(&manager.install_dir, &manager.current_version) else {
@@ -36,7 +27,6 @@ pub(super) fn load(manager: &UpdateManager) -> Result<Option<ReleaseIdentity>> {
     load_from_app_dir(manager, &active_app_dir, Some(&manager.current_version))
 }
 
-#[cfg(unix)]
 pub(super) fn load_previous_swap(manager: &UpdateManager, app_dir: &Path) -> Result<Option<ReleaseIdentity>> {
     load_from_app_dir(manager, app_dir, None)
 }

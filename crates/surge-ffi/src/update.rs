@@ -4,12 +4,12 @@ use std::time::Duration;
 
 use surge_core::config::manifest::{InstallArtifactCachePolicy, InstallArtifactCacheRetention};
 use surge_core::error::SurgeError;
-use surge_core::update::manager::{ProgressInfo, UpdateManager};
+use surge_core::update::manager::{ProgressInfo, UpdateApplyOutcome, UpdateManager};
 
 use crate::handles::{ReleaseEntryFfi, SurgeReleasesInfoHandle, SurgeUpdateManagerHandle};
 use crate::shared::{
-    ProgressBridge, SURGE_CANCELLED, SURGE_ERROR, SURGE_NOT_FOUND, SURGE_OK, SurgeProgressCallback, catch_ffi,
-    clear_shared_error, cstr_to_string, ffi_trace, set_ctx_error, set_shared_error,
+    ProgressBridge, SURGE_CANCELLED, SURGE_ERROR, SURGE_NOT_FOUND, SURGE_OK, SURGE_UPDATE_SCHEDULED,
+    SurgeProgressCallback, catch_ffi, clear_shared_error, cstr_to_string, ffi_trace, set_ctx_error, set_shared_error,
 };
 
 const DEFAULT_UPDATE_CHECK_TIMEOUT: Duration = Duration::from_mins(1);
@@ -439,7 +439,8 @@ pub unsafe extern "C" fn surge_update_download_and_apply(
         };
 
         match result {
-            Ok(()) => SURGE_OK,
+            Ok(UpdateApplyOutcome::Finalized) => SURGE_OK,
+            Ok(UpdateApplyOutcome::ExternalFinalizeScheduled) => SURGE_UPDATE_SCHEDULED,
             Err(e) => set_shared_error(&mgr_ref.ctx, &mgr_ref.last_error, &e),
         }
     }))

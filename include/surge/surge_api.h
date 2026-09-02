@@ -67,7 +67,13 @@ typedef struct surge_pack_context surge_pack_context;
 /* -------------------------------------------------------------------------- */
 
 /** Result codes returned by most API functions. */
-typedef enum surge_result { SURGE_OK = 0, SURGE_ERROR = -1, SURGE_CANCELLED = -2, SURGE_NOT_FOUND = -3 } surge_result;
+typedef enum surge_result {
+    SURGE_OK = 0,
+    SURGE_UPDATE_SCHEDULED = 1,
+    SURGE_ERROR = -1,
+    SURGE_CANCELLED = -2,
+    SURGE_NOT_FOUND = -3
+} surge_result;
 
 /** Phases reported through progress callbacks. */
 typedef enum surge_progress_phase {
@@ -278,12 +284,10 @@ SURGE_API surge_result SURGE_CALL surge_update_manager_set_release_retention_lim
  * Allow the running application to swap its own active directory during apply.
  *
  * `allow` is treated as a boolean: zero disables (the default), non-zero
- * enables. When disabled, an updater running from the active application
- * executable refuses the swap and expects an external Surge updater. A
- * self-hosted application that updates in-process (calling
- * `surge_update_download_and_apply` from inside the installed app) must
- * enable this to keep self-updating; other processes running the active
- * executable are still quiesced before the swap.
+ * enables. When disabled, an updater running from a supervised stable `app`
+ * directory transfers finalization to an external helper. Other self-hosted
+ * layouts refuse the swap. Enabling this restores the legacy in-process swap;
+ * other processes running the active executable are still quiesced first.
  *
  * `mgr` must be a valid update manager handle or NULL.
  */
@@ -315,7 +319,15 @@ SURGE_API surge_result SURGE_CALL surge_update_check(surge_update_manager* mgr, 
  * @param info        Release information from surge_update_check().
  * @param progress_cb Optional progress callback (may be NULL).
  * @param user_data   Opaque pointer forwarded to @p progress_cb.
- * @return SURGE_OK on success.
+ *
+ * A self-hosted supervised updater normally returns before the active
+ * application directory is changed. SURGE_UPDATE_SCHEDULED means a stable
+ * helper accepted ownership and is waiting for the calling application to
+ * exit. The caller must exit promptly, then inspect persisted update status
+ * after restart; scheduling alone is not installation success.
+ *
+ * @return SURGE_OK when finalization completed in this call;
+ *         SURGE_UPDATE_SCHEDULED when external finalization was accepted.
  */
 SURGE_API surge_result SURGE_CALL surge_update_download_and_apply(surge_update_manager* mgr,
                                                                   const surge_releases_info* info,

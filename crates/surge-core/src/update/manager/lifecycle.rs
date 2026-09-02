@@ -39,6 +39,8 @@ pub(super) enum SupervisorRestartOutcome {
         reason: String,
         failure_phase: &'static str,
     },
+    /// A stable helper owns the remaining quiesce, swap, and restart work.
+    ExternalFinalizeScheduled,
 }
 
 pub(super) async fn request_supervisor_shutdown(install_dir: &Path, supervisor_id: &str) -> Result<()> {
@@ -174,6 +176,29 @@ pub(super) fn restart_supervisor_after_update_with_pid(
         active_app_dir,
         latest,
         watched_pid,
+        None,
+        Some(&latest.version),
+        SUPERVISOR_RESTART_CONFIRM_TIMEOUT,
+        SUPERVISOR_RESTART_MAX_ATTEMPTS,
+        SUPERVISOR_RESTART_RETRY_DELAY,
+    )
+}
+
+pub(in crate::update::manager) fn restart_supervisor_after_update_with_args(
+    install_dir: &Path,
+    active_app_dir: &Path,
+    release: &ReleaseEntry,
+    watched_pid: u32,
+    restart_args: &[String],
+    handoff_version: Option<&str>,
+) -> SupervisorRestartOutcome {
+    restart_supervisor_after_update_with_config(
+        install_dir,
+        active_app_dir,
+        release,
+        watched_pid,
+        Some(restart_args),
+        handoff_version,
         SUPERVISOR_RESTART_CONFIRM_TIMEOUT,
         SUPERVISOR_RESTART_MAX_ATTEMPTS,
         SUPERVISOR_RESTART_RETRY_DELAY,
@@ -185,6 +210,8 @@ fn restart_supervisor_after_update_with_config(
     active_app_dir: &Path,
     latest: &ReleaseEntry,
     watched_pid: u32,
+    restart_args: Option<&[String]>,
+    handoff_version: Option<&str>,
     confirm_timeout: Duration,
     max_attempts: u32,
     retry_delay: Duration,
@@ -242,24 +269,27 @@ fn restart_supervisor_after_update_with_config(
         };
     }
 
-    let restart_args = match read_restart_args(install_dir, supervisor_id) {
-        Ok(args) => args,
-        Err(e) => {
-            warn!(
-                supervisor_id,
-                error = %e,
-                "Failed reading stored supervisor restart arguments; restarting with no extra args"
-            );
-            Vec::new()
-        }
-    };
+    let restart_args = restart_args.map_or_else(
+        || match read_restart_args(install_dir, supervisor_id) {
+            Ok(args) => args,
+            Err(e) => {
+                warn!(
+                    supervisor_id,
+                    error = %e,
+                    "Failed reading stored supervisor restart arguments; restarting with no extra args"
+                );
+                Vec::new()
+            }
+        },
+        <[String]>::to_vec,
+    );
 
     let args = supervisor_watch_args(
         supervisor_id,
         install_dir,
         watched_pid,
         watched_pid_start_time,
-        &latest.version,
+        handoff_version,
         &restart_args,
     );
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -322,7 +352,7 @@ fn supervisor_watch_args(
     install_dir: &Path,
     watched_pid: u32,
     watched_pid_start_time: u64,
-    handoff_version: &str,
+    handoff_version: Option<&str>,
     restart_args: &[String],
 ) -> Vec<String> {
     let mut args = vec![
@@ -335,9 +365,11 @@ fn supervisor_watch_args(
         watched_pid.to_string(),
         "--pid-start-time".to_string(),
         watched_pid_start_time.to_string(),
-        "--handoff-version".to_string(),
-        handoff_version.to_string(),
     ];
+    if let Some(handoff_version) = handoff_version {
+        args.push("--handoff-version".to_string());
+        args.push(handoff_version.to_string());
+    }
     if !restart_args.is_empty() {
         args.push("--".to_string());
         args.extend(restart_args.iter().cloned());
@@ -360,7 +392,7 @@ mod tests {
             Path::new("/opt/demo"),
             42,
             1_234,
-            "2.0.0",
+            Some("2.0.0"),
             &restart_args,
         );
 
@@ -428,6 +460,8 @@ mod tests {
             &active_app_dir,
             &latest,
             std::process::id(),
+            None,
+            Some(&latest.version),
             Duration::from_millis(200),
             2,
             Duration::from_millis(10),
@@ -438,6 +472,9 @@ mod tests {
                 assert_eq!(failure_phase, RESTART_HANDOFF_FAILED_PHASE);
             }
             SupervisorRestartOutcome::NotApplicable => panic!("expected PendingRestart failure, got NotApplicable"),
+            SupervisorRestartOutcome::ExternalFinalizeScheduled => {
+                panic!("expected PendingRestart failure, got ExternalFinalizeScheduled")
+            }
         }
 
         let deadline = std::time::Instant::now() + Duration::from_secs(2);

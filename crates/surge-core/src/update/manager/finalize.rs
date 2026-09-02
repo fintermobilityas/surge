@@ -49,6 +49,33 @@ pub(super) async fn finalize_update<F>(
 where
     F: Fn(ProgressInfo) + Send + Sync,
 {
+    finalize_update_with_pre_restart(
+        manager,
+        info,
+        extracted_final_dir,
+        staging_dir,
+        artifact_cache_dir,
+        progress_emitter,
+        None,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_lines)]
+pub(in crate::update::manager) async fn finalize_update_with_pre_restart<F>(
+    manager: &UpdateManager,
+    info: &UpdateInfo,
+    extracted_final_dir: &Path,
+    staging_dir: &Path,
+    artifact_cache_dir: &Path,
+    progress_emitter: &PhaseProgressEmitter<'_, F>,
+    pre_restart: Option<&(dyn Fn() -> Result<()> + Send + Sync)>,
+    restart_args: Option<&[String]>,
+) -> Result<SupervisorRestartOutcome>
+where
+    F: Fn(ProgressInfo) + Send + Sync,
+{
     emit_progress(
         progress_emitter.progress,
         ProgressInfo {
@@ -218,11 +245,27 @@ where
     // supervisor having been running before the update: if the release
     // configures supervision, a fresh watch supervisor is always started so a
     // supervisor that died before the update is recovered here.
-    let restart_outcome = if latest.supervisor_id.trim().is_empty() {
+    let defer_restart = restart_args.is_some();
+    let mut restart_outcome = if latest.supervisor_id.trim().is_empty() || defer_restart {
         SupervisorRestartOutcome::NotApplicable
     } else {
+        if let Some(pre_restart) = pre_restart {
+            pre_restart()?;
+        }
         progress_emitter.emit_substep(6, finalize_phase::RESTARTING_SUPERVISOR, 96);
-        lifecycle::restart_supervisor_after_update(&manager.install_dir, &active_app_dir, latest)
+        restart_args.map_or_else(
+            || lifecycle::restart_supervisor_after_update(&manager.install_dir, &active_app_dir, latest),
+            |restart_args| {
+                lifecycle::restart_supervisor_after_update_with_args(
+                    &manager.install_dir,
+                    &active_app_dir,
+                    latest,
+                    crate::platform::process::current_pid(),
+                    restart_args,
+                    Some(&latest.version),
+                )
+            },
+        )
     };
 
     if !latest.shortcuts.is_empty() {
@@ -251,7 +294,7 @@ where
     }
 
     progress_emitter.emit_substep(6, finalize_phase::PRUNING_OLD_VERSIONS, 98);
-    if previous_swap_dir.is_dir() {
+    if !defer_restart && previous_swap_dir.is_dir() {
         let previous_version_dir = manager.install_dir.join(format!("app-{}", manager.current_version));
         if !manager.current_version.trim().is_empty()
             && previous_version_dir != active_app_dir
@@ -336,7 +379,23 @@ where
         }
     }
 
-    progress_emitter.emit_substep(6, finalize_phase::POST_UPDATE_HOOK, 99);
+    if defer_restart {
+        let pre_restart = pre_restart.ok_or_else(|| {
+            SurgeError::Update("Deferred supervisor restart requires terminal status persistence".to_string())
+        })?;
+        pre_restart()?;
+        emit_progress(
+            progress_emitter.progress,
+            ProgressInfo {
+                phase: 6,
+                phase_label: finalize_phase::POST_UPDATE_HOOK,
+                total_percent: 99,
+                ..ProgressInfo::default()
+            },
+        );
+    } else {
+        progress_emitter.emit_substep(6, finalize_phase::POST_UPDATE_HOOK, 99);
+    }
     lifecycle::invoke_post_update_hook(&manager.install_dir, &active_app_dir, latest);
 
     match lifecycle::terminate_superseded_app_processes(&manager.install_dir, &active_app_dir, &latest.main_exe) {
@@ -349,6 +408,26 @@ where
             );
         }
         Err(e) => return Err(e),
+    }
+
+    if defer_restart {
+        emit_progress(
+            progress_emitter.progress,
+            ProgressInfo {
+                phase: 6,
+                phase_label: finalize_phase::RESTARTING_SUPERVISOR,
+                total_percent: 99,
+                ..ProgressInfo::default()
+            },
+        );
+        restart_outcome = lifecycle::restart_supervisor_after_update_with_args(
+            &manager.install_dir,
+            &active_app_dir,
+            latest,
+            crate::platform::process::current_pid(),
+            restart_args.unwrap_or_default(),
+            Some(&latest.version),
+        );
     }
 
     emit_progress(

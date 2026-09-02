@@ -100,6 +100,18 @@ fn parse_linux_process_start_time(stat: &[u8]) -> Option<u64> {
 
 #[cfg(target_os = "macos")]
 pub(super) fn process_start_time(pid: u32) -> Option<u64> {
+    macos_process_info(pid, false).and_then(|info| macos_process_start_time(&info))
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn process_identity_is_alive(pid: u32, expected_start_time: u64) -> Option<bool> {
+    let info = macos_process_info(pid, true)?;
+    let actual_start_time = macos_process_start_time(&info)?;
+    Some(actual_start_time == expected_start_time && info.pbi_status != libc::SZOMB)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_info(pid: u32, include_zombies: bool) -> Option<libc::proc_bsdinfo> {
     let pid = libc::pid_t::try_from(pid).ok()?;
     if pid <= 0 {
         return None;
@@ -107,13 +119,15 @@ pub(super) fn process_start_time(pid: u32) -> Option<u64> {
 
     let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
     let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
+    // XNU searches its zombie list for BSD process info only when arg is nonzero.
+    let zombie_lookup = if include_zombies { 1 } else { 0 };
     // SAFETY: `info` points to writable storage of exactly the size passed to
     // proc_pidinfo. A full-size return is required before the value is read.
     let written = unsafe {
         libc::proc_pidinfo(
             pid,
             libc::PROC_PIDTBSDINFO,
-            0,
+            zombie_lookup,
             info.as_mut_ptr().cast::<libc::c_void>(),
             size,
         )
@@ -123,7 +137,11 @@ pub(super) fn process_start_time(pid: u32) -> Option<u64> {
     }
 
     // SAFETY: proc_pidinfo reported that it initialized the complete structure.
-    let info = unsafe { info.assume_init() };
+    Some(unsafe { info.assume_init() })
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_start_time(info: &libc::proc_bsdinfo) -> Option<u64> {
     info.pbi_start_tvsec
         .checked_mul(1_000_000)?
         .checked_add(info.pbi_start_tvusec)

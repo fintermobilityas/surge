@@ -38,9 +38,9 @@ Large anonymized profile, `sdk_only`, `100` deltas, `sparse-file-ops`
 - per-delta apply cost is **flat in chain depth**: with per-step
   instrumentation, every step took a constant ~`6.4 s` originally,
   ~`4.8 s` after the carried-tree apply, ~`2.2 s` after identity-chunk
-  patches, ~`1.6 s` after the verified-hash carry, and ~`1.5-2.0 s`
-  after the streamed target hash (the range is host-load variance, not
-  a regression). Per-step cost is CPU/IO-bound and varies ~3x with
+  patches, ~`1.6 s` after the verified-hash carry, ~`1.5-2.0 s` after
+  the streamed target hash, and ~`1.2-1.3 s` after lazy intermediate
+  repacks (the range is host-load variance, not a regression). Per-step cost is CPU/IO-bound and varies ~3x with
   host load
 - per-step cost breakdown (loaded host, scale 1.0, phase-instrumented):
   chunked `bspatch` over the 1 GB file ~`3.5-5.0 s` **before** the
@@ -56,6 +56,16 @@ Large anonymized profile, `sdk_only`, `100` deltas, `sparse-file-ops`
   20-delta apply `128.7 s` → `100.7 s` (−22%), download bytes and the
   applied payload unchanged (install-tree assertion + byte-identical
   unit equivalence)
+- **Lazy intermediate repacks (landed)**: in an all-sparse chain the
+  intermediate rebuilt archives are never consumed (each step applies
+  ops to the carried workdir), so the per-step repack now only runs on
+  the final step (and before any non-sparse hop). Per-file SHA-256
+  verification still runs at every step and the final step still
+  repacks and passes the full-archive SHA-256 check; the per-step
+  archive pinning is what is skipped for intermediate steps.
+  Same-session 100-delta A/B: `166.0 s` -> `74.6 s` (−55%); 10-delta
+  interleaved pairs `1,988/1,849` -> `1,223/1,256 ms/step`
+  (−32 to −39%); install tree byte-identical (1,214,024,073 B).
 - **Identity-chunk chunked patches (landed)**: chunked bsdiff format
   v2 (`CSDF`) marks unchanged chunks in a per-chunk bitset instead of
   carrying a whole-chunk identity bsdiff. The diff side skips the

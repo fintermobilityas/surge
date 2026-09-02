@@ -148,6 +148,11 @@ pub struct PackBuilder {
     /// Decoded sparse tree carried across consecutive publishes so the
     /// publisher can skip re-decoding the previous full archive.
     sparse_tree_reuse: Option<SparseTreeReuse>,
+    /// Staging root the full package was packed from (the canonical pack
+    /// root, which may be a temp mirror of `artifacts_dir` with bundled
+    /// artifacts added). Kept alive so the sparse delta build can walk the
+    /// exact tree that was packed instead of re-decoding the archive.
+    pack_root: Option<tempfile::TempDir>,
 }
 
 impl PackBuilder {
@@ -227,6 +232,7 @@ impl PackBuilder {
             storage,
             artifacts: Vec::new(),
             sparse_tree_reuse: None,
+            pack_root: None,
         })
     }
 

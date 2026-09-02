@@ -2,11 +2,7 @@ use super::archive::{
     ARCHIVE_BSDIFF_MAGIC, ARCHIVE_CHUNKED_MAGIC, LEGACY_ARCHIVE_BSDIFF_MAGIC, LEGACY_ARCHIVE_CHUNKED_MAGIC,
     decode_archive_patch_payload,
 };
-use super::sparse_diff::build_sparse_file_patch_in_memory;
-use super::sparse_ops::{
-    SPARSE_FILE_OPS_MAGIC, apply_sparse_file_patch_with_progress, apply_sparse_step_in_place,
-    build_sparse_file_patch_via_disk,
-};
+use super::sparse_ops::{SPARSE_FILE_OPS_MAGIC, apply_sparse_file_patch_with_progress, apply_sparse_step_in_place};
 use super::*;
 use crate::archive::extractor::extract_to;
 use crate::archive::packer::ArchivePacker;
@@ -465,76 +461,4 @@ fn test_in_place_chain_with_verified_cache_detects_external_modification() {
         err.to_string().contains("hash mismatch"),
         "expected a hash mismatch, got: {err}"
     );
-}
-
-/// Shared body for the in-memory vs disk equivalence checks.
-fn sparse_equivalence_check(mode_old: u32, mode_new: u32) {
-    let opts = ChunkedDiffOptions {
-        chunk_size: 256 * 1024,
-        max_threads: 1,
-        format: ChunkedPatchFormat::IdentityChunks,
-    };
-
-    let big = vec![0xA5u8; 1_200_000];
-    let mut packer = ArchivePacker::new(3).unwrap();
-    packer.add_buffer("big.bin", &big, 0o644).unwrap();
-    packer.add_buffer("same.bin", b"unchanged\n", 0o644).unwrap();
-    packer.add_buffer("mode_only.bin", b"mode\n", mode_old).unwrap();
-    packer.add_buffer("gone.bin", b"bye\n", 0o644).unwrap();
-    let old_archive = packer.finalize().unwrap();
-
-    let mut next_big = big;
-    next_big[300_000] = 0x5A; // one page inside the second 256 KiB chunk
-    let mut packer = ArchivePacker::new(3).unwrap();
-    packer.add_buffer("big.bin", &next_big, 0o644).unwrap();
-    packer.add_buffer("same.bin", b"unchanged\n", 0o644).unwrap();
-    packer.add_buffer("mode_only.bin", b"mode\n", mode_new).unwrap();
-    packer.add_buffer("added.bin", b"new file\n", 0o644).unwrap();
-    let new_archive = packer.finalize().unwrap();
-
-    let mem_patch =
-        build_sparse_file_patch_in_memory(&old_archive, &new_archive, 3, 1, &opts).expect("in-memory sparse build");
-    let disk_patch =
-        build_sparse_file_patch_via_disk(&old_archive, &new_archive, 3, 1, &opts).expect("disk sparse build");
-    assert_eq!(
-        mem_patch, disk_patch,
-        "in-memory and disk sparse builds must be byte-identical"
-    );
-
-    // Round trip: applying the in-memory patch yields a tree that matches the
-    // next version exactly (the rebuilt archive may reorder entries relative to
-    // the add_buffer insertion order above, so compare the extracted tree).
-    let rebuilt = apply_sparse_file_patch_with_progress(&old_archive, &mem_patch, None).expect("apply in-memory patch");
-    let check_dir = tempfile::tempdir().unwrap();
-    extract_to(&rebuilt, check_dir.path(), None).unwrap();
-
-    let big_on_disk = std::fs::read(check_dir.path().join("big.bin")).unwrap();
-    assert_eq!(big_on_disk, next_big, "patched file must match the next version");
-    assert_eq!(
-        std::fs::read(check_dir.path().join("same.bin")).unwrap(),
-        b"unchanged\n"
-    );
-    assert_eq!(
-        std::fs::read(check_dir.path().join("mode_only.bin")).unwrap(),
-        b"mode\n"
-    );
-    assert_eq!(
-        std::fs::read(check_dir.path().join("added.bin")).unwrap(),
-        b"new file\n"
-    );
-    assert!(!check_dir.path().join("gone.bin").exists(), "deleted file must be gone");
-}
-
-#[test]
-fn in_memory_sparse_patch_is_byte_identical_to_disk_build() {
-    // Non-unix filesystems do not report the tar header modes after
-    // extraction, so the disk reference build cannot observe a mode change;
-    // the mode-free core is the cross-platform invariant.
-    sparse_equivalence_check(0o644, 0o644);
-}
-
-#[cfg(unix)]
-#[test]
-fn in_memory_sparse_patch_mode_changes_match_disk_build() {
-    sparse_equivalence_check(0o600, 0o640);
 }

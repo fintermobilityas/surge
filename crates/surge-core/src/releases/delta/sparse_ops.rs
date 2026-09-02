@@ -15,7 +15,7 @@ use crate::error::{Result, SurgeError};
 
 use super::fs_apply::{apply_sparse_file_ops_with_progress, sparse_file_ops_work_units};
 #[cfg(test)]
-use super::tree::{TreeEntryKind, collect_tree_entries, files_identical};
+use super::tree::{TreeEntryKind, collect_tree_entries_with_executables, files_identical};
 use super::{DeltaApplyProgress, DeltaApplyProgressCallback};
 
 pub(super) const SPARSE_FILE_OPS_MAGIC: &[u8; 4] = b"SFD1";
@@ -93,8 +93,8 @@ pub(super) fn build_sparse_file_patch_via_disk(
     extract_to(older_archive, older_dir.path(), None)?;
     extract_to(newer_archive, newer_dir.path(), None)?;
 
-    let older_tree = collect_tree_entries(older_dir.path())?;
-    let newer_tree = collect_tree_entries(newer_dir.path())?;
+    let older_tree = collect_tree_entries_with_executables(older_dir.path(), &std::collections::BTreeSet::new())?;
+    let newer_tree = collect_tree_entries_with_executables(newer_dir.path(), &std::collections::BTreeSet::new())?;
 
     let mut ops = Vec::new();
     let mut payloads = Vec::new();

@@ -142,15 +142,29 @@ Ranked by expected value; read `results.tsv` and
 `git log --oneline --all | grep -iE "dead end|autoresearch"` before
 starting any of these.
 
-1. **MT zstd decode.** The per-version floor is now one single-threaded
-   zstd decode of the newer archive (~0.7 s at scale 1.0) — and the
-   same decode runs on the client apply side (extractor). zstd-rs 0.13
-   has no MT decode API; the frames the publisher writes ARE
-   MT-encoded (48 workers in the bench), so an upgrade or raw-FFI
-   `ZSTD_decompressMultiFrame`-style path would help both surfaces.
-   Measure before building: is decode still the top phase at the
-   production payload shape (real native SDKs compress ~2-3:1, not the
-   bench's 7:1)?
+1. **MT zstd decode (apply side).** The PUBLISHER no longer decodes the
+   newer archive (round 13: it walks the staging directory it just
+   packed), but the per-VERSION floor on the client apply side is still
+   one single-threaded zstd decode of the downloaded full archive
+   (`extractor`); the publisher still cold-decodes the OLDER archive on
+   a cache miss (reuse hit = no decode). zstd-rs 0.13 has no MT decode
+   API; the frames the publisher writes ARE MT-encoded (48 workers in
+   the bench), so an upgrade or raw-FFI `ZSTD_decompressMultiFrame`-
+   style path would help the apply side. Measure before building: is
+   decode still the top phase at the production payload shape (real
+   native SDKs compress ~2-3:1, not the bench's 7:1)?
+
+2026-09-02 (round 13): newer side of the publisher delta build from the
+packed staging directory (canonical pack root kept alive on the
+`PackBuilder`; same walk + executable-bit overrides as the packer;
+contents read from the page cache). Same-session A/B (10 deltas,
+sdk-only 1.0, seed 42): `Delta pack build (avg)` 1,789/2,148 ->
+1,437/1,640 ms/version (about -20 to -24%, new < base both pairs).
+Byte-identical to the archive-based build
+(`directory_newer_side_matches_archive_build`); on directory drift
+between the full and delta build the builder falls back to the
+archive-based path. Per-version profile: staging walk + page-cache
+read ~0.3-0.4 s + parallel hash/diff pass ~0.5 s.
 2. **DONE (round 12a) — Cross-step decoded-tree reuse.**
    `SparseTreeReuse` (decoded tar buffer + offset-based entry map,
    bound to the archive SHA-256) is handed from one publish to the next

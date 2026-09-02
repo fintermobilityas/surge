@@ -37,7 +37,11 @@ impl PackBuilder {
         } else {
             Some(materialize_canonical_pack_root(&self.artifacts_dir, &bundled)?)
         };
-        let pack_root = staging_root
+        // Keep the staging mirror alive: the sparse delta build walks this
+        // exact tree as its newer side instead of decoding the archive.
+        self.pack_root = staging_root;
+        let pack_root = self
+            .pack_root
             .as_ref()
             .map_or(self.artifacts_dir.as_path(), tempfile::TempDir::path);
 
@@ -68,7 +72,7 @@ impl PackBuilder {
         })
     }
 
-    fn executable_archive_paths(&self) -> BTreeSet<String> {
+    pub(super) fn executable_archive_paths(&self) -> BTreeSet<String> {
         if !rid_uses_unix_executable_bits(&self.rid) {
             return BTreeSet::new();
         }

@@ -6,6 +6,7 @@ use crate::diff::chunked::{ChunkedDiffOptions, ChunkedPatchFormat, DEFAULT_CHUNK
 use crate::error::{Result, SurgeError};
 use crate::releases::delta::{
     build_archive_bsdiff_patch, build_archive_chunked_patch, build_sparse_file_patch_with_tree,
+    build_sparse_file_patch_with_tree_from_directory,
 };
 use crate::releases::manifest::{
     PATCH_FORMAT_BSDIFF4_ARCHIVE_V3, PATCH_FORMAT_CHUNKED_BSDIFF_ARCHIVE_V3, PATCH_FORMAT_SPARSE_FILE_OPS_V1,
@@ -66,8 +67,8 @@ impl PackBuilder {
 
         let (patch, patch_format) = match self.pack_policy.delta_strategy {
             PackDeltaStrategy::SparseFileOps => {
-                let (patch, next_tree) = build_sparse_file_patch_with_tree(
-                    self.sparse_tree_reuse.as_ref(),
+                let (patch, next_tree) = sparse_delta_patch(
+                    self,
                     &prev_data,
                     &previous_release.full_sha256,
                     new_data,
@@ -127,6 +128,59 @@ impl PackBuilder {
             zstd_workers: n_workers,
             bytes: compressed,
         }))
+    }
+}
+
+/// Build the sparse delta from the packed staging directory (no newer-side
+/// zstd decode). If the directory no longer matches what was packed — a file
+/// changed between the full and delta build — fall back to the
+/// archive-based build, which is the source of truth for the published
+/// bytes.
+fn sparse_delta_patch(
+    builder: &PackBuilder,
+    prev_data: &[u8],
+    prev_sha256: &str,
+    new_data: &[u8],
+    newer_sha256: &str,
+    compression_level: i32,
+    n_workers: u32,
+    diff_options: &ChunkedDiffOptions,
+) -> Result<(Vec<u8>, crate::releases::delta::SparseTreeReuse)> {
+    let pack_root = builder
+        .pack_root
+        .as_ref()
+        .map_or(builder.artifacts_dir.as_path(), tempfile::TempDir::path);
+    let executable_paths = builder.executable_archive_paths();
+    match build_sparse_file_patch_with_tree_from_directory(
+        builder.sparse_tree_reuse.as_ref(),
+        prev_data,
+        prev_sha256,
+        pack_root,
+        &executable_paths,
+        newer_sha256,
+        compression_level,
+        n_workers,
+        diff_options,
+    ) {
+        Ok(result) => Ok(result),
+        Err(e) => {
+            tracing::warn!(
+                app_id = %builder.app_id,
+                version = %builder.version,
+                error = %e,
+                "Staging directory changed since the full pack; falling back to the archive-based sparse delta build"
+            );
+            build_sparse_file_patch_with_tree(
+                builder.sparse_tree_reuse.as_ref(),
+                prev_data,
+                prev_sha256,
+                new_data,
+                newer_sha256,
+                compression_level,
+                n_workers,
+                diff_options,
+            )
+        }
     }
 }
 

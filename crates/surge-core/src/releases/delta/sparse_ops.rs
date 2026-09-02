@@ -244,7 +244,9 @@ pub(super) fn apply_sparse_file_patch_with_progress(
         &mut verified,
         true,
     )
-    .map(|rebuilt| rebuilt.expect("single-shot apply always repacks"))
+    .and_then(|rebuilt| {
+        rebuilt.ok_or_else(|| SurgeError::Archive("Sparse single-shot apply failed to rebuild the archive".to_string()))
+    })
 }
 
 /// Unit space of one in-place chain step: ops + repack. The repack

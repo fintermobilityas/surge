@@ -158,6 +158,19 @@ while the chunked diff executes. No archive is extracted to disk.
   hash/diff pass (~0.5 s). The single-threaded zstd decode remains on
   the client apply side (`extractor`), where MT decode would still pay
   off.
+- Many changed files (broad churn) run their hash/diff pipelines across
+  a bounded pool (cap 2, thread budget split evenly, largest files
+  first so the cold-cache cost of a big chunked diff runs on the full
+  budget before smaller files share the machine). The chunked diff
+  output is independent of its thread count (per-chunk results are
+  serialized by chunk index), so patch bytes are identical to the
+  sequential build (`parallel_file_passes_produce_identical_payloads`).
+  The single-file canonical shape is untouched (pool of one). Same-
+  session A/B (scale 0.25, `full_release`, 10 deltas): 7,022/6,935 ->
+  4,302/4,288 ms/version (-38%); the cap was measured, not picked: cap
+  4 and 8 make the cold first delta 2-4x slower (page-cache fill +
+  random chunk access contend) and lose the average, while cap 2 never
+  regresses the cold step.
 
 ## CI Tracking Guidance
 

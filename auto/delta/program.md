@@ -154,6 +154,19 @@ starting any of these.
    decode still the top phase at the production payload shape (real
    native SDKs compress ~2-3:1, not the bench's 7:1)?
 
+2026-09-02 (round 15): per-file hash/diff pipelines of the sparse
+delta build run across a bounded pool (cap 2, budget split evenly,
+largest files first). Same-session interleaved A/B (scale 0.25,
+full-release, 10 deltas): 7,022/6,935 -> 4,302/4,288 ms/version
+(-38%); sdk-only canonical unchanged (pool of one); patch bytes
+identical across parallelism levels
+(`parallel_file_passes_produce_identical_payloads`). Cap 4/8 rejected
+after measurement: the cold first delta is 2-4x slower (concurrent
+random-access bsdiff while the page cache fills), which loses the
+10-delta average (cap 4 interleaved: 5,407/5,512 = -21 to -25%; cap 8
+solo: 9,332 ms). Footgun: an early draft accidentally carried the
+cap-4 constant into the final A/B (docs said cap 2) - caught in
+review, corrected; always check the constant against the claim.
 2026-09-02 (round 13): newer side of the publisher delta build from the
 packed staging directory (canonical pack root kept alive on the
 `PackBuilder`; same walk + executable-bit overrides as the packer;

@@ -155,3 +155,64 @@ fn directory_newer_side_matches_archive_build() {
         "without the executable override the modes (and patch) must differ"
     );
 }
+
+#[test]
+fn parallel_file_passes_produce_identical_payloads() {
+    // Many changed files: the publisher runs their hash+diff pipelines on a
+    // bounded worker pool. The ops list and payload bytes must not depend
+    // on how many pipelines run concurrently (per-chunk diff results are
+    // serialized by chunk index, hashes are order-independent).
+    let dir_v1 = tempfile::tempdir().unwrap();
+    let dir_v2 = tempfile::tempdir().unwrap();
+    let mut seed: u64 = 0x5eed;
+    let mut next = || -> u64 {
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        seed
+    };
+    for i in 0..20usize {
+        let base: Vec<u8> = (0..(1024 * 1024)).map(|j| (next() >> (j % 61)) as u8).collect();
+        let mut changed = base.clone();
+        let at = (i * 13) % changed.len();
+        changed[at] = 0xA0;
+        let name = format!("file_{i:02}.bin");
+        std::fs::write(dir_v1.path().join(&name), &base).unwrap();
+        std::fs::write(dir_v2.path().join(&name), &changed).unwrap();
+    }
+    // Plus an unchanged file and a new file to exercise the other paths.
+    std::fs::write(dir_v1.path().join("same.bin"), b"steady\n").unwrap();
+    std::fs::write(dir_v2.path().join("same.bin"), b"steady\n").unwrap();
+    std::fs::write(dir_v2.path().join("added.bin"), b"brand new\n").unwrap();
+
+    let pack = |d: &std::path::Path| -> Vec<u8> {
+        let mut packer = ArchivePacker::new(3).unwrap();
+        packer.add_directory(d, "").unwrap();
+        packer.finalize().unwrap()
+    };
+    let old_archive = pack(dir_v1.path());
+    let new_archive = pack(dir_v2.path());
+
+    let opts = ChunkedDiffOptions {
+        chunk_size: 256 * 1024,
+        max_threads: 0,
+        format: ChunkedPatchFormat::IdentityChunks,
+    };
+    // 8-worker budget => the bounded pool runs several file pipelines at
+    // once; a 1-worker budget forces the sequential build. Both must
+    // produce the same ops and payload bytes.
+    let patch_wide = build_sparse_file_patch(&old_archive, &new_archive, 3, 8, &opts).unwrap();
+    let patch_narrow = build_sparse_file_patch(&old_archive, &new_archive, 3, 1, &opts).unwrap();
+
+    let (manifest_wide, payloads_wide) = super::sparse_ops::decode_sparse_file_ops_payload(&patch_wide).unwrap();
+    let (manifest_narrow, payloads_narrow) = super::sparse_ops::decode_sparse_file_ops_payload(&patch_narrow).unwrap();
+    assert_eq!(
+        format!("{:?}", manifest_wide.ops),
+        format!("{:?}", manifest_narrow.ops),
+        "ops must be parallelism-independent"
+    );
+    assert_eq!(
+        payloads_wide, payloads_narrow,
+        "payload bytes must be parallelism-independent"
+    );
+}

@@ -374,8 +374,8 @@ mod tests {
     fn rollback_restores_previous_app_and_removes_failed_target() {
         let temp = tempfile::tempdir().unwrap();
         let (manager, identity) = fixture_manager(&temp);
-        let active = temp.path().join("app");
-        let previous = temp.path().join(".surge-app-prev");
+        let active = manager.install_dir.join("app");
+        let previous = manager.install_dir.join(".surge-app-prev");
         write_app(&active, "2.0.0", "target");
         write_app(&previous, "1.0.0", "previous");
 
@@ -386,14 +386,14 @@ mod tests {
 
         assert_eq!(std::fs::read_to_string(active.join("version")).unwrap(), "previous");
         assert!(!previous.exists());
-        assert!(!temp.path().join(".surge-app-failed-operation").exists());
+        assert!(!manager.install_dir.join(".surge-app-failed-operation").exists());
     }
 
     #[test]
     fn rollback_is_noop_before_directory_swap() {
         let temp = tempfile::tempdir().unwrap();
         let (manager, identity) = fixture_manager(&temp);
-        let active = temp.path().join("app");
+        let active = manager.install_dir.join("app");
         write_app(&active, "1.0.0", "previous");
 
         assert_eq!(
@@ -407,8 +407,8 @@ mod tests {
     fn rollback_ignores_stale_previous_swap_before_new_swap() {
         let temp = tempfile::tempdir().unwrap();
         let (manager, identity) = fixture_manager(&temp);
-        let active = temp.path().join("app");
-        let stale = temp.path().join(".surge-app-prev");
+        let active = manager.install_dir.join("app");
+        let stale = manager.install_dir.join(".surge-app-prev");
         write_app(&active, "1.0.0", "current");
         write_app(&stale, "0.9.0", "stale");
 
@@ -424,8 +424,8 @@ mod tests {
     fn rollback_restores_legacy_versioned_app_after_target_activation() {
         let temp = tempfile::tempdir().unwrap();
         let (manager, identity) = fixture_manager(&temp);
-        let active = temp.path().join("app");
-        let legacy = temp.path().join("app-1.0.0");
+        let active = manager.install_dir.join("app");
+        let legacy = manager.install_dir.join("app-1.0.0");
         write_app(&active, "2.0.0", "target");
         write_app(&legacy, "1.0.0", "previous");
         assert_eq!(

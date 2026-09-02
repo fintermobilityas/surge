@@ -17,6 +17,7 @@ use crate::config::manifest::{PackPolicy, ShortcutLocation, SurgeManifest};
 use crate::context::Context;
 use crate::error::{Result, SurgeError};
 use crate::platform::fs::write_file_atomic;
+use crate::releases::delta::SparseTreeReuse;
 use crate::releases::manifest::UNRECORDED_ZSTD_WORKERS;
 use crate::storage::{StorageBackend, create_storage_backend};
 
@@ -144,6 +145,9 @@ pub struct PackBuilder {
     pack_policy: PackPolicy,
     storage: Box<dyn StorageBackend>,
     artifacts: Vec<PackageArtifact>,
+    /// Decoded sparse tree carried across consecutive publishes so the
+    /// publisher can skip re-decoding the previous full archive.
+    sparse_tree_reuse: Option<SparseTreeReuse>,
 }
 
 impl PackBuilder {
@@ -222,7 +226,24 @@ impl PackBuilder {
             pack_policy,
             storage,
             artifacts: Vec::new(),
+            sparse_tree_reuse: None,
         })
+    }
+
+    /// Seed the sparse delta builder with a decoded tree from a previous
+    /// publish in the same chain (see [`SparseTreeReuse`]). The tree is only
+    /// reused when the previous release's full SHA-256 matches, so a stale
+    /// cache degrades to a cold decode instead of building a wrong patch.
+    #[must_use]
+    pub fn with_sparse_tree_reuse(mut self, reuse: Option<SparseTreeReuse>) -> Self {
+        self.sparse_tree_reuse = reuse;
+        self
+    }
+
+    /// Take the decoded sparse tree of this publish's full archive, for
+    /// handing to the next publish in the chain.
+    pub fn take_sparse_tree_reuse(&mut self) -> Option<SparseTreeReuse> {
+        self.sparse_tree_reuse.take()
     }
 
     /// Build the full and delta packages.

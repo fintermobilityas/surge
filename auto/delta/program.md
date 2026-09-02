@@ -91,6 +91,13 @@ cargo run -p surge-bench --release -- --update-only --scale 1.0 \
 
 - production default strategy: `sparse-file-ops` (per-file chunked bsdiff,
   zstd level 3, 256 MiB diff budget)
+- the sparse delta builder compares archives in memory (concurrent
+  zstd decode, zero-copy entry slices, basis hash parallel to the
+  diff); no disk extraction. Byte-identical to the previous
+  disk-based build (equivalence test in
+  `crates/surge-core/src/releases/delta/tests.rs`). Same-session A/B:
+  Delta pack build 4,163->2,187 ms/version (-47%), 11-release publish
+  93.3s->61.2s (-34%)
 - chunk size derived per pack from the memory budget: `per_thread / 12`,
   clamped to `[4 MiB, 64 MiB]`
 - fallback: patch >= full package → publish a full checkpoint instead
@@ -133,7 +140,28 @@ Ranked by expected value; read `results.tsv` and
 `git log --oneline --all | grep -iE "dead end|autoresearch"` before
 starting any of these.
 
-1. **CLOSED — Knee-first chunking for the archive fallback only.**
+1. **Cross-step decoded-tree reuse.** Consecutive chain steps share a
+   tree: step N+1's older archive is step N's newer archive. Cache the
+   decoded tar buffer + entry map between consecutive sparse delta
+   builds (the publish loop builds deltas sequentially in one process;
+   the `PackBuilder` is per-release, so the cache must be
+   caller-held, e.g. a `SparseTreeReuse` value threaded through the
+   publish loop). Expected: drops one of the two zstd decodes per
+   version (~0.9 s wall of the ~2.2 s in-memory build) and one collect
+   pass. The cache holds exactly one decoded buffer and swaps it each
+   step — no leak. Validate with the same byte-identical-equivalence
+   test shape (reused tree must produce the same patch bytes as a
+   cold decode).
+2. **DONE (round 11) — In-memory sparse delta build.** Replaced the
+   extract-to-disk + walk comparison with in-memory decode (two
+   archives decoded concurrently), zero-copy entry slices, and the
+   basis hash on a worker thread while the chunked diff runs.
+   Byte-identical to the disk build (equivalence test). Same-session
+   A/B (10 deltas, sdk_only 1.0, seed 42): Delta pack build
+   4,163->2,187 ms/version (-47%); publish 93.3s->61.2s (-34%).
+   Remaining per-version floor: single-threaded zstd decode x2
+   (~0.9 s wall) + full-file SHA-256 passes (~0.6 s).
+3. **CLOSED — Knee-first chunking for the archive fallback only.**
    Measured through the real update chain at scale 1.0 / 20 deltas /
    `archive-chunked-bsdiff` / 256 MiB budget on 48 cores: wire bytes
    flat (+0.4%, 98,981 vs 98,597 B), 12x slower delta build (34,135 vs
@@ -143,7 +171,7 @@ starting any of these.
    Wire bytes are flat across 4-64 MiB chunks, so chunk policy is a
    pure time lever and the current floor + parallel derivation is
    correct as-is for both strategies. Do not retry either knee variant.
-2. **CLOSED — Patch compression level.** Measured on 20 real
+4. **CLOSED — Patch compression level.** Measured on 20 real
    sparse-file-ops patch documents (scale 1.0 sdk-only): wire bytes
    L9 −0.09% / L19 −0.97% vs L3, with L19 encode +38%. The
    compressible part of an SFD1 patch is JSON structure, which L3
@@ -151,21 +179,21 @@ starting any of these.
    headroom. Not worth a manifest/pack-policy knob. **With ideas 1-2
    closed, the wire-byte axis (chunk size, zstd level) is exhausted
    for this payload shape** — remaining headroom is format-level
-   (ideas 4-6) or a different payload shape (broad churn, many large
+   (ideas 6-8) or a different payload shape (broad churn, many large
    changed files). The large-scale validation owed to the update
    surface is the 100-delta sparse chain rerun (see
    `docs/performance/update-chains.md`, "When To Rerun").
-3. **Parallelism/memory trade.** Subsumed by idea 1: the sweep showed
+5. **Parallelism/memory trade.** Subsumed by idea 1: the sweep showed
    diff time tracks the largest chunk under the thread count the budget
    allows, so the lever is the (chunk, threads) pair, not threads alone.
-4. **bsdiff C-backend tuning.** Suffix-array construction dominates
+6. **bsdiff C-backend tuning.** Suffix-array construction dominates
    classic bsdiff. Candidate: early-skip chunks whose content hashes are
    identical before diffing (needs a format version bump).
-5. **Per-file strategy heuristics.** Sparse ops already diff per file;
+7. **Per-file strategy heuristics.** Sparse ops already diff per file;
    consider skipping the diff entirely for files below a threshold where
    a full-file entry in the sparse patch would be smaller (measure the
    overhead of the per-file patch header first).
-6. **Alternative algorithms** (xdelta/vcdiff, binpatch, lz4-based
+8. **Alternative algorithms** (xdelta/vcdiff, binpatch, lz4-based
    rolling) as a fourth `PackDeltaStrategy`. Only after 1-5 show the
    bsdiff family is the ceiling; a new format is a large surface area
    (FFI, .NET, Kotlin are not involved, but restore/apply + tests are).

@@ -1,6 +1,7 @@
 mod archive;
 mod format;
 mod fs_apply;
+mod sparse_diff;
 mod sparse_ops;
 #[cfg(test)]
 mod tests;

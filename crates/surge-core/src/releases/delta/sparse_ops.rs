@@ -1,3 +1,4 @@
+#[cfg(test)]
 use std::fs;
 use std::path::Path;
 
@@ -5,11 +6,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::archive::extractor::extract_to;
 use crate::archive::packer::ArchivePacker;
+#[cfg(test)]
 use crate::crypto::sha256::sha256_hex_file;
-use crate::diff::chunked::{ChunkedDiffOptions, chunked_bsdiff_files};
+use crate::diff::chunked::ChunkedDiffOptions;
+#[cfg(test)]
+use crate::diff::chunked::chunked_bsdiff_files;
 use crate::error::{Result, SurgeError};
 
 use super::fs_apply::{apply_sparse_file_ops_with_progress, sparse_file_ops_work_units};
+#[cfg(test)]
 use super::tree::{TreeEntryKind, collect_tree_entries, files_identical};
 use super::{DeltaApplyProgress, DeltaApplyProgressCallback};
 
@@ -18,10 +23,10 @@ pub(super) const SPARSE_FILE_OPS_MAGIC: &[u8; 4] = b"SFD1";
 const SPARSE_FILE_OPS_HEADER_LEN: usize = 12;
 
 #[derive(Debug, Serialize, Deserialize)]
-struct SparseFileDeltaManifest {
-    compression_level: i32,
-    zstd_workers: u32,
-    ops: Vec<SparseFileOp>,
+pub(super) struct SparseFileDeltaManifest {
+    pub(super) compression_level: i32,
+    pub(super) zstd_workers: u32,
+    pub(super) ops: Vec<SparseFileOp>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -60,6 +65,23 @@ pub(super) enum SparseFileOp {
 }
 
 pub fn build_sparse_file_patch(
+    older_archive: &[u8],
+    newer_archive: &[u8],
+    compression_level: i32,
+    zstd_workers: u32,
+    diff_options: &ChunkedDiffOptions,
+) -> Result<Vec<u8>> {
+    super::sparse_diff::build_sparse_file_patch_in_memory(
+        older_archive,
+        newer_archive,
+        compression_level,
+        zstd_workers,
+        diff_options,
+    )
+}
+
+#[cfg(test)]
+pub(super) fn build_sparse_file_patch_via_disk(
     older_archive: &[u8],
     newer_archive: &[u8],
     compression_level: i32,
@@ -319,7 +341,7 @@ fn sparse_ops_and_repack(
     Ok(rebuilt)
 }
 
-fn encode_sparse_file_ops_payload(manifest: &SparseFileDeltaManifest, payloads: &[u8]) -> Result<Vec<u8>> {
+pub(super) fn encode_sparse_file_ops_payload(manifest: &SparseFileDeltaManifest, payloads: &[u8]) -> Result<Vec<u8>> {
     let manifest_bytes = serde_json::to_vec(manifest)?;
     let manifest_len = u64::try_from(manifest_bytes.len())
         .map_err(|_| SurgeError::Archive("Sparse delta manifest exceeds supported size".to_string()))?;
@@ -353,7 +375,7 @@ fn decode_sparse_file_ops_payload(data: &[u8]) -> Result<(SparseFileDeltaManifes
     Ok((manifest, &data[manifest_end..]))
 }
 
-fn append_payload(buffer: &mut Vec<u8>, payload: &[u8]) -> Result<(u64, u64)> {
+pub(super) fn append_payload(buffer: &mut Vec<u8>, payload: &[u8]) -> Result<(u64, u64)> {
     let offset = u64::try_from(buffer.len())
         .map_err(|_| SurgeError::Archive("Sparse delta payload exceeds supported size".to_string()))?;
     let len = u64::try_from(payload.len())
@@ -362,7 +384,7 @@ fn append_payload(buffer: &mut Vec<u8>, payload: &[u8]) -> Result<(u64, u64)> {
     Ok((offset, len))
 }
 
-fn path_depth(path: &str) -> usize {
+pub(super) fn path_depth(path: &str) -> usize {
     std::path::Path::new(path).components().count()
 }
 

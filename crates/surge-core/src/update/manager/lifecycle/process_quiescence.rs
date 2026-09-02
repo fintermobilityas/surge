@@ -8,6 +8,8 @@ use std::time::Duration;
 use tracing::{info, warn};
 
 mod discovery;
+#[cfg(unix)]
+mod process_target;
 
 #[cfg(unix)]
 use self::discovery::AppProcess;
@@ -15,10 +17,14 @@ use self::discovery::AppProcess;
 use self::discovery::app_process_pids;
 #[cfg(unix)]
 use self::discovery::{app_process_identities, current_process_environment};
+#[cfg(unix)]
+use self::process_target::ProcessTarget;
 use crate::error::Result;
 #[cfg(unix)]
 use crate::error::SurgeError;
 use crate::platform::process::current_pid;
+#[cfg(unix)]
+use crate::platform::process::{ProcessIdentity, ProcessSignalOutcome};
 
 #[cfg(unix)]
 mod active_entrypoint;
@@ -213,6 +219,32 @@ fn refuse_process_in_swap(
 }
 
 #[cfg(unix)]
+fn add_process_targets(
+    targets: &mut Vec<ProcessTarget>,
+    identities: impl IntoIterator<Item = ProcessIdentity>,
+) -> Result<()> {
+    for identity in identities {
+        if targets.iter().any(|target| target.identity() == identity) {
+            continue;
+        }
+        if let Some(target) = ProcessTarget::open(identity)? {
+            targets.push(target);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn process_targets_are_running(targets: &[ProcessTarget]) -> Result<bool> {
+    for target in targets {
+        if target.is_running()? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(unix)]
 fn terminate_matching_app_processes<F, E, C>(
     main_exe: &str,
     protected_pid: u32,
@@ -227,9 +259,6 @@ where
     E: Fn(&Path) -> Result<bool>,
     C: Fn(&[OsString], Option<&Path>) -> Result<bool>,
 {
-    use nix::errno::Errno;
-    use nix::sys::signal::Signal;
-
     let main_exe = main_exe.trim();
     if main_exe.is_empty() {
         return Ok(0);
@@ -242,14 +271,17 @@ where
         &executable_may_match,
         &command_may_match,
     )?;
-    if identities.is_empty() {
+    let mut targets = Vec::new();
+    add_process_targets(&mut targets, identities)?;
+    if targets.is_empty() {
         return Ok(0);
     }
+    let initial_count = targets.len();
 
-    for identity in &identities {
-        if let Err(e) = signal_pid(identity.pid, Signal::SIGTERM) {
-            let pid = identity.pid;
-            warn!(pid, error = %e, process_scope, "Failed to request app process termination");
+    for target in &targets {
+        if let Err(error) = target.terminate() {
+            let pid = target.identity().pid;
+            warn!(pid, error = %error, process_scope, "Failed to request app process termination");
         }
     }
 
@@ -259,10 +291,11 @@ where
         &matches_process,
         &executable_may_match,
         &command_may_match,
+        &mut targets,
         Duration::from_secs(5),
     )? {
-        info!(count = identities.len(), process_scope, "Terminated app processes");
-        return Ok(identities.len());
+        info!(count = initial_count, process_scope, "Terminated app processes");
+        return Ok(initial_count);
     }
 
     let remaining = app_process_identities(
@@ -272,12 +305,15 @@ where
         &executable_may_match,
         &command_may_match,
     )?;
-    for identity in &remaining {
-        match signal_pid(identity.pid, Signal::SIGKILL) {
-            Ok(()) | Err(Errno::ESRCH) => {}
-            Err(e) => {
-                let pid = identity.pid;
-                warn!(pid, error = %e, process_scope, "Failed to force-kill app process");
+    add_process_targets(&mut targets, remaining)?;
+    let mut forced_count = 0;
+    for target in &targets {
+        match target.kill() {
+            Ok(ProcessSignalOutcome::Delivered) => forced_count += 1,
+            Ok(ProcessSignalOutcome::Exited) => {}
+            Err(error) => {
+                let pid = target.identity().pid;
+                warn!(pid, error = %error, process_scope, "Failed to force-kill app process");
             }
         }
     }
@@ -288,31 +324,21 @@ where
         &matches_process,
         &executable_may_match,
         &command_may_match,
+        &mut targets,
         Duration::from_secs(2),
     )? {
         info!(
-            count = identities.len(),
-            forced = remaining.len(),
+            count = initial_count,
+            forced = forced_count,
             process_scope,
             "Force-killed app processes"
         );
-        return Ok(identities.len());
+        return Ok(initial_count);
     }
 
     Err(SurgeError::Platform(format!(
         "Timed out waiting for {process_scope} '{main_exe}' processes to exit"
     )))
-}
-
-#[cfg(unix)]
-fn signal_pid(pid: u32, signal: nix::sys::signal::Signal) -> std::result::Result<(), nix::errno::Errno> {
-    use nix::sys::signal::kill;
-    use nix::unistd::Pid;
-
-    let Ok(raw_pid) = i32::try_from(pid) else {
-        return Ok(());
-    };
-    kill(Pid::from_raw(raw_pid), signal)
 }
 
 #[cfg(not(unix))]
@@ -342,6 +368,7 @@ fn wait_until_app_processes_exit<F, E, C>(
     matches_process: &F,
     executable_may_match: &E,
     command_may_match: &C,
+    targets: &mut Vec<ProcessTarget>,
     timeout: Duration,
 ) -> Result<bool>
 where
@@ -351,15 +378,16 @@ where
 {
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        if app_process_identities(
+        let identities = app_process_identities(
             protected_pid,
             inspect_environment,
             matches_process,
             executable_may_match,
             command_may_match,
-        )?
-        .is_empty()
-        {
+        )?;
+        let snapshot_is_empty = identities.is_empty();
+        add_process_targets(targets, identities)?;
+        if snapshot_is_empty && !process_targets_are_running(targets)? {
             return Ok(true);
         }
         if std::time::Instant::now() >= deadline {
@@ -562,6 +590,42 @@ fn is_superseded_app_exe(install_dir: &Path, active_app_dir: &Path, main_exe: &s
 mod tests {
     #[cfg(unix)]
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stable_process_target_survives_exec() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "read _; exec sleep 30"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let identity = crate::platform::process::process_identity(child.id()).unwrap().unwrap();
+        let target = ProcessTarget::open(identity).unwrap().unwrap();
+
+        writeln!(child.stdin.as_mut().unwrap(), "continue").unwrap();
+        let expected_executable = std::fs::canonicalize("/bin/sleep").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            if std::fs::read_link(format!("/proc/{}/exe", child.id()))
+                .ok()
+                .and_then(|path| std::fs::canonicalize(path).ok())
+                .as_deref()
+                == Some(expected_executable.as_path())
+            {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "child did not exec sleep");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(target.is_running().unwrap());
+        assert_eq!(target.terminate().unwrap(), ProcessSignalOutcome::Delivered);
+        assert!(!child.wait().unwrap().success());
+        assert!(!target.is_running().unwrap());
+    }
 
     #[cfg(unix)]
     #[test]

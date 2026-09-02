@@ -64,7 +64,25 @@ impl StableProcessHandle {
     }
 
     pub fn is_running(&self) -> io::Result<bool> {
-        process_identity_matches(self.identity)
+        #[cfg(target_os = "linux")]
+        {
+            use rustix::event::{PollFd, PollFlags, Timespec, poll};
+
+            let mut descriptor = [PollFd::new(&self.pidfd, PollFlags::IN)];
+            let _ = poll(&mut descriptor, Some(&Timespec::default()))?;
+            let events = descriptor[0].revents();
+            if events.contains(PollFlags::NVAL) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "stable process handle is invalid",
+                ));
+            }
+            Ok(events.is_empty())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            process_identity_matches(self.identity)
+        }
     }
 
     pub fn terminate(&self) -> io::Result<ProcessSignalOutcome> {

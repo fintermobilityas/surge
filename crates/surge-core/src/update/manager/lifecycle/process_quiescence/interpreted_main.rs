@@ -1,9 +1,12 @@
 use std::ffi::{OsStr, OsString};
 use std::io::Read;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Result, SurgeError};
+
+mod env_path;
+
+use self::env_path::{paths_resolve_to_same_executable, select_path_executable};
 
 #[cfg(target_os = "macos")]
 const SHEBANG_IDENTITY_LIMIT: usize = 512;
@@ -122,23 +125,29 @@ impl EnvCommand {
     }
 
     fn matches_executable(&self, executable: &Path, environment: &[OsString]) -> Result<bool> {
-        let Some(resolved) = self.resolve_executable(Some(environment))? else {
+        let Some(resolved) = self.resolve_executable(Some(environment), Some(executable))? else {
             return Ok(false);
         };
         Ok(paths_resolve_to_same_executable(executable, &resolved))
     }
 
     fn matches_required_executable(&self, executable: &Path, environment: &[OsString]) -> Result<bool> {
-        let resolved = self.resolve_executable(Some(environment))?.ok_or_else(|| {
-            SurgeError::Platform(format!(
-                "Failed to resolve active application env interpreter '{}' from its configured launch environment",
-                Path::new(&self.program).display()
-            ))
-        })?;
+        let resolved = self
+            .resolve_executable(Some(environment), Some(executable))?
+            .ok_or_else(|| {
+                SurgeError::Platform(format!(
+                    "Failed to resolve active application env interpreter '{}' from its configured launch environment",
+                    Path::new(&self.program).display()
+                ))
+            })?;
         Ok(paths_resolve_to_same_executable(executable, &resolved))
     }
 
-    fn resolve_executable(&self, environment: Option<&[OsString]>) -> Result<Option<PathBuf>> {
+    fn resolve_executable(
+        &self,
+        environment: Option<&[OsString]>,
+        observed_executable: Option<&Path>,
+    ) -> Result<Option<PathBuf>> {
         let program = Path::new(&self.program);
         if program.is_absolute() {
             let resolved = std::fs::canonicalize(program).map_err(|e| {
@@ -147,7 +156,9 @@ impl EnvCommand {
                     program.display()
                 ))
             })?;
-            if !is_executable_file(&resolved) {
+            if !observed_executable.is_some_and(|observed| paths_resolve_to_same_executable(observed, &resolved))
+                && !is_executable_file(&resolved)
+            {
                 return Err(SurgeError::Platform(format!(
                     "Active application env interpreter '{}' is not executable",
                     program.display()
@@ -175,59 +186,16 @@ impl EnvCommand {
             (EnvSearchPath::Default, _) => OsStr::new(DEFAULT_ENV_SEARCH_PATH),
             (EnvSearchPath::Explicit(search_path), _) => search_path,
         };
-        for directory in std::env::split_paths(search_path) {
-            if directory.as_os_str().is_empty() || directory.is_relative() {
-                return Err(SurgeError::Platform(format!(
-                    "Cannot safely resolve env interpreter '{}' through a relative PATH entry before swap",
-                    program.display()
-                )));
-            }
-            let candidate = directory.join(program);
-            let Ok(candidate) = std::fs::canonicalize(candidate) else {
-                continue;
-            };
-            if !is_executable_file(&candidate) {
-                continue;
-            }
-            return validate_resolved_interpreter(candidate).map(Some);
-        }
-        Ok(None)
+        let Some(candidate) = select_path_executable(search_path, program, observed_executable)? else {
+            return Ok(None);
+        };
+        validate_resolved_interpreter(candidate).map(Some)
     }
-}
-
-fn paths_resolve_to_same_executable(actual: &Path, expected: &Path) -> bool {
-    if actual == expected {
-        return true;
-    }
-    if std::fs::canonicalize(actual)
-        .ok()
-        .zip(std::fs::canonicalize(expected).ok())
-        .is_some_and(|(actual, expected)| actual == expected)
-    {
-        return true;
-    }
-
-    std::fs::metadata(actual)
-        .ok()
-        .zip(std::fs::metadata(expected).ok())
-        .is_some_and(|(actual, expected)| actual.dev() == expected.dev() && actual.ino() == expected.ino())
-        || macos_system_shell_identity_matches(actual, expected)
-}
-
-#[cfg(target_os = "macos")]
-fn macos_system_shell_identity_matches(actual: &Path, expected: &Path) -> bool {
-    // macOS reports a stable /bin/sh script process as /bin/bash while retaining /bin/sh as argv[0].
-    actual == Path::new("/bin/bash") && expected == Path::new("/bin/sh")
-}
-
-#[cfg(not(target_os = "macos"))]
-fn macos_system_shell_identity_matches(_actual: &Path, _expected: &Path) -> bool {
-    false
 }
 
 #[cfg(test)]
 fn resolve_env_command(command: &EnvCommand) -> Result<PathBuf> {
-    command.resolve_executable(None)?.ok_or_else(|| {
+    command.resolve_executable(None, None)?.ok_or_else(|| {
         SurgeError::Platform(format!(
             "Failed to resolve active application env interpreter '{}' from the updater PATH",
             Path::new(&command.program).display()
@@ -771,6 +739,26 @@ mod tests {
             &resolve_env_command(&command).unwrap(),
             &expected
         ));
+    }
+
+    #[test]
+    fn env_path_matches_observed_candidate_after_execute_permission_is_removed() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let observed = first.path().join("demo-interpreter");
+        std::fs::copy(std::env::current_exe().unwrap(), &observed).unwrap();
+        std::fs::set_permissions(&observed, std::fs::Permissions::from_mode(0o644)).unwrap();
+        symlink("/bin/sh", second.path().join("demo-interpreter")).unwrap();
+        let search_path = std::env::join_paths([first.path(), second.path()]).unwrap();
+        let command = EnvCommand {
+            program: OsString::from("demo-interpreter"),
+            fixed_argument_count: 0,
+            search_path: EnvSearchPath::Explicit(search_path),
+        };
+
+        assert!(command.matches_executable(&observed, &[]).unwrap());
     }
 
     #[test]

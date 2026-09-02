@@ -33,6 +33,8 @@ pub(crate) mod labels {
     pub const WRITING_REBUILT_PACKAGE: &str = "writing rebuilt package";
     pub const EXTRACTING_REBUILT_PACKAGE: &str = "extracting rebuilt package";
     pub const PACKAGE_APPLY_COMPLETED: &str = "package apply completed";
+    pub const STARTING_EXTERNAL_FINALIZER: &str = "starting external finalizer";
+    pub const WAITING_FOR_UPDATER_EXIT: &str = "waiting for updating app to exit";
     pub const STOPPING_SUPERVISOR: &str = "stopping supervisor";
     pub const QUIESCING_ACTIVE_APP: &str = "quiescing active app before swap";
     pub const PREPARING_SWAP: &str = "preparing app swap";

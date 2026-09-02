@@ -19,14 +19,17 @@
 //!   progress-staleness window; never fail an attempt on an inconclusive
 //!   probe.
 
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::error::{Result, SurgeError};
 use crate::platform::fs::write_file_atomic;
-use crate::platform::process::{PidLiveness, probe_pid_liveness, probe_process_identity, process_start_time};
+use crate::platform::process::{PidLiveness, current_pid, probe_process_identity, process_start_time};
 
 use super::{
     FailureContext, UpdateConvergenceState, UpdateStatusRecord, next_retry_timestamp, now_utc_rfc3339,
@@ -34,6 +37,7 @@ use super::{
 };
 
 const UPDATE_WORKER_FILE_NAME: &str = ".surge-update-worker.json";
+const UPDATE_WORKER_LOCK_FILE_NAME: &str = ".surge-update-worker.lock";
 
 /// A live worker whose progress has been silent this long is presumed hung
 /// (deadlocked or stalled on a frozen connection): active update work emits
@@ -42,6 +46,7 @@ const UPDATE_WORKER_FILE_NAME: &str = ".surge-update-worker.json";
 /// window used without a marker, because a live substep may be quiet for a
 /// while without being hung.
 const STALLED_LIVE_WORKER_PROGRESS_DEADLINE: Duration = Duration::from_mins(30);
+const LEGACY_WORKER_MARKER_GRACE: Duration = Duration::from_mins(5);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct UpdateWorkerRecord {
@@ -51,49 +56,143 @@ struct UpdateWorkerRecord {
     started_at_utc: String,
     #[serde(default)]
     process_start_time: Option<u64>,
+    #[serde(default)]
+    owner_id: String,
 }
 
 pub struct UpdateWorkerGuard {
     path: PathBuf,
-    pid: u32,
-    app_id: String,
-    target_version: String,
+    lock_path: PathBuf,
+    owner_id: String,
 }
 
 impl UpdateWorkerGuard {
     pub fn record(install_dir: &Path, app_id: &str, target_version: &str) -> Result<Self> {
-        let record = UpdateWorkerRecord {
-            pid: std::process::id(),
-            app_id: app_id.to_string(),
-            target_version: target_version.to_string(),
-            started_at_utc: now_utc_rfc3339(),
-            process_start_time: process_start_time(std::process::id()),
-        };
-        let path = update_worker_path(install_dir);
-        let json = serde_json::to_vec_pretty(&record)
-            .map_err(|e| SurgeError::Config(format!("Failed to encode update worker marker: {e}")))?;
-        write_file_atomic(&path, &json)?;
-        Ok(Self {
-            path,
-            pid: record.pid,
-            app_id: record.app_id,
-            target_version: record.target_version,
-        })
+        let lock_path = update_worker_lock_path(install_dir);
+        let _lock = acquire_worker_lock(&lock_path)?;
+        if let Some(existing) = read_update_worker(install_dir)?
+            && worker_blocks_new_attempt(install_dir, &existing)?
+        {
+            return Err(SurgeError::Update(format!(
+                "Another update worker (pid {}) already owns this installation",
+                existing.pid
+            )));
+        }
+
+        write_owned_worker(install_dir, &lock_path, app_id, target_version)
+    }
+
+    pub(crate) fn take_over(
+        install_dir: &Path,
+        app_id: &str,
+        target_version: &str,
+        expected_pid: u32,
+        expected_start_time: u64,
+    ) -> Result<Self> {
+        let lock_path = update_worker_lock_path(install_dir);
+        let _lock = acquire_worker_lock(&lock_path)?;
+        let existing = read_update_worker(install_dir)?.ok_or_else(|| {
+            SurgeError::Update("The external finalizer could not find the updating worker to take over".to_string())
+        })?;
+        if existing.pid != expected_pid
+            || existing.process_start_time != Some(expected_start_time)
+            || existing.app_id != app_id
+            || existing.target_version != target_version
+            || !matches!(probe_worker_liveness(&existing), PidLiveness::Alive)
+        {
+            return Err(SurgeError::Update(
+                "Update worker ownership changed before the external finalizer took over".to_string(),
+            ));
+        }
+
+        write_owned_worker(install_dir, &lock_path, app_id, target_version)
     }
 }
 
 impl Drop for UpdateWorkerGuard {
     fn drop(&mut self) {
+        let Ok(_lock) = acquire_worker_lock(&self.lock_path) else {
+            return;
+        };
         let Ok(raw) = std::fs::read(&self.path) else {
             return;
         };
         let Ok(record) = serde_json::from_slice::<UpdateWorkerRecord>(&raw) else {
             return;
         };
-        if record.pid == self.pid && record.app_id == self.app_id && record.target_version == self.target_version {
+        if record.owner_id == self.owner_id {
             let _ = std::fs::remove_file(&self.path);
         }
     }
+}
+
+fn write_owned_worker(
+    install_dir: &Path,
+    lock_path: &Path,
+    app_id: &str,
+    target_version: &str,
+) -> Result<UpdateWorkerGuard> {
+    let pid = current_pid();
+    let process_start_time = process_start_time(pid).ok_or_else(|| {
+        SurgeError::Platform(format!(
+            "Could not read start-time identity for update worker process {pid}"
+        ))
+    })?;
+    let record = UpdateWorkerRecord {
+        pid,
+        app_id: app_id.to_string(),
+        target_version: target_version.to_string(),
+        started_at_utc: now_utc_rfc3339(),
+        process_start_time: Some(process_start_time),
+        owner_id: Uuid::new_v4().to_string(),
+    };
+    let path = update_worker_path(install_dir);
+    let json = serde_json::to_vec_pretty(&record)
+        .map_err(|e| SurgeError::Config(format!("Failed to encode update worker marker: {e}")))?;
+    write_file_atomic(&path, &json)?;
+    Ok(UpdateWorkerGuard {
+        path,
+        lock_path: lock_path.to_path_buf(),
+        owner_id: record.owner_id,
+    })
+}
+
+fn acquire_worker_lock(path: &Path) -> Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    FileExt::lock_exclusive(&file)?;
+    Ok(file)
+}
+
+fn probe_worker_liveness(worker: &UpdateWorkerRecord) -> PidLiveness {
+    worker.process_start_time.map_or(PidLiveness::Unknown, |start_time| {
+        probe_process_identity(worker.pid, start_time)
+    })
+}
+
+fn worker_blocks_new_attempt(install_dir: &Path, worker: &UpdateWorkerRecord) -> Result<bool> {
+    if worker.process_start_time.is_some() {
+        return Ok(!matches!(probe_worker_liveness(worker), PidLiveness::Dead));
+    }
+
+    if let Some(status) = read_update_status(install_dir)?
+        && status.app_id == worker.app_id
+        && status.target_version == worker.target_version
+    {
+        return Ok(status.state == UpdateConvergenceState::InProgress);
+    }
+
+    let started_at = chrono::DateTime::parse_from_rfc3339(&worker.started_at_utc)
+        .ok()
+        .map(|timestamp| timestamp.with_timezone(&chrono::Utc));
+    Ok(started_at.is_some_and(|started_at| {
+        let age = chrono::Utc::now().signed_duration_since(started_at);
+        chrono::Duration::from_std(LEGACY_WORKER_MARKER_GRACE).is_ok_and(|grace| age < grace)
+    }))
 }
 
 pub fn fail_abandoned_in_progress_update(
@@ -158,10 +257,7 @@ fn fail_abandoned_in_progress_update_at(
         return Ok(Some(failed));
     };
 
-    let worker_liveness = worker.process_start_time.map_or_else(
-        || probe_pid_liveness(worker.pid),
-        |start_time| probe_process_identity(worker.pid, start_time),
-    );
+    let worker_liveness = probe_worker_liveness(&worker);
 
     if worker.process_start_time.is_some()
         && worker.pid == std::process::id()
@@ -307,6 +403,11 @@ fn update_worker_path(install_dir: &Path) -> PathBuf {
     install_dir.join(UPDATE_WORKER_FILE_NAME)
 }
 
+#[must_use]
+fn update_worker_lock_path(install_dir: &Path) -> PathBuf {
+    install_dir.join(UPDATE_WORKER_LOCK_FILE_NAME)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -420,7 +521,8 @@ mod tests {
             "2026-05-15T20:09:45Z".to_string(),
         );
         write_update_status(dir.path(), &record).unwrap();
-        write_worker_file(dir.path(), dead_helper_pid(), "demo-app", "9999.0.0");
+        let (pid, start_time) = dead_helper_identity();
+        write_worker_file_with_start_time(dir.path(), pid, "demo-app", "9999.0.0", Some(start_time));
 
         let failed = fail_abandoned_in_progress_update_at(
             dir.path(),
@@ -570,27 +672,39 @@ mod tests {
     }
 
     fn write_worker_file(dir: &Path, pid: u32, app_id: &str, target_version: &str) {
+        write_worker_file_with_start_time(dir, pid, app_id, target_version, process_start_time(pid));
+    }
+
+    fn write_worker_file_with_start_time(
+        dir: &Path,
+        pid: u32,
+        app_id: &str,
+        target_version: &str,
+        process_start_time: Option<u64>,
+    ) {
         let record = UpdateWorkerRecord {
             pid,
             app_id: app_id.to_string(),
             target_version: target_version.to_string(),
             started_at_utc: now_utc_rfc3339(),
-            process_start_time: process_start_time(pid),
+            process_start_time,
+            owner_id: String::new(),
         };
         let json = serde_json::to_vec_pretty(&record).unwrap();
         write_file_atomic(&update_worker_path(dir), &json).unwrap();
     }
 
-    fn dead_helper_pid() -> u32 {
-        let mut child = spawn_helper(false);
+    fn dead_helper_identity() -> (u32, u64) {
+        let (pid, mut child) = live_helper_pid();
+        let start_time = process_start_time(pid).expect("live helper start time");
+        let _ = child.kill();
         let _ = child.wait();
-        let pid = child.id();
         let deadline = Instant::now() + Duration::from_secs(5);
         while is_pid_alive(pid) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(!is_pid_alive(pid), "helper pid {pid} should be dead before the test");
-        pid
+        (pid, start_time)
     }
 
     fn live_helper_pid() -> (u32, std::process::Child) {
@@ -686,6 +800,7 @@ mod tests {
             target_version: "9999.0.0".to_string(),
             started_at_utc: now_utc_rfc3339(),
             process_start_time: Some(actual_start_time ^ 1),
+            owner_id: "stale-owner".to_string(),
         };
         let json = serde_json::to_vec_pretty(&worker).unwrap();
         write_file_atomic(&update_worker_path(dir.path()), &json).unwrap();
@@ -706,5 +821,35 @@ mod tests {
 
         assert_eq!(failed.state, UpdateConvergenceState::Failed);
         assert!(failed.reason.as_deref().unwrap().contains("exited without completing"));
+    }
+
+    #[test]
+    fn live_worker_excludes_a_second_update_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = UpdateWorkerGuard::record(dir.path(), "demo-app", "9999.0.0").unwrap();
+
+        let Err(error) = UpdateWorkerGuard::record(dir.path(), "demo-app", "9999.0.0") else {
+            panic!("a live worker must keep exclusive ownership");
+        };
+
+        assert!(error.to_string().contains("already owns"));
+        drop(first);
+        assert!(UpdateWorkerGuard::record(dir.path(), "demo-app", "9999.0.0").is_ok());
+    }
+
+    #[test]
+    fn external_helper_takeover_survives_parent_guard_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = UpdateWorkerGuard::record(dir.path(), "demo-app", "9999.0.0").unwrap();
+        let pid = current_pid();
+        let start_time = process_start_time(pid).unwrap();
+        let helper = UpdateWorkerGuard::take_over(dir.path(), "demo-app", "9999.0.0", pid, start_time).unwrap();
+
+        drop(parent);
+
+        let persisted = read_update_worker(dir.path()).unwrap().unwrap();
+        assert_eq!(persisted.owner_id, helper.owner_id);
+        drop(helper);
+        assert!(read_update_worker(dir.path()).unwrap().is_none());
     }
 }

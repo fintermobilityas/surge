@@ -3,6 +3,7 @@
 mod apply;
 mod artifacts;
 mod current_install;
+mod external_finalize;
 mod finalize;
 mod lifecycle;
 mod progress;
@@ -24,6 +25,7 @@ use crate::update::status::{self, FailureContext, UpdateStatusRecord, UpdateWork
 
 use self::apply::materialize_update_payload;
 use self::artifacts::prepare_update_artifacts;
+pub use self::external_finalize::run_external_finalize;
 use self::finalize::finalize_update;
 use self::lifecycle::SupervisorRestartOutcome;
 pub use self::progress::ProgressInfo;
@@ -37,6 +39,16 @@ use self::release_index::{load_release_index as load_release_index_impl, resolve
 pub enum ApplyStrategy {
     Full,
     Delta,
+}
+
+/// Result of a successful update apply request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateApplyOutcome {
+    /// Finalization completed before the apply call returned.
+    Finalized,
+    /// A stable helper accepted ownership and will finalize after the calling
+    /// supervised application exits.
+    ExternalFinalizeScheduled,
 }
 
 /// Information about available updates.
@@ -69,6 +81,7 @@ pub struct UpdateCheckState {
     current_version: String,
     channel: String,
     install_dir: PathBuf,
+    cached_index: Option<ReleaseIndex>,
     current_release_identity: Option<current_install::ReleaseIdentity>,
 }
 
@@ -207,6 +220,7 @@ impl UpdateManager {
             current_version: self.current_version.clone(),
             channel: self.channel.clone(),
             install_dir: self.install_dir.clone(),
+            cached_index: self.cached_index.clone(),
             current_release_identity: self.current_release_identity.clone(),
         }
     }
@@ -231,6 +245,7 @@ impl UpdateManager {
             ));
         }
 
+        self.cached_index.clone_from(&state.cached_index);
         self.current_release_identity = installed_identity;
         Ok(())
     }
@@ -322,7 +337,7 @@ impl UpdateManager {
     /// tooling can distinguish "update in progress", "applied but pending
     /// supervisor restart", "fully converged", and "failed" without inferring
     /// state from version drift alone (see [`status`]).
-    pub async fn download_and_apply<F>(&self, info: &UpdateInfo, progress: Option<F>) -> Result<()>
+    pub async fn download_and_apply<F>(&self, info: &UpdateInfo, progress: Option<F>) -> Result<UpdateApplyOutcome>
     where
         F: Fn(ProgressInfo) + Send + Sync,
     {
@@ -355,13 +370,7 @@ impl UpdateManager {
             .flatten()
             .filter(|record| record.app_id == self.app_id && record.target_version == target_version);
 
-        let _worker_guard = match UpdateWorkerGuard::record(&self.install_dir, &self.app_id, &target_version) {
-            Ok(guard) => Some(guard),
-            Err(e) => {
-                warn!(error = %e, "Failed to persist update worker marker (continuing)");
-                None
-            }
-        };
+        let _worker_guard = UpdateWorkerGuard::record(&self.install_dir, &self.app_id, &target_version)?;
 
         let in_progress_record = UpdateStatusRecord::in_progress(
             &self.app_id,
@@ -376,22 +385,30 @@ impl UpdateManager {
 
         let progress = progress.map(Arc::new);
         match self
-            .download_and_apply_inner(info, progress, in_progress_record.clone())
+            .download_and_apply_inner(
+                info,
+                progress,
+                in_progress_record.clone(),
+                previous_attempt_status.clone(),
+            )
             .await
         {
             Ok(restart_outcome) => {
                 let completed_at_utc = status::now_utc_rfc3339();
-                let record = match restart_outcome {
-                    SupervisorRestartOutcome::NotApplicable => UpdateStatusRecord::converged(
-                        &self.app_id,
-                        &target_version,
-                        &self.channel,
-                        Some(attempted_at_utc),
-                        completed_at_utc,
-                        false,
+                let (record, outcome) = match restart_outcome {
+                    SupervisorRestartOutcome::NotApplicable => (
+                        Some(UpdateStatusRecord::converged(
+                            &self.app_id,
+                            &target_version,
+                            &self.channel,
+                            Some(attempted_at_utc),
+                            completed_at_utc,
+                            false,
+                        )),
+                        UpdateApplyOutcome::Finalized,
                     ),
-                    SupervisorRestartOutcome::PendingRestart { reason, failure_phase } => {
-                        UpdateStatusRecord::pending_restart_with_failure_phase(
+                    SupervisorRestartOutcome::PendingRestart { reason, failure_phase } => (
+                        Some(UpdateStatusRecord::pending_restart_with_failure_phase(
                             &self.app_id,
                             &target_version,
                             &target_version,
@@ -400,13 +417,19 @@ impl UpdateManager {
                             completed_at_utc,
                             &reason,
                             failure_phase,
-                        )
+                        )),
+                        UpdateApplyOutcome::Finalized,
+                    ),
+                    SupervisorRestartOutcome::ExternalFinalizeScheduled => {
+                        (None, UpdateApplyOutcome::ExternalFinalizeScheduled)
                     }
                 };
-                if let Err(e) = status::write_update_status(&self.install_dir, &record) {
+                if let Some(record) = record
+                    && let Err(e) = status::write_update_status(&self.install_dir, &record)
+                {
                     warn!(error = %e, "Failed to persist post-update convergence status (continuing)");
                 }
-                Ok(())
+                Ok(outcome)
             }
             Err(e) => {
                 let status_context = status::read_update_status(&self.install_dir).ok().flatten();
@@ -439,6 +462,7 @@ impl UpdateManager {
         info: &UpdateInfo,
         progress: Option<Arc<F>>,
         in_progress_template: UpdateStatusRecord,
+        previous_attempt_status: Option<UpdateStatusRecord>,
     ) -> Result<SupervisorRestartOutcome>
     where
         F: Fn(ProgressInfo) + Send + Sync,
@@ -513,6 +537,23 @@ impl UpdateManager {
         progress_emitter.emit_completed_phase(update_phase::PACKAGE_APPLY_COMPLETED);
 
         // Phase 6: Finalize
+        if external_finalize::schedule_if_required(
+            self,
+            info,
+            &extracted_final_dir,
+            &in_progress_template,
+            previous_attempt_status,
+            &progress_emitter,
+        )
+        .await?
+        {
+            info!(
+                version = %info.latest_version,
+                "Update staged; external finalizer scheduled"
+            );
+            return Ok(SupervisorRestartOutcome::ExternalFinalizeScheduled);
+        }
+
         let restart_outcome = finalize_update(
             self,
             info,
@@ -789,6 +830,39 @@ mod tests {
         let error = applying.restore_check_state(&check_state).unwrap_err();
 
         assert!(error.to_string().contains("does not match"));
+    }
+
+    #[test]
+    fn restore_check_state_preserves_the_checked_release_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("store");
+        std::fs::create_dir_all(&store_root).unwrap();
+
+        let ctx = Arc::new(Context::new());
+        ctx.set_storage(
+            StorageProvider::Filesystem,
+            store_root.to_str().unwrap(),
+            "",
+            "",
+            "",
+            "",
+        );
+        let mut checked =
+            UpdateManager::new(Arc::clone(&ctx), "app", "1.0.0", "stable", tmp.path().to_str().unwrap()).unwrap();
+        checked.cached_index = Some(ReleaseIndex {
+            app_id: "app".to_string(),
+            releases: vec![make_entry("2.0.0", "stable", "linux", "linux-x64")],
+            ..ReleaseIndex::default()
+        });
+        let check_state = checked.capture_check_state();
+        let mut applying = UpdateManager::new(ctx, "app", "1.0.0", "stable", tmp.path().to_str().unwrap()).unwrap();
+
+        applying.restore_check_state(&check_state).unwrap();
+
+        let restored = applying.cached_index.as_ref().unwrap();
+        assert_eq!(restored.app_id, "app");
+        assert_eq!(restored.releases.len(), 1);
+        assert_eq!(restored.releases[0].version, "2.0.0");
     }
 
     #[test]

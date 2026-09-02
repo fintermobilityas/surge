@@ -68,7 +68,8 @@ pub fn spawn_process(
     spawn_impl(exe, args, working_dir, envs, Stdio::inherit(), Stdio::inherit(), false)
 }
 
-/// Spawn a process fully detached (stdin/stdout/stderr = null).
+/// Spawn a process fully detached (stdin/stdout/stderr = null and independent
+/// from the caller's process group or job).
 pub fn spawn_detached(
     exe: &Path,
     args: &[&str],
@@ -90,13 +91,23 @@ fn spawn_impl(
     let mut cmd = Command::new(exe);
     cmd.args(args).stdin(Stdio::null()).stdout(stdout).stderr(stderr);
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     let _ = detached;
 
     #[cfg(unix)]
     if detached {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
+    }
+
+    #[cfg(windows)]
+    if detached {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Threading::{
+            CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS,
+        };
+
+        cmd.creation_flags(CREATE_BREAKAWAY_FROM_JOB | CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
     }
 
     if let Some(wd) = working_dir {
@@ -231,19 +242,44 @@ pub fn probe_pid_liveness(pid: u32) -> PidLiveness {
 
 /// Probe whether `pid` still identifies the process with `expected_start_time`.
 ///
-/// A different start time conclusively means the original process exited and
-/// the PID was reused. If start-time inspection is unavailable while the PID
-/// still appears live, the result is [`PidLiveness::Unknown`] so callers can
-/// fail closed.
+/// A different start time or a confirmed terminal state conclusively means the
+/// original process exited. If identity inspection is unavailable while the
+/// PID still appears live, the result is [`PidLiveness::Unknown`] so callers
+/// can fail closed.
 #[must_use]
 pub fn probe_process_identity(pid: u32, expected_start_time: u64) -> PidLiveness {
-    match process_start_time(pid) {
-        Some(actual_start_time) if actual_start_time == expected_start_time => PidLiveness::Alive,
-        Some(_) => PidLiveness::Dead,
-        None => match probe_pid_liveness(pid) {
-            PidLiveness::Dead => PidLiveness::Dead,
-            PidLiveness::Alive | PidLiveness::Unknown => PidLiveness::Unknown,
-        },
+    #[cfg(target_os = "macos")]
+    let known_liveness = descriptors::process_identity_is_alive(pid, expected_start_time).map(|is_alive| {
+        if is_alive {
+            PidLiveness::Alive
+        } else {
+            PidLiveness::Dead
+        }
+    });
+    #[cfg(not(target_os = "macos"))]
+    let known_liveness = process_start_time(pid).map(|actual_start_time| {
+        if actual_start_time == expected_start_time {
+            PidLiveness::Alive
+        } else {
+            PidLiveness::Dead
+        }
+    });
+
+    known_liveness.unwrap_or_else(|| match probe_pid_liveness(pid) {
+        PidLiveness::Dead => PidLiveness::Dead,
+        PidLiveness::Alive | PidLiveness::Unknown => PidLiveness::Unknown,
+    })
+}
+
+#[cfg(all(test, target_os = "macos"))]
+fn wait_for_identity_to_exit(pid: u32, start_time: u64) -> PidLiveness {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let liveness = probe_process_identity(pid, start_time);
+        if liveness == PidLiveness::Dead || std::time::Instant::now() >= deadline {
+            return liveness;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }
 
@@ -372,6 +408,21 @@ mod tests {
 
         assert_eq!(probe_process_identity(pid, start_time), PidLiveness::Alive);
         assert_eq!(probe_process_identity(pid, start_time ^ 1), PidLiveness::Dead);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn process_identity_reports_an_unreaped_zombie_dead() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn helper");
+        let pid = child.id();
+        let start_time = process_start_time(pid).expect("child process start time");
+        child.kill().expect("kill helper");
+
+        assert_eq!(super::wait_for_identity_to_exit(pid, start_time), PidLiveness::Dead);
+        child.wait().expect("reap helper");
     }
 
     #[test]

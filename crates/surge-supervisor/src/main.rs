@@ -97,6 +97,18 @@ enum Commands {
         verbose: bool,
     },
 
+    /// Finalize a staged supervised update after the updating child exits
+    #[command(hide = true)]
+    FinalizeUpdate {
+        /// Path to the armed external-finalizer plan
+        #[arg(long)]
+        plan: PathBuf,
+
+        /// Enable verbose logging
+        #[arg(long, short = 'v')]
+        verbose: bool,
+    },
+
     /// Print SHA-256 hash of a file
     #[command(name = "sha256")]
     Sha256 {
@@ -200,6 +212,23 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
             ExitCode::SUCCESS
+        }
+        Commands::FinalizeUpdate { plan, verbose } => {
+            init_tracing(verbose);
+            let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    tracing::error!(%error, "Failed to create external finalizer runtime");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match runtime.block_on(surge_core::update::manager::run_external_finalize(&plan)) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    tracing::error!(%error, "External update finalization failed");
+                    ExitCode::FAILURE
+                }
+            }
         }
         Commands::Sha256 { file } => match surge_core::crypto::sha256::sha256_hex_file(&file) {
             Ok(hash) => {

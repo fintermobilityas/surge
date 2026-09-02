@@ -20,6 +20,8 @@ use super::schedule::{marker_matches, write_handshake_marker};
 
 const HELPER_ARM_TIMEOUT: Duration = Duration::from_secs(30);
 const HANDSHAKE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const TERMINAL_STATUS_WRITE_ATTEMPTS: u32 = 5;
+const TERMINAL_STATUS_WRITE_RETRY_DELAY: Duration = Duration::from_millis(200);
 
 /// Complete a staged update from the stable helper process.
 ///
@@ -37,18 +39,30 @@ where
     let _worker_guard =
         UpdateWorkerGuard::take_over(&plan.install_dir, &plan.app_id, &plan.latest.version, plan.updater_pid)?;
     if let Err(error) = write_handshake_marker(&plan.ready_path(), &plan.operation_id) {
-        persist_external_failure(&plan, &error, None);
+        if let Err(status_error) = persist_external_failure(&plan, &error, None) {
+            return Err(SurgeError::Update(format!(
+                "External finalizer failed before becoming ready: {error}; terminal status persistence also failed: {status_error}"
+            )));
+        }
         cleanup_operation(&plan, "failed");
         return Err(error);
     }
 
     if let Err(error) = wait_until_armed(&plan).await {
-        persist_external_failure(&plan, &error, None);
+        if let Err(status_error) = persist_external_failure(&plan, &error, None) {
+            return Err(SurgeError::Update(format!(
+                "External finalizer failed before it was armed: {error}; terminal status persistence also failed: {status_error}"
+            )));
+        }
         cleanup_operation(&plan, "failed");
         return Err(error);
     }
     if let Err(error) = write_handshake_marker(&plan.accepted_path(), &plan.operation_id) {
-        persist_external_failure(&plan, &error, None);
+        if let Err(status_error) = persist_external_failure(&plan, &error, None) {
+            return Err(SurgeError::Update(format!(
+                "External finalizer failed before accepting ownership: {error}; terminal status persistence also failed: {status_error}"
+            )));
+        }
         cleanup_operation(&plan, "failed");
         return Err(error);
     }
@@ -56,7 +70,7 @@ where
     let result = run_armed_finalize(&plan, &mut manager, quiesce_updater).await;
     match result {
         Ok(outcome) => {
-            persist_external_success(&plan, &outcome);
+            persist_external_success(&plan, &outcome)?;
             cleanup_operation(&plan, "completed");
             Ok(())
         }
@@ -64,7 +78,11 @@ where
             let recovery_error = recover_previous_runtime(&plan, &manager).await.err();
             let _ = std::fs::remove_file(plan.armed_path());
             let _ = std::fs::remove_file(plan.ready_path());
-            persist_external_failure(&plan, &error, recovery_error.as_ref());
+            if let Err(status_error) = persist_external_failure(&plan, &error, recovery_error.as_ref()) {
+                return Err(SurgeError::Update(format!(
+                    "External finalization failed: {error}; terminal status persistence also failed: {status_error}"
+                )));
+            }
             cleanup_operation(&plan, "failed");
             if let Some(recovery_error) = recovery_error {
                 return Err(SurgeError::Update(format!(
@@ -161,7 +179,7 @@ fn persist_external_phase(plan: &ExternalFinalizePlan, phase: &'static str) {
     }
 }
 
-fn persist_external_success(plan: &ExternalFinalizePlan, outcome: &SupervisorRestartOutcome) {
+fn persist_external_success(plan: &ExternalFinalizePlan, outcome: &SupervisorRestartOutcome) -> Result<()> {
     let completed_at_utc = status::now_utc_rfc3339();
     let attempted_at_utc = plan
         .in_progress_template
@@ -190,16 +208,19 @@ fn persist_external_success(plan: &ExternalFinalizePlan, outcome: &SupervisorRes
             )
         }
         SupervisorRestartOutcome::ExternalFinalizeScheduled => {
-            warn!("External finalizer unexpectedly scheduled another external finalizer");
-            return;
+            return Err(SurgeError::Update(
+                "External finalizer unexpectedly scheduled another external finalizer".to_string(),
+            ));
         }
     };
-    if let Err(error) = status::write_update_status(&plan.install_dir, &record) {
-        warn!(error = %error, "Failed to persist external finalizer completion status");
-    }
+    write_terminal_status(&plan.install_dir, &record)
 }
 
-fn persist_external_failure(plan: &ExternalFinalizePlan, error: &SurgeError, recovery_error: Option<&SurgeError>) {
+fn persist_external_failure(
+    plan: &ExternalFinalizePlan,
+    error: &SurgeError,
+    recovery_error: Option<&SurgeError>,
+) -> Result<()> {
     let attempted_at_utc = plan
         .in_progress_template
         .attempted_at_utc
@@ -225,9 +246,58 @@ fn persist_external_failure(plan: &ExternalFinalizePlan, error: &SurgeError, rec
     } else {
         record
     };
-    if let Err(write_error) = status::write_update_status(&plan.install_dir, &record) {
-        warn!(error = %write_error, "Failed to persist external finalizer failure status");
+    write_terminal_status(&plan.install_dir, &record)
+}
+
+fn write_terminal_status(install_dir: &Path, record: &UpdateStatusRecord) -> Result<()> {
+    write_terminal_status_with(
+        install_dir,
+        record,
+        TERMINAL_STATUS_WRITE_ATTEMPTS,
+        TERMINAL_STATUS_WRITE_RETRY_DELAY,
+        status::write_update_status,
+    )
+}
+
+fn write_terminal_status_with<F>(
+    install_dir: &Path,
+    record: &UpdateStatusRecord,
+    attempts: u32,
+    retry_delay: Duration,
+    mut write_status: F,
+) -> Result<()>
+where
+    F: FnMut(&Path, &UpdateStatusRecord) -> Result<()>,
+{
+    if attempts == 0 {
+        return Err(SurgeError::Config(
+            "Terminal status persistence requires at least one attempt".to_string(),
+        ));
     }
+
+    for attempt in 1..=attempts {
+        match write_status(install_dir, record) {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt < attempts => {
+                warn!(
+                    error = %error,
+                    attempt,
+                    attempts,
+                    "Failed to persist terminal external finalizer status; retrying"
+                );
+                if !retry_delay.is_zero() {
+                    std::thread::sleep(retry_delay);
+                }
+            }
+            Err(error) => {
+                return Err(SurgeError::Update(format!(
+                    "Failed to persist terminal external finalizer status after {attempts} attempts: {error}"
+                )));
+            }
+        }
+    }
+
+    unreachable!("terminal status write loop always returns")
 }
 
 async fn recover_previous_runtime(plan: &ExternalFinalizePlan, manager: &UpdateManager) -> Result<()> {
@@ -362,6 +432,7 @@ fn release_from_identity(identity: &super::super::current_install::ReleaseIdenti
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
@@ -433,6 +504,41 @@ mod tests {
             active
         );
         assert_eq!(std::fs::read_to_string(active.join("version")).unwrap(), "previous");
+    }
+
+    #[test]
+    fn terminal_status_write_retries_transient_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let attempts = Cell::new(0);
+        let record = UpdateStatusRecord::converged("demo", "2.0.0", "test", None, status::now_utc_rfc3339(), true);
+
+        write_terminal_status_with(temp.path(), &record, 3, Duration::ZERO, |_, _| {
+            attempts.set(attempts.get() + 1);
+            if attempts.get() < 3 {
+                Err(SurgeError::Update("transient write failure".to_string()))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+
+        assert_eq!(attempts.get(), 3);
+    }
+
+    #[test]
+    fn terminal_status_write_reports_exhausted_retries() {
+        let temp = tempfile::tempdir().unwrap();
+        let attempts = Cell::new(0);
+        let record = UpdateStatusRecord::converged("demo", "2.0.0", "test", None, status::now_utc_rfc3339(), true);
+
+        let error = write_terminal_status_with(temp.path(), &record, 3, Duration::ZERO, |_, _| {
+            attempts.set(attempts.get() + 1);
+            Err(SurgeError::Update("persistent write failure".to_string()))
+        })
+        .unwrap_err();
+
+        assert_eq!(attempts.get(), 3);
+        assert!(error.to_string().contains("after 3 attempts"));
     }
 
     fn fixture_manager(

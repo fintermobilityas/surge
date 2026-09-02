@@ -194,7 +194,7 @@ fn signal_process(identity: &ProcessIdentity, _force: bool) -> Result<()> {
     {
         return Ok(());
     }
-    if process.kill() {
+    if process.kill() || !identity_is_running(identity)? {
         Ok(())
     } else {
         Err(SurgeError::Supervisor(format!(

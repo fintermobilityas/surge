@@ -189,21 +189,12 @@ fn resolve_active_executable(active_app_dir: &Path, main_exe: &str) -> Result<Pa
     Ok(active_exe)
 }
 
-#[cfg(unix)]
-fn same_executable(left: &Path, right: &Path) -> Result<bool> {
-    use std::os::unix::fs::MetadataExt;
-
-    let left = std::fs::metadata(left)?;
-    let right = std::fs::metadata(right)?;
-    Ok(left.dev() == right.dev() && left.ino() == right.ino())
-}
-
 #[cfg(windows)]
 fn same_executable(left: &Path, right: &Path) -> Result<bool> {
     Ok(left.to_string_lossy().eq_ignore_ascii_case(&right.to_string_lossy()))
 }
 
-#[cfg(not(any(unix, windows)))]
+#[cfg(not(windows))]
 fn same_executable(left: &Path, right: &Path) -> Result<bool> {
     Ok(left == right)
 }
@@ -283,7 +274,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn executable_identity_accepts_hard_linked_active_path() {
+    fn executable_identity_rejects_hard_linked_external_path() {
         let temp = tempfile::tempdir().unwrap();
         let current = std::env::current_exe().unwrap();
         let active_root = temp.path().join("app");
@@ -292,7 +283,7 @@ mod tests {
         std::fs::hard_link(&current, &active).unwrap();
 
         let resolved = resolve_active_executable(&active_root, "active-app").unwrap();
-        assert!(same_executable(&current, &resolved).unwrap());
+        assert!(!same_executable(&current, &resolved).unwrap());
     }
 
     #[cfg(unix)]

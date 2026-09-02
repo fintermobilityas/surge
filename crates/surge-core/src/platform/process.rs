@@ -2,11 +2,10 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
-use sysinfo::{Pid, ProcessesToUpdate, System};
-
 use crate::error::{Result, SurgeError};
 
 mod descriptors;
+mod identity;
 
 pub struct ProcessHandle {
     child: Child,
@@ -155,21 +154,11 @@ pub fn current_pid() -> u32 {
     std::process::id()
 }
 
-/// Start-time identity for a live process, in the platform units exposed by
-/// `sysinfo`. Combined with a PID, this distinguishes a worker from an
-/// unrelated process that later reused the same PID.
+/// High-resolution native creation identity for a live process. Combined with
+/// a PID, this distinguishes a worker from a later process that reused it.
 #[must_use]
-pub(crate) fn process_start_time(pid: u32) -> Option<u64> {
-    if pid == 0 {
-        return None;
-    }
-    let pid = Pid::from_u32(pid);
-    let mut system = System::new();
-    let _ = system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
-    system
-        .process(pid)
-        .map(sysinfo::Process::start_time)
-        .filter(|start_time| *start_time != 0)
+pub fn process_start_time(pid: u32) -> Option<u64> {
+    identity::process_start_time(pid)
 }
 
 /// Liveness of the process identified by `pid`.
@@ -258,7 +247,7 @@ pub fn probe_pid_liveness(pid: u32) -> PidLiveness {
 /// the PID was reused. If start-time inspection is unavailable while the PID
 /// still appears live, the result is `Unknown` and callers must fail closed.
 #[must_use]
-pub(crate) fn probe_process_identity(pid: u32, expected_start_time: u64) -> PidLiveness {
+pub fn probe_process_identity(pid: u32, expected_start_time: u64) -> PidLiveness {
     match process_start_time(pid) {
         Some(actual_start_time) if actual_start_time == expected_start_time => PidLiveness::Alive,
         Some(_) => PidLiveness::Dead,

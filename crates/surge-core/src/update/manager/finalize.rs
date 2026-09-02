@@ -348,9 +348,7 @@ where
                 "Terminated stale app processes from superseded install directories"
             );
         }
-        Err(e) => {
-            warn!(error = %e, "Failed to terminate stale app processes after update");
-        }
+        Err(e) => return Err(e),
     }
 
     emit_progress(

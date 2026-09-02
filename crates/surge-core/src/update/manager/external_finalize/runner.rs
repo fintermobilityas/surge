@@ -117,12 +117,12 @@ where
     F: FnMut(u32, &Path) -> Result<()>,
 {
     persist_external_phase(plan, update_phase::STOPPING_SUPERVISOR);
+    *recovery_required = true;
     super::super::lifecycle::request_supervisor_shutdown(
         &plan.install_dir,
         &plan.current_release_identity.supervisor_id,
     )
     .await?;
-    *recovery_required = true;
 
     persist_external_phase(plan, update_phase::WAITING_FOR_UPDATER_EXIT);
     quiesce_updater(plan.updater_pid, &plan.updater_exe)?;
@@ -317,6 +317,11 @@ async fn recover_previous_runtime<F>(
 where
     F: FnMut(u32, &Path) -> Result<()>,
 {
+    super::super::lifecycle::request_supervisor_shutdown(
+        &plan.install_dir,
+        &plan.current_release_identity.supervisor_id,
+    )
+    .await?;
     if plan.latest.supervisor_id != plan.current_release_identity.supervisor_id {
         super::super::lifecycle::request_supervisor_shutdown(&plan.install_dir, &plan.latest.supervisor_id).await?;
     }

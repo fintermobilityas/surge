@@ -92,9 +92,14 @@ fn process_identity(pid: u32, expected_executable: &Path) -> Result<Option<Proce
     if !executable_paths_equal(&executable, expected_executable) {
         return Ok(None);
     }
+    let start_time = surge_core::platform::process::process_start_time(pid).ok_or_else(|| {
+        SurgeError::Supervisor(format!(
+            "Could not resolve creation identity for updating process {pid}"
+        ))
+    })?;
     Ok(Some(ProcessIdentity {
         pid,
-        start_time: process.start_time(),
+        start_time,
         executable,
     }))
 }
@@ -103,22 +108,22 @@ fn matching_processes(expected_executable: &Path) -> Result<Vec<ProcessIdentity>
     let mut system = System::new();
     let _ = system.refresh_processes(ProcessesToUpdate::All, true);
     let own_pid = std::process::id();
-    Ok(system
-        .processes()
-        .iter()
-        .filter_map(|(pid, process)| {
-            let pid = pid.as_u32();
-            if pid == own_pid {
-                return None;
-            }
-            let executable = normalize_executable(process.exe()?);
-            executable_paths_equal(&executable, expected_executable).then_some(ProcessIdentity {
-                pid,
-                start_time: process.start_time(),
-                executable,
-            })
-        })
-        .collect())
+    let mut matching = Vec::new();
+    for (pid, process) in system.processes() {
+        let pid = pid.as_u32();
+        if pid == own_pid {
+            continue;
+        }
+        let Some(executable) = process.exe().map(normalize_executable) else {
+            continue;
+        };
+        if executable_paths_equal(&executable, expected_executable)
+            && let Some(identity) = process_identity(pid, expected_executable)?
+        {
+            matching.push(identity);
+        }
+    }
+    Ok(matching)
 }
 
 fn wait_until_identity_exits(identity: &ProcessIdentity, timeout: Duration) -> Result<bool> {

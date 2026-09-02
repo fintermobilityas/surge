@@ -1,11 +1,13 @@
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus};
 
+#[cfg(windows)]
 use sysinfo::{Pid, ProcessesToUpdate, System};
 
 use crate::SupervisorError;
 use crate::handoff;
 use crate::ownership::supervisor_was_superseded;
+use surge_core::platform::process::{PidLiveness, probe_process_identity};
 
 const RESTART_HANDOFF_STABILITY_WINDOW: std::time::Duration = std::time::Duration::from_secs(4);
 
@@ -179,15 +181,10 @@ pub(crate) fn wait_for_pid_or_stop(
 
 fn is_process_identity_running(pid: u32, expected_start_time: Option<u64>) -> bool {
     if let Some(expected_start_time) = expected_start_time {
-        let system_pid = Pid::from_u32(pid);
-        let mut system = System::new();
-        let _ = system.refresh_processes(ProcessesToUpdate::Some(&[system_pid]), true);
-        if let Some(process) = system.process(system_pid) {
-            let actual_start_time = process.start_time();
-            if actual_start_time != 0 {
-                return actual_start_time == expected_start_time;
-            }
-        }
+        return match probe_process_identity(pid, expected_start_time) {
+            PidLiveness::Dead => false,
+            PidLiveness::Alive | PidLiveness::Unknown => true,
+        };
     }
 
     is_process_running(pid)
@@ -305,11 +302,7 @@ mod tests {
     #[test]
     fn watched_process_identity_rejects_a_reused_pid() {
         let pid = std::process::id();
-        let system_pid = Pid::from_u32(pid);
-        let mut system = System::new();
-        let _ = system.refresh_processes(ProcessesToUpdate::Some(&[system_pid]), true);
-        let start_time = system.process(system_pid).unwrap().start_time();
-        assert_ne!(start_time, 0);
+        let start_time = surge_core::platform::process::process_start_time(pid).unwrap();
 
         assert!(is_process_identity_running(pid, Some(start_time)));
         let reused_start_time = if start_time == u64::MAX {

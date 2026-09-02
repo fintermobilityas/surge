@@ -81,8 +81,11 @@ tree still matches.
 - localized 100-delta chain at large scale: download ≈ 510 KiB,
   full-chain apply 657 s -> 489 s (carried tree) -> 221 s
   (identity chunks) -> ~157 s (verified-hash carry) -> ~154 s
-  (streamed target hash + in-place patching) -> **74.6 s (2026-09-02,
-  lazy intermediate repacks)** — `docs/performance/update-chains.md`
+  (streamed target hash + in-place patching) -> 74.6 s (2026-09-02,
+  lazy intermediate repacks) -> **~8.7-10.8 s (2026-09-03, CSDF v3
+  chunk-target digests: in-place apply verifies rewritten chunks in
+  memory and skips the full-file target re-read)** —
+  `docs/performance/update-chains.md`
 - **KEPT (this session): carried-tree chain apply.** The chain walker
   extracts the starting archive once and applies consecutive sparse
   deltas in place, keeping the per-step repack + full SHA-256 check.

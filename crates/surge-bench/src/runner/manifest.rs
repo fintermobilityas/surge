@@ -82,7 +82,7 @@ pack:
     # Format version 2 (identity-chunk bitset) keeps the canonical update
     # baseline on the identity-chunk apply path; 1 is the safe default for
     # fleets with pre-v2 readers (surge-core #267).
-    chunked_patch_format: 2
+    chunked_patch_format: 3
   compression:
     format: zstd
     level: {pack_zstd_level}

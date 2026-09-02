@@ -13,7 +13,7 @@ pub use bspatch::{
     chunked_bspatch_file_with_progress_and_sha256, chunked_bspatch_file_with_progress_and_sha256_in_place,
 };
 pub use format::has_magic_prefix;
-use format::{ChunkedPatchData, deserialize_patch, serialize_patch};
+use format::{ChunkedPatchData, SerializedChunk, deserialize_patch, serialize_patch};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
@@ -23,6 +23,7 @@ use std::{
     path::Path,
 };
 
+use crate::crypto::sha256::sha256_raw;
 use crate::error::{Result, SurgeError};
 
 use super::wrapper;
@@ -48,6 +49,10 @@ pub enum ChunkedPatchFormat {
     Legacy,
     /// Format version 2: unchanged chunks are marked in an identity bitset and carry no payload.
     IdentityChunks,
+    /// Format version 3: the identity bitset plus a SHA-256 target digest for
+    /// every changed chunk, letting the in-place applier verify rewritten
+    /// chunks in memory instead of re-reading the whole target file.
+    IdentityChunksWithTargetHashes,
 }
 
 /// Options for chunked diff/patch operations.
@@ -132,6 +137,14 @@ fn into_inner<T>(m: Mutex<T>) -> T {
 /// If a chunk exists only in the newer file (file grew), it is stored verbatim.
 /// If a chunk exists only in the older file (file shrank), it is omitted
 /// (the patch records the new file size so bspatch knows when to stop).
+/// Identity-chunk marking is available in both identity-bitset formats.
+fn identity_format_enabled(format: ChunkedPatchFormat) -> bool {
+    matches!(
+        format,
+        ChunkedPatchFormat::IdentityChunks | ChunkedPatchFormat::IdentityChunksWithTargetHashes
+    )
+}
+
 pub fn chunked_bsdiff(older: &[u8], newer: &[u8], opts: &ChunkedDiffOptions) -> Result<Vec<u8>> {
     let chunk_size = opts.chunk_size;
     if chunk_size == 0 {
@@ -145,7 +158,7 @@ pub fn chunked_bsdiff(older: &[u8], newer: &[u8], opts: &ChunkedDiffOptions) -> 
 
     // Parallel chunk diffing
     let work_counter = AtomicUsize::new(0);
-    let results: Mutex<Vec<(usize, Vec<u8>, bool)>> = Mutex::new(Vec::with_capacity(num_chunks));
+    let results: Mutex<Vec<SerializedChunk>> = Mutex::new(Vec::with_capacity(num_chunks));
     let error: Mutex<Option<SurgeError>> = Mutex::new(None);
 
     thread::scope(|s| {
@@ -182,7 +195,7 @@ pub fn chunked_bsdiff(older: &[u8], newer: &[u8], opts: &ChunkedDiffOptions) -> 
                         (new_chunk.to_vec(), false)
                     } else if new_chunk.is_empty() {
                         (Vec::new(), false)
-                    } else if old_chunk == new_chunk && opts.format == ChunkedPatchFormat::IdentityChunks {
+                    } else if old_chunk == new_chunk && identity_format_enabled(opts.format) {
                         // Unchanged chunk: record the identity marker instead
                         // of paying for a whole-chunk bsdiff.
                         (Vec::new(), true)
@@ -196,7 +209,29 @@ pub fn chunked_bsdiff(older: &[u8], newer: &[u8], opts: &ChunkedDiffOptions) -> 
                         }
                     };
 
-                    lock_mutex(&results).push((idx, patch, identity));
+                    // v3 records the target digest of every changed chunk;
+                    // the chunk's target content is `new_chunk` in all
+                    // branches, so no extra read is needed.
+                    let target_hash = if opts.format == ChunkedPatchFormat::IdentityChunksWithTargetHashes && !identity
+                    {
+                        match sha256_raw(new_chunk).try_into() {
+                            Ok(digest) => Some(digest),
+                            Err(_) => {
+                                *lock_mutex(&error) =
+                                    Some(SurgeError::Diff("sha256 digest has an invalid length".into()));
+                                return;
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
+                    lock_mutex(&results).push(SerializedChunk {
+                        idx,
+                        patch,
+                        identity,
+                        target_hash,
+                    });
                 }
             });
         }
@@ -207,7 +242,7 @@ pub fn chunked_bsdiff(older: &[u8], newer: &[u8], opts: &ChunkedDiffOptions) -> 
     }
 
     let mut chunks = into_inner(results);
-    chunks.sort_by_key(|(idx, _, _)| *idx);
+    chunks.sort_by_key(|chunk| chunk.idx);
 
     serialize_patch(older.len(), newer.len(), chunk_size, &chunks, opts.format)
 }
@@ -221,6 +256,7 @@ pub fn chunked_bspatch(older: &[u8], patch: &[u8], opts: &ChunkedDiffOptions) ->
         chunk_size,
         chunks: chunk_patches,
         identity,
+        chunk_hashes,
     } = decoded;
 
     if older.len() != old_size {
@@ -284,6 +320,23 @@ pub fn chunked_bspatch(older: &[u8], patch: &[u8], opts: &ChunkedDiffOptions) ->
                             }
                         }
                     };
+                    let expected_hash = (!identity[idx]).then_some(chunk_hashes[idx]).flatten();
+                    if let Some(expected) = expected_hash {
+                        let actual: [u8; 32] = match sha256_raw(&new_chunk).try_into() {
+                            Ok(digest) => digest,
+                            Err(_) => {
+                                *lock_mutex(&error) =
+                                    Some(SurgeError::Diff("sha256 digest has an invalid length".into()));
+                                return;
+                            }
+                        };
+                        if actual != expected {
+                            *lock_mutex(&error) = Some(SurgeError::Diff(format!(
+                                "chunk {idx} target digest mismatch: patch records a stale digest"
+                            )));
+                            return;
+                        }
+                    }
                     lock_mutex(&results).push((idx, new_chunk));
                 }
             });
@@ -330,7 +383,7 @@ pub fn chunked_bsdiff_files(older_path: &Path, newer_path: &Path, opts: &Chunked
     let num_chunks = num_old_chunks.max(num_new_chunks);
     let num_threads = opts.effective_threads();
     let work_counter = AtomicUsize::new(0);
-    let results: Mutex<Vec<(usize, Vec<u8>, bool)>> = Mutex::new(Vec::with_capacity(num_chunks));
+    let results: Mutex<Vec<SerializedChunk>> = Mutex::new(Vec::with_capacity(num_chunks));
     let error: Mutex<Option<SurgeError>> = Mutex::new(None);
 
     thread::scope(|scope| {
@@ -379,10 +432,10 @@ pub fn chunked_bsdiff_files(older_path: &Path, newer_path: &Path, opts: &Chunked
                     };
 
                     let (patch, identity) = if old_chunk.is_empty() {
-                        (new_chunk, false)
+                        (new_chunk.clone(), false)
                     } else if new_chunk.is_empty() {
                         (Vec::new(), false)
-                    } else if old_chunk == new_chunk && opts.format == ChunkedPatchFormat::IdentityChunks {
+                    } else if old_chunk == new_chunk && identity_format_enabled(opts.format) {
                         // Unchanged chunk: record the identity marker instead
                         // of paying for a whole-chunk bsdiff.
                         (Vec::new(), true)
@@ -395,7 +448,25 @@ pub fn chunked_bsdiff_files(older_path: &Path, newer_path: &Path, opts: &Chunked
                             }
                         }
                     };
-                    lock_mutex(&results).push((idx, patch, identity));
+                    let target_hash = if opts.format == ChunkedPatchFormat::IdentityChunksWithTargetHashes && !identity
+                    {
+                        match sha256_raw(&new_chunk).try_into() {
+                            Ok(digest) => Some(digest),
+                            Err(_) => {
+                                *lock_mutex(&error) =
+                                    Some(SurgeError::Diff("sha256 digest has an invalid length".into()));
+                                return;
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    lock_mutex(&results).push(SerializedChunk {
+                        idx,
+                        patch,
+                        identity,
+                        target_hash,
+                    });
                 }
             });
         }
@@ -405,7 +476,7 @@ pub fn chunked_bsdiff_files(older_path: &Path, newer_path: &Path, opts: &Chunked
         return Err(err);
     }
     let mut chunks = into_inner(results);
-    chunks.sort_by_key(|(idx, _, _)| *idx);
+    chunks.sort_by_key(|chunk| chunk.idx);
     serialize_patch(old_size, new_size, chunk_size, &chunks, opts.format)
 }
 
@@ -638,7 +709,11 @@ mod tests {
             .expect("apply patch");
         assert!(result.applied_in_place);
         assert!(!unused_output.exists(), "in-place patch must not write the output path");
-        assert_eq!(result.target_hash, sha256_hex(&new));
+        assert_eq!(result.target_hash, Some(sha256_hex(&new)));
+        assert!(
+            !result.chunk_hashes_verified,
+            "v2 patches have no digests: the full read must run"
+        );
         assert_eq!(std::fs::read(&old_path).expect("read target"), new);
     }
 
@@ -669,7 +744,11 @@ mod tests {
         let result = chunked_bspatch_file_with_progress_and_sha256_in_place(&old_path, &patch, &unused_output, None)
             .expect("apply patch");
         assert!(result.applied_in_place);
-        assert_eq!(result.target_hash, sha256_hex(&old));
+        assert_eq!(result.target_hash, Some(sha256_hex(&old)));
+        assert!(
+            !result.chunk_hashes_verified,
+            "all-identity patches have no changed chunk to digest-verify"
+        );
         assert_eq!(std::fs::read(&old_path).expect("read target"), old);
     }
 
@@ -702,7 +781,7 @@ mod tests {
         let result = chunked_bspatch_file_with_progress_and_sha256_in_place(&old_path, &patch, &output, None)
             .expect("apply patch");
         assert!(!result.applied_in_place);
-        assert_eq!(result.target_hash, sha256_hex(&new));
+        assert_eq!(result.target_hash, Some(sha256_hex(&new)));
         assert_eq!(std::fs::read(&output).expect("read rebuilt"), new);
         assert_eq!(std::fs::read(&old_path).expect("read target"), old);
     }
@@ -735,8 +814,73 @@ mod tests {
         let result = chunked_bspatch_file_with_progress_and_sha256_in_place(&old_path, &patch, &output, None)
             .expect("apply patch");
         assert!(!result.applied_in_place);
-        assert_eq!(result.target_hash, sha256_hex(&new));
+        assert_eq!(result.target_hash, Some(sha256_hex(&new)));
         assert_eq!(std::fs::read(&output).expect("read rebuilt"), new);
         assert_eq!(std::fs::read(&old_path).expect("read target"), old);
+    }
+
+    #[test]
+    fn in_place_bspatch_v3_digests_verify_without_full_read() {
+        use crate::crypto::sha256::sha256_hex;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let old_path = tmp.path().join("target.bin");
+        let new_path = tmp.path().join("new.bin");
+        let unused_output = tmp.path().join("unused.bin");
+
+        let old = vec![11u8; 1024 * 1024];
+        let mut new = old.clone();
+        new[70_000] = 200; // inside the second 256 KiB chunk
+
+        std::fs::write(&old_path, &old).expect("write target");
+        std::fs::write(&new_path, &new).expect("write new");
+
+        let patch = chunked_bsdiff_files(
+            &old_path,
+            &new_path,
+            &ChunkedDiffOptions {
+                chunk_size: 256 * 1024,
+                max_threads: 1,
+                format: ChunkedPatchFormat::IdentityChunksWithTargetHashes,
+            },
+        )
+        .expect("build patch");
+
+        let result = chunked_bspatch_file_with_progress_and_sha256_in_place(&old_path, &patch, &unused_output, None)
+            .expect("apply patch");
+        assert!(result.applied_in_place);
+        assert!(
+            result.chunk_hashes_verified,
+            "v3 digests must verify the rewritten chunk"
+        );
+        assert_eq!(result.target_hash, None, "digest-verified path skips the full read");
+        assert_eq!(std::fs::read(&old_path).expect("read target"), new);
+        assert!(!unused_output.exists(), "in-place patch must not write the output path");
+
+        // A tampered recorded digest must be rejected.
+        let decoded = super::format::deserialize_patch(&patch).expect("decode");
+        let header = 4 + 1 + 8 + 8 + 8 + 4;
+        let bitset = decoded.chunks.len().div_ceil(8);
+        let chunk0_len = u64::from_le_bytes(patch[header + bitset..header + bitset + 8].try_into().unwrap()) as usize;
+        let mut tampered = patch.clone();
+        tampered[header + bitset + 8 + chunk0_len] ^= 0xFF;
+        let err = chunked_bspatch_file_with_progress_and_sha256_in_place(
+            &tmp.path().join("target2.bin"),
+            &tampered,
+            &unused_output,
+            None,
+        );
+        // Re-create the target file first: the previous apply already
+        // patched target.bin in place.
+        let _ = err;
+        std::fs::write(&old_path, &old).expect("restore target");
+        let err = chunked_bspatch_file_with_progress_and_sha256_in_place(&old_path, &tampered, &unused_output, None)
+            .unwrap_err();
+        assert!(err.to_string().contains("target digest mismatch"), "{err}");
+        assert_eq!(
+            std::fs::read(&old_path).expect("read target"),
+            old,
+            "failed apply must leave the target untouched"
+        );
+        let _ = sha256_hex(&old);
     }
 }

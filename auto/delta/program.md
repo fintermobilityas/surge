@@ -154,6 +154,13 @@ starting any of these.
    decode still the top phase at the production payload shape (real
    native SDKs compress ~2-3:1, not the bench's 7:1)?
 
+2026-09-03 (round 16, update-surface change): CSDF v3 chunk-target
+digests skip the client's full-file target re-read. Publisher side is
+flat: the per-chunk target digests are computed in the diff workers,
+which already hold each changed chunk's target content in memory (no
+extra pass, no extra I/O). Same-session delta pack build: 1,343/1,349
+vs 1,348/1,343 ms/version (noise). Client 100-delta apply -87%/-85%
+(see auto/update/results.tsv).
 2026-09-02 (round 15): per-file hash/diff pipelines of the sparse
 delta build run across a bounded pool (cap 2, budget split evenly,
 largest files first). Same-session interleaved A/B (scale 0.25,

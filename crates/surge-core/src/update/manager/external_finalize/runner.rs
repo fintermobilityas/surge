@@ -6,7 +6,7 @@ use tracing::warn;
 
 use crate::error::{Result, SurgeError};
 use crate::platform::fs::atomic_rename;
-use crate::platform::process::{current_pid, is_pid_alive, spawn_detached};
+use crate::platform::process::{current_pid, spawn_detached};
 use crate::releases::manifest::ReleaseEntry;
 use crate::update::status::{self, FailureContext, UpdateStatusRecord, UpdateWorkerGuard};
 
@@ -28,9 +28,9 @@ const TERMINAL_STATUS_WRITE_RETRY_DELAY: Duration = Duration::from_millis(200);
 /// This API is intended for `surge-supervisor finalize-update`; consumers
 /// should continue to use [`UpdateManager::download_and_apply`].
 #[doc(hidden)]
-pub async fn run_external_finalize<F>(plan_path: &Path, quiesce_updater: F) -> Result<()>
+pub async fn run_external_finalize<F>(plan_path: &Path, mut quiesce_updater: F) -> Result<()>
 where
-    F: FnOnce(u32, &Path) -> Result<()>,
+    F: FnMut(u32, &Path) -> Result<()>,
 {
     let plan = read_and_validate_plan(plan_path)?;
     let mut manager = manager_from_plan(&plan)?;
@@ -67,7 +67,8 @@ where
         return Err(error);
     }
 
-    let result = run_armed_finalize(&plan, &mut manager, quiesce_updater).await;
+    let mut recovery_required = false;
+    let result = run_armed_finalize(&plan, &mut manager, &mut quiesce_updater, &mut recovery_required).await;
     match result {
         Ok(outcome) => {
             persist_external_success(&plan, &outcome)?;
@@ -75,7 +76,13 @@ where
             Ok(())
         }
         Err(error) => {
-            let recovery_error = recover_previous_runtime(&plan, &manager).await.err();
+            let recovery_error = if recovery_required {
+                recover_previous_runtime(&plan, &manager, &mut quiesce_updater)
+                    .await
+                    .err()
+            } else {
+                None
+            };
             let _ = std::fs::remove_file(plan.armed_path());
             let _ = std::fs::remove_file(plan.ready_path());
             if let Err(status_error) = persist_external_failure(&plan, &error, recovery_error.as_ref()) {
@@ -103,10 +110,11 @@ fn cleanup_operation(plan: &ExternalFinalizePlan, outcome: &str) {
 async fn run_armed_finalize<F>(
     plan: &ExternalFinalizePlan,
     manager: &mut UpdateManager,
-    quiesce_updater: F,
+    quiesce_updater: &mut F,
+    recovery_required: &mut bool,
 ) -> Result<SupervisorRestartOutcome>
 where
-    F: FnOnce(u32, &Path) -> Result<()>,
+    F: FnMut(u32, &Path) -> Result<()>,
 {
     persist_external_phase(plan, update_phase::STOPPING_SUPERVISOR);
     super::super::lifecycle::request_supervisor_shutdown(
@@ -114,6 +122,7 @@ where
         &plan.current_release_identity.supervisor_id,
     )
     .await?;
+    *recovery_required = true;
 
     persist_external_phase(plan, update_phase::WAITING_FOR_UPDATER_EXIT);
     quiesce_updater(plan.updater_pid, &plan.updater_exe)?;
@@ -300,10 +309,23 @@ where
     unreachable!("terminal status write loop always returns")
 }
 
-async fn recover_previous_runtime(plan: &ExternalFinalizePlan, manager: &UpdateManager) -> Result<()> {
+async fn recover_previous_runtime<F>(
+    plan: &ExternalFinalizePlan,
+    manager: &UpdateManager,
+    quiesce_updater: &mut F,
+) -> Result<()>
+where
+    F: FnMut(u32, &Path) -> Result<()>,
+{
     if plan.latest.supervisor_id != plan.current_release_identity.supervisor_id {
         super::super::lifecycle::request_supervisor_shutdown(&plan.install_dir, &plan.latest.supervisor_id).await?;
     }
+
+    quiesce_updater(plan.updater_pid, &plan.updater_exe).map_err(|error| {
+        SurgeError::Supervisor(format!(
+            "Refusing to restart the previous runtime because application quiescence could not be confirmed: {error}"
+        ))
+    })?;
 
     let current_app_dir = restore_previous_app_dir(
         manager,
@@ -321,29 +343,22 @@ async fn recover_previous_runtime(plan: &ExternalFinalizePlan, manager: &UpdateM
 
     let current_release = release_from_identity(&plan.current_release_identity);
     if current_release.supervisor_id.trim().is_empty() {
-        if !is_pid_alive(plan.updater_pid) {
-            let executable = current_app_dir.join(&current_release.main_exe);
-            let args: [&str; 0] = [];
-            let _ = spawn_detached(
-                &executable,
-                &args,
-                Some(&plan.install_dir),
-                &current_release.environment,
-            )?;
-        }
+        let executable = current_app_dir.join(&current_release.main_exe);
+        let args: [&str; 0] = [];
+        let _ = spawn_detached(
+            &executable,
+            &args,
+            Some(&plan.install_dir),
+            &current_release.environment,
+        )?;
         return Ok(());
     }
 
-    let watched_pid = if is_pid_alive(plan.updater_pid) {
-        plan.updater_pid
-    } else {
-        current_pid()
-    };
     match super::super::lifecycle::restart_supervisor_after_update_with_pid(
         &plan.install_dir,
         &current_app_dir,
         &current_release,
-        watched_pid,
+        current_pid(),
     ) {
         SupervisorRestartOutcome::PendingRestart { failure_phase, reason }
             if failure_phase == status::RESTART_HANDOFF_FAILED_PHASE =>
@@ -438,6 +453,7 @@ mod tests {
 
     use crate::context::{Context, StorageProvider};
     use crate::install::{InstallProfile, RuntimeManifestMetadata, write_runtime_manifest};
+    use crate::releases::manifest::ReleaseIndex;
 
     use super::*;
 
@@ -539,6 +555,51 @@ mod tests {
 
         assert_eq!(attempts.get(), 3);
         assert!(error.to_string().contains("after 3 attempts"));
+    }
+
+    #[tokio::test]
+    async fn recovery_refuses_to_restart_without_confirmed_application_quiescence() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut manager, identity) = fixture_manager(&temp);
+        let active = manager.install_dir.join("app");
+        write_app(&active, "1.0.0", "previous");
+        manager.current_release_identity = Some(identity.clone());
+        let latest = ReleaseEntry {
+            version: "2.0.0".to_string(),
+            main_exe: "demo".to_string(),
+            supervisor_id: identity.supervisor_id.clone(),
+            ..ReleaseEntry::default()
+        };
+        manager.cached_index = Some(ReleaseIndex {
+            app_id: "demo".to_string(),
+            releases: vec![latest.clone()],
+            ..ReleaseIndex::default()
+        });
+        let in_progress = UpdateStatusRecord::in_progress("demo", "1.0.0", "2.0.0", "test", status::now_utc_rfc3339());
+        let plan = ExternalFinalizePlan::from_manager(
+            &manager,
+            &latest,
+            active.join("demo"),
+            active.clone(),
+            &in_progress,
+            None,
+        )
+        .unwrap();
+        let attempts = Cell::new(0);
+        let mut reject_quiescence = |pid, executable: &Path| {
+            attempts.set(attempts.get() + 1);
+            assert_eq!(pid, plan.updater_pid);
+            assert_eq!(executable, plan.updater_exe);
+            Err(SurgeError::Supervisor("matching process remains".to_string()))
+        };
+
+        let error = recover_previous_runtime(&plan, &manager, &mut reject_quiescence)
+            .await
+            .unwrap_err();
+
+        assert_eq!(attempts.get(), 1);
+        assert!(error.to_string().contains("quiescence could not be confirmed"));
+        assert_eq!(std::fs::read_to_string(active.join("version")).unwrap(), "previous");
     }
 
     fn fixture_manager(

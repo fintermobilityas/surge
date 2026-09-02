@@ -42,6 +42,7 @@ pub enum ApplyStrategy {
 }
 
 /// Result of a successful update apply request.
+#[must_use = "handle ExternalFinalizeScheduled by exiting promptly and verifying persisted convergence after restart"]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpdateApplyOutcome {
     /// Finalization completed before the apply call returned.
@@ -1762,7 +1763,7 @@ echo started > new-child-started
         let info = manager.check_for_updates().await.unwrap().unwrap();
         assert_eq!(info.apply_strategy, ApplyStrategy::Full);
 
-        manager
+        let _ = manager
             .download_and_apply(&info, None::<fn(ProgressInfo)>)
             .await
             .unwrap();
@@ -1783,7 +1784,7 @@ echo started > new-child-started
         std::fs::remove_file(app_store.join(&full_filename)).unwrap();
         manager.set_current_version("1.1.0").unwrap();
         manager.current_release_identity = current_install::load(&manager).unwrap();
-        manager
+        let _ = manager
             .download_and_apply(&info, None::<fn(ProgressInfo)>)
             .await
             .unwrap();
@@ -2069,7 +2070,7 @@ echo started > new-child-started
         let info = manager.check_for_updates().await.unwrap().unwrap();
         assert_eq!(info.apply_strategy, ApplyStrategy::Full);
 
-        manager
+        let _ = manager
             .download_and_apply(&info, None::<fn(ProgressInfo)>)
             .await
             .unwrap();
@@ -2166,7 +2167,7 @@ echo started > new-child-started
         let observed = Arc::new(Mutex::new(Vec::<ProgressInfo>::new()));
         let observed_for_progress = Arc::clone(&observed);
 
-        manager
+        let _ = manager
             .download_and_apply(
                 &info,
                 Some(move |progress: ProgressInfo| {
@@ -2322,7 +2323,7 @@ echo started > new-child-started
         let mut manager = UpdateManager::new(ctx, app_id, "1.0.0", "stable", install_root.to_str().unwrap()).unwrap();
         let info = manager.check_for_updates().await.unwrap().unwrap();
 
-        manager
+        let _ = manager
             .download_and_apply(
                 &info,
                 Some(move |progress: ProgressInfo| {
@@ -2442,7 +2443,7 @@ echo started > new-child-started
 
         let mut manager = UpdateManager::new(ctx, app_id, "1.0.0", "stable", install_root.to_str().unwrap()).unwrap();
         let info = manager.check_for_updates().await.unwrap().unwrap();
-        manager
+        let _ = manager
             .download_and_apply(&info, None::<fn(ProgressInfo)>)
             .await
             .unwrap();
@@ -2664,7 +2665,7 @@ echo started > new-child-started
 
         let observed = Arc::new(Mutex::new(Vec::<ProgressInfo>::new()));
         let observed_for_progress = Arc::clone(&observed);
-        manager
+        let _ = manager
             .download_and_apply(
                 &info,
                 Some(move |progress: ProgressInfo| {
@@ -2837,7 +2838,7 @@ echo started > new-child-started
 
         let observed = Arc::new(Mutex::new(Vec::<ProgressInfo>::new()));
         let observed_for_progress = Arc::clone(&observed);
-        manager
+        let _ = manager
             .download_and_apply(
                 &info,
                 Some(move |progress: ProgressInfo| {
@@ -3026,7 +3027,7 @@ echo started > new-child-started
 
         let observed = Arc::new(Mutex::new(Vec::<ProgressInfo>::new()));
         let observed_for_progress = Arc::clone(&observed);
-        manager
+        let _ = manager
             .download_and_apply(
                 &info,
                 Some(move |progress: ProgressInfo| {
@@ -3284,7 +3285,7 @@ echo started > new-child-started
         let mut manager = UpdateManager::new(ctx, app_id, "1.0.0", "stable", install_root.to_str().unwrap()).unwrap();
         let info = manager.check_for_updates().await.unwrap().unwrap();
         assert_eq!(info.apply_strategy, ApplyStrategy::Delta);
-        manager
+        let _ = manager
             .download_and_apply(&info, None::<fn(ProgressInfo)>)
             .await
             .unwrap();
@@ -3402,7 +3403,7 @@ echo started > new-child-started
             ApplyStrategy::Full,
             "no delta path exists from 1.0.0"
         );
-        manager
+        let _ = manager
             .download_and_apply(&info, None::<fn(ProgressInfo)>)
             .await
             .expect("the missing full must be rebuilt from v2 full + v3 delta");
@@ -3577,7 +3578,7 @@ echo started > new-child-started
 
         let observed = Arc::new(Mutex::new(Vec::<ProgressInfo>::new()));
         let observed_for_progress = Arc::clone(&observed);
-        manager
+        let _ = manager
             .download_and_apply(
                 &info,
                 Some(move |progress: ProgressInfo| {
@@ -3751,7 +3752,7 @@ echo started > new-child-started
 
         let observed = Arc::new(Mutex::new(Vec::<ProgressInfo>::new()));
         let observed_for_progress = Arc::clone(&observed);
-        manager
+        let _ = manager
             .download_and_apply(
                 &info,
                 Some(move |progress: ProgressInfo| {
@@ -3963,7 +3964,7 @@ echo started > new-child-started
         let mut manager = UpdateManager::new(ctx, app_id, "1.0.0", "stable", install_root.to_str().unwrap()).unwrap();
         let info = manager.check_for_updates().await.unwrap().unwrap();
         assert_eq!(info.apply_strategy, ApplyStrategy::Delta);
-        manager
+        let _ = manager
             .download_and_apply(&info, None::<fn(ProgressInfo)>)
             .await
             .unwrap();
@@ -4460,7 +4461,7 @@ echo started > new-child-started
         let info = manager.check_for_updates().await.unwrap().unwrap();
         assert_eq!(ctx.storage_config().prefix, app_id);
         assert_eq!(info.apply_strategy, ApplyStrategy::Delta);
-        manager
+        let _ = manager
             .download_and_apply(&info, None::<fn(ProgressInfo)>)
             .await
             .unwrap();
@@ -4541,7 +4542,7 @@ echo started > new-child-started
 
         let mut manager = UpdateManager::new(ctx, app_id, "1.0.0", "stable", install_root.to_str().unwrap()).unwrap();
         let info = manager.check_for_updates().await.unwrap().unwrap();
-        manager
+        let _ = manager
             .download_and_apply(&info, None::<fn(ProgressInfo)>)
             .await
             .unwrap();
@@ -4625,7 +4626,7 @@ echo started > new-child-started
                 .map(|release| release.main_exe.as_str()),
             Some("old-app")
         );
-        manager
+        let _ = manager
             .download_and_apply(&info, None::<fn(ProgressInfo)>)
             .await
             .unwrap();
@@ -4695,7 +4696,7 @@ echo started > new-child-started
         );
         let mut manager = UpdateManager::new(ctx, app_id, "1.0.0", "stable", install_root.to_str().unwrap()).unwrap();
         let info = manager.check_for_updates().await.unwrap().unwrap();
-        manager
+        let _ = manager
             .download_and_apply(&info, None::<fn(ProgressInfo)>)
             .await
             .unwrap();
@@ -4783,7 +4784,7 @@ echo started > new-child-started
         manager.set_release_retention_limit(1);
 
         let info = manager.check_for_updates().await.unwrap().unwrap();
-        manager
+        let _ = manager
             .download_and_apply(&info, None::<fn(ProgressInfo)>)
             .await
             .unwrap();
@@ -4868,7 +4869,7 @@ echo started > new-child-started
         manager.set_release_retention_limit(0);
 
         let info = manager.check_for_updates().await.unwrap().unwrap();
-        manager
+        let _ = manager
             .download_and_apply(&info, None::<fn(ProgressInfo)>)
             .await
             .unwrap();
@@ -4960,7 +4961,7 @@ echo started > new-child-started
             .unwrap();
 
         let info = manager.check_for_updates().await.unwrap().unwrap();
-        manager
+        let _ = manager
             .download_and_apply(&info, None::<fn(ProgressInfo)>)
             .await
             .unwrap();
@@ -5045,7 +5046,7 @@ echo started > new-child-started
             .unwrap();
 
         let info = manager.check_for_updates().await.unwrap().unwrap();
-        manager
+        let _ = manager
             .download_and_apply(&info, None::<fn(ProgressInfo)>)
             .await
             .unwrap();
@@ -5144,7 +5145,7 @@ echo started > new-child-started
         let mut manager = UpdateManager::new(ctx, app_id, "1.0.0", "stable", install_root.to_str().unwrap()).unwrap();
         let info = manager.check_for_updates().await.unwrap().unwrap();
         assert_eq!(info.apply_strategy, ApplyStrategy::Full);
-        manager
+        let _ = manager
             .download_and_apply(&info, None::<fn(ProgressInfo)>)
             .await
             .unwrap();

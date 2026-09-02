@@ -70,7 +70,8 @@ pub fn spawn_process(
     spawn_impl(exe, args, working_dir, envs, Stdio::inherit(), Stdio::inherit(), false)
 }
 
-/// Spawn a process fully detached (stdin/stdout/stderr = null).
+/// Spawn a process fully detached (stdin/stdout/stderr = null and independent
+/// from the caller's process group or job).
 pub fn spawn_detached(
     exe: &Path,
     args: &[&str],
@@ -92,13 +93,23 @@ fn spawn_impl(
     let mut cmd = Command::new(exe);
     cmd.args(args).stdin(Stdio::null()).stdout(stdout).stderr(stderr);
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     let _ = detached;
 
     #[cfg(unix)]
     if detached {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
+    }
+
+    #[cfg(windows)]
+    if detached {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Threading::{
+            CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS,
+        };
+
+        cmd.creation_flags(CREATE_BREAKAWAY_FROM_JOB | CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
     }
 
     if let Some(wd) = working_dir {

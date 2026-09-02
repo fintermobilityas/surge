@@ -2,6 +2,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Result, SurgeError};
+use crate::update::manager::current_install::safe_relative_path;
 
 pub(super) struct Identity {
     configured_launch_path: PathBuf,
@@ -12,6 +13,11 @@ pub(super) struct Identity {
 
 impl Identity {
     pub(super) fn resolve(active_app_dir: &Path, main_exe: &str) -> Result<Self> {
+        if safe_relative_path(Path::new(main_exe)).is_none() {
+            return Err(SurgeError::Platform(
+                "Active application executable must be a safe relative path".to_string(),
+            ));
+        }
         let configured_launch_path = std::path::absolute(active_app_dir.join(main_exe)).map_err(|e| {
             SurgeError::Platform(format!(
                 "Failed to resolve configured active application path before swap: {e}"
@@ -205,5 +211,32 @@ mod tests {
                 .matches_argument(shared_dir.join("demo").as_os_str(), None)
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn resolve_accepts_dot_prefixed_entrypoint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let active_app_dir = tmp.path().join("app");
+        std::fs::create_dir_all(&active_app_dir).unwrap();
+        std::fs::write(active_app_dir.join("demo"), "fixture").unwrap();
+
+        let identity = Identity::resolve(&active_app_dir, "./demo").unwrap();
+
+        assert_eq!(
+            identity.resolved,
+            std::fs::canonicalize(active_app_dir.join("demo")).unwrap()
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_entrypoints_outside_the_active_app() {
+        let tmp = tempfile::tempdir().unwrap();
+        let active_app_dir = tmp.path().join("app");
+        std::fs::create_dir_all(&active_app_dir).unwrap();
+
+        for main_exe in ["../other-app", "/opt/other-app", "."] {
+            let error = Identity::resolve(&active_app_dir, main_exe).err().unwrap();
+            assert!(error.to_string().contains("must be a safe relative path"));
+        }
     }
 }

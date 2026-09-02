@@ -151,7 +151,7 @@ fn bind_absolute_parent(path: &Path) -> PathBuf {
     std::fs::canonicalize(parent).map_or_else(|_| path.to_path_buf(), |bound_parent| bound_parent.join(file_name))
 }
 
-fn safe_relative_path(path: &Path) -> Option<String> {
+pub(super) fn safe_relative_path(path: &Path) -> Option<String> {
     let mut has_normal_component = false;
     for component in path.components() {
         match component {

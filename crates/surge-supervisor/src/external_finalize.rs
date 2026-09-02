@@ -225,11 +225,10 @@ fn executable_paths_equal(left: &Path, right: &Path) -> bool {
     left == right
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
     #[test]
     fn quiesce_stops_only_the_exact_updating_executable() {
         use std::os::unix::fs::PermissionsExt;
@@ -259,7 +258,6 @@ mod tests {
         assert!(child.wait().unwrap().code().is_none_or(|code| code != 0));
     }
 
-    #[cfg(unix)]
     #[test]
     fn mismatched_executable_does_not_stop_process() {
         let mut child = std::process::Command::new("/bin/sleep").arg("30").spawn().unwrap();

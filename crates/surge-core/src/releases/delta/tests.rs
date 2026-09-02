@@ -397,9 +397,13 @@ fn test_in_place_chain_steps_match_single_shot_apply() {
     // step 2's basis check for config.json is answered from step 1's
     // target verification instead of a full re-hash.
     let mut verified = VerifiedFileHashes::new();
-    let chain_step1 = apply_sparse_step_in_place(&chain_dir, &patch_12, 0, None, &mut verified).unwrap();
+    let chain_step1 = apply_sparse_step_in_place(&chain_dir, &patch_12, 0, None, &mut verified, true)
+        .unwrap()
+        .expect("repack");
     assert_eq!(chain_step1, single_step1);
-    let chain_step2 = apply_sparse_step_in_place(&chain_dir, &patch_23, 0, None, &mut verified).unwrap();
+    let chain_step2 = apply_sparse_step_in_place(&chain_dir, &patch_23, 0, None, &mut verified, true)
+        .unwrap()
+        .expect("repack");
     assert_eq!(chain_step2, single_step2);
 }
 
@@ -445,7 +449,9 @@ fn test_in_place_chain_with_verified_cache_detects_external_modification() {
     let chain_dir = dir.path().join("chain");
     extract_to(&full_v1, &chain_dir, None).unwrap();
     let mut verified = VerifiedFileHashes::new();
-    let step1 = apply_sparse_step_in_place(&chain_dir, &patch_12, 0, None, &mut verified).unwrap();
+    let step1 = apply_sparse_step_in_place(&chain_dir, &patch_12, 0, None, &mut verified, true)
+        .unwrap()
+        .expect("repack");
     assert_eq!(step1, full_v2);
     // The cache now believes payload.bin holds the v2 content.
 
@@ -456,9 +462,93 @@ fn test_in_place_chain_with_verified_cache_detects_external_modification() {
 
     // Step 2 skips the basis re-hash via the cache, but the post-patch
     // target hash must still catch the corrupted source.
-    let err = apply_sparse_step_in_place(&chain_dir, &patch_23, 0, None, &mut verified).unwrap_err();
+    let err = apply_sparse_step_in_place(&chain_dir, &patch_23, 0, None, &mut verified, true).unwrap_err();
     assert!(
         err.to_string().contains("hash mismatch"),
         "expected a hash mismatch, got: {err}"
+    );
+}
+
+#[test]
+fn test_skipped_intermediate_repack_matches_full_repack_chain() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let v1_dir = dir.path().join("v1");
+    let v2_dir = dir.path().join("v2");
+    let v3_dir = dir.path().join("v3");
+    for v in [&v1_dir, &v2_dir, &v3_dir] {
+        std::fs::create_dir_all(v).unwrap();
+        let payload = (0..(256 * 1024)).map(|i| (i % 251) as u8).collect::<Vec<u8>>();
+        std::fs::write(v.join("payload.bin"), &payload).unwrap();
+        std::fs::write(v.join("side.bin"), b"side\n").unwrap();
+    }
+    for (v, tag) in [
+        (v1_dir.as_path(), 1u8),
+        (v2_dir.as_path(), 2u8),
+        (v3_dir.as_path(), 3u8),
+    ] {
+        let mut p = std::fs::read(v.join("payload.bin")).unwrap();
+        p[0] = tag;
+        std::fs::write(v.join("payload.bin"), p).unwrap();
+    }
+
+    let pack = |d: &std::path::Path| -> Vec<u8> {
+        let mut packer = ArchivePacker::new(7).unwrap();
+        packer.add_directory(d, "").unwrap();
+        packer.finalize().unwrap()
+    };
+    let full_v1 = pack(&v1_dir);
+    let full_v2 = pack(&v2_dir);
+    let full_v3 = pack(&v3_dir);
+
+    let opts = ChunkedDiffOptions {
+        chunk_size: 128 * 1024,
+        max_threads: 1,
+        format: ChunkedPatchFormat::Legacy,
+    };
+    let patch_12 = build_sparse_file_patch(&full_v1, &full_v2, 7, 0, &opts).unwrap();
+    let patch_23 = build_sparse_file_patch(&full_v2, &full_v3, 7, 0, &opts).unwrap();
+
+    // Full-repack reference chain.
+    let ref_dir = dir.path().join("ref");
+    extract_to(&full_v1, &ref_dir, None).unwrap();
+    let mut ref_verified = VerifiedFileHashes::new();
+    let _ = apply_sparse_step_in_place(&ref_dir, &patch_12, 0, None, &mut ref_verified, true)
+        .unwrap()
+        .expect("repack");
+    let ref_final = apply_sparse_step_in_place(&ref_dir, &patch_23, 0, None, &mut ref_verified, true)
+        .unwrap()
+        .expect("repack");
+
+    // Skipped intermediate repack: step 1 returns None, step 2 repacks.
+    let skip_dir = dir.path().join("skip");
+    extract_to(&full_v1, &skip_dir, None).unwrap();
+    let mut skip_verified = VerifiedFileHashes::new();
+    let skipped = apply_sparse_step_in_place(&skip_dir, &patch_12, 0, None, &mut skip_verified, false).unwrap();
+    assert!(skipped.is_none(), "intermediate repack must be skipped");
+    let skip_final = apply_sparse_step_in_place(&skip_dir, &patch_23, 0, None, &mut skip_verified, true)
+        .unwrap()
+        .expect("final repack");
+
+    assert_eq!(
+        skip_final, ref_final,
+        "skipped intermediate repack must produce the identical final archive"
+    );
+    assert_eq!(skip_final, full_v3, "final archive must match the published v3 bytes");
+
+    // A skipped step must still fail closed on a tampered file between
+    // steps: fresh chain, skip the repack on step 1, corrupt the file,
+    // then step 2's post-patch hash must reject it.
+    let tamper_dir = dir.path().join("tamper");
+    extract_to(&full_v1, &tamper_dir, None).unwrap();
+    let mut tamper_verified = VerifiedFileHashes::new();
+    apply_sparse_step_in_place(&tamper_dir, &patch_12, 0, None, &mut tamper_verified, false).unwrap();
+    let mut corrupted = std::fs::read(tamper_dir.join("payload.bin")).unwrap();
+    corrupted[1] = 0xEE;
+    std::fs::write(tamper_dir.join("payload.bin"), corrupted).unwrap();
+    let err = apply_sparse_step_in_place(&tamper_dir, &patch_23, 0, None, &mut tamper_verified, true).unwrap_err();
+    assert!(
+        err.to_string().contains("hash mismatch"),
+        "expected a hash mismatch after tamper, got: {err}"
     );
 }

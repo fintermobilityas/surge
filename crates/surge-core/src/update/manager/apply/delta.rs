@@ -33,7 +33,7 @@ pub(super) async fn apply_target_deltas<F>(
     manager: &UpdateManager,
     info: &UpdateInfo,
     staging_dir: &Path,
-    mut rebuilt_archive: Vec<u8>,
+    rebuilt_archive: Vec<u8>,
     progress: Option<&Arc<F>>,
     progress_emitter: &PhaseProgressEmitter<'_, F>,
     apply_delta_total_items: i64,
@@ -48,16 +48,20 @@ where
     let mut apply_delta_bytes_done = 0i64;
     // Carried extracted tree for consecutive sparse deltas: the starting
     // archive is extracted once and each step applies ops in place,
-    // skipping the per-step re-extract. Per-step repack and the full
-    // SHA-256 check below are unchanged.
+    // skipping the per-step re-extract. In an all-sparse chain the
+    // intermediate rebuilt archives are never consumed (the next step
+    // applies ops to the carried workdir), so they are skipped: per-file
+    // SHA-256 verification still runs at every step and the final step
+    // repacks and passes the full-archive SHA-256 check.
     let mut chain_workdir: Option<tempfile::TempDir> = None;
+    let mut rebuilt_archive: Option<Vec<u8>> = Some(rebuilt_archive);
     // Hashes verified by this walk; lets consecutive sparse steps skip the
     // redundant full-file basis re-hash (the target hash of step N is the
     // basis hash of step N+1).
     let mut verified_hashes = VerifiedFileHashes::new();
 
     progress_emitter.emit_substep(5, apply_phase::APPLYING_TARGET_DELTAS, 60);
-    for release in &info.apply_releases {
+    for (step_index, release) in info.apply_releases.iter().enumerate() {
         manager.ctx.check_cancelled()?;
 
         let Some(delta) = release.selected_delta() else {
@@ -127,17 +131,28 @@ where
             progress_emitter.persist_current_phase(apply_phase::APPLYING_TARGET_DELTAS);
         };
 
-        let next_archive: Result<Vec<u8>> = if is_sparse_file_ops_delta(&delta) {
+        // Rebuild the archive only when it is consumed: the final step
+        // (the install source + full-archive SHA-256 check) or a step
+        // followed by a non-sparse hop (which patches archive bytes).
+        let next_is_sparse = info
+            .apply_releases
+            .get(step_index + 1)
+            .and_then(crate::releases::manifest::ReleaseEntry::selected_delta)
+            .is_some_and(|next_delta| is_sparse_file_ops_delta(&next_delta));
+        let rebuild_archive = step_index + 1 == info.apply_releases.len() || !next_is_sparse;
+        let next_archive: Result<Option<Vec<u8>>> = if is_sparse_file_ops_delta(&delta) {
             // The closure returns Result so every failure in this arm flows
             // through the shared error handler below (filename context +
             // VerifyFailureBudget), like the archive path.
-            let mut apply_sparse_carry = |workdir_slot: &mut Option<tempfile::TempDir>| -> Result<Vec<u8>> {
+            let mut apply_sparse_carry = |workdir_slot: &mut Option<tempfile::TempDir>| -> Result<Option<Vec<u8>>> {
                 let (existing, needs_extract) = match workdir_slot.take() {
                     Some(wd) => (Some(wd), false),
                     None => (None, true),
                 };
                 let extract_units = if needs_extract {
-                    u64::try_from(rebuilt_archive.len()).unwrap_or(u64::MAX).max(1)
+                    u64::try_from(rebuilt_archive.as_ref().map_or(0, Vec::len))
+                        .unwrap_or(u64::MAX)
+                        .max(1)
                 } else {
                     0
                 };
@@ -165,8 +180,11 @@ where
                                     units_total: total_units,
                                 });
                             };
+                        let base_archive = rebuilt_archive
+                            .as_ref()
+                            .ok_or_else(|| SurgeError::Update("Missing base archive for delta chain".to_string()))?;
                         extract_to(
-                            &rebuilt_archive,
+                            base_archive,
                             wd.path(),
                             Some(&extract_progress as &crate::archive::extractor::ExtractProgress<'_>),
                         )?;
@@ -179,6 +197,7 @@ where
                     extract_units,
                     Some(&delta_progress),
                     &mut verified_hashes,
+                    rebuild_archive,
                 )?;
                 *workdir_slot = Some(workdir);
                 Ok(applied)
@@ -186,9 +205,17 @@ where
             apply_sparse_carry(&mut chain_workdir)
         } else {
             // A non-sparse hop rebuilds from archive bytes; the carried tree
-            // is stale at that point, so drop it before applying.
+            // is stale at that point, so drop it before applying. A skipped
+            // intermediate repack can never precede a non-sparse hop (a skip
+            // only happens when the next step is sparse), so the archive
+            // must be present; fail closed if the invariant is broken.
+            let rebuilt = rebuilt_archive.take().ok_or_else(|| {
+                SurgeError::Update(
+                    "Missing rebuilt archive before non-sparse delta step (internal chain state)".to_string(),
+                )
+            })?;
             chain_workdir = None;
-            apply_delta_patch_with_progress(&rebuilt_archive, &patch, &delta, Some(&delta_progress))
+            apply_delta_patch_with_progress(&rebuilt, &patch, &delta, Some(&delta_progress)).map(Some)
         };
         rebuilt_archive = next_archive.map_err(|e| {
             let error = SurgeError::Update(format!("Failed to apply delta {}: {e}", delta.filename));
@@ -202,8 +229,11 @@ where
             error
         })?;
 
-        if !release.full_sha256.is_empty() {
-            let hash = sha256_hex(&rebuilt_archive);
+        // The full-archive check only runs when the step produced archive
+        // bytes; skipped intermediate steps rely on the per-file SHA-256
+        // verification above plus the final step's archive check.
+        if let Some(archive) = rebuilt_archive.as_ref().filter(|_| !release.full_sha256.is_empty()) {
+            let hash = sha256_hex(archive);
             if hash != release.full_sha256 {
                 let message = format!(
                     "SHA-256 mismatch for rebuilt full archive {}: expected {}, got {hash}",
@@ -254,7 +284,7 @@ where
         },
     );
 
-    Ok(rebuilt_archive)
+    rebuilt_archive.ok_or_else(|| SurgeError::Update("Delta apply chain ended without a rebuilt archive".to_string()))
 }
 
 fn scale_progress_units_i64(total: i64, done: u64, units_total: u64) -> i64 {

@@ -232,6 +232,7 @@ pub(super) fn apply_sparse_file_patch_with_progress(
     emit_progress(progress, extract_units, total_units);
 
     // Single-shot apply: no cross-step state, so a fresh (empty) cache.
+    // The caller consumes the rebuilt archive, so always repack.
     let mut verified = super::fs_apply::VerifiedFileHashes::new();
     sparse_ops_and_repack(
         working_dir.path(),
@@ -241,7 +242,9 @@ pub(super) fn apply_sparse_file_patch_with_progress(
         total_units,
         progress,
         &mut verified,
+        true,
     )
+    .map(|rebuilt| rebuilt.expect("single-shot apply always repacks"))
 }
 
 /// Unit space of one in-place chain step: ops + repack. The repack
@@ -263,21 +266,37 @@ pub(crate) fn sparse_step_units_for(patch: &[u8], extract_units: u64) -> Result<
 
 /// Apply one sparse delta to an already-extracted working directory and
 /// repack it. Chain walkers use this to carry the extracted tree across
-/// consecutive sparse deltas, skipping the per-step re-extract; the
-/// per-step repack and the caller's full-archive SHA-256 check are
-/// unchanged. `unit_offset` shifts the emitted unit space so a first
-/// step that included an extract stays monotonic.
+/// consecutive sparse deltas, skipping the per-step re-extract.
+///
+/// `rebuild_archive` controls the per-step repack: in an all-sparse chain
+/// the intermediate rebuilt archives are never consumed (the next step
+/// applies ops to the carried workdir, and per-file SHA-256 verification
+/// plus the final step's full-archive SHA-256 check still guard
+/// integrity), so chain walkers pass `false` for every step except the
+/// last. Returns `Some(rebuilt archive)` when a repack was performed,
+/// `None` when it was skipped. `unit_offset` shifts the emitted unit
+/// space so a first step that included an extract stays monotonic.
 pub(crate) fn apply_sparse_step_in_place(
     dir: &Path,
     patch: &[u8],
     unit_offset: u64,
     progress: Option<&DeltaApplyProgressCallback<'_>>,
     verified: &mut super::fs_apply::VerifiedFileHashes,
-) -> Result<Vec<u8>> {
+    rebuild_archive: bool,
+) -> Result<Option<Vec<u8>>> {
     let (manifest, payloads) = decode_sparse_file_ops_payload(patch)?;
     let step_units = sparse_step_units(&manifest, payloads, unit_offset);
     let total_units = unit_offset.saturating_add(step_units);
-    sparse_ops_and_repack(dir, &manifest, payloads, unit_offset, total_units, progress, verified)
+    sparse_ops_and_repack(
+        dir,
+        &manifest,
+        payloads,
+        unit_offset,
+        total_units,
+        progress,
+        verified,
+        rebuild_archive,
+    )
 }
 
 fn sparse_ops_and_repack(
@@ -288,10 +307,10 @@ fn sparse_ops_and_repack(
     total_units: u64,
     progress: Option<&DeltaApplyProgressCallback<'_>>,
     verified: &mut super::fs_apply::VerifiedFileHashes,
-) -> Result<Vec<u8>> {
+    rebuild_archive: bool,
+) -> Result<Option<Vec<u8>>> {
     let ops_units = sparse_file_ops_work_units(&manifest.ops);
     emit_progress(progress, segment_base, total_units);
-
     let ops_progress = |done: u64, total: u64| {
         emit_progress(
             progress,
@@ -306,6 +325,10 @@ fn sparse_ops_and_repack(
         progress.map(|_| &ops_progress as &super::fs_apply::SparseOpProgress<'_>),
         verified,
     )?;
+    if !rebuild_archive {
+        emit_progress(progress, total_units, total_units);
+        return Ok(None);
+    }
     let repack_start_units = segment_base.saturating_add(ops_units);
     let repack_units = total_units.saturating_sub(repack_start_units);
     emit_progress(progress, repack_start_units, total_units);
@@ -338,7 +361,7 @@ fn sparse_ops_and_repack(
 
     let rebuilt = packer.finalize()?;
     emit_progress(progress, total_units, total_units);
-    Ok(rebuilt)
+    Ok(Some(rebuilt))
 }
 
 pub(super) fn encode_sparse_file_ops_payload(manifest: &SparseFileDeltaManifest, payloads: &[u8]) -> Result<Vec<u8>> {

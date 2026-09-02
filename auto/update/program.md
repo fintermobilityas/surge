@@ -78,10 +78,11 @@ tree still matches.
 
 - sparse file-ops deltas, zstd 3, `max_chain_length` 8,
   `checkpoint_every` 10, keep 2 latest fulls (pack-policy defaults)
-- localized 100-delta chain at large scale (measured 2026-08-28):
-  download ≈ 510 KiB, full-chain apply ≈ 489 s with the carried-tree
-  walk (657 s before it; archive-chunked reference: 15.6 MiB / ~18 s)
-  — `docs/performance/update-chains.md`
+- localized 100-delta chain at large scale: download ≈ 510 KiB,
+  full-chain apply 657 s -> 489 s (carried tree) -> 221 s
+  (identity chunks) -> ~157 s (verified-hash carry) -> ~154 s
+  (streamed target hash + in-place patching) -> **74.6 s (2026-09-02,
+  lazy intermediate repacks)** — `docs/performance/update-chains.md`
 - **KEPT (this session): carried-tree chain apply.** The chain walker
   extracts the starting archive once and applies consecutive sparse
   deltas in place, keeping the per-step repack + full SHA-256 check.
@@ -117,6 +118,24 @@ Open questions from `docs/performance/update-chains.md`:
 
 Ranked by expected value; read `results.tsv` and
 `git log --oneline --all | grep -iE "dead end|autoresearch"` first.
+
+0. **KEPT (round 14) — Lazy intermediate repacks.** Phase profile of a
+   loaded 100-delta step: ops ~635 ms median (basis check via verified
+   carry, in-place chunk patch, one full-read target hash) + repack
+   ~656 ms median (walk 1.06 GB + zstd-encode 152 MB). In an all-sparse
+   chain the intermediate rebuilt archives are never consumed — the
+   next step applies ops to the carried workdir — so
+   `apply_sparse_step_in_place` now takes `rebuild_archive: bool` and
+   the chain walker passes `false` for every step except the last (and
+   before any non-sparse hop, which patches archive bytes and fails
+   closed if the archive is missing). Per-file SHA-256 verification is
+   unchanged at every step; the final step repacks and passes the
+   full-archive SHA-256 check. Same-session A/B: 10-delta pairs
+   1,988/1,849 -> 1,223/1,256 ms/step (−32 to −39%, new < base both
+   pairs); 100-delta 166.0 s -> 74.6 s (−55%); install tree
+   byte-identical (1,214,024,073 B). Remaining per-step shape:
+   ops ~0.64 s (full-read target hash is the floor) + ~0.1 s manager
+   overhead.
 
 0. **KEPT — Identity-chunk chunked patches (format v2, `CSDF`).**
    Phase instrumentation of a 100-delta step showed the "ops" cost

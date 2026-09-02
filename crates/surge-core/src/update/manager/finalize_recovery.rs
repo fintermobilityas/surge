@@ -14,6 +14,13 @@ pub(super) enum RecoveredGeneration {
     Target,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetPlacement {
+    Unknown,
+    Staged,
+    Active,
+}
+
 pub(super) struct Guard {
     install_dir: PathBuf,
     current_app_dir: Option<PathBuf>,
@@ -23,8 +30,7 @@ pub(super) struct Guard {
     previous: ReleaseEntry,
     target: ReleaseEntry,
     previous_moved: bool,
-    target_staged: bool,
-    target_active: bool,
+    target_placement: TargetPlacement,
     armed: bool,
 }
 
@@ -57,14 +63,13 @@ impl Guard {
             },
             target: target.clone(),
             previous_moved: false,
-            target_staged: false,
-            target_active: false,
+            target_placement: TargetPlacement::Unknown,
             armed: true,
         }
     }
 
     pub(super) fn mark_target_staged(&mut self) {
-        self.target_staged = true;
+        self.target_placement = TargetPlacement::Staged;
     }
 
     pub(super) fn mark_previous_moved(&mut self) {
@@ -72,8 +77,7 @@ impl Guard {
     }
 
     pub(super) fn mark_target_active(&mut self) {
-        self.target_staged = false;
-        self.target_active = true;
+        self.target_placement = TargetPlacement::Active;
     }
 
     pub(super) fn complete_supervisor_restart(&mut self) {
@@ -114,7 +118,8 @@ impl Guard {
     }
 
     fn recovery_start(&mut self) -> Option<RecoveryStart> {
-        if self.target_active && self.active_app_dir.is_dir() && !self.move_target_aside() {
+        if self.target_placement == TargetPlacement::Active && self.active_app_dir.is_dir() && !self.move_target_aside()
+        {
             return Some(RecoveryStart::target(self.active_app_dir.clone()));
         }
 
@@ -144,7 +149,7 @@ impl Guard {
             return Some(RecoveryStart::previous(current_app_dir.clone()));
         }
 
-        if self.target_staged || self.next_app_dir.is_dir() {
+        if self.target_placement == TargetPlacement::Staged || self.next_app_dir.is_dir() {
             return self.restore_target_to_canonical_path().or_else(|| {
                 self.next_app_dir
                     .is_dir()
@@ -152,7 +157,7 @@ impl Guard {
             });
         }
 
-        if self.target_active && self.active_app_dir.is_dir() {
+        if self.target_placement == TargetPlacement::Active && self.active_app_dir.is_dir() {
             return Some(RecoveryStart::target(self.active_app_dir.clone()));
         }
         None
@@ -169,8 +174,7 @@ impl Guard {
         }
         match atomic_rename(&self.active_app_dir, &self.next_app_dir) {
             Ok(()) => {
-                self.target_active = false;
-                self.target_staged = true;
+                self.target_placement = TargetPlacement::Staged;
                 true
             }
             Err(error) => {
@@ -187,8 +191,7 @@ impl Guard {
 
     fn restore_target_to_canonical_path(&mut self) -> Option<RecoveryStart> {
         if self.active_app_dir.is_dir() {
-            return self
-                .target_active
+            return (self.target_placement == TargetPlacement::Active)
                 .then(|| RecoveryStart::target(self.active_app_dir.clone()));
         }
         if !self.next_app_dir.is_dir() {
@@ -196,8 +199,7 @@ impl Guard {
         }
         match atomic_rename(&self.next_app_dir, &self.active_app_dir) {
             Ok(()) => {
-                self.target_staged = false;
-                self.target_active = true;
+                self.target_placement = TargetPlacement::Active;
                 Some(RecoveryStart::target(self.active_app_dir.clone()))
             }
             Err(error) => {

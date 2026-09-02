@@ -560,14 +560,10 @@ mod tests {
     fn prepare_supervisor_instance(
         install_dir: &Path,
         supervisor_id: &str,
-        supervisor_pid: u32,
+        owner_pid: u32,
     ) -> SupervisorTakeoverInstance {
-        std::fs::write(
-            supervisor_pid_file(install_dir, supervisor_id),
-            supervisor_pid.to_string(),
-        )
-        .unwrap();
-        let instance = SupervisorTakeoverInstance::new(supervisor_pid);
+        std::fs::write(supervisor_pid_file(install_dir, supervisor_id), owner_pid.to_string()).unwrap();
+        let instance = SupervisorTakeoverInstance::new(owner_pid);
         write_supervisor_takeover_instance(install_dir, supervisor_id, &instance).unwrap();
         instance
     }
@@ -577,8 +573,8 @@ mod tests {
     async fn acknowledged_supervisor_handoff_returns_the_refreshed_child_identity() {
         let dir = tempfile::tempdir().unwrap();
         let supervisor_id = "demo-supervisor";
-        let supervisor_pid = 42;
-        prepare_supervisor_instance(dir.path(), supervisor_id, supervisor_pid);
+        let owner_pid = 42;
+        prepare_supervisor_instance(dir.path(), supervisor_id, owner_pid);
         let install_dir = dir.path().to_path_buf();
         let responder = std::thread::spawn(move || {
             let request = wait_for_takeover_request(&install_dir, supervisor_id);

@@ -577,6 +577,7 @@ mod tests {
     #![allow(clippy::cast_possible_wrap)]
 
     use std::collections::BTreeSet;
+    use std::fmt::Write as _;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
     use std::time::Duration;
@@ -706,7 +707,7 @@ mod tests {
         if !environment.is_empty() {
             manifest.push_str("environment:\n");
             for (key, value) in environment {
-                manifest.push_str(&format!("  {key}: \"{value}\"\n"));
+                let _ = writeln!(manifest, "  {key}: \"{value}\"");
             }
         }
         std::fs::write(manifest_path, manifest).unwrap();

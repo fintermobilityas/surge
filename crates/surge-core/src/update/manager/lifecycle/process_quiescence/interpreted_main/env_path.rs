@@ -42,7 +42,7 @@ where
             {
                 continue;
             }
-            Err(error) => return Err(candidate_inspection_error(&candidate, error)),
+            Err(error) => return Err(candidate_inspection_error(&candidate, &error)),
         };
         if !metadata.is_file() {
             continue;
@@ -93,7 +93,7 @@ fn ensure_candidate_identity(candidate: &Path, expected: &std::fs::Metadata) -> 
     Ok(())
 }
 
-fn candidate_inspection_error(candidate: &Path, error: std::io::Error) -> SurgeError {
+fn candidate_inspection_error(candidate: &Path, error: &std::io::Error) -> SurgeError {
     SurgeError::Platform(format!(
         "Cannot safely inspect env interpreter candidate '{}': {error}",
         candidate.display()

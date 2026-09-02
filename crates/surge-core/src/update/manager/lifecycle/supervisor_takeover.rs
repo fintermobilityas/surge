@@ -20,7 +20,7 @@ pub(super) async fn request_shutdown(
     poll_interval: Duration,
 ) -> Result<Option<ProcessIdentity>> {
     let pid_file = supervisor_pid_file(install_dir, supervisor_id);
-    let Some(supervisor_pid) = read_supervisor_pid_owner(&pid_file)? else {
+    let Some(owner_pid) = read_supervisor_pid_owner(&pid_file)? else {
         if let Some(handoff) = take_accepted_supervisor_takeover(install_dir, supervisor_id)? {
             return Ok(handoff.child_identity);
         }
@@ -37,9 +37,9 @@ pub(super) async fn request_shutdown(
             "Supervisor '{supervisor_id}' does not advertise acknowledged takeover support"
         ))
     })?;
-    if instance.supervisor_pid != supervisor_pid {
+    if instance.supervisor_pid != owner_pid {
         return Err(SurgeError::Update(format!(
-            "Supervisor '{supervisor_id}' takeover instance belongs to PID {}, but its pid file belongs to PID {supervisor_pid}",
+            "Supervisor '{supervisor_id}' takeover instance belongs to PID {}, but its pid file belongs to PID {owner_pid}",
             instance.supervisor_pid
         )));
     }
@@ -96,7 +96,7 @@ pub(super) async fn request_shutdown(
             )?;
         }
 
-        if read_supervisor_pid_owner(&pid_file)? != Some(supervisor_pid) {
+        if read_supervisor_pid_owner(&pid_file)? != Some(owner_pid) {
             if let Some(handoff) = read_accepted_supervisor_takeover(install_dir, supervisor_id)? {
                 ensure_handoff_matches_request(supervisor_id, &handoff, &request)?;
                 return take_matching_accepted_handoff(install_dir, supervisor_id, &request);

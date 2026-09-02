@@ -238,7 +238,16 @@ pub async fn run_installer_scenario(
 
     let template = PayloadTemplate::new(scale, seed);
     template.write_base(&artifacts_dir, seed)?;
-    let publication = publish_release(Arc::clone(&ctx), &manifest_path, app_id, &rid, &version, &artifacts_dir).await?;
+    let (publication, _next_tree_reuse) = publish_release(
+        Arc::clone(&ctx),
+        &manifest_path,
+        app_id,
+        &rid,
+        &version,
+        &artifacts_dir,
+        None,
+    )
+    .await?;
     let full_package_path = store_dir.join(app_id).join(&publication.full_build.filename);
 
     let surge_binary = resolve_tool_binary("SURGE_INSTALLER_BINARY", surge_binary_name_for_rid(&rid))?;

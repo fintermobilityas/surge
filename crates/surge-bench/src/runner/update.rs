@@ -12,6 +12,7 @@ use surge_core::error::{Result, SurgeError};
 use surge_core::install::{InstallProfile, RuntimeManifestMetadata, write_runtime_manifest};
 use surge_core::pack::builder::{PackBuilder, TimedArtifact};
 use surge_core::platform::detect::current_rid;
+use surge_core::releases::delta::SparseTreeReuse;
 use surge_core::update::manager::{ApplyStrategy, ProgressInfo, UpdateManager};
 
 use crate::payload::{PayloadTemplate, ScenarioProfile};
@@ -91,7 +92,8 @@ pub(super) async fn publish_release(
     rid: &str,
     version: &str,
     artifacts_dir: &Path,
-) -> Result<ReleasePublication> {
+    tree_reuse: Option<SparseTreeReuse>,
+) -> Result<(ReleasePublication, Option<SparseTreeReuse>)> {
     let mut builder = PackBuilder::new(
         ctx,
         manifest_path.to_str().ok_or_else(|| {
@@ -106,8 +108,10 @@ pub(super) async fn publish_release(
                 artifacts_dir.display()
             ))
         })?,
-    )?;
+    )?
+    .with_sparse_tree_reuse(tree_reuse);
     let build = builder.build_with_breakdown(None).await?;
+    let next_tree_reuse = builder.take_sparse_tree_reuse();
     let push = builder.push_with_breakdown("stable", None).await?;
     let full_upload = push
         .artifacts
@@ -117,14 +121,17 @@ pub(super) async fn publish_release(
         .ok_or_else(|| SurgeError::Pack("Full artifact upload timing was not recorded".to_string()))?;
     let delta_upload = push.artifacts.iter().find(|artifact| artifact.is_delta).cloned();
 
-    Ok(ReleasePublication {
-        full_build: build.full,
-        delta_build: build.delta,
-        full_upload,
-        delta_upload,
-        release_index_update: push.release_index_update,
-        total_push: push.total,
-    })
+    Ok((
+        ReleasePublication {
+            full_build: build.full,
+            delta_build: build.delta,
+            full_upload,
+            delta_upload,
+            release_index_update: push.release_index_update,
+            total_push: push.total,
+        },
+        next_tree_reuse,
+    ))
 }
 
 pub async fn run_update_scenario(
@@ -157,6 +164,7 @@ pub async fn run_update_scenario(
     let base_input_bytes = template.write_base(&artifacts_dir, seed)?;
     let mut total_input_bytes = base_input_bytes;
     let publish_started = Instant::now();
+    let mut tree_reuse: Option<SparseTreeReuse> = None;
     let mut baseline_publication = None;
     let mut incremental_full_builds = Vec::new();
     let mut incremental_full_build_sizes = Vec::new();
@@ -185,8 +193,17 @@ pub async fn run_update_scenario(
         let current_payload_bytes = dir_size_recursive(&artifacts_dir);
 
         let version = version_label(version_index);
-        let publication =
-            publish_release(Arc::clone(&ctx), &manifest_path, app_id, &rid, &version, &artifacts_dir).await?;
+        let (publication, next_tree_reuse) = publish_release(
+            Arc::clone(&ctx),
+            &manifest_path,
+            app_id,
+            &rid,
+            &version,
+            &artifacts_dir,
+            tree_reuse,
+        )
+        .await?;
+        tree_reuse = next_tree_reuse;
         let release_index_size =
             fs::metadata(store_dir.join(app_id).join(RELEASES_FILE_COMPRESSED)).map_or(0, |meta| meta.len());
         release_index_updates.push(publication.release_index_update);

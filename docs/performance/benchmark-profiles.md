@@ -126,10 +126,24 @@ while the chunked diff executes. No archive is extracted to disk.
 - Same-session A/B (10 deltas, `sdk_only` scale 1.0, seed 42):
   `Delta pack build (avg)` 4,163→2,187 ms/version (−47%); the 11-release
   publish total drops 93.3s→61.2s (−34%).
-- Remaining per-version costs are the single-threaded zstd decode of
-  both archives and the full-file SHA-256 passes; cross-step decoded-tree
-  reuse (older tree of step N+1 = newer tree of step N) is the next
-  candidate for the `auto/delta/` surface.
+- The changed-file work is three independent CPU-bound passes over the
+  same file (newer hash, basis hash, chunked diff); the two hashes run on
+  worker threads while the diff runs on the calling thread (wall time is
+  then dominated by the single-threaded hash passes, ~0.5 s for a 1 GB
+  file at scale 1.0).
+- Consecutive publishes can hand the decoded tree of the previous full
+  archive to the next `PackBuilder`
+  (`PackBuilder::with_sparse_tree_reuse` / `take_sparse_tree_reuse`,
+  bound to the release's `full_sha256`; a mismatched hash degrades to a
+  cold decode). On a 48-core host the cold decodes already overlap, so
+  the reuse saves the remaining serial collect pass plus decode
+  contention; the bench publish loop threads it through.
+- Cumulative publisher-side result on the canonical payload
+  (scale 1.0, `sdk_only`, seed 42, same-session A/Bs): delta pack build
+  4,163 ms/version (disk build) -> 2,187 (in-memory) -> 1,551 ms
+  (tree reuse + parallel passes), i.e. -63% from the pre-round-11
+  baseline. Remaining per-version floor: one single-threaded zstd decode
+  of the newer archive (~0.7 s) plus the parallel hash/diff pass (~0.5 s).
 
 ## CI Tracking Guidance
 

@@ -4,7 +4,9 @@ use crate::context::ResourceBudget;
 use crate::crypto::sha256::sha256_hex;
 use crate::diff::chunked::{ChunkedDiffOptions, ChunkedPatchFormat, DEFAULT_CHUNK_SIZE};
 use crate::error::{Result, SurgeError};
-use crate::releases::delta::{build_archive_bsdiff_patch, build_archive_chunked_patch, build_sparse_file_patch};
+use crate::releases::delta::{
+    build_archive_bsdiff_patch, build_archive_chunked_patch, build_sparse_file_patch_with_tree,
+};
 use crate::releases::manifest::{
     PATCH_FORMAT_BSDIFF4_ARCHIVE_V3, PATCH_FORMAT_CHUNKED_BSDIFF_ARCHIVE_V3, PATCH_FORMAT_SPARSE_FILE_OPS_V1,
     ReleaseIndex, decompress_release_index,
@@ -18,7 +20,7 @@ use tracing::{info, warn};
 use super::{PackBuilder, PackageArtifact};
 
 impl PackBuilder {
-    pub(super) async fn build_delta_package(&self) -> Result<Option<PackageArtifact>> {
+    pub(super) async fn build_delta_package(&mut self) -> Result<Option<PackageArtifact>> {
         let data = match self.storage.get_object(RELEASES_FILE_COMPRESSED).await {
             Ok(d) => d,
             Err(SurgeError::NotFound(_)) => return Ok(None),
@@ -60,18 +62,23 @@ impl PackBuilder {
             new_data.len(),
             self.pack_policy.chunked_patch_format.into(),
         );
+        let newer_full_sha256 = full_sha256_of(&self.artifacts);
 
         let (patch, patch_format) = match self.pack_policy.delta_strategy {
-            PackDeltaStrategy::SparseFileOps => (
-                build_sparse_file_patch(
+            PackDeltaStrategy::SparseFileOps => {
+                let (patch, next_tree) = build_sparse_file_patch_with_tree(
+                    self.sparse_tree_reuse.as_ref(),
                     &prev_data,
+                    &previous_release.full_sha256,
                     new_data,
+                    &newer_full_sha256,
                     budget.zstd_compression_level,
                     n_workers,
                     &diff_options,
-                )?,
-                PATCH_FORMAT_SPARSE_FILE_OPS_V1.to_string(),
-            ),
+                )?;
+                self.sparse_tree_reuse = Some(next_tree);
+                (patch, PATCH_FORMAT_SPARSE_FILE_OPS_V1.to_string())
+            }
             PackDeltaStrategy::ArchiveChunkedBsdiff => (
                 build_archive_chunked_patch(
                     &prev_data,
@@ -121,6 +128,14 @@ impl PackBuilder {
             bytes: compressed,
         }))
     }
+}
+
+fn full_sha256_of(artifacts: &[PackageArtifact]) -> String {
+    artifacts
+        .iter()
+        .find(|a| !a.is_delta)
+        .map(|a| a.sha256.clone())
+        .unwrap_or_default()
 }
 
 fn should_retain_checkpoint_full(

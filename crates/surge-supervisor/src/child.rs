@@ -7,6 +7,7 @@ use sysinfo::{Pid, ProcessesToUpdate, System};
 use crate::SupervisorError;
 use crate::handoff;
 use crate::ownership::supervisor_was_superseded;
+use surge_core::platform::process::{PidLiveness, probe_process_identity};
 
 const RESTART_HANDOFF_STABILITY_WINDOW: std::time::Duration = std::time::Duration::from_secs(4);
 
@@ -151,6 +152,7 @@ fn wait_for_child_startup_or_stop(
 
 pub(crate) fn wait_for_pid_or_stop(
     pid: u32,
+    expected_start_time: Option<u64>,
     shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     stop_file: &Path,
     pid_file: &Path,
@@ -169,12 +171,23 @@ pub(crate) fn wait_for_pid_or_stop(
             return WaitOutcome::StopRequested;
         }
 
-        if !is_process_running(pid) {
+        if !is_process_identity_running(pid, expected_start_time) {
             return WaitOutcome::ObservedProcessExited;
         }
 
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+}
+
+fn is_process_identity_running(pid: u32, expected_start_time: Option<u64>) -> bool {
+    if let Some(expected_start_time) = expected_start_time {
+        return match probe_process_identity(pid, expected_start_time) {
+            PidLiveness::Dead => false,
+            PidLiveness::Alive | PidLiveness::Unknown => true,
+        };
+    }
+
+    is_process_running(pid)
 }
 
 fn wait_for_child_or_stop(
@@ -280,6 +293,20 @@ fn is_process_running(pid: u32) -> bool {
     };
 
     matches!(kill(Pid::from_raw(raw_pid), None), Ok(()) | Err(Errno::EPERM))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn watched_process_identity_rejects_a_reused_pid() {
+        let pid = std::process::id();
+        let start_time = surge_core::platform::process::process_start_time(pid).unwrap();
+
+        assert!(is_process_identity_running(pid, Some(start_time)));
+        assert!(!is_process_identity_running(pid, Some(start_time ^ 1)));
+    }
 }
 
 #[cfg(windows)]

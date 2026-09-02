@@ -142,6 +142,13 @@ pub fn current_pid() -> u32 {
     std::process::id()
 }
 
+/// High-resolution native creation identity for a live process. Combined with
+/// a PID, this distinguishes a process from a later process that reused it.
+#[must_use]
+pub fn process_start_time(pid: u32) -> Option<u64> {
+    descriptors::process_start_time(pid)
+}
+
 /// Liveness of the process identified by `pid`.
 ///
 /// `Unknown` means the probe itself failed (the probe utility could not be
@@ -219,6 +226,24 @@ pub fn probe_pid_liveness(pid: u32) -> PidLiveness {
     {
         let _ = pid;
         PidLiveness::Unknown
+    }
+}
+
+/// Probe whether `pid` still identifies the process with `expected_start_time`.
+///
+/// A different start time conclusively means the original process exited and
+/// the PID was reused. If start-time inspection is unavailable while the PID
+/// still appears live, the result is [`PidLiveness::Unknown`] so callers can
+/// fail closed.
+#[must_use]
+pub fn probe_process_identity(pid: u32, expected_start_time: u64) -> PidLiveness {
+    match process_start_time(pid) {
+        Some(actual_start_time) if actual_start_time == expected_start_time => PidLiveness::Alive,
+        Some(_) => PidLiveness::Dead,
+        None => match probe_pid_liveness(pid) {
+            PidLiveness::Dead => PidLiveness::Dead,
+            PidLiveness::Alive | PidLiveness::Unknown => PidLiveness::Unknown,
+        },
     }
 }
 
@@ -325,7 +350,7 @@ mod tests {
         assert_eq!(result.exit_code, 0);
     }
 
-    use super::{PidLiveness, is_pid_alive, probe_pid_liveness};
+    use super::{PidLiveness, is_pid_alive, probe_pid_liveness, probe_process_identity, process_start_time};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -341,6 +366,15 @@ mod tests {
     }
 
     #[test]
+    fn process_identity_rejects_a_reused_pid() {
+        let pid = std::process::id();
+        let start_time = process_start_time(pid).expect("current process start time");
+
+        assert_eq!(probe_process_identity(pid, start_time), PidLiveness::Alive);
+        assert_eq!(probe_process_identity(pid, start_time ^ 1), PidLiveness::Dead);
+    }
+
+    #[test]
     fn is_pid_alive_reflects_a_positive_probe() {
         assert!(is_pid_alive(std::process::id()));
         assert!(!is_pid_alive(0));
@@ -350,13 +384,14 @@ mod tests {
     fn exited_process_is_reported_dead() {
         let mut child = std::process::Command::new(if cfg!(target_os = "windows") { "cmd" } else { "sh" })
             .args(if cfg!(target_os = "windows") {
-                ["/c", "exit /b 0"]
+                ["/c", "ping -n 2 127.0.0.1 > nul"]
             } else {
-                ["-c", "exit 0"]
+                ["-c", "sleep 0.1"]
             })
             .spawn()
             .expect("spawn helper");
         let pid = child.id();
+        let start_time = process_start_time(pid).expect("child process start time");
         let _ = child.wait();
 
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -366,5 +401,6 @@ mod tests {
         assert!(!is_pid_alive(pid));
         assert!(!is_pid_alive(0));
         assert_eq!(probe_pid_liveness(pid), PidLiveness::Dead);
+        assert_eq!(probe_process_identity(pid, start_time), PidLiveness::Dead);
     }
 }

@@ -4,7 +4,9 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use crate::error::{Result, SurgeError};
-use crate::platform::process::{ProcessHandle, current_pid, spawn_detached, spawn_process, supervisor_binary_name};
+use crate::platform::process::{
+    ProcessHandle, current_pid, process_start_time, spawn_detached, spawn_process, supervisor_binary_name,
+};
 use crate::releases::manifest::ReleaseEntry;
 use crate::supervisor::state::{
     read_restart_args, supervisor_pid_file, supervisor_stop_file, write_supervisor_exe_path,
@@ -192,6 +194,18 @@ fn restart_supervisor_after_update_with_config(
         return SupervisorRestartOutcome::NotApplicable;
     }
 
+    let Some(watched_pid_start_time) = process_start_time(watched_pid) else {
+        let reason = format!("could not capture start-time identity for watched process {watched_pid}");
+        warn!(
+            watched_pid,
+            "Cannot restart supervisor without a stable watched-process identity"
+        );
+        return SupervisorRestartOutcome::PendingRestart {
+            reason,
+            failure_phase: RESTART_HANDOFF_FAILED_PHASE,
+        };
+    };
+
     let supervisor_path = active_app_dir.join(supervisor_binary_name());
     if !supervisor_path.is_file() {
         warn!(
@@ -240,7 +254,14 @@ fn restart_supervisor_after_update_with_config(
         }
     };
 
-    let args = supervisor_watch_args(supervisor_id, install_dir, watched_pid, &latest.version, &restart_args);
+    let args = supervisor_watch_args(
+        supervisor_id,
+        install_dir,
+        watched_pid,
+        watched_pid_start_time,
+        &latest.version,
+        &restart_args,
+    );
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
 
     let mut last_failure: Option<(String, &'static str)> = None;
@@ -300,6 +321,7 @@ fn supervisor_watch_args(
     supervisor_id: &str,
     install_dir: &Path,
     watched_pid: u32,
+    watched_pid_start_time: u64,
     handoff_version: &str,
     restart_args: &[String],
 ) -> Vec<String> {
@@ -311,6 +333,8 @@ fn supervisor_watch_args(
         install_dir.to_string_lossy().into_owned(),
         "--pid".to_string(),
         watched_pid.to_string(),
+        "--pid-start-time".to_string(),
+        watched_pid_start_time.to_string(),
         "--handoff-version".to_string(),
         handoff_version.to_string(),
     ];
@@ -331,7 +355,14 @@ mod tests {
     fn supervisor_watch_args_include_handoff_version_before_child_args() {
         let restart_args = vec!["--app-mode".to_string(), "service".to_string()];
 
-        let args = supervisor_watch_args("demo-supervisor", Path::new("/opt/demo"), 42, "2.0.0", &restart_args);
+        let args = supervisor_watch_args(
+            "demo-supervisor",
+            Path::new("/opt/demo"),
+            42,
+            1_234,
+            "2.0.0",
+            &restart_args,
+        );
 
         assert_eq!(
             args,
@@ -343,6 +374,8 @@ mod tests {
                 "/opt/demo",
                 "--pid",
                 "42",
+                "--pid-start-time",
+                "1234",
                 "--handoff-version",
                 "2.0.0",
                 "--",

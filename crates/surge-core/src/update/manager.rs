@@ -41,6 +41,16 @@ pub enum ApplyStrategy {
     Delta,
 }
 
+/// Result of a successful update apply request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateApplyOutcome {
+    /// Finalization completed before the apply call returned.
+    Finalized,
+    /// A stable helper accepted ownership and will finalize after the calling
+    /// application exits.
+    ExternalFinalizeScheduled,
+}
+
 /// Information about available updates.
 #[derive(Debug, Clone)]
 pub struct UpdateInfo {
@@ -322,15 +332,18 @@ impl UpdateManager {
     /// 6. Finalize - move files into place, clean up
     ///
     /// A self-hosted updater leaves phase 6 to a stable external helper. In
-    /// that case this method returns after the helper is ready and armed; the
-    /// helper waits for the caller to exit before it swaps the `app` directory.
+    /// that case this method returns [`UpdateApplyOutcome::ExternalFinalizeScheduled`]
+    /// after the helper accepts ownership, before the directory swap. The
+    /// caller must stop new work and exit promptly. After restart, read the
+    /// persisted update status until it reaches `Converged`, `PendingRestart`,
+    /// or `Failed`; scheduling alone is not installation success.
     ///
     /// On every attempt this method also writes an explicit convergence record
     /// to `{install_dir}/.surge-update-status.json` so dashboards and repair
     /// tooling can distinguish "update in progress", "applied but pending
     /// supervisor restart", "fully converged", and "failed" without inferring
     /// state from version drift alone (see [`status`]).
-    pub async fn download_and_apply<F>(&self, info: &UpdateInfo, progress: Option<F>) -> Result<()>
+    pub async fn download_and_apply<F>(&self, info: &UpdateInfo, progress: Option<F>) -> Result<UpdateApplyOutcome>
     where
         F: Fn(ProgressInfo) + Send + Sync,
     {
@@ -388,16 +401,19 @@ impl UpdateManager {
         {
             Ok(restart_outcome) => {
                 let completed_at_utc = status::now_utc_rfc3339();
-                let record = match restart_outcome {
-                    SupervisorRestartOutcome::NotApplicable => Some(UpdateStatusRecord::converged(
-                        &self.app_id,
-                        &target_version,
-                        &self.channel,
-                        Some(attempted_at_utc),
-                        completed_at_utc,
-                        false,
-                    )),
-                    SupervisorRestartOutcome::PendingRestart { reason, failure_phase } => {
+                let (record, outcome) = match restart_outcome {
+                    SupervisorRestartOutcome::NotApplicable => (
+                        Some(UpdateStatusRecord::converged(
+                            &self.app_id,
+                            &target_version,
+                            &self.channel,
+                            Some(attempted_at_utc),
+                            completed_at_utc,
+                            false,
+                        )),
+                        UpdateApplyOutcome::Finalized,
+                    ),
+                    SupervisorRestartOutcome::PendingRestart { reason, failure_phase } => (
                         Some(UpdateStatusRecord::pending_restart_with_failure_phase(
                             &self.app_id,
                             &target_version,
@@ -407,16 +423,19 @@ impl UpdateManager {
                             completed_at_utc,
                             &reason,
                             failure_phase,
-                        ))
+                        )),
+                        UpdateApplyOutcome::Finalized,
+                    ),
+                    SupervisorRestartOutcome::ExternalFinalizeScheduled => {
+                        (None, UpdateApplyOutcome::ExternalFinalizeScheduled)
                     }
-                    SupervisorRestartOutcome::ExternalFinalizeScheduled => None,
                 };
                 if let Some(record) = record
                     && let Err(e) = status::write_update_status(&self.install_dir, &record)
                 {
                     warn!(error = %e, "Failed to persist post-update convergence status (continuing)");
                 }
-                Ok(())
+                Ok(outcome)
             }
             Err(e) => {
                 let status_context = status::read_update_status(&self.install_dir).ok().flatten();

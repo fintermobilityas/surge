@@ -243,14 +243,22 @@ namespace Surge
         /// <param name="progressSource">Optional progress source for receiving update progress.</param>
         /// <param name="onUpdatesAvailable">Called when updates are found, before applying.</param>
         /// <param name="onBeforeApplyUpdate">Called before applying a specific release.</param>
-        /// <param name="onAfterApplyUpdate">Called after successfully applying a release.</param>
+        /// <param name="onAfterApplyUpdate">
+        /// Called after a release is fully applied before this method returns.
+        /// It is not called when external finalization is scheduled.
+        /// </param>
         /// <param name="onApplyUpdateException">Called when applying a release fails.</param>
         /// <param name="cancellationToken">Token to cancel the operation.</param>
         /// <returns>
-        /// The <see cref="SurgeAppInfo"/> for the newly installed version,
-        /// or null if no updates were available, native cancellation occurred
-        /// without the supplied token being cancelled, or a previous
-        /// retry-safe failure is still inside its retry-backoff window.
+        /// The <see cref="SurgeAppInfo"/> for the newly installed version. For
+        /// a self-hosted update, returns the current installed version with
+        /// <see cref="SurgeAppInfo.IsUpdateFinalizationScheduled"/> set and
+        /// <see cref="SurgeAppInfo.PendingUpdateVersion"/> identifying the
+        /// target. The caller must then exit promptly and inspect the persisted
+        /// convergence status after restart. Returns null if no updates were
+        /// available, native cancellation occurred without the supplied token
+        /// being cancelled, or a previous retry-safe failure is still inside
+        /// its retry-backoff window.
         /// </returns>
         /// <exception cref="OperationCanceledException">
         /// The supplied cancellation token was cancelled.
@@ -400,12 +408,18 @@ namespace Surge
                             if (HandleNativeCancellation(applyResult, cancellationToken))
                                 return null;
 
-                            if (applyResult != 0)
+                            bool finalizationScheduled = applyResult == NativeMethods.UpdateScheduled;
+                            if (applyResult != 0 && !finalizationScheduled)
                             {
                                 var errorMsg = GetLastError();
                                 var ex = new SurgeException(applyResult, errorMsg ?? "Update apply failed.");
                                 onApplyUpdateException?.Invoke(latestRelease, ex);
                                 throw ex;
+                            }
+
+                            if (finalizationScheduled)
+                            {
+                                return CreateScheduledUpdateInfo(SurgeApp.Current, _currentVersion, latestRelease);
                             }
 
                             onAfterApplyUpdate?.Invoke(latestRelease);
@@ -492,6 +506,28 @@ namespace Surge
         private static string? NullIfEmpty(string value)
         {
             return string.IsNullOrWhiteSpace(value) ? null : value;
+        }
+
+        internal static SurgeAppInfo CreateScheduledUpdateInfo(
+            SurgeAppInfo? currentApp,
+            string currentVersion,
+            SurgeRelease latestRelease)
+        {
+            return new SurgeAppInfo
+            {
+                Id = currentApp?.Id ?? "",
+                Version = currentApp?.Version ?? currentVersion,
+                Channel = latestRelease.Channel,
+                InstallDirectory = currentApp?.InstallDirectory ?? "",
+                SupervisorId = currentApp?.SupervisorId ?? "",
+                StorageProvider = currentApp?.StorageProvider ?? "",
+                StorageBucket = currentApp?.StorageBucket ?? "",
+                StorageRegion = currentApp?.StorageRegion ?? "",
+                StorageEndpoint = currentApp?.StorageEndpoint ?? "",
+                IsSupervisorRunning = currentApp?.IsSupervisorRunning ?? false,
+                IsUpdateFinalizationScheduled = true,
+                PendingUpdateVersion = latestRelease.Version
+            };
         }
 
         internal static bool HandleNativeCancellation(int result, CancellationToken cancellationToken)

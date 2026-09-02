@@ -22,7 +22,7 @@ tracing-subscriber = { workspace = true }
 clap = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
-sysinfo = "0.39.3"
+sysinfo = { workspace = true }
 signal-hook = "0.4.4"
 
 [target.'cfg(unix)'.dependencies]

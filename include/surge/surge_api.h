@@ -67,7 +67,13 @@ typedef struct surge_pack_context surge_pack_context;
 /* -------------------------------------------------------------------------- */
 
 /** Result codes returned by most API functions. */
-typedef enum surge_result { SURGE_OK = 0, SURGE_ERROR = -1, SURGE_CANCELLED = -2, SURGE_NOT_FOUND = -3 } surge_result;
+typedef enum surge_result {
+    SURGE_OK = 0,
+    SURGE_UPDATE_SCHEDULED = 1,
+    SURGE_ERROR = -1,
+    SURGE_CANCELLED = -2,
+    SURGE_NOT_FOUND = -3
+} surge_result;
 
 /** Phases reported through progress callbacks. */
 typedef enum surge_progress_phase {
@@ -314,7 +320,15 @@ SURGE_API surge_result SURGE_CALL surge_update_check(surge_update_manager* mgr, 
  * @param info        Release information from surge_update_check().
  * @param progress_cb Optional progress callback (may be NULL).
  * @param user_data   Opaque pointer forwarded to @p progress_cb.
- * @return SURGE_OK on success.
+ * A self-hosted updater normally returns before the active application
+ * directory is changed. SURGE_UPDATE_SCHEDULED means a stable helper accepted
+ * ownership and is waiting for the calling application to exit. The caller
+ * must stop new work and exit promptly, then use
+ * surge_update_status_read_json() after restart until the state is converged,
+ * pending_restart, or failed. Scheduling alone is not installation success.
+ *
+ * @return SURGE_OK when finalization completed in this call;
+ *         SURGE_UPDATE_SCHEDULED when external finalization was accepted.
  */
 SURGE_API surge_result SURGE_CALL surge_update_download_and_apply(surge_update_manager* mgr,
                                                                   const surge_releases_info* info,

@@ -29,7 +29,9 @@ use uuid::Uuid;
 
 use crate::error::{Result, SurgeError};
 use crate::platform::fs::write_file_atomic;
-use crate::platform::process::{PidLiveness, probe_pid_liveness};
+use crate::platform::process::{
+    PidLiveness, current_pid, probe_pid_liveness, probe_process_identity, process_start_time,
+};
 
 use super::{
     FailureContext, UpdateConvergenceState, UpdateStatusRecord, next_retry_timestamp, now_utc_rfc3339,
@@ -54,6 +56,8 @@ struct UpdateWorkerRecord {
     target_version: String,
     started_at_utc: String,
     #[serde(default)]
+    process_start_time: Option<u64>,
+    #[serde(default)]
     owner_id: String,
 }
 
@@ -68,7 +72,7 @@ impl UpdateWorkerGuard {
         let lock_path = update_worker_lock_path(install_dir);
         let _lock = acquire_worker_lock(&lock_path)?;
         if let Some(existing) = read_update_worker(install_dir)?
-            && !matches!(probe_pid_liveness(existing.pid), PidLiveness::Dead)
+            && !matches!(probe_worker_liveness(&existing), PidLiveness::Dead)
         {
             return Err(SurgeError::Update(format!(
                 "Another update worker (pid {}) already owns this installation",
@@ -84,7 +88,11 @@ impl UpdateWorkerGuard {
         let existing = read_update_worker(install_dir)?.ok_or_else(|| {
             SurgeError::Update("The external finalizer could not find the updating worker to take over".to_string())
         })?;
-        if existing.pid != expected_pid || existing.app_id != app_id || existing.target_version != target_version {
+        if existing.pid != expected_pid
+            || existing.app_id != app_id
+            || existing.target_version != target_version
+            || !matches!(probe_worker_liveness(&existing), PidLiveness::Alive)
+        {
             return Err(SurgeError::Update(
                 "Update worker ownership changed before the external finalizer took over".to_string(),
             ));
@@ -116,11 +124,18 @@ fn write_owned_worker(
     app_id: &str,
     target_version: &str,
 ) -> Result<UpdateWorkerGuard> {
+    let pid = current_pid();
+    let process_start_time = process_start_time(pid).ok_or_else(|| {
+        SurgeError::Platform(format!(
+            "Could not read start-time identity for update worker process {pid}"
+        ))
+    })?;
     let record = UpdateWorkerRecord {
-        pid: std::process::id(),
+        pid,
         app_id: app_id.to_string(),
         target_version: target_version.to_string(),
         started_at_utc: now_utc_rfc3339(),
+        process_start_time: Some(process_start_time),
         owner_id: Uuid::new_v4().to_string(),
     };
     let path = update_worker_path(install_dir);
@@ -143,6 +158,13 @@ fn acquire_worker_lock(path: &Path) -> Result<File> {
         .open(path)?;
     FileExt::lock_exclusive(&file)?;
     Ok(file)
+}
+
+fn probe_worker_liveness(worker: &UpdateWorkerRecord) -> PidLiveness {
+    worker.process_start_time.map_or_else(
+        || probe_pid_liveness(worker.pid),
+        |start_time| probe_process_identity(worker.pid, start_time),
+    )
 }
 
 pub fn fail_abandoned_in_progress_update(
@@ -207,13 +229,14 @@ fn fail_abandoned_in_progress_update_at(
         return Ok(Some(failed));
     };
 
-    if worker.pid == std::process::id() {
+    let worker_liveness = probe_worker_liveness(&worker);
+    if worker.pid == current_pid() && matches!(worker_liveness, PidLiveness::Alive) {
         // Do not reclassify work owned by this process as abandoned. The
         // exclusive acquisition that follows rejects an overlapping apply.
         return Ok(None);
     }
 
-    match probe_pid_liveness(worker.pid) {
+    match worker_liveness {
         PidLiveness::Dead => {
             // Dead foreign worker: the attempt can never make progress again,
             // so fail it immediately instead of waiting out the staleness
@@ -620,6 +643,7 @@ mod tests {
             app_id: app_id.to_string(),
             target_version: target_version.to_string(),
             started_at_utc: now_utc_rfc3339(),
+            process_start_time: process_start_time(pid),
             owner_id: String::new(),
         };
         let json = serde_json::to_vec_pretty(&record).unwrap();
@@ -722,6 +746,33 @@ mod tests {
         assert!(error.to_string().contains("already owns"));
         drop(first);
         assert!(UpdateWorkerGuard::record(dir.path(), "demo-app", "9999.0.0").is_ok());
+    }
+
+    #[test]
+    fn reused_worker_pid_does_not_exclude_a_new_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid = current_pid();
+        let current_start_time = process_start_time(pid).unwrap();
+        let stale = UpdateWorkerRecord {
+            pid,
+            app_id: "demo-app".to_string(),
+            target_version: "9999.0.0".to_string(),
+            started_at_utc: now_utc_rfc3339(),
+            process_start_time: Some(current_start_time ^ 1),
+            owner_id: "stale-owner".to_string(),
+        };
+        write_file_atomic(
+            &update_worker_path(dir.path()),
+            &serde_json::to_vec_pretty(&stale).unwrap(),
+        )
+        .unwrap();
+
+        let guard = UpdateWorkerGuard::record(dir.path(), "demo-app", "9999.0.0").unwrap();
+        let current = read_update_worker(dir.path()).unwrap().unwrap();
+
+        assert_eq!(current.pid, pid);
+        assert_eq!(current.process_start_time, Some(current_start_time));
+        drop(guard);
     }
 
     #[test]

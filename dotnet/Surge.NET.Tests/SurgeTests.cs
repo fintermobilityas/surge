@@ -186,6 +186,8 @@ namespace Surge.Tests
             Assert.Equal("", info.StorageRegion);
             Assert.Equal("", info.StorageEndpoint);
             Assert.False(info.IsSupervisorRunning);
+            Assert.False(info.IsUpdateFinalizationScheduled);
+            Assert.Equal("", info.PendingUpdateVersion);
         }
 
         [Fact]
@@ -201,7 +203,9 @@ namespace Surge.Tests
                 StorageProvider = "filesystem",
                 StorageBucket = "/tmp/releases",
                 StorageRegion = "us-east-1",
-                StorageEndpoint = "http://localhost:9000"
+                StorageEndpoint = "http://localhost:9000",
+                IsUpdateFinalizationScheduled = true,
+                PendingUpdateVersion = "1.2.4"
             };
 
             Assert.Equal("myapp", info.Id);
@@ -213,6 +217,8 @@ namespace Surge.Tests
             Assert.Equal("/tmp/releases", info.StorageBucket);
             Assert.Equal("us-east-1", info.StorageRegion);
             Assert.Equal("http://localhost:9000", info.StorageEndpoint);
+            Assert.True(info.IsUpdateFinalizationScheduled);
+            Assert.Equal("1.2.4", info.PendingUpdateVersion);
         }
     }
 
@@ -239,6 +245,7 @@ namespace Surge.Tests
 
         [Theory]
         [InlineData(0)]
+        [InlineData(1)]
         [InlineData(-1)]
         [InlineData(-3)]
         public void HandleNativeCancellation_IgnoresOtherResults(int result)
@@ -260,6 +267,30 @@ namespace Surge.Tests
 
             Assert.Throws<OperationCanceledException>(
                 () => SurgeUpdateManager.HandleNativeCancellation(-2, source.Token));
+        }
+
+        [Fact]
+        public void ScheduledUpdateInfo_KeepsInstalledVersionAndExposesTarget()
+        {
+            var current = new SurgeAppInfo
+            {
+                Id = "demo",
+                Version = "1.2.3",
+                Channel = "beta",
+                InstallDirectory = "/opt/demo",
+                SupervisorId = "demo-supervisor",
+                StorageProvider = "filesystem",
+                StorageBucket = "/tmp/releases"
+            };
+            var release = new SurgeRelease { Version = "1.2.4", Channel = "beta" };
+
+            var result = SurgeUpdateManager.CreateScheduledUpdateInfo(current, "0.0.0", release);
+
+            Assert.Equal("1.2.3", result.Version);
+            Assert.Equal("1.2.4", result.PendingUpdateVersion);
+            Assert.True(result.IsUpdateFinalizationScheduled);
+            Assert.Equal(current.InstallDirectory, result.InstallDirectory);
+            Assert.Equal(current.StorageBucket, result.StorageBucket);
         }
     }
 

@@ -14,6 +14,7 @@ use crate::handles::{SurgeContextHandle, SurgeErrorOwned};
 use crate::utils::lock_recover;
 
 pub(crate) const SURGE_OK: i32 = 0;
+pub(crate) const SURGE_UPDATE_SCHEDULED: i32 = 1;
 pub(crate) const SURGE_ERROR: i32 = -1;
 pub(crate) const SURGE_CANCELLED: i32 = -2;
 pub(crate) const SURGE_NOT_FOUND: i32 = -3;

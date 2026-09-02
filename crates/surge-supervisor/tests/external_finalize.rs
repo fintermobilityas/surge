@@ -11,7 +11,7 @@ use surge_core::install::{InstallProfile, RuntimeManifestMetadata, write_runtime
 use surge_core::platform::detect::current_rid;
 use surge_core::platform::process::supervisor_binary_name;
 use surge_core::releases::manifest::{ReleaseEntry, ReleaseIndex, compress_release_index};
-use surge_core::update::manager::{ProgressInfo, UpdateManager};
+use surge_core::update::manager::{ProgressInfo, UpdateApplyOutcome, UpdateManager};
 use surge_core::update::status::{UpdateConvergenceState, read_update_status};
 
 const APP_ID: &str = "external-finalizer-fixture";
@@ -61,10 +61,11 @@ fn run_self_update() {
         .unwrap();
     runtime.block_on(async move {
         let update = manager.check_for_updates().await.unwrap().unwrap();
-        manager
+        let outcome = manager
             .download_and_apply(&update, None::<fn(ProgressInfo)>)
             .await
             .unwrap();
+        assert_eq!(outcome, UpdateApplyOutcome::ExternalFinalizeScheduled);
     });
     std::fs::write(returned_marker, "returned").unwrap();
     assert!(wait_until(Duration::from_secs(10), || allow_exit_marker.is_file()));

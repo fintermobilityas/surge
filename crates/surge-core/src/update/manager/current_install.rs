@@ -36,6 +36,19 @@ pub(super) fn load(manager: &UpdateManager) -> Result<Option<ReleaseIdentity>> {
     load_from_app_dir(manager, &active_app_dir, Some(&manager.current_version))
 }
 
+pub(super) fn ensure_captured_install_still_has_app_dir(
+    current_app_dir: Option<&Path>,
+    captured_release_identity: bool,
+) -> Result<()> {
+    if current_app_dir.is_none() && captured_release_identity {
+        return Err(SurgeError::Update(
+            "Installed application directory disappeared after the update check; refusing to swap the active application"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 pub(super) fn load_previous_swap(manager: &UpdateManager, app_dir: &Path) -> Result<Option<ReleaseIdentity>> {
     load_from_app_dir(manager, app_dir, None)
@@ -185,6 +198,17 @@ mod tests {
         assert_eq!(safe_relative_path(Path::new("")), None);
         assert_eq!(safe_relative_path(Path::new("../demo")), None);
         assert_eq!(safe_relative_path(Path::new("/opt/demo")), None);
+    }
+
+    #[test]
+    fn captured_install_requires_a_current_app_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        assert!(ensure_captured_install_still_has_app_dir(Some(tmp.path()), true).is_ok());
+        assert!(ensure_captured_install_still_has_app_dir(None, false).is_ok());
+        let error = ensure_captured_install_still_has_app_dir(None, true).unwrap_err();
+
+        assert!(error.to_string().contains("disappeared after the update check"));
     }
 
     #[cfg(unix)]

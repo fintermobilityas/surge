@@ -28,6 +28,7 @@ use crate::releases::restore::{
 };
 use crate::supervisor::state::supervisor_pid_file;
 
+use super::current_install::ensure_captured_install_still_has_app_dir;
 #[cfg(unix)]
 use super::finalize_quiescence::{
     prepare_and_quiesce_active_app_before_swap, prepare_and_quiesce_previous_swap_before_reuse,
@@ -151,14 +152,7 @@ where
     } else {
         fallback_previous_app_dir.as_deref()
     };
-    #[cfg(unix)]
-    if current_app_dir.is_none() && manager.current_release_identity.is_some() {
-        return Err(SurgeError::Update(
-            "Installed application directory disappeared after the update check; refusing to swap the active application"
-                .to_string(),
-        )
-        .into());
-    }
+    ensure_captured_install_still_has_app_dir(current_app_dir, manager.current_release_identity.is_some())?;
     #[cfg(unix)]
     let (current_version, current_main_exe, current_supervisor_id, current_environment) = if current_app_dir.is_some() {
         let installed_identity = super::current_install::load(manager)?;

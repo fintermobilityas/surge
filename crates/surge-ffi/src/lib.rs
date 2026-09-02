@@ -256,6 +256,16 @@ pub unsafe extern "C" fn surge_supervisor_start(
             return SURGE_ERROR;
         }
 
+        let process_id = surge_core::platform::process::current_pid();
+        let Some(process_start_time) = surge_core::platform::process::process_start_time(process_id) else {
+            tracing::error!(
+                process_id,
+                "supervisor_start failed: could not capture exact process identity"
+            );
+            ffi_trace("surge_supervisor_start: process identity unavailable");
+            return SURGE_ERROR;
+        };
+
         ffi_trace("surge_supervisor_start: writing restart args");
         if let Err(e) = write_restart_args(install_dir, &sup_id, &args_owned) {
             tracing::error!("supervisor_start failed: {e}");
@@ -270,12 +280,9 @@ pub unsafe extern "C" fn surge_supervisor_start(
             return SURGE_ERROR;
         }
 
-        let pid = surge_core::platform::process::current_pid().to_string();
-        let mut args: Vec<&str> = vec!["watch", "--id", &sup_id, "--dir", &install_dir_s, "--pid", &pid];
-        if !args_owned.is_empty() {
-            args.push("--");
-            args.extend(args_owned.iter().map(String::as_str));
-        }
+        let args_owned =
+            build_self_supervisor_watch_args(&sup_id, &install_dir_s, process_id, process_start_time, &args_owned);
+        let args = args_owned.iter().map(String::as_str).collect::<Vec<_>>();
 
         ffi_trace("surge_supervisor_start: spawning supervisor");
         match surge_core::platform::process::spawn_detached(
@@ -296,6 +303,31 @@ pub unsafe extern "C" fn surge_supervisor_start(
             }
         }
     }))
+}
+
+fn build_self_supervisor_watch_args(
+    supervisor_id: &str,
+    install_dir: &str,
+    process_id: u32,
+    process_start_time: u64,
+    child_args: &[String],
+) -> Vec<String> {
+    let mut args = vec![
+        "watch".to_string(),
+        "--id".to_string(),
+        supervisor_id.to_string(),
+        "--dir".to_string(),
+        install_dir.to_string(),
+        "--pid".to_string(),
+        process_id.to_string(),
+        "--pid-start-time".to_string(),
+        process_start_time.to_string(),
+    ];
+    if !child_args.is_empty() {
+        args.push("--".to_string());
+        args.extend(child_args.iter().cloned());
+    }
+    args
 }
 
 fn mark_self_supervised_runtime_converged(install_dir: &Path, active_app_dir: &Path) {
@@ -585,6 +617,31 @@ mod tests {
             format!("id: demo-app\nversion: {version}\nchannel: test\n"),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn self_supervisor_watch_args_include_exact_process_identity() {
+        let child_args = vec!["--mode".to_string(), "service".to_string()];
+
+        let args = super::build_self_supervisor_watch_args("demo-supervisor", "/opt/demo", 42, 1_234, &child_args);
+
+        assert_eq!(
+            args,
+            vec![
+                "watch",
+                "--id",
+                "demo-supervisor",
+                "--dir",
+                "/opt/demo",
+                "--pid",
+                "42",
+                "--pid-start-time",
+                "1234",
+                "--",
+                "--mode",
+                "service",
+            ]
+        );
     }
 
     #[test]

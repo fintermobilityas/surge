@@ -1,9 +1,10 @@
 //! Update-worker ownership marker and abandoned-attempt classification.
 //!
-//! A live update attempt records its worker (pid, app, target version) next
-//! to the status file. When a later attempt finds an `InProgress` record it
-//! classifies that attempt against the worker marker:
-//! - worker pid is this process → the attempt is (re)started by us; proceed.
+//! A live update attempt records its worker (pid, process start time, app,
+//! target version) next to the status file. When a later attempt finds an
+//! `InProgress` record it classifies that attempt against the worker marker:
+//! - worker identity is this process → the attempt is (re)started by us;
+//!   proceed.
 //! - worker pid is another *live* process with recent progress → a
 //!   concurrent updater is active; never reclassify it.
 //! - worker pid is another *live* process whose progress has been silent
@@ -25,7 +26,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, SurgeError};
 use crate::platform::fs::write_file_atomic;
-use crate::platform::process::{PidLiveness, probe_pid_liveness};
+use crate::platform::process::{PidLiveness, probe_pid_liveness, probe_process_identity, process_start_time};
 
 use super::{
     FailureContext, UpdateConvergenceState, UpdateStatusRecord, next_retry_timestamp, now_utc_rfc3339,
@@ -48,6 +49,8 @@ struct UpdateWorkerRecord {
     app_id: String,
     target_version: String,
     started_at_utc: String,
+    #[serde(default)]
+    process_start_time: Option<u64>,
 }
 
 pub struct UpdateWorkerGuard {
@@ -64,6 +67,7 @@ impl UpdateWorkerGuard {
             app_id: app_id.to_string(),
             target_version: target_version.to_string(),
             started_at_utc: now_utc_rfc3339(),
+            process_start_time: process_start_time(std::process::id()),
         };
         let path = update_worker_path(install_dir);
         let json = serde_json::to_vec_pretty(&record)
@@ -154,14 +158,22 @@ fn fail_abandoned_in_progress_update_at(
         return Ok(Some(failed));
     };
 
-    if worker.pid == std::process::id() {
+    let worker_liveness = worker.process_start_time.map_or_else(
+        || probe_pid_liveness(worker.pid),
+        |start_time| probe_process_identity(worker.pid, start_time),
+    );
+
+    if worker.process_start_time.is_some()
+        && worker.pid == std::process::id()
+        && matches!(worker_liveness, PidLiveness::Alive)
+    {
         // The marker belongs to this process: a previous in-process attempt
         // stalled. The caller proceeds with its own attempt, which takes over
         // the record; there is nothing to reclassify.
         return Ok(None);
     }
 
-    match probe_pid_liveness(worker.pid) {
+    match worker_liveness {
         PidLiveness::Dead => {
             // Dead foreign worker: the attempt can never make progress again,
             // so fail it immediately instead of waiting out the staleness
@@ -563,6 +575,7 @@ mod tests {
             app_id: app_id.to_string(),
             target_version: target_version.to_string(),
             started_at_utc: now_utc_rfc3339(),
+            process_start_time: process_start_time(pid),
         };
         let json = serde_json::to_vec_pretty(&record).unwrap();
         write_file_atomic(&update_worker_path(dir), &json).unwrap();
@@ -650,5 +663,48 @@ mod tests {
         let persisted = read_update_status(dir.path()).unwrap().unwrap();
         assert_eq!(persisted.state, UpdateConvergenceState::InProgress);
         assert_eq!(persisted.current_phase.as_deref(), Some("package apply started"));
+    }
+
+    #[test]
+    fn reused_current_pid_does_not_own_worker_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = UpdateStatusRecord::in_progress(
+            "demo-app",
+            "9998.0.0",
+            "9999.0.0",
+            "stable",
+            "2026-05-15T20:00:00Z".to_string(),
+        )
+        .with_current_phase_at("package apply started", "2026-05-15T20:09:45Z".to_string());
+        write_update_status(dir.path(), &record).unwrap();
+
+        let pid = std::process::id();
+        let actual_start_time = process_start_time(pid).expect("current process start time");
+        let worker = UpdateWorkerRecord {
+            pid,
+            app_id: "demo-app".to_string(),
+            target_version: "9999.0.0".to_string(),
+            started_at_utc: now_utc_rfc3339(),
+            process_start_time: Some(actual_start_time ^ 1),
+        };
+        let json = serde_json::to_vec_pretty(&worker).unwrap();
+        write_file_atomic(&update_worker_path(dir.path()), &json).unwrap();
+
+        let now = chrono::DateTime::parse_from_rfc3339("2026-05-15T20:10:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let failed = fail_abandoned_in_progress_update_at(
+            dir.path(),
+            "demo-app",
+            "9999.0.0",
+            "stable",
+            Duration::from_mins(5),
+            now,
+        )
+        .unwrap()
+        .expect("a reused pid must not retain worker ownership");
+
+        assert_eq!(failed.state, UpdateConvergenceState::Failed);
+        assert!(failed.reason.as_deref().unwrap().contains("exited without completing"));
     }
 }

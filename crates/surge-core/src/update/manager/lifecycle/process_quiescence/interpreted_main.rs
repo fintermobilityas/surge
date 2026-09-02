@@ -68,7 +68,7 @@ impl Identity {
                 if argv0 != &expected.program {
                     return Ok(false);
                 }
-                expected.matches_executable(executable, environment)
+                expected.matches_required_executable(executable, environment)
             }
         }
     }
@@ -84,29 +84,19 @@ impl Identity {
         }
     }
 
-    pub(super) fn matches_interpreter(&self, executable: &Path, argv0: Option<&OsStr>) -> Result<bool> {
-        let command = argv0.map_or_else(Vec::new, |argv0| vec![argv0.to_os_string()]);
-        let environment = current_process_path_environment();
-        if let Interpreter::EnvCommand(expected) = &self.interpreter {
-            if argv0 != Some(expected.program.as_os_str()) {
-                return Ok(false);
+    pub(super) fn executable_may_match_without_environment(&self, executable: &Path) -> Result<bool> {
+        match &self.interpreter {
+            Interpreter::Resolved(expected) => Ok(paths_resolve_to_same_executable(executable, expected)),
+            Interpreter::EnvCommand(expected) => {
+                if expected.matches_executable(executable, &[])? {
+                    return Ok(true);
+                }
+                Ok(expected.requires_environment())
             }
-            let _ = resolve_env_command(expected)?;
         }
-        if self.matches_interpreter_in_environment(executable, &command, &environment)? {
-            return Ok(true);
-        }
-        if let Interpreter::EnvCommand(expected) = &self.interpreter
-            && argv0 == Some(expected.program.as_os_str())
-        {
-            return Err(SurgeError::Platform(format!(
-                "Cannot verify env interpreter '{}' from the updater environment; refusing to swap while its process identity is ambiguous",
-                expected.program.to_string_lossy()
-            )));
-        }
-        Ok(false)
     }
 
+    #[cfg(test)]
     pub(super) fn executable_may_match(&self, executable: &Path) -> Result<bool> {
         let environment = current_process_path_environment();
         if let Interpreter::EnvCommand(expected) = &self.interpreter {
@@ -135,6 +125,16 @@ impl EnvCommand {
         let Some(resolved) = self.resolve_executable(Some(environment))? else {
             return Ok(false);
         };
+        Ok(paths_resolve_to_same_executable(executable, &resolved))
+    }
+
+    fn matches_required_executable(&self, executable: &Path, environment: &[OsString]) -> Result<bool> {
+        let resolved = self.resolve_executable(Some(environment))?.ok_or_else(|| {
+            SurgeError::Platform(format!(
+                "Failed to resolve active application env interpreter '{}' from its configured launch environment",
+                Path::new(&self.program).display()
+            ))
+        })?;
         Ok(paths_resolve_to_same_executable(executable, &resolved))
     }
 
@@ -225,6 +225,7 @@ fn macos_system_shell_identity_matches(_actual: &Path, _expected: &Path) -> bool
     false
 }
 
+#[cfg(test)]
 fn resolve_env_command(command: &EnvCommand) -> Result<PathBuf> {
     command.resolve_executable(None)?.ok_or_else(|| {
         SurgeError::Platform(format!(
@@ -246,6 +247,7 @@ fn environment_variable<'a>(environment: &'a [OsString], name: &[u8]) -> Option<
     })
 }
 
+#[cfg(test)]
 fn current_process_path_environment() -> Vec<OsString> {
     std::env::var_os("PATH")
         .map(|path| {
@@ -861,6 +863,37 @@ mod tests {
         };
 
         assert!(identity.executable_may_match(Path::new("/bin/sleep")).unwrap());
+    }
+
+    #[test]
+    fn missing_environment_broadens_only_inherited_path_candidates() {
+        let inherited = Identity {
+            interpreter: Interpreter::EnvCommand(EnvCommand {
+                program: OsString::from("sh"),
+                fixed_argument_count: 0,
+                search_path: EnvSearchPath::Inherited,
+            }),
+            script_argument_index: 1,
+        };
+        let default = Identity {
+            interpreter: Interpreter::EnvCommand(EnvCommand {
+                program: OsString::from("sh"),
+                fixed_argument_count: 0,
+                search_path: EnvSearchPath::Default,
+            }),
+            script_argument_index: 1,
+        };
+
+        assert!(
+            inherited
+                .executable_may_match_without_environment(Path::new("/bin/sleep"))
+                .unwrap()
+        );
+        assert!(
+            !default
+                .executable_may_match_without_environment(Path::new("/bin/sleep"))
+                .unwrap()
+        );
     }
 
     #[test]

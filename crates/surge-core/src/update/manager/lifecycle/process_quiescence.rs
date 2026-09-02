@@ -11,10 +11,10 @@ mod discovery;
 
 #[cfg(unix)]
 use self::discovery::AppProcess;
-#[cfg(unix)]
-use self::discovery::app_process_identities;
 #[cfg(all(unix, test))]
 use self::discovery::app_process_pids;
+#[cfg(unix)]
+use self::discovery::{app_process_identities, current_process_environment};
 use crate::error::Result;
 #[cfg(unix)]
 use crate::error::SurgeError;
@@ -30,6 +30,7 @@ pub(in crate::update::manager) struct PreparedAppQuiescence {
     main_exe: String,
     active_entrypoint: active_entrypoint::Identity,
     interpreted_main: Option<interpreted_main::Identity>,
+    inspect_environment: bool,
 }
 
 pub(in crate::update::manager) fn terminate_superseded_app_processes(
@@ -77,10 +78,14 @@ fn prepare_app_quiescence_except(
     } else {
         refuse_in_process_swap(&active_entrypoint, interpreted_main.as_ref(), protected_pid)?;
     }
+    let inspect_environment = interpreted_main
+        .as_ref()
+        .is_some_and(interpreted_main::Identity::requires_environment);
     Ok(Some(PreparedAppQuiescence {
         main_exe: main_exe.to_string(),
         active_entrypoint,
         interpreted_main,
+        inspect_environment,
     }))
 }
 
@@ -100,6 +105,7 @@ fn terminate_superseded_app_processes_except(
         main_exe,
         protected_pid,
         "superseded",
+        false,
         |process| {
             Ok(is_superseded_app_exe(
                 install_dir,
@@ -134,6 +140,7 @@ fn terminate_prepared_app_processes_except(prepared: &PreparedAppQuiescence, pro
         &prepared.main_exe,
         protected_pid,
         "active",
+        prepared.inspect_environment,
         |process| is_active_app_process(&prepared.active_entrypoint, prepared.interpreted_main.as_ref(), process),
         |exe| active_app_executable_may_match(&prepared.active_entrypoint, prepared.interpreted_main.as_ref(), exe),
         |command, cwd| {
@@ -165,6 +172,7 @@ fn refuse_in_process_swap(
         })?,
         command: std::env::args_os().collect(),
         command_inspected: true,
+        environment: current_process_environment(),
         cwd: Some(std::env::current_dir().map_err(|e| {
             SurgeError::Platform(format!(
                 "Failed to resolve updater working directory before application swap: {e}"
@@ -209,6 +217,7 @@ fn terminate_matching_app_processes<F, E, C>(
     main_exe: &str,
     protected_pid: u32,
     process_scope: &'static str,
+    inspect_environment: bool,
     matches_process: F,
     executable_may_match: E,
     command_may_match: C,
@@ -228,6 +237,7 @@ where
 
     let identities = app_process_identities(
         protected_pid,
+        inspect_environment,
         &matches_process,
         &executable_may_match,
         &command_may_match,
@@ -245,6 +255,7 @@ where
 
     if wait_until_app_processes_exit(
         protected_pid,
+        inspect_environment,
         &matches_process,
         &executable_may_match,
         &command_may_match,
@@ -256,6 +267,7 @@ where
 
     let remaining = app_process_identities(
         protected_pid,
+        inspect_environment,
         &matches_process,
         &executable_may_match,
         &command_may_match,
@@ -272,6 +284,7 @@ where
 
     if wait_until_app_processes_exit(
         protected_pid,
+        inspect_environment,
         &matches_process,
         &executable_may_match,
         &command_may_match,
@@ -325,6 +338,7 @@ fn terminate_active_app_processes_except(
 #[cfg(unix)]
 fn wait_until_app_processes_exit<F, E, C>(
     protected_pid: u32,
+    inspect_environment: bool,
     matches_process: &F,
     executable_may_match: &E,
     command_may_match: &C,
@@ -337,7 +351,15 @@ where
 {
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        if app_process_identities(protected_pid, matches_process, executable_may_match, command_may_match)?.is_empty() {
+        if app_process_identities(
+            protected_pid,
+            inspect_environment,
+            matches_process,
+            executable_may_match,
+            command_may_match,
+        )?
+        .is_empty()
+        {
             return Ok(true);
         }
         if std::time::Instant::now() >= deadline {
@@ -379,16 +401,29 @@ pub(in crate::update::manager) fn spawn_native_test_app(app_path: &Path) -> std:
 }
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+fn matching_active_app_pids(
+    protected_pid: u32,
+    active_entrypoint: &active_entrypoint::Identity,
+    interpreted_main: Option<&interpreted_main::Identity>,
+) -> Result<Vec<u32>> {
+    app_process_pids(
+        protected_pid,
+        interpreted_main.is_some_and(interpreted_main::Identity::requires_environment),
+        &|process| is_active_app_process(active_entrypoint, interpreted_main, process),
+        &|executable| active_app_executable_may_match(active_entrypoint, interpreted_main, executable),
+        &|command, cwd| active_app_command_may_match(active_entrypoint, interpreted_main, command, cwd),
+    )
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 pub(in crate::update::manager) fn wait_for_native_test_app(app_path: &Path, child_pid: u32) {
     let active_app_dir = app_path.parent().unwrap();
     let main_exe = app_path.file_name().unwrap().to_str().unwrap();
     let active_entrypoint = active_entrypoint::Identity::resolve(active_app_dir, main_exe).unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while !app_process_pids(u32::MAX, &|process| {
-        is_active_app_process(&active_entrypoint, None, process)
-    })
-    .unwrap()
-    .contains(&child_pid)
+    while !matching_active_app_pids(u32::MAX, &active_entrypoint, None)
+        .unwrap()
+        .contains(&child_pid)
     {
         assert!(
             std::time::Instant::now() < deadline,
@@ -408,7 +443,7 @@ fn active_app_executable_may_match(
         return Ok(true);
     }
     match interpreted_main {
-        Some(identity) => identity.executable_may_match(executable),
+        Some(identity) => identity.executable_may_match_without_environment(executable),
         None => Ok(false),
     }
 }
@@ -480,7 +515,9 @@ fn is_active_app_process(
     let Some(identity) = interpreted_main else {
         return Ok(false);
     };
-    if process.command.iter().all(|argument| argument.is_empty()) && identity.executable_may_match(&process.exe)? {
+    if process.command.iter().all(|argument| argument.is_empty())
+        && identity.executable_may_match_in_environment(&process.exe, &process.environment)?
+    {
         return Err(SurgeError::Platform(
             "Cannot inspect the command line of the active application interpreter before swap".to_string(),
         ));
@@ -491,12 +528,12 @@ fn is_active_app_process(
     if !active_entrypoint.matches_argument(argument, process.cwd.as_deref())? {
         return Ok(false);
     }
-    if !process.command_inspected && identity.executable_may_match(&process.exe)? {
+    if !process.command_inspected && identity.executable_may_match_in_environment(&process.exe, &process.environment)? {
         return Err(SurgeError::Platform(
             "Cannot inspect the command line of the active application interpreter before swap".to_string(),
         ));
     }
-    if !identity.matches_interpreter(&process.exe, process.command.first().map(OsString::as_os_str))? {
+    if !identity.matches_interpreter_in_environment(&process.exe, &process.command, &process.environment)? {
         return Ok(false);
     }
     Ok(true)
@@ -642,6 +679,7 @@ mod tests {
             exe: std::fs::canonicalize("/bin/sh").unwrap(),
             command: vec![OsString::from("/bin/sh"), app_path.into_os_string()],
             command_inspected: true,
+            environment: Vec::new(),
             cwd: Some(active_app_dir),
         };
 
@@ -663,6 +701,7 @@ mod tests {
             exe: std::fs::canonicalize("/bin/sleep").unwrap(),
             command: vec![app_path.into_os_string()],
             command_inspected: true,
+            environment: Vec::new(),
             cwd: Some(active_app_dir),
         };
 
@@ -683,10 +722,48 @@ mod tests {
             exe: std::fs::canonicalize("/bin/sleep").unwrap(),
             command: vec![OsString::from("/bin/sh"), app_path.into_os_string()],
             command_inspected: true,
+            environment: Vec::new(),
             cwd: Some(active_app_dir),
         };
 
         assert!(!is_active_app_process(&active_entrypoint, Some(&interpreted_main), &process).unwrap());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn env_interpreter_argv0_does_not_spoof_executable_identity() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let active_app_dir = tmp.path().join("app");
+        let interpreter_dir = tmp.path().join("interpreters");
+        std::fs::create_dir_all(&active_app_dir).unwrap();
+        std::fs::create_dir_all(&interpreter_dir).unwrap();
+        let interpreter_name = "surge-test-interpreter";
+        symlink("/bin/sh", interpreter_dir.join(interpreter_name)).unwrap();
+        let app_path = active_app_dir.join("demo-script");
+        std::fs::write(&app_path, format!("#!/usr/bin/env {interpreter_name}\n")).unwrap();
+        let active_entrypoint = active_entrypoint::Identity::resolve(&active_app_dir, "demo-script").unwrap();
+        let interpreted_main = interpreted_main::resolve(&active_entrypoint.resolved).unwrap().unwrap();
+        let environment = vec![OsString::from(format!("PATH={}", interpreter_dir.display()))];
+        let command = vec![OsString::from(interpreter_name), app_path.into_os_string()];
+        let valid = AppProcess {
+            exe: std::fs::canonicalize("/bin/sh").unwrap(),
+            command: command.clone(),
+            command_inspected: true,
+            environment: environment.clone(),
+            cwd: None,
+        };
+        let spoofed = AppProcess {
+            exe: std::fs::canonicalize("/bin/sleep").unwrap(),
+            command,
+            command_inspected: true,
+            environment,
+            cwd: None,
+        };
+
+        assert!(is_active_app_process(&active_entrypoint, Some(&interpreted_main), &valid).unwrap());
+        assert!(!is_active_app_process(&active_entrypoint, Some(&interpreted_main), &spoofed).unwrap());
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -703,6 +780,7 @@ mod tests {
             exe: std::fs::canonicalize("/bin/sh").unwrap(),
             command: Vec::new(),
             command_inspected: false,
+            environment: Vec::new(),
             cwd: None,
         };
 
@@ -725,6 +803,7 @@ mod tests {
             exe: std::fs::canonicalize("/bin/sh").unwrap(),
             command: vec![OsString::new()],
             command_inspected: true,
+            environment: Vec::new(),
             cwd: None,
         };
 
@@ -747,6 +826,7 @@ mod tests {
             exe: std::fs::canonicalize("/bin/sh").unwrap(),
             command: vec![OsString::new(), OsString::new()],
             command_inspected: true,
+            environment: Vec::new(),
             cwd: None,
         };
 
@@ -769,6 +849,7 @@ mod tests {
             exe: std::fs::canonicalize("/bin/sleep").unwrap(),
             command: vec![OsString::new()],
             command_inspected: true,
+            environment: Vec::new(),
             cwd: None,
         };
 
@@ -791,6 +872,7 @@ mod tests {
             exe: std::fs::canonicalize("/bin/sh").unwrap(),
             command: vec![OsString::from("/bin/sh"), OsString::from("demo-script")],
             command_inspected: true,
+            environment: Vec::new(),
             cwd: None,
         };
 
@@ -851,10 +933,7 @@ mod tests {
 
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
         loop {
-            let matches = app_process_pids(u32::MAX, &|process| {
-                is_active_app_process(&active_entrypoint, None, process)
-            })
-            .unwrap();
+            let matches = matching_active_app_pids(u32::MAX, &active_entrypoint, None).unwrap();
             if matches.contains(&app_child_pid) {
                 assert!(!matches.contains(&unrelated_child_pid));
                 break;
@@ -880,13 +959,30 @@ mod tests {
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn assert_interpreted_active_app_process_is_terminated_before_swap(shebang: &str) {
+    fn assert_interpreted_active_app_process_is_terminated_before_swap(
+        shebang: &str,
+        isolated_env_interpreter: Option<&str>,
+    ) {
         use std::os::unix::fs::PermissionsExt;
         use std::process::{Command, Stdio};
 
         let tmp = tempfile::tempdir().unwrap();
         let active_app_dir = tmp.path().join("app");
         std::fs::create_dir_all(&active_app_dir).unwrap();
+        let (shebang, child_path) = if let Some(interpreter_name) = isolated_env_interpreter {
+            let interpreter_dir = tmp.path().join("child-path");
+            std::fs::create_dir_all(&interpreter_dir).unwrap();
+            std::os::unix::fs::symlink("/bin/sh", interpreter_dir.join(interpreter_name)).unwrap();
+            let updater_path = std::env::var_os("PATH").unwrap_or_default();
+            let mut child_paths = vec![interpreter_dir];
+            child_paths.extend(std::env::split_paths(&updater_path));
+            (
+                format!("#!/usr/bin/env {interpreter_name}"),
+                Some(std::env::join_paths(child_paths).unwrap()),
+            )
+        } else {
+            (shebang.to_string(), None)
+        };
         let app_path = active_app_dir.join("demo-script");
         std::fs::write(&app_path, format!("{shebang}\nread _\n")).unwrap();
         let mut permissions = std::fs::metadata(&app_path).unwrap().permissions();
@@ -899,6 +995,9 @@ mod tests {
         let mut child = loop {
             let mut command = Command::new(&app_path);
             command.stdin(Stdio::piped());
+            if let Some(child_path) = &child_path {
+                command.env("PATH", child_path);
+            }
             match command.spawn() {
                 Ok(child) => break child,
                 Err(error)
@@ -912,11 +1011,9 @@ mod tests {
         };
         let child_pid = child.id();
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        while !app_process_pids(u32::MAX, &|process| {
-            is_active_app_process(&active_entrypoint, Some(&interpreted_main), process)
-        })
-        .unwrap()
-        .contains(&child_pid)
+        while !matching_active_app_pids(u32::MAX, &active_entrypoint, Some(&interpreted_main))
+            .unwrap()
+            .contains(&child_pid)
         {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -936,7 +1033,13 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn interpreted_active_app_process_is_terminated_before_swap() {
-        assert_interpreted_active_app_process_is_terminated_before_swap("#!/bin/sh");
+        assert_interpreted_active_app_process_is_terminated_before_swap("#!/bin/sh", None);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn env_interpreted_app_uses_the_launched_process_path() {
+        assert_interpreted_active_app_process_is_terminated_before_swap("", Some("surge-test-interpreter"));
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -953,6 +1056,7 @@ mod tests {
             exe: std::fs::canonicalize("/bin/sh").unwrap(),
             command: vec![OsString::from("/bin/sh"), OsString::from("./demo-script")],
             command_inspected: true,
+            environment: Vec::new(),
             cwd: Some(std::path::PathBuf::from("/")),
         };
 
@@ -999,9 +1103,11 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(
-            app_process_pids(u32::MAX, &|process| {
-                is_active_app_process(&prepared.active_entrypoint, prepared.interpreted_main.as_ref(), process)
-            })
+            matching_active_app_pids(
+                u32::MAX,
+                &prepared.active_entrypoint,
+                prepared.interpreted_main.as_ref(),
+            )
             .unwrap()
             .contains(&child_pid)
         );
@@ -1017,7 +1123,7 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn interpreted_active_app_with_multiple_interpreter_options_is_terminated_before_swap() {
-        assert_interpreted_active_app_process_is_terminated_before_swap("#!/usr/bin/env -S -i /bin/sh -e -u");
+        assert_interpreted_active_app_process_is_terminated_before_swap("#!/usr/bin/env -S -i /bin/sh -e -u", None);
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1035,6 +1141,7 @@ mod tests {
             exe: std::fs::canonicalize("/bin/sh").unwrap(),
             command: vec![OsString::from(interpreter_name), app_path.into_os_string()],
             command_inspected: true,
+            environment: Vec::new(),
             cwd: Some(active_app_dir),
         };
 
@@ -1062,6 +1169,7 @@ mod tests {
             exe: std::fs::canonicalize("/bin/sh").unwrap(),
             command: vec![OsString::from(interpreter_name), OsString::from("/other/script")],
             command_inspected: true,
+            environment: Vec::new(),
             cwd: Some(active_app_dir),
         };
 
@@ -1071,12 +1179,12 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn direct_interpreted_app_with_multiple_options_is_terminated_before_swap() {
-        assert_interpreted_active_app_process_is_terminated_before_swap("#!/bin/sh -e -u");
+        assert_interpreted_active_app_process_is_terminated_before_swap("#!/bin/sh -e -u", None);
     }
     #[cfg(target_os = "macos")]
     #[test]
     fn env_interpreted_app_with_multiple_options_is_terminated_before_swap() {
-        assert_interpreted_active_app_process_is_terminated_before_swap("#!/usr/bin/env /bin/sh -e -u");
+        assert_interpreted_active_app_process_is_terminated_before_swap("#!/usr/bin/env /bin/sh -e -u", None);
     }
     #[cfg(target_os = "linux")]
     #[test]
@@ -1096,6 +1204,7 @@ mod tests {
             exe: std::fs::canonicalize("/bin/sleep").unwrap(),
             command: discovery::parse_proc_cmdline(&command),
             command_inspected: true,
+            environment: Vec::new(),
             cwd: Some(active_app_dir),
         };
 

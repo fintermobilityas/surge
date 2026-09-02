@@ -19,11 +19,13 @@ pub(super) struct AppProcess {
     pub(super) command: Vec<OsString>,
     pub(super) command_inspected: bool,
     pub(super) cwd: Option<std::path::PathBuf>,
+    pub(super) environment: Vec<OsString>,
 }
 
 #[cfg(unix)]
 pub(super) fn app_process_identities<F, E, C>(
     protected_pid: u32,
+    inspect_environment: bool,
     matches_process: &F,
     executable_may_match: &E,
     command_may_match: &C,
@@ -33,21 +35,70 @@ where
     E: Fn(&Path) -> Result<bool>,
     C: Fn(&[OsString], Option<&Path>) -> Result<bool>,
 {
-    app_process_identities_impl(protected_pid, matches_process, executable_may_match, command_may_match)
+    app_process_identities_impl(
+        protected_pid,
+        inspect_environment,
+        matches_process,
+        executable_may_match,
+        command_may_match,
+    )
 }
 
 #[cfg(all(unix, test))]
-pub(super) fn app_process_pids<F>(protected_pid: u32, matches_process: &F) -> Result<Vec<u32>>
+pub(super) fn app_process_pids<F, E, C>(
+    protected_pid: u32,
+    inspect_environment: bool,
+    matches_process: &F,
+    executable_may_match: &E,
+    command_may_match: &C,
+) -> Result<Vec<u32>>
 where
     F: Fn(&AppProcess) -> Result<bool>,
+    E: Fn(&Path) -> Result<bool>,
+    C: Fn(&[OsString], Option<&Path>) -> Result<bool>,
 {
-    app_process_identities(protected_pid, matches_process, &|_| Ok(true), &|_, _| Ok(true))
-        .map(|identities| identities.into_iter().map(|identity| identity.pid).collect())
+    app_process_identities(
+        protected_pid,
+        inspect_environment,
+        matches_process,
+        executable_may_match,
+        command_may_match,
+    )
+    .map(|identities| identities.into_iter().map(|identity| identity.pid).collect())
+}
+
+#[cfg(unix)]
+pub(super) fn current_process_environment() -> Vec<OsString> {
+    std::env::vars_os()
+        .map(|(name, value)| {
+            let mut assignment = name;
+            assignment.push("=");
+            assignment.push(value);
+            assignment
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+fn should_inspect_process_environment<C>(
+    inspect_environment: bool,
+    command: &[OsString],
+    cwd: Option<&Path>,
+    command_may_match: &C,
+) -> Result<bool>
+where
+    C: Fn(&[OsString], Option<&Path>) -> Result<bool>,
+{
+    if !inspect_environment {
+        return Ok(false);
+    }
+    command_may_match(command, cwd)
 }
 
 #[cfg(target_os = "linux")]
 fn app_process_identities_impl<F, E, C>(
     protected_pid: u32,
+    inspect_environment: bool,
     matches_process: &F,
     executable_may_match: &E,
     command_may_match: &C,
@@ -125,11 +176,22 @@ where
             }
             (Err(error), Err(_)) => return Err(process_inspection_error(pid, "executable", &error)),
         };
+        let environment =
+            if should_inspect_process_environment(inspect_environment, &command, cwd.as_deref(), command_may_match)? {
+                match read_proc_arguments(pid, "environ") {
+                    Ok(environment) => environment,
+                    Err(error) if process_exited_during_inspection(&error) => continue,
+                    Err(error) => return Err(process_inspection_error(pid, "environment", &error)),
+                }
+            } else {
+                Vec::new()
+            };
         let process = AppProcess {
             exe: executable,
             command,
             command_inspected: true,
             cwd,
+            environment,
         };
         if matches_process(&process)? && inspected_identity_still_matches(identity)? {
             identities.push(identity);
@@ -243,6 +305,7 @@ fn process_inspection_error(pid: u32, field: &str, error: &std::io::Error) -> Su
 #[cfg(target_os = "macos")]
 fn app_process_identities_impl<F, E, C>(
     protected_pid: u32,
+    inspect_environment: bool,
     matches_process: &F,
     _executable_may_match: &E,
     command_may_match: &C,
@@ -262,7 +325,8 @@ where
             .with_exe(UpdateKind::Always)
             .with_cmd(UpdateKind::Always)
             .with_cwd(UpdateKind::Always)
-            .with_user(UpdateKind::Always),
+            .with_user(UpdateKind::Always)
+            .with_environ(UpdateKind::Never),
     );
     let updater = system
         .process(Pid::from_u32(crate::platform::process::current_pid()))
@@ -272,14 +336,44 @@ where
     let updater_user = updater
         .effective_user_id()
         .or_else(|| updater.user_id())
+        .cloned()
         .ok_or_else(|| {
             SurgeError::Platform("Failed to inspect updater user identity before application swap".to_string())
         })?;
 
     let mut identities = Vec::new();
-    for (pid, process) in system.processes() {
-        let pid = pid.as_u32();
-        if pid == protected_pid || process.effective_user_id().or_else(|| process.user_id()) != Some(updater_user) {
+    let process_ids: Vec<_> = system.processes().keys().copied().collect();
+    for process_id in process_ids {
+        let pid = process_id.as_u32();
+        if pid == protected_pid {
+            continue;
+        }
+
+        let Some(process) = system.process(process_id) else {
+            continue;
+        };
+        if process.effective_user_id().or_else(|| process.user_id()) != Some(&updater_user) {
+            continue;
+        }
+        let inspect_candidate_environment =
+            should_inspect_process_environment(inspect_environment, process.cmd(), process.cwd(), command_may_match)?;
+        if inspect_candidate_environment {
+            let _ = system.refresh_processes_specifics(
+                ProcessesToUpdate::Some(&[process_id]),
+                true,
+                ProcessRefreshKind::nothing()
+                    .with_exe(UpdateKind::Always)
+                    .with_cmd(UpdateKind::Always)
+                    .with_cwd(UpdateKind::Always)
+                    .with_user(UpdateKind::Always)
+                    .with_environ(UpdateKind::Always),
+            );
+        }
+
+        let Some(process) = system.process(process_id) else {
+            continue;
+        };
+        if process.effective_user_id().or_else(|| process.user_id()) != Some(&updater_user) {
             continue;
         }
         let Some(identity) = inspected_process_identity(pid)? else {
@@ -303,6 +397,11 @@ where
             command,
             command_inspected: !process.cmd().is_empty(),
             cwd,
+            environment: if inspect_candidate_environment {
+                process.environ().to_vec()
+            } else {
+                Vec::new()
+            },
         };
         if matches_process(&app_process)? && inspected_identity_still_matches(identity)? {
             identities.push(identity);
@@ -315,6 +414,7 @@ where
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn app_process_identities_impl<F, E, C>(
     _protected_pid: u32,
+    _inspect_environment: bool,
     _matches_process: &F,
     _executable_may_match: &E,
     _command_may_match: &C,
@@ -385,6 +485,14 @@ mod tests {
                 .to_string()
                 .contains("Failed to inspect process 42 command line")
         );
+    }
+
+    #[test]
+    fn environment_candidate_is_not_evaluated_when_inspection_is_disabled() {
+        let candidate =
+            |_: &[OsString], _: Option<&Path>| -> Result<bool> { panic!("environment candidate must not run") };
+
+        assert!(!should_inspect_process_environment(false, &[], None, &candidate).unwrap());
     }
 
     #[test]

@@ -12,6 +12,30 @@ pub(super) struct ProcessTarget {
     handle: StableProcessHandle,
 }
 
+pub(super) fn add_process_targets(
+    targets: &mut Vec<ProcessTarget>,
+    identities: impl IntoIterator<Item = ProcessIdentity>,
+) -> Result<()> {
+    for identity in identities {
+        if targets.iter().any(|target| target.identity() == identity) {
+            continue;
+        }
+        if let Some(target) = ProcessTarget::open(identity)? {
+            targets.push(target);
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn process_targets_are_running(targets: &[ProcessTarget]) -> Result<bool> {
+    for target in targets {
+        if target.is_running()? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 impl ProcessTarget {
     pub(super) fn open(identity: ProcessIdentity) -> Result<Option<Self>> {
         #[cfg(target_os = "linux")]

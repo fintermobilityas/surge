@@ -263,6 +263,7 @@ where
             let quarantined_quiescence = lifecycle::prepare_app_quiescence(
                 &previous_swap_quarantine_dir,
                 previous_main_exe,
+                None,
                 manager.allow_in_process_swap,
             )?
             .ok_or_else(|| {

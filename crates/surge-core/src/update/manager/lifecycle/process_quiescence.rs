@@ -18,7 +18,7 @@ use self::discovery::app_process_pids;
 #[cfg(unix)]
 use self::discovery::{app_process_identities, current_process_environment};
 #[cfg(unix)]
-use self::process_target::ProcessTarget;
+use self::process_target::{ProcessTarget, add_process_targets, process_targets_are_running};
 use crate::error::Result;
 #[cfg(unix)]
 use crate::error::SurgeError;
@@ -37,6 +37,7 @@ pub(in crate::update::manager) struct PreparedAppQuiescence {
     active_entrypoint: active_entrypoint::Identity,
     interpreted_main: Option<interpreted_main::Identity>,
     inspect_environment: bool,
+    supervised_child_identity: Option<ProcessIdentity>,
 }
 
 pub(in crate::update::manager) fn terminate_superseded_app_processes(
@@ -60,9 +61,16 @@ pub(in crate::update::manager) fn terminate_active_app_processes_before_swap(
 pub(in crate::update::manager) fn prepare_app_quiescence(
     active_app_dir: &Path,
     main_exe: &str,
+    supervised_child_identity: Option<ProcessIdentity>,
     allow_in_process_swap: bool,
 ) -> Result<Option<PreparedAppQuiescence>> {
-    prepare_app_quiescence_except(active_app_dir, main_exe, current_pid(), allow_in_process_swap)
+    prepare_app_quiescence_except(
+        active_app_dir,
+        main_exe,
+        current_pid(),
+        supervised_child_identity,
+        allow_in_process_swap,
+    )
 }
 
 #[cfg(unix)]
@@ -70,6 +78,7 @@ fn prepare_app_quiescence_except(
     active_app_dir: &Path,
     main_exe: &str,
     protected_pid: u32,
+    supervised_child_identity: Option<ProcessIdentity>,
     allow_in_process_swap: bool,
 ) -> Result<Option<PreparedAppQuiescence>> {
     let main_exe = main_exe.trim();
@@ -92,6 +101,7 @@ fn prepare_app_quiescence_except(
         active_entrypoint,
         interpreted_main,
         inspect_environment,
+        supervised_child_identity,
     }))
 }
 
@@ -112,6 +122,7 @@ fn terminate_superseded_app_processes_except(
         protected_pid,
         "superseded",
         false,
+        None,
         |process| {
             Ok(is_superseded_app_exe(
                 install_dir,
@@ -130,9 +141,16 @@ fn terminate_active_app_processes_except(
     active_app_dir: &Path,
     main_exe: &str,
     protected_pid: u32,
+    supervised_child_identity: Option<ProcessIdentity>,
     allow_in_process_swap: bool,
 ) -> Result<usize> {
-    let Some(prepared) = prepare_app_quiescence_except(active_app_dir, main_exe, protected_pid, allow_in_process_swap)?
+    let Some(prepared) = prepare_app_quiescence_except(
+        active_app_dir,
+        main_exe,
+        protected_pid,
+        supervised_child_identity,
+        allow_in_process_swap,
+    )?
     else {
         return Ok(0);
     };
@@ -147,6 +165,7 @@ fn terminate_prepared_app_processes_except(prepared: &PreparedAppQuiescence, pro
         protected_pid,
         "active",
         prepared.inspect_environment,
+        prepared.supervised_child_identity,
         |process| is_active_app_process(&prepared.active_entrypoint, prepared.interpreted_main.as_ref(), process),
         |exe| active_app_executable_may_match(&prepared.active_entrypoint, prepared.interpreted_main.as_ref(), exe),
         |command, cwd| {
@@ -219,37 +238,12 @@ fn refuse_process_in_swap(
 }
 
 #[cfg(unix)]
-fn add_process_targets(
-    targets: &mut Vec<ProcessTarget>,
-    identities: impl IntoIterator<Item = ProcessIdentity>,
-) -> Result<()> {
-    for identity in identities {
-        if targets.iter().any(|target| target.identity() == identity) {
-            continue;
-        }
-        if let Some(target) = ProcessTarget::open(identity)? {
-            targets.push(target);
-        }
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn process_targets_are_running(targets: &[ProcessTarget]) -> Result<bool> {
-    for target in targets {
-        if target.is_running()? {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-#[cfg(unix)]
 fn terminate_matching_app_processes<F, E, C>(
     main_exe: &str,
     protected_pid: u32,
     process_scope: &'static str,
     inspect_environment: bool,
+    supervised_child_identity: Option<ProcessIdentity>,
     matches_process: F,
     executable_may_match: E,
     command_may_match: C,
@@ -264,6 +258,15 @@ where
         return Ok(0);
     }
 
+    if let Some(identity) = supervised_child_identity
+        && (identity.pid == 0 || identity.pid == protected_pid)
+    {
+        return Err(SurgeError::Platform(format!(
+            "Supervisor returned invalid child process identity for PID {} during update handoff",
+            identity.pid
+        )));
+    }
+
     let identities = app_process_identities(
         protected_pid,
         inspect_environment,
@@ -273,6 +276,9 @@ where
     )?;
     let mut targets = Vec::new();
     add_process_targets(&mut targets, identities)?;
+    if let Some(identity) = supervised_child_identity {
+        add_process_targets(&mut targets, [identity])?;
+    }
     if targets.is_empty() {
         return Ok(0);
     }
@@ -627,6 +633,96 @@ mod tests {
         assert!(!target.is_running().unwrap());
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn supervised_child_remains_a_target_after_exec() {
+        use std::io::Write;
+        use std::os::unix::fs::symlink;
+        use std::process::{Command, Stdio};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let active_app_dir = tmp.path().join("app");
+        std::fs::create_dir_all(&active_app_dir).unwrap();
+        symlink("/bin/true", active_app_dir.join("demo")).unwrap();
+
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "read _; exec sleep 30"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let identity = crate::platform::process::process_identity(child.id()).unwrap().unwrap();
+        writeln!(child.stdin.as_mut().unwrap(), "continue").unwrap();
+        let expected_executable = std::fs::canonicalize("/bin/sleep").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while std::fs::read_link(format!("/proc/{}/exe", child.id()))
+            .ok()
+            .and_then(|path| std::fs::canonicalize(path).ok())
+            .as_deref()
+            != Some(expected_executable.as_path())
+        {
+            assert!(std::time::Instant::now() < deadline, "child did not exec sleep");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let terminated =
+            terminate_active_app_processes_except(&active_app_dir, "demo", u32::MAX, Some(identity), false).unwrap();
+        let status = child.wait().unwrap();
+
+        assert_eq!(terminated, 1);
+        assert!(!status.success());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn stale_supervised_child_generation_is_not_signalled() {
+        use std::os::unix::fs::symlink;
+        use std::process::Command;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let active_app_dir = tmp.path().join("app");
+        std::fs::create_dir_all(&active_app_dir).unwrap();
+        symlink("/bin/true", active_app_dir.join("demo")).unwrap();
+
+        let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let identity = crate::platform::process::process_identity(child.id()).unwrap().unwrap();
+        let stale_identity = ProcessIdentity {
+            generation: identity.generation.wrapping_add(1),
+            ..identity
+        };
+
+        let terminated =
+            terminate_active_app_processes_except(&active_app_dir, "demo", u32::MAX, Some(stale_identity), false)
+                .unwrap();
+        let child_still_running = child.try_wait().unwrap().is_none();
+        if child_still_running {
+            child.kill().unwrap();
+        }
+        let _ = child.wait();
+
+        assert_eq!(terminated, 0);
+        assert!(child_still_running);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn updater_identity_is_rejected_as_a_supervised_child() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let active_app_dir = tmp.path().join("app");
+        std::fs::create_dir_all(&active_app_dir).unwrap();
+        symlink("/bin/true", active_app_dir.join("demo")).unwrap();
+        let identity = crate::platform::process::process_identity(current_pid())
+            .unwrap()
+            .unwrap();
+
+        let error =
+            terminate_active_app_processes_except(&active_app_dir, "demo", current_pid(), Some(identity), false)
+                .unwrap_err();
+
+        assert!(error.to_string().contains("invalid child process identity"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn superseded_app_exe_detection_matches_retained_directories_only() {
@@ -688,7 +784,7 @@ mod tests {
         wait_for_native_test_app(&app_path, child_pid);
 
         let terminated =
-            terminate_active_app_processes_except(&linked_active_app_dir, "demo", u32::MAX, false).unwrap();
+            terminate_active_app_processes_except(&linked_active_app_dir, "demo", u32::MAX, None, false).unwrap();
         let status = child.wait().unwrap();
 
         assert_eq!(terminated, 1);
@@ -711,7 +807,8 @@ mod tests {
         std::fs::create_dir_all(&active_app_dir).unwrap();
         std::fs::hard_link(std::env::current_exe().unwrap(), active_app_dir.join("demo")).unwrap();
 
-        let error = terminate_active_app_processes_except(&active_app_dir, "demo", current_pid(), false).unwrap_err();
+        let error =
+            terminate_active_app_processes_except(&active_app_dir, "demo", current_pid(), None, false).unwrap_err();
 
         assert!(error.to_string().contains("refusing an in-process directory swap"));
     }
@@ -724,7 +821,8 @@ mod tests {
         std::fs::create_dir_all(&active_app_dir).unwrap();
         std::fs::hard_link(std::env::current_exe().unwrap(), active_app_dir.join("demo")).unwrap();
 
-        let terminated = terminate_active_app_processes_except(&active_app_dir, "demo", current_pid(), true).unwrap();
+        let terminated =
+            terminate_active_app_processes_except(&active_app_dir, "demo", current_pid(), None, true).unwrap();
 
         assert_eq!(terminated, 0);
     }
@@ -961,7 +1059,7 @@ mod tests {
         let mut child = Command::new(&app_path).arg("30").spawn().unwrap();
         std::fs::remove_file(&app_path).unwrap();
 
-        let error = terminate_active_app_processes_except(&active_app_dir, "demo", u32::MAX, false).unwrap_err();
+        let error = terminate_active_app_processes_except(&active_app_dir, "demo", u32::MAX, None, false).unwrap_err();
         let child_still_running = child.try_wait().unwrap().is_none();
         if child_still_running {
             child.kill().unwrap();
@@ -1009,7 +1107,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
 
-        let terminated = terminate_active_app_processes_except(&active_app_dir, "demo", u32::MAX, false);
+        let terminated = terminate_active_app_processes_except(&active_app_dir, "demo", u32::MAX, None, false);
         let app_status = app_child.wait().unwrap();
         let unrelated_still_running = unrelated_child.try_wait().unwrap().is_none();
         if unrelated_still_running {
@@ -1087,7 +1185,7 @@ mod tests {
         }
 
         let terminated =
-            terminate_active_app_processes_except(&active_app_dir, "demo-script", u32::MAX, false).unwrap();
+            terminate_active_app_processes_except(&active_app_dir, "demo-script", u32::MAX, None, false).unwrap();
         let status = child.wait().unwrap();
 
         assert_eq!(terminated, 1);
@@ -1147,7 +1245,7 @@ mod tests {
         permissions.set_mode(0o755);
         std::fs::set_permissions(&app_path, permissions).unwrap();
 
-        let prepared = prepare_app_quiescence_except(&active_app_dir, "demo-script", u32::MAX, false)
+        let prepared = prepare_app_quiescence_except(&active_app_dir, "demo-script", u32::MAX, None, false)
             .unwrap()
             .unwrap();
         assert_eq!(terminate_prepared_app_processes_except(&prepared, u32::MAX).unwrap(), 0);

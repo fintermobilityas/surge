@@ -22,7 +22,12 @@ pub(super) fn prepare_and_quiesce_active_app_before_swap(
     allow_in_process_swap: bool,
 ) -> Result<Option<lifecycle::PreparedAppQuiescence>> {
     let result = (|| {
-        let prepared = lifecycle::prepare_app_quiescence(current_app_dir, current_main_exe, allow_in_process_swap)?;
+        let prepared = lifecycle::prepare_app_quiescence(
+            current_app_dir,
+            current_main_exe,
+            supervised_child_identity,
+            allow_in_process_swap,
+        )?;
         if let Some(prepared) = &prepared {
             lifecycle::terminate_prepared_app_processes(prepared)?;
         }
@@ -119,6 +124,7 @@ pub(super) async fn prepare_and_quiesce_previous_swap_before_reuse(
         let prepared = lifecycle::prepare_app_quiescence(
             previous_swap_dir,
             &previous_swap_identity.main_exe,
+            previous_supervised_child_identity,
             manager.allow_in_process_swap,
         )?
         .ok_or_else(|| {

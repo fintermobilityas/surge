@@ -9,6 +9,7 @@ use surge_core::supervisor::state::{read_supervisor_exe_path, supervisor_pid_fil
 use thiserror::Error;
 
 mod child;
+mod external_finalize;
 mod handoff;
 mod ownership;
 
@@ -87,6 +88,18 @@ enum Commands {
         /// Arguments to pass when launching the replacement child process
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
+
+        /// Enable verbose logging
+        #[arg(long, short = 'v')]
+        verbose: bool,
+    },
+
+    /// Finalize a staged update after the updating application exits
+    #[command(hide = true)]
+    FinalizeUpdate {
+        /// Path to the ready/armed external finalizer plan
+        #[arg(long)]
+        plan: PathBuf,
 
         /// Enable verbose logging
         #[arg(long, short = 'v')]
@@ -184,6 +197,25 @@ fn main() -> ExitCode {
             };
             if let Err(e) = run_supervisor(&id, &dir, &exe_path, &args, Some(pid), handoff_version.as_deref()) {
                 tracing::error!("{e}");
+                return ExitCode::FAILURE;
+            }
+            ExitCode::SUCCESS
+        }
+        Commands::FinalizeUpdate { plan, verbose } => {
+            init_tracing(verbose);
+            let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    tracing::error!(%error, "Failed to create external finalizer runtime");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let result = runtime.block_on(surge_core::update::manager::run_external_finalize(
+                &plan,
+                external_finalize::quiesce_updating_application,
+            ));
+            if let Err(error) = result {
+                tracing::error!(%error, "External update finalization failed");
                 return ExitCode::FAILURE;
             }
             ExitCode::SUCCESS

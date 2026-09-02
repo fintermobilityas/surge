@@ -3,6 +3,7 @@
 mod apply;
 mod artifacts;
 mod current_install;
+mod external_finalize;
 mod finalize;
 mod lifecycle;
 mod progress;
@@ -24,6 +25,7 @@ use crate::update::status::{self, FailureContext, UpdateStatusRecord, UpdateWork
 
 use self::apply::materialize_update_payload;
 use self::artifacts::prepare_update_artifacts;
+pub use self::external_finalize::run_external_finalize;
 use self::finalize::finalize_update;
 use self::lifecycle::SupervisorRestartOutcome;
 pub use self::progress::ProgressInfo;
@@ -69,6 +71,7 @@ pub struct UpdateCheckState {
     current_version: String,
     channel: String,
     install_dir: PathBuf,
+    cached_index: Option<ReleaseIndex>,
     current_release_identity: Option<current_install::ReleaseIdentity>,
 }
 
@@ -207,6 +210,7 @@ impl UpdateManager {
             current_version: self.current_version.clone(),
             channel: self.channel.clone(),
             install_dir: self.install_dir.clone(),
+            cached_index: self.cached_index.clone(),
             current_release_identity: self.current_release_identity.clone(),
         }
     }
@@ -231,6 +235,7 @@ impl UpdateManager {
             ));
         }
 
+        self.cached_index.clone_from(&state.cached_index);
         self.current_release_identity = installed_identity;
         Ok(())
     }
@@ -266,12 +271,11 @@ impl UpdateManager {
 
     /// Allow the running application to swap its own active directory during apply.
     ///
-    /// Defaults to `false`, matching the fail-closed pre-swap quiescence contract: an
-    /// updater running from the active application executable refuses the swap and
-    /// expects an external Surge updater. A self-hosted application that updates
-    /// in-process can opt back in to the legacy in-place swap; other processes running
-    /// the active executable are still quiesced before the swap, and the
-    /// interpreted-entrypoint and shared-executable checks remain fail-closed.
+    /// Defaults to `false`: an updater running from the active application
+    /// executable hands finalization to the bundled supervisor at a stable path,
+    /// then the helper waits for the caller to exit before swapping directories.
+    /// A self-hosted application can opt back in to the legacy in-process swap;
+    /// other processes running the active executable are still quiesced first.
     pub fn set_allow_in_process_swap(&mut self, allow: bool) {
         self.allow_in_process_swap = allow;
     }
@@ -316,6 +320,10 @@ impl UpdateManager {
     /// 4. Extract - extract the final archive into the install tree
     /// 5. Apply delta - rebuild the final archive when using delta updates
     /// 6. Finalize - move files into place, clean up
+    ///
+    /// A self-hosted updater leaves phase 6 to a stable external helper. In
+    /// that case this method returns after the helper is ready and armed; the
+    /// helper waits for the caller to exit before it swaps the `app` directory.
     ///
     /// On every attempt this method also writes an explicit convergence record
     /// to `{install_dir}/.surge-update-status.json` so dashboards and repair
@@ -376,22 +384,27 @@ impl UpdateManager {
 
         let progress = progress.map(Arc::new);
         match self
-            .download_and_apply_inner(info, progress, in_progress_record.clone())
+            .download_and_apply_inner(
+                info,
+                progress,
+                in_progress_record.clone(),
+                previous_attempt_status.clone(),
+            )
             .await
         {
             Ok(restart_outcome) => {
                 let completed_at_utc = status::now_utc_rfc3339();
                 let record = match restart_outcome {
-                    SupervisorRestartOutcome::NotApplicable => UpdateStatusRecord::converged(
+                    SupervisorRestartOutcome::NotApplicable => Some(UpdateStatusRecord::converged(
                         &self.app_id,
                         &target_version,
                         &self.channel,
                         Some(attempted_at_utc),
                         completed_at_utc,
                         false,
-                    ),
+                    )),
                     SupervisorRestartOutcome::PendingRestart { reason, failure_phase } => {
-                        UpdateStatusRecord::pending_restart_with_failure_phase(
+                        Some(UpdateStatusRecord::pending_restart_with_failure_phase(
                             &self.app_id,
                             &target_version,
                             &target_version,
@@ -400,10 +413,13 @@ impl UpdateManager {
                             completed_at_utc,
                             &reason,
                             failure_phase,
-                        )
+                        ))
                     }
+                    SupervisorRestartOutcome::ExternalFinalizeScheduled => None,
                 };
-                if let Err(e) = status::write_update_status(&self.install_dir, &record) {
+                if let Some(record) = record
+                    && let Err(e) = status::write_update_status(&self.install_dir, &record)
+                {
                     warn!(error = %e, "Failed to persist post-update convergence status (continuing)");
                 }
                 Ok(())
@@ -439,6 +455,7 @@ impl UpdateManager {
         info: &UpdateInfo,
         progress: Option<Arc<F>>,
         in_progress_template: UpdateStatusRecord,
+        previous_attempt_status: Option<UpdateStatusRecord>,
     ) -> Result<SupervisorRestartOutcome>
     where
         F: Fn(ProgressInfo) + Send + Sync,
@@ -513,6 +530,23 @@ impl UpdateManager {
         progress_emitter.emit_completed_phase(update_phase::PACKAGE_APPLY_COMPLETED);
 
         // Phase 6: Finalize
+        if external_finalize::schedule_if_required(
+            self,
+            info,
+            &extracted_final_dir,
+            &in_progress_template,
+            previous_attempt_status,
+            &progress_emitter,
+        )
+        .await?
+        {
+            info!(
+                version = %info.latest_version,
+                "Update staged; external finalizer scheduled"
+            );
+            return Ok(SupervisorRestartOutcome::ExternalFinalizeScheduled);
+        }
+
         let restart_outcome = finalize_update(
             self,
             info,
@@ -789,6 +823,38 @@ mod tests {
         let error = applying.restore_check_state(&check_state).unwrap_err();
 
         assert!(error.to_string().contains("does not match"));
+    }
+
+    #[test]
+    fn restore_check_state_preserves_release_index_for_deferred_finalization() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("store");
+        std::fs::create_dir_all(&store_root).unwrap();
+
+        let ctx = Arc::new(Context::new());
+        ctx.set_storage(
+            StorageProvider::Filesystem,
+            store_root.to_str().unwrap(),
+            "",
+            "",
+            "",
+            "",
+        );
+        let mut checked =
+            UpdateManager::new(Arc::clone(&ctx), "app", "1.0.0", "stable", tmp.path().to_str().unwrap()).unwrap();
+        checked.cached_index = Some(ReleaseIndex {
+            app_id: "app".to_string(),
+            ..ReleaseIndex::default()
+        });
+        let check_state = checked.capture_check_state();
+        let mut applying = UpdateManager::new(ctx, "app", "1.0.0", "stable", tmp.path().to_str().unwrap()).unwrap();
+
+        applying.restore_check_state(&check_state).unwrap();
+
+        assert_eq!(
+            applying.cached_index.as_ref().map(|index| index.app_id.as_str()),
+            Some("app")
+        );
     }
 
     #[test]

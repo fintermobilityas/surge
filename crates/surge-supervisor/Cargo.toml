@@ -10,17 +10,26 @@ description = "Process supervisor for the Surge update framework"
 name = "surge-supervisor"
 path = "src/main.rs"
 
+[[test]]
+name = "external_finalize"
+path = "tests/external_finalize.rs"
+harness = false
+
 [dependencies]
 surge-core = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
 sysinfo = "0.39.3"
 signal-hook = "0.4.4"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["signal", "process"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

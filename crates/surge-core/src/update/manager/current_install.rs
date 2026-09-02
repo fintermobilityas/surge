@@ -2,6 +2,8 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 use crate::error::{Result, SurgeError};
 use crate::install::read_runtime_manifest_identity;
 use crate::releases::version::compare_versions;
@@ -9,7 +11,7 @@ use crate::supervisor::state::read_supervisor_exe_path;
 
 use super::{UpdateManager, apply};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct ReleaseIdentity {
     pub(super) version: String,
     pub(super) main_exe: String,
@@ -36,7 +38,6 @@ pub(super) fn load(manager: &UpdateManager) -> Result<Option<ReleaseIdentity>> {
     load_from_app_dir(manager, &active_app_dir, Some(&manager.current_version))
 }
 
-#[cfg(unix)]
 pub(super) fn load_previous_swap(manager: &UpdateManager, app_dir: &Path) -> Result<Option<ReleaseIdentity>> {
     load_from_app_dir(manager, app_dir, None)
 }

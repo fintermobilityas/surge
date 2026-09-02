@@ -279,11 +279,10 @@ SURGE_API surge_result SURGE_CALL surge_update_manager_set_release_retention_lim
  *
  * `allow` is treated as a boolean: zero disables (the default), non-zero
  * enables. When disabled, an updater running from the active application
- * executable refuses the swap and expects an external Surge updater. A
- * self-hosted application that updates in-process (calling
- * `surge_update_download_and_apply` from inside the installed app) must
- * enable this to keep self-updating; other processes running the active
- * executable are still quiesced before the swap.
+ * executable transfers finalization to a stable helper, which waits for the
+ * caller to exit before swapping directories. Enabling this restores the
+ * legacy in-process swap; other processes running the active executable are
+ * still quiesced before the swap.
  *
  * `mgr` must be a valid update manager handle or NULL.
  */

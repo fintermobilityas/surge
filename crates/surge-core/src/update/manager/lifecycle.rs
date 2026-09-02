@@ -37,6 +37,9 @@ pub(super) enum SupervisorRestartOutcome {
         reason: String,
         failure_phase: &'static str,
     },
+    /// The payload is fully materialized and a stable helper owns the remaining
+    /// quiesce, swap, and restart work. The helper writes the terminal status.
+    ExternalFinalizeScheduled,
 }
 
 pub(super) async fn request_supervisor_shutdown(install_dir: &Path, supervisor_id: &str) -> Result<()> {
@@ -405,6 +408,9 @@ mod tests {
                 assert_eq!(failure_phase, RESTART_HANDOFF_FAILED_PHASE);
             }
             SupervisorRestartOutcome::NotApplicable => panic!("expected PendingRestart failure, got NotApplicable"),
+            SupervisorRestartOutcome::ExternalFinalizeScheduled => {
+                panic!("expected PendingRestart failure, got ExternalFinalizeScheduled")
+            }
         }
 
         let deadline = std::time::Instant::now() + Duration::from_secs(2);

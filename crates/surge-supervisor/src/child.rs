@@ -1,7 +1,6 @@
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus};
 
-#[cfg(windows)]
 use sysinfo::{Pid, ProcessesToUpdate, System};
 
 use crate::SupervisorError;
@@ -151,6 +150,7 @@ fn wait_for_child_startup_or_stop(
 
 pub(crate) fn wait_for_pid_or_stop(
     pid: u32,
+    expected_start_time: Option<u64>,
     shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     stop_file: &Path,
     pid_file: &Path,
@@ -169,12 +169,28 @@ pub(crate) fn wait_for_pid_or_stop(
             return WaitOutcome::StopRequested;
         }
 
-        if !is_process_running(pid) {
+        if !is_process_identity_running(pid, expected_start_time) {
             return WaitOutcome::ObservedProcessExited;
         }
 
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+}
+
+fn is_process_identity_running(pid: u32, expected_start_time: Option<u64>) -> bool {
+    if let Some(expected_start_time) = expected_start_time {
+        let system_pid = Pid::from_u32(pid);
+        let mut system = System::new();
+        let _ = system.refresh_processes(ProcessesToUpdate::Some(&[system_pid]), true);
+        if let Some(process) = system.process(system_pid) {
+            let actual_start_time = process.start_time();
+            if actual_start_time != 0 {
+                return actual_start_time == expected_start_time;
+            }
+        }
+    }
+
+    is_process_running(pid)
 }
 
 fn wait_for_child_or_stop(
@@ -280,6 +296,29 @@ fn is_process_running(pid: u32) -> bool {
     };
 
     matches!(kill(Pid::from_raw(raw_pid), None), Ok(()) | Err(Errno::EPERM))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn watched_process_identity_rejects_a_reused_pid() {
+        let pid = std::process::id();
+        let system_pid = Pid::from_u32(pid);
+        let mut system = System::new();
+        let _ = system.refresh_processes(ProcessesToUpdate::Some(&[system_pid]), true);
+        let start_time = system.process(system_pid).unwrap().start_time();
+        assert_ne!(start_time, 0);
+
+        assert!(is_process_identity_running(pid, Some(start_time)));
+        let reused_start_time = if start_time == u64::MAX {
+            start_time - 1
+        } else {
+            start_time + 1
+        };
+        assert!(!is_process_identity_running(pid, Some(reused_start_time)));
+    }
 }
 
 #[cfg(windows)]

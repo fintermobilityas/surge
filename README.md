@@ -230,19 +230,29 @@ explicit SSH identity, pass `--node-user <account>` (or set `--node <account>@<n
 **.NET**
 ```csharp
 using var mgr = new SurgeUpdateManager();
-await mgr.UpdateToLatestReleaseAsync(
+var result = await mgr.UpdateToLatestReleaseAsync(
     onUpdatesAvailable: releases =>
         Console.WriteLine($"{releases.Count} update(s), latest: {releases.Latest?.Version}"),
     onAfterApplyUpdate: release =>
         Console.WriteLine($"Updated to {release.Version}")
 );
+if (result?.IsUpdateFinalizationScheduled == true)
+{
+    Environment.Exit(0);
+}
 ```
 
 **Rust**
 ```rust
 let mut mgr = UpdateManager::new(ctx, "my-app", "1.0.0", "stable", install_dir)?;
 if let Some(info) = mgr.check_for_updates().await? {
-    mgr.download_and_apply(&info, None::<fn(_)>).await?;
+    let outcome = mgr.download_and_apply(&info, None::<fn(_)>).await?;
+    if matches!(
+        outcome,
+        surge_core::update::manager::UpdateApplyOutcome::ExternalFinalizeScheduled
+    ) {
+        return Ok(());
+    }
 }
 ```
 
@@ -250,13 +260,21 @@ if let Some(info) = mgr.check_for_updates().await? {
 ```c
 surge_update_manager* mgr = surge_update_manager_create(ctx, "my-app", "1.0.0", "stable", dir);
 surge_releases_info* info = NULL;
+surge_result apply_result = SURGE_OK;
 if (surge_update_check(mgr, &info) == SURGE_OK) {
-    surge_update_download_and_apply(mgr, info, progress_cb, NULL);
+    apply_result = surge_update_download_and_apply(mgr, info, progress_cb, NULL);
     surge_releases_destroy(info);
 }
 surge_update_manager_destroy(mgr);
 surge_context_destroy(ctx);
+if (apply_result == SURGE_UPDATE_SCHEDULED) {
+    return 0;
+}
 ```
+
+`ExternalFinalizeScheduled` / `IsUpdateFinalizationScheduled` / `SURGE_UPDATE_SCHEDULED`
+means the helper accepted the remaining work, not that installation finished. Stop application
+work and exit promptly, then verify the persisted convergence status after restart.
 
 ## CI/CD Integration
 

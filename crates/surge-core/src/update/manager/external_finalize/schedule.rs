@@ -151,11 +151,7 @@ fn self_hosted_updater(manager: &UpdateManager) -> Result<Option<SelfHostedUpdat
     let Some(current_app_dir) = apply::find_previous_app_dir(&manager.install_dir, &manager.current_version) else {
         return Ok(None);
     };
-    let active_exe = std::fs::canonicalize(current_app_dir.join(&identity.main_exe)).map_err(|error| {
-        SurgeError::Platform(format!(
-            "Failed to resolve the active application executable before external finalization: {error}"
-        ))
-    })?;
+    let active_exe = resolve_active_executable(&current_app_dir, &identity.main_exe)?;
     let updater_exe = std::fs::canonicalize(std::env::current_exe()?).map_err(|error| {
         SurgeError::Platform(format!(
             "Failed to resolve the updating process executable before external finalization: {error}"
@@ -170,6 +166,27 @@ fn self_hosted_updater(manager: &UpdateManager) -> Result<Option<SelfHostedUpdat
     } else {
         Ok(None)
     }
+}
+
+fn resolve_active_executable(active_app_dir: &Path, main_exe: &str) -> Result<PathBuf> {
+    let active_app_root = std::fs::canonicalize(active_app_dir).map_err(|error| {
+        SurgeError::Platform(format!(
+            "Failed to resolve the active application directory before external finalization: {error}"
+        ))
+    })?;
+    let unresolved_executable = active_app_root.join(main_exe);
+    let active_exe = std::fs::canonicalize(&unresolved_executable).map_err(|error| {
+        SurgeError::Platform(format!(
+            "Failed to resolve the active application executable before external finalization: {error}"
+        ))
+    })?;
+    if !active_exe.starts_with(&active_app_root) {
+        return Err(SurgeError::Platform(format!(
+            "Active application executable '{}' resolves outside the active application directory; refusing to signal a shared executable",
+            unresolved_executable.display()
+        )));
+    }
+    Ok(active_exe)
 }
 
 #[cfg(unix)]
@@ -269,10 +286,27 @@ mod tests {
     fn executable_identity_accepts_hard_linked_active_path() {
         let temp = tempfile::tempdir().unwrap();
         let current = std::env::current_exe().unwrap();
-        let active = temp.path().join("active-app");
+        let active_root = temp.path().join("app");
+        std::fs::create_dir(&active_root).unwrap();
+        let active = active_root.join("active-app");
         std::fs::hard_link(&current, &active).unwrap();
 
-        assert!(same_executable(&current, &active).unwrap());
+        let resolved = resolve_active_executable(&active_root, "active-app").unwrap();
+        assert!(same_executable(&current, &resolved).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_executable_symlink_cannot_escape_application_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let active_root = temp.path().join("app");
+        std::fs::create_dir(&active_root).unwrap();
+        let shared_executable = temp.path().join("shared-app");
+        std::fs::write(&shared_executable, "shared").unwrap();
+        std::os::unix::fs::symlink(&shared_executable, active_root.join("demo")).unwrap();
+
+        let error = resolve_active_executable(&active_root, "demo").unwrap_err();
+        assert!(error.to_string().contains("resolves outside"));
     }
 
     #[test]

@@ -76,6 +76,10 @@ enum Commands {
         #[arg(long)]
         pid: u32,
 
+        /// Start-time identity of the process named by --pid
+        #[arg(long)]
+        pid_start_time: Option<u64>,
+
         /// Target version whose update handoff should converge after replacement child startup
         #[arg(long)]
         handoff_version: Option<String>,
@@ -172,7 +176,7 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            if let Err(e) = run_supervisor(&id, &dir, &exe_path, &args, None, None) {
+            if let Err(e) = run_supervisor(&id, &dir, &exe_path, &args, None, None, None) {
                 tracing::error!("{e}");
                 return ExitCode::FAILURE;
             }
@@ -182,6 +186,7 @@ fn main() -> ExitCode {
             id,
             dir,
             pid,
+            pid_start_time,
             handoff_version,
             exe,
             args,
@@ -195,7 +200,15 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            if let Err(e) = run_supervisor(&id, &dir, &exe_path, &args, Some(pid), handoff_version.as_deref()) {
+            if let Err(e) = run_supervisor(
+                &id,
+                &dir,
+                &exe_path,
+                &args,
+                Some(pid),
+                pid_start_time,
+                handoff_version.as_deref(),
+            ) {
                 tracing::error!("{e}");
                 return ExitCode::FAILURE;
             }
@@ -239,6 +252,7 @@ fn run_supervisor(
     exe_path: &Path,
     args: &[String],
     watched_pid: Option<u32>,
+    watched_pid_start_time: Option<u64>,
     handoff_version: Option<&str>,
 ) -> Result<(), SupervisorError> {
     tracing::info!(
@@ -269,6 +283,7 @@ fn run_supervisor(
     let mut next_child_args = Some(first_child_args);
     let mut pending_handoff_version = handoff::pending_restart_handoff_version(watched_pid, handoff_version, args);
     let mut watched_pid = watched_pid;
+    let mut watched_pid_start_time = watched_pid_start_time;
 
     loop {
         if shutdown.load(std::sync::atomic::Ordering::Acquire) || stop_file.exists() {
@@ -282,7 +297,14 @@ fn run_supervisor(
 
         if let Some(pid) = watched_pid.take() {
             tracing::info!("Watching running process PID {pid} before relaunch");
-            match wait_for_pid_or_stop(pid, &shutdown, &stop_file, &pid_file, own_pid) {
+            match wait_for_pid_or_stop(
+                pid,
+                watched_pid_start_time.take(),
+                &shutdown,
+                &stop_file,
+                &pid_file,
+                own_pid,
+            ) {
                 WaitOutcome::ObservedProcessExited => {
                     if supervisor_was_superseded(&pid_file, own_pid) {
                         break;
@@ -465,6 +487,8 @@ mod tests {
             "/tmp/demo",
             "--pid",
             "42",
+            "--pid-start-time",
+            "1234",
             "--handoff-version",
             "2.0.0",
             "--exe",
@@ -475,12 +499,16 @@ mod tests {
         .unwrap();
 
         let Commands::Watch {
-            handoff_version, args, ..
+            pid_start_time,
+            handoff_version,
+            args,
+            ..
         } = cli.command
         else {
             panic!("expected watch command");
         };
 
+        assert_eq!(pid_start_time, Some(1_234));
         assert_eq!(handoff_version.as_deref(), Some("2.0.0"));
         assert_eq!(args, vec!["--app-mode"]);
     }
@@ -523,6 +551,7 @@ mod tests {
                 &exe_path_for_thread,
                 &[],
                 Some(watched_pid),
+                None,
                 None,
             );
             tx.send(result).unwrap();
@@ -643,6 +672,7 @@ mod tests {
                 ],
                 None,
                 None,
+                None,
             );
             tx.send(result).unwrap();
         });
@@ -711,6 +741,7 @@ mod tests {
                 &exe_path_for_thread,
                 &[],
                 Some(watched_pid),
+                None,
                 Some("2.0.0"),
             );
             tx.send(result).unwrap();
@@ -777,6 +808,7 @@ mod tests {
                 &install_dir_for_thread,
                 &exe_path_for_thread,
                 &[],
+                None,
                 None,
                 None,
             );

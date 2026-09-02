@@ -1,15 +1,11 @@
-#[cfg(test)]
 use std::collections::BTreeMap;
-#[cfg(test)]
 use std::fs;
 #[cfg(test)]
 use std::io::Read;
-#[cfg(test)]
 use std::path::{Component, Path, PathBuf};
 
 #[cfg(test)]
 use crate::config::constants::IO_CHUNK_SIZE;
-#[cfg(test)]
 use crate::error::{Result, SurgeError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,7 +15,6 @@ pub(super) enum TreeEntryKind {
     Symlink,
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone)]
 pub(super) struct TreeEntry {
     pub(super) source_path: PathBuf,
@@ -28,17 +23,21 @@ pub(super) struct TreeEntry {
     pub(super) symlink_target: Option<String>,
 }
 
-#[cfg(test)]
-pub(super) fn collect_tree_entries(root: &Path) -> Result<BTreeMap<String, TreeEntry>> {
+/// Walk a directory tree the same way the packer packs it, applying the
+/// executable-bit overrides so header modes match the packed archive.
+pub(super) fn collect_tree_entries_with_executables(
+    root: &Path,
+    executable_paths: &std::collections::BTreeSet<String>,
+) -> Result<BTreeMap<String, TreeEntry>> {
     let mut entries = BTreeMap::new();
-    collect_tree_entries_recursive(root, root, &mut entries)?;
+    collect_tree_entries_recursive(root, root, executable_paths, &mut entries)?;
     Ok(entries)
 }
 
-#[cfg(test)]
 fn collect_tree_entries_recursive(
     root: &Path,
     current: &Path,
+    executable_paths: &std::collections::BTreeSet<String>,
     entries: &mut BTreeMap<String, TreeEntry>,
 ) -> Result<()> {
     let mut children = fs::read_dir(current)?.collect::<std::result::Result<Vec<_>, std::io::Error>>()?;
@@ -50,6 +49,13 @@ fn collect_tree_entries_recursive(
         let relative = normalize_relative_path(root, &path)?;
         let file_type = metadata.file_type();
 
+        let file_mode = {
+            let mut mode = normalized_mode(&metadata, false);
+            if executable_paths.contains(&relative) {
+                mode |= 0o111;
+            }
+            mode
+        };
         let entry = if file_type.is_dir() {
             TreeEntry {
                 source_path: path.clone(),
@@ -68,7 +74,7 @@ fn collect_tree_entries_recursive(
             TreeEntry {
                 source_path: path.clone(),
                 kind: TreeEntryKind::File,
-                mode: normalized_mode(&metadata, false),
+                mode: file_mode,
                 symlink_target: None,
             }
         } else {
@@ -80,14 +86,13 @@ fn collect_tree_entries_recursive(
         entries.insert(relative.clone(), entry);
 
         if file_type.is_dir() {
-            collect_tree_entries_recursive(root, &path, entries)?;
+            collect_tree_entries_recursive(root, &path, executable_paths, entries)?;
         }
     }
 
     Ok(())
 }
 
-#[cfg(test)]
 fn normalize_relative_path(root: &Path, path: &Path) -> Result<String> {
     let relative = path
         .strip_prefix(root)
@@ -135,7 +140,7 @@ pub(super) fn files_identical(left: &Path, right: &Path) -> Result<bool> {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(unix)]
 fn normalized_mode(metadata: &fs::Metadata, is_dir: bool) -> u32 {
     use std::os::unix::fs::PermissionsExt;
 
@@ -147,7 +152,7 @@ fn normalized_mode(metadata: &fs::Metadata, is_dir: bool) -> u32 {
     }
 }
 
-#[cfg(all(test, not(unix)))]
+#[cfg(not(unix))]
 fn normalized_mode(_metadata: &fs::Metadata, is_dir: bool) -> u32 {
     if is_dir { 0o755 } else { 0o644 }
 }

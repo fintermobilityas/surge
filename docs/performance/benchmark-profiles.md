@@ -138,12 +138,26 @@ while the chunked diff executes. No archive is extracted to disk.
   cold decode). On a 48-core host the cold decodes already overlap, so
   the reuse saves the remaining serial collect pass plus decode
   contention; the bench publish loop threads it through.
+- The newer side is not decoded from the archive at all: within one
+  `build()`, the full package is packed from the staging root first, and
+  the sparse delta then walks that exact directory (same walk semantics
+  and executable-bit overrides as the packer, contents read from the
+  page cache) instead of re-decoding the zstd frame it just wrote.
+  The patch bytes are identical to the archive-based build
+  (`directory_newer_side_matches_archive_build` pins the equivalence);
+  if a file changed between the full and delta build, the builder falls
+  back to the archive-based path (the published bytes stay the source of
+  truth).
 - Cumulative publisher-side result on the canonical payload
   (scale 1.0, `sdk_only`, seed 42, same-session A/Bs): delta pack build
-  4,163 ms/version (disk build) -> 2,187 (in-memory) -> 1,551 ms
-  (tree reuse + parallel passes), i.e. -63% from the pre-round-11
-  baseline. Remaining per-version floor: one single-threaded zstd decode
-  of the newer archive (~0.7 s) plus the parallel hash/diff pass (~0.5 s).
+  4,163 ms/version (disk build) -> 2,187 (in-memory) -> 1,551 (tree
+  reuse + parallel passes) -> ~1,540 (directory newer side; 10-delta
+  A/B pairs 1,437/1,640 vs 1,789/2,148), i.e. -63% from the pre-round-11
+  baseline. Remaining per-version floor: the staging-directory walk and
+  page-cache read of the newer files (~0.3-0.4 s) plus the parallel
+  hash/diff pass (~0.5 s). The single-threaded zstd decode remains on
+  the client apply side (`extractor`), where MT decode would still pay
+  off.
 
 ## CI Tracking Guidance
 

@@ -14,7 +14,7 @@ const SHEBANG_IDENTITY_LIMIT: usize = 256;
 #[cfg(not(target_os = "macos"))]
 const SHEBANG_READ_LIMIT: u64 = 257;
 const SUPPORTED_ENV_INTERPRETERS: [&str; 2] = ["/usr/bin/env", "/bin/env"];
-const DEFAULT_ENV_SEARCH_PATH: &str = "/usr/bin:/bin";
+const DEFAULT_ENV_SEARCH_PATH: &str = "/bin:/usr/bin";
 
 pub(super) struct Identity {
     interpreter: Interpreter,
@@ -40,41 +40,158 @@ enum EnvSearchPath {
 }
 
 impl Identity {
-    pub(super) fn matches_interpreter(&self, executable: &Path, argv0: Option<&OsStr>) -> Result<bool> {
+    pub(super) fn requires_environment(&self) -> bool {
+        matches!(
+            &self.interpreter,
+            Interpreter::EnvCommand(command) if command.requires_environment()
+        )
+    }
+
+    pub(super) fn matches_interpreter_in_environment(
+        &self,
+        executable: &Path,
+        command: &[OsString],
+        environment: &[OsString],
+    ) -> Result<bool> {
         match &self.interpreter {
             Interpreter::Resolved(expected) => Ok(paths_resolve_to_same_executable(executable, expected)),
             Interpreter::EnvCommand(expected) => {
-                if argv0 != Some(expected.program.as_os_str()) {
+                let Some(argv0) = command.first() else {
+                    #[cfg(target_os = "macos")]
+                    if expected.matches_executable(executable, environment)? {
+                        return Err(SurgeError::Platform(
+                            "Cannot inspect the command line of the configured env interpreter before swap".to_string(),
+                        ));
+                    }
+                    return Ok(false);
+                };
+                if argv0 != &expected.program {
                     return Ok(false);
                 }
-                let resolved = resolve_env_command(expected)?;
-                if paths_resolve_to_same_executable(executable, &resolved) {
-                    Ok(true)
-                } else {
-                    Err(SurgeError::Platform(format!(
-                        "Cannot verify env interpreter '{}' from the updater environment; refusing to swap while its process identity is ambiguous",
-                        expected.program.to_string_lossy()
-                    )))
-                }
+                expected.matches_executable(executable, environment)
             }
         }
     }
 
-    pub(super) fn executable_may_match(&self, executable: &Path) -> Result<bool> {
+    pub(super) fn executable_may_match_in_environment(
+        &self,
+        executable: &Path,
+        environment: &[OsString],
+    ) -> Result<bool> {
         match &self.interpreter {
             Interpreter::Resolved(expected) => Ok(paths_resolve_to_same_executable(executable, expected)),
-            Interpreter::EnvCommand(expected) => {
-                let resolved = resolve_env_command(expected)?;
-                if paths_resolve_to_same_executable(executable, &resolved) {
-                    return Ok(true);
-                }
-                let program = Path::new(&expected.program);
-                Ok(
-                    matches!(expected.search_path, EnvSearchPath::Inherited | EnvSearchPath::Default)
-                        && program.components().count() == 1,
-                )
-            }
+            Interpreter::EnvCommand(expected) => expected.matches_executable(executable, environment),
         }
+    }
+
+    pub(super) fn matches_interpreter(&self, executable: &Path, argv0: Option<&OsStr>) -> Result<bool> {
+        let command = argv0.map_or_else(Vec::new, |argv0| vec![argv0.to_os_string()]);
+        let environment = current_process_path_environment();
+        if let Interpreter::EnvCommand(expected) = &self.interpreter {
+            if argv0 != Some(expected.program.as_os_str()) {
+                return Ok(false);
+            }
+            let _ = resolve_env_command(expected)?;
+        }
+        if self.matches_interpreter_in_environment(executable, &command, &environment)? {
+            return Ok(true);
+        }
+        if let Interpreter::EnvCommand(expected) = &self.interpreter
+            && argv0 == Some(expected.program.as_os_str())
+        {
+            return Err(SurgeError::Platform(format!(
+                "Cannot verify env interpreter '{}' from the updater environment; refusing to swap while its process identity is ambiguous",
+                expected.program.to_string_lossy()
+            )));
+        }
+        Ok(false)
+    }
+
+    pub(super) fn executable_may_match(&self, executable: &Path) -> Result<bool> {
+        let environment = current_process_path_environment();
+        if let Interpreter::EnvCommand(expected) = &self.interpreter {
+            let _ = resolve_env_command(expected)?;
+        }
+        if self.executable_may_match_in_environment(executable, &environment)? {
+            return Ok(true);
+        }
+        let Interpreter::EnvCommand(expected) = &self.interpreter else {
+            return Ok(false);
+        };
+        let program = Path::new(&expected.program);
+        Ok(
+            (self.requires_environment() || matches!(expected.search_path, EnvSearchPath::Default))
+                && program.components().count() == 1,
+        )
+    }
+}
+
+impl EnvCommand {
+    fn requires_environment(&self) -> bool {
+        matches!(self.search_path, EnvSearchPath::Inherited) && Path::new(&self.program).components().count() == 1
+    }
+
+    fn matches_executable(&self, executable: &Path, environment: &[OsString]) -> Result<bool> {
+        let Some(resolved) = self.resolve_executable(Some(environment))? else {
+            return Ok(false);
+        };
+        Ok(paths_resolve_to_same_executable(executable, &resolved))
+    }
+
+    fn resolve_executable(&self, environment: Option<&[OsString]>) -> Result<Option<PathBuf>> {
+        let program = Path::new(&self.program);
+        if program.is_absolute() {
+            let resolved = std::fs::canonicalize(program).map_err(|e| {
+                SurgeError::Platform(format!(
+                    "Failed to resolve active application env interpreter '{}': {e}",
+                    program.display()
+                ))
+            })?;
+            if !is_executable_file(&resolved) {
+                return Err(SurgeError::Platform(format!(
+                    "Active application env interpreter '{}' is not executable",
+                    program.display()
+                )));
+            }
+            return validate_resolved_interpreter(resolved).map(Some);
+        }
+        if program.components().count() != 1 {
+            return Err(SurgeError::Platform(format!(
+                "Cannot safely resolve relative env interpreter '{}' before swap",
+                program.display()
+            )));
+        }
+
+        let current_search_path;
+        let search_path = match (&self.search_path, environment) {
+            (EnvSearchPath::Inherited, Some(environment)) => {
+                environment_variable(environment, b"PATH").unwrap_or_else(|| OsStr::new(DEFAULT_ENV_SEARCH_PATH))
+            }
+            (EnvSearchPath::Inherited, None) => {
+                current_search_path =
+                    std::env::var_os("PATH").unwrap_or_else(|| OsString::from(DEFAULT_ENV_SEARCH_PATH));
+                current_search_path.as_os_str()
+            }
+            (EnvSearchPath::Default, _) => OsStr::new(DEFAULT_ENV_SEARCH_PATH),
+            (EnvSearchPath::Explicit(search_path), _) => search_path,
+        };
+        for directory in std::env::split_paths(search_path) {
+            if directory.as_os_str().is_empty() || directory.is_relative() {
+                return Err(SurgeError::Platform(format!(
+                    "Cannot safely resolve env interpreter '{}' through a relative PATH entry before swap",
+                    program.display()
+                )));
+            }
+            let candidate = directory.join(program);
+            let Ok(candidate) = std::fs::canonicalize(candidate) else {
+                continue;
+            };
+            if !is_executable_file(&candidate) {
+                continue;
+            }
+            return validate_resolved_interpreter(candidate).map(Some);
+        }
+        Ok(None)
     }
 }
 
@@ -109,55 +226,35 @@ fn macos_system_shell_identity_matches(_actual: &Path, _expected: &Path) -> bool
 }
 
 fn resolve_env_command(command: &EnvCommand) -> Result<PathBuf> {
-    let program = Path::new(&command.program);
-    if program.is_absolute() {
-        let resolved = std::fs::canonicalize(program).map_err(|e| {
-            SurgeError::Platform(format!(
-                "Failed to resolve active application env interpreter '{}': {e}",
-                program.display()
-            ))
-        })?;
-        if !is_executable_file(&resolved) {
-            return Err(SurgeError::Platform(format!(
-                "Active application env interpreter '{}' is not executable",
-                program.display()
-            )));
-        }
-        return validate_resolved_interpreter(resolved);
-    }
-    if program.components().count() != 1 {
-        return Err(SurgeError::Platform(format!(
-            "Cannot safely resolve relative env interpreter '{}' before swap",
-            program.display()
-        )));
-    }
+    command.resolve_executable(None)?.ok_or_else(|| {
+        SurgeError::Platform(format!(
+            "Failed to resolve active application env interpreter '{}' from the updater PATH",
+            Path::new(&command.program).display()
+        ))
+    })
+}
 
-    let search_path = match &command.search_path {
-        EnvSearchPath::Inherited => std::env::var_os("PATH").unwrap_or_else(|| OsString::from(DEFAULT_ENV_SEARCH_PATH)),
-        EnvSearchPath::Default => OsString::from(DEFAULT_ENV_SEARCH_PATH),
-        EnvSearchPath::Explicit(search_path) => search_path.clone(),
-    };
-    for directory in std::env::split_paths(&search_path) {
-        if directory.as_os_str().is_empty() || directory.is_relative() {
-            return Err(SurgeError::Platform(format!(
-                "Cannot safely resolve env interpreter '{}' through a relative PATH entry before swap",
-                program.display()
-            )));
-        }
-        let candidate = directory.join(program);
-        let Ok(candidate) = std::fs::canonicalize(candidate) else {
-            continue;
-        };
-        if !is_executable_file(&candidate) {
-            continue;
-        }
-        return validate_resolved_interpreter(candidate);
-    }
+fn environment_variable<'a>(environment: &'a [OsString], name: &[u8]) -> Option<&'a OsStr> {
+    use std::os::unix::ffi::OsStrExt;
 
-    Err(SurgeError::Platform(format!(
-        "Failed to resolve active application env interpreter '{}' from the updater PATH",
-        program.display()
-    )))
+    environment.iter().find_map(|entry| {
+        let bytes = entry.as_os_str().as_bytes();
+        let separator = bytes.iter().position(|byte| *byte == b'=')?;
+        let (entry_name, value) = bytes.split_at(separator);
+        let value = value.get(1..)?;
+        (entry_name == name).then(|| OsStr::from_bytes(value))
+    })
+}
+
+fn current_process_path_environment() -> Vec<OsString> {
+    std::env::var_os("PATH")
+        .map(|path| {
+            let mut assignment = OsString::from("PATH=");
+            assignment.push(path);
+            assignment
+        })
+        .into_iter()
+        .collect()
 }
 
 pub(super) fn resolve(active_exe: &Path) -> Result<Option<Identity>> {
@@ -319,6 +416,12 @@ fn env_command_index(words: &[String]) -> Result<(usize, EnvSearchPath)> {
                     continue;
                 }
                 _ if word.starts_with("--chdir=") => {
+                    index += 1;
+                    continue;
+                }
+                _ if word.starts_with("--path=") => {
+                    search_path = word.strip_prefix("--path=").map(ToString::to_string);
+                    path_unset = false;
                     index += 1;
                     continue;
                 }
@@ -565,6 +668,69 @@ mod tests {
             command.search_path,
             EnvSearchPath::Explicit(OsString::from("/opt/interpreters"))
         );
+
+        let long_option = parse_env_command("-S --path=/srv/interpreters demo-interpreter").unwrap();
+        assert_eq!(
+            long_option.search_path,
+            EnvSearchPath::Explicit(OsString::from("/srv/interpreters"))
+        );
+    }
+
+    #[test]
+    fn observed_environment_uses_the_first_path_assignment_and_executable() {
+        use std::os::unix::fs::symlink;
+
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        symlink("/bin/sleep", first.path().join("demo-interpreter")).unwrap();
+        symlink("/bin/sh", second.path().join("demo-interpreter")).unwrap();
+        let environment = [
+            OsString::from(format!("PATH={}", first.path().display())),
+            OsString::from(format!("PATH={}", second.path().display())),
+        ];
+        let command = EnvCommand {
+            program: OsString::from("demo-interpreter"),
+            fixed_argument_count: 0,
+            search_path: EnvSearchPath::Inherited,
+        };
+
+        assert!(
+            command
+                .matches_executable(&std::fs::canonicalize("/bin/sleep").unwrap(), &environment)
+                .unwrap()
+        );
+        assert!(
+            !command
+                .matches_executable(&std::fs::canonicalize("/bin/sh").unwrap(), &environment)
+                .unwrap()
+        );
+        assert_eq!(
+            environment_variable(&environment, b"PATH"),
+            Some(OsStr::new(&format!("{}", first.path().display())))
+        );
+    }
+
+    #[test]
+    fn inherited_env_identity_requires_the_observed_environment() {
+        let inherited = Identity {
+            interpreter: Interpreter::EnvCommand(EnvCommand {
+                program: OsString::from("sh"),
+                fixed_argument_count: 0,
+                search_path: EnvSearchPath::Inherited,
+            }),
+            script_argument_index: 1,
+        };
+        let explicit = Identity {
+            interpreter: Interpreter::EnvCommand(EnvCommand {
+                program: OsString::from("sh"),
+                fixed_argument_count: 0,
+                search_path: EnvSearchPath::Explicit(OsString::from("/bin")),
+            }),
+            script_argument_index: 1,
+        };
+
+        assert!(inherited.requires_environment());
+        assert!(!explicit.requires_environment());
     }
 
     #[test]

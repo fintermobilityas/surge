@@ -20,6 +20,7 @@ pub(super) const EXTERNAL_FINALIZE_DIR: &str = ".surge-finalize";
 pub(super) const PLAN_FILE_NAME: &str = "plan.json";
 pub(super) const READY_FILE_NAME: &str = "ready";
 pub(super) const ARMED_FILE_NAME: &str = "armed";
+pub(super) const ACCEPTED_FILE_NAME: &str = "accepted";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ExternalStorageConfig {
@@ -117,7 +118,11 @@ impl ExternalFinalizePlan {
     }
 
     pub(super) fn operation_dir(&self) -> PathBuf {
-        self.install_dir.join(EXTERNAL_FINALIZE_DIR).join(&self.operation_id)
+        self.operations_dir().join(&self.operation_id)
+    }
+
+    pub(super) fn operations_dir(&self) -> PathBuf {
+        self.install_dir.join(EXTERNAL_FINALIZE_DIR)
     }
 
     pub(super) fn plan_path(&self) -> PathBuf {
@@ -130,6 +135,10 @@ impl ExternalFinalizePlan {
 
     pub(super) fn armed_path(&self) -> PathBuf {
         self.operation_dir().join(ARMED_FILE_NAME)
+    }
+
+    pub(super) fn accepted_path(&self) -> PathBuf {
+        self.operation_dir().join(ACCEPTED_FILE_NAME)
     }
 
     pub(super) fn staging_dir(&self) -> PathBuf {
@@ -324,6 +333,10 @@ mod tests {
         assert_eq!(
             plan.armed_path().file_name().and_then(|name| name.to_str()),
             Some("armed")
+        );
+        assert_eq!(
+            plan.accepted_path().file_name().and_then(|name| name.to_str()),
+            Some("accepted")
         );
     }
 }

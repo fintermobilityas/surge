@@ -34,11 +34,22 @@ where
     let mut manager = manager_from_plan(&plan)?;
     validate_materialized_target(&plan, &manager)?;
 
-    let _worker_guard = UpdateWorkerGuard::record(&plan.install_dir, &plan.app_id, &plan.latest.version)?;
-    write_handshake_marker(&plan.ready_path(), &plan.operation_id)?;
+    let _worker_guard =
+        UpdateWorkerGuard::take_over(&plan.install_dir, &plan.app_id, &plan.latest.version, plan.updater_pid)?;
+    if let Err(error) = write_handshake_marker(&plan.ready_path(), &plan.operation_id) {
+        persist_external_failure(&plan, &error, None);
+        cleanup_operation(&plan, "failed");
+        return Err(error);
+    }
 
     if let Err(error) = wait_until_armed(&plan).await {
         persist_external_failure(&plan, &error, None);
+        cleanup_operation(&plan, "failed");
+        return Err(error);
+    }
+    if let Err(error) = write_handshake_marker(&plan.accepted_path(), &plan.operation_id) {
+        persist_external_failure(&plan, &error, None);
+        cleanup_operation(&plan, "failed");
         return Err(error);
     }
 
@@ -46,9 +57,7 @@ where
     match result {
         Ok(outcome) => {
             persist_external_success(&plan, &outcome);
-            if let Err(error) = std::fs::remove_dir_all(plan.operation_dir()) {
-                warn!(error = %error, "Failed to remove completed external finalizer plan directory");
-            }
+            cleanup_operation(&plan, "completed");
             Ok(())
         }
         Err(error) => {
@@ -56,6 +65,7 @@ where
             let _ = std::fs::remove_file(plan.armed_path());
             let _ = std::fs::remove_file(plan.ready_path());
             persist_external_failure(&plan, &error, recovery_error.as_ref());
+            cleanup_operation(&plan, "failed");
             if let Some(recovery_error) = recovery_error {
                 return Err(SurgeError::Update(format!(
                     "External finalization failed: {error}; previous runtime recovery also failed: {recovery_error}"
@@ -63,6 +73,12 @@ where
             }
             Err(error)
         }
+    }
+}
+
+fn cleanup_operation(plan: &ExternalFinalizePlan, outcome: &str) {
+    if let Err(error) = std::fs::remove_dir_all(plan.operation_dir()) {
+        warn!(error = %error, outcome, "Failed to remove terminal external finalizer plan directory");
     }
 }
 

@@ -3,7 +3,8 @@
 //! A live update attempt records its worker (pid, app, target version) next
 //! to the status file. When a later attempt finds an `InProgress` record it
 //! classifies that attempt against the worker marker:
-//! - worker pid is this process → the attempt is (re)started by us; proceed.
+//! - worker pid is this process → leave the attempt in progress; exclusive
+//!   acquisition still rejects an overlapping apply in that process.
 //! - worker pid is another *live* process with recent progress → a
 //!   concurrent updater is active; never reclassify it.
 //! - worker pid is another *live* process whose progress has been silent
@@ -18,10 +19,13 @@
 //!   progress-staleness window; never fail an attempt on an inconclusive
 //!   probe.
 
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::error::{Result, SurgeError};
 use crate::platform::fs::write_file_atomic;
@@ -33,6 +37,7 @@ use super::{
 };
 
 const UPDATE_WORKER_FILE_NAME: &str = ".surge-update-worker.json";
+const UPDATE_WORKER_LOCK_FILE_NAME: &str = ".surge-update-worker.lock";
 
 /// A live worker whose progress has been silent this long is presumed hung
 /// (deadlocked or stalled on a frozen connection): active update work emits
@@ -48,48 +53,96 @@ struct UpdateWorkerRecord {
     app_id: String,
     target_version: String,
     started_at_utc: String,
+    #[serde(default)]
+    owner_id: String,
 }
 
 pub struct UpdateWorkerGuard {
     path: PathBuf,
-    pid: u32,
-    app_id: String,
-    target_version: String,
+    lock_path: PathBuf,
+    owner_id: String,
 }
 
 impl UpdateWorkerGuard {
     pub fn record(install_dir: &Path, app_id: &str, target_version: &str) -> Result<Self> {
-        let record = UpdateWorkerRecord {
-            pid: std::process::id(),
-            app_id: app_id.to_string(),
-            target_version: target_version.to_string(),
-            started_at_utc: now_utc_rfc3339(),
-        };
-        let path = update_worker_path(install_dir);
-        let json = serde_json::to_vec_pretty(&record)
-            .map_err(|e| SurgeError::Config(format!("Failed to encode update worker marker: {e}")))?;
-        write_file_atomic(&path, &json)?;
-        Ok(Self {
-            path,
-            pid: record.pid,
-            app_id: record.app_id,
-            target_version: record.target_version,
-        })
+        let lock_path = update_worker_lock_path(install_dir);
+        let _lock = acquire_worker_lock(&lock_path)?;
+        if let Some(existing) = read_update_worker(install_dir)?
+            && !matches!(probe_pid_liveness(existing.pid), PidLiveness::Dead)
+        {
+            return Err(SurgeError::Update(format!(
+                "Another update worker (pid {}) already owns this installation",
+                existing.pid
+            )));
+        }
+        write_owned_worker(install_dir, &lock_path, app_id, target_version)
+    }
+
+    pub(crate) fn take_over(install_dir: &Path, app_id: &str, target_version: &str, expected_pid: u32) -> Result<Self> {
+        let lock_path = update_worker_lock_path(install_dir);
+        let _lock = acquire_worker_lock(&lock_path)?;
+        let existing = read_update_worker(install_dir)?.ok_or_else(|| {
+            SurgeError::Update("The external finalizer could not find the updating worker to take over".to_string())
+        })?;
+        if existing.pid != expected_pid || existing.app_id != app_id || existing.target_version != target_version {
+            return Err(SurgeError::Update(
+                "Update worker ownership changed before the external finalizer took over".to_string(),
+            ));
+        }
+        write_owned_worker(install_dir, &lock_path, app_id, target_version)
     }
 }
 
 impl Drop for UpdateWorkerGuard {
     fn drop(&mut self) {
+        let Ok(_lock) = acquire_worker_lock(&self.lock_path) else {
+            return;
+        };
         let Ok(raw) = std::fs::read(&self.path) else {
             return;
         };
         let Ok(record) = serde_json::from_slice::<UpdateWorkerRecord>(&raw) else {
             return;
         };
-        if record.pid == self.pid && record.app_id == self.app_id && record.target_version == self.target_version {
+        if record.owner_id == self.owner_id {
             let _ = std::fs::remove_file(&self.path);
         }
     }
+}
+
+fn write_owned_worker(
+    install_dir: &Path,
+    lock_path: &Path,
+    app_id: &str,
+    target_version: &str,
+) -> Result<UpdateWorkerGuard> {
+    let record = UpdateWorkerRecord {
+        pid: std::process::id(),
+        app_id: app_id.to_string(),
+        target_version: target_version.to_string(),
+        started_at_utc: now_utc_rfc3339(),
+        owner_id: Uuid::new_v4().to_string(),
+    };
+    let path = update_worker_path(install_dir);
+    let json = serde_json::to_vec_pretty(&record)
+        .map_err(|e| SurgeError::Config(format!("Failed to encode update worker marker: {e}")))?;
+    write_file_atomic(&path, &json)?;
+    Ok(UpdateWorkerGuard {
+        path,
+        lock_path: lock_path.to_path_buf(),
+        owner_id: record.owner_id,
+    })
+}
+
+fn acquire_worker_lock(path: &Path) -> Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    FileExt::lock_exclusive(&file)?;
+    Ok(file)
 }
 
 pub fn fail_abandoned_in_progress_update(
@@ -155,9 +208,8 @@ fn fail_abandoned_in_progress_update_at(
     };
 
     if worker.pid == std::process::id() {
-        // The marker belongs to this process: a previous in-process attempt
-        // stalled. The caller proceeds with its own attempt, which takes over
-        // the record; there is nothing to reclassify.
+        // Do not reclassify work owned by this process as abandoned. The
+        // exclusive acquisition that follows rejects an overlapping apply.
         return Ok(None);
     }
 
@@ -293,6 +345,11 @@ fn read_update_worker(install_dir: &Path) -> Result<Option<UpdateWorkerRecord>> 
 #[must_use]
 fn update_worker_path(install_dir: &Path) -> PathBuf {
     install_dir.join(UPDATE_WORKER_FILE_NAME)
+}
+
+#[must_use]
+fn update_worker_lock_path(install_dir: &Path) -> PathBuf {
+    install_dir.join(UPDATE_WORKER_LOCK_FILE_NAME)
 }
 
 #[cfg(test)]
@@ -563,6 +620,7 @@ mod tests {
             app_id: app_id.to_string(),
             target_version: target_version.to_string(),
             started_at_utc: now_utc_rfc3339(),
+            owner_id: String::new(),
         };
         let json = serde_json::to_vec_pretty(&record).unwrap();
         write_file_atomic(&update_worker_path(dir), &json).unwrap();
@@ -645,10 +703,38 @@ mod tests {
 
         assert!(
             result.is_none(),
-            "the current process owns the marker; its new attempt takes over"
+            "work owned by the current process must not be reclassified as abandoned"
         );
         let persisted = read_update_status(dir.path()).unwrap().unwrap();
         assert_eq!(persisted.state, UpdateConvergenceState::InProgress);
         assert_eq!(persisted.current_phase.as_deref(), Some("package apply started"));
+    }
+
+    #[test]
+    fn live_worker_excludes_a_second_update_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = UpdateWorkerGuard::record(dir.path(), "demo-app", "9999.0.0").unwrap();
+
+        let Err(error) = UpdateWorkerGuard::record(dir.path(), "demo-app", "9999.0.0") else {
+            panic!("a live worker must keep exclusive ownership");
+        };
+
+        assert!(error.to_string().contains("already owns"));
+        drop(first);
+        assert!(UpdateWorkerGuard::record(dir.path(), "demo-app", "9999.0.0").is_ok());
+    }
+
+    #[test]
+    fn external_helper_takeover_survives_parent_guard_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = UpdateWorkerGuard::record(dir.path(), "demo-app", "9999.0.0").unwrap();
+        let helper = UpdateWorkerGuard::take_over(dir.path(), "demo-app", "9999.0.0", std::process::id()).unwrap();
+
+        drop(parent);
+
+        let persisted = read_update_worker(dir.path()).unwrap().unwrap();
+        assert_eq!(persisted.owner_id, helper.owner_id);
+        drop(helper);
+        assert!(read_update_worker(dir.path()).unwrap().is_none());
     }
 }

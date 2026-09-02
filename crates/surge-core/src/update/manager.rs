@@ -363,13 +363,7 @@ impl UpdateManager {
             .flatten()
             .filter(|record| record.app_id == self.app_id && record.target_version == target_version);
 
-        let _worker_guard = match UpdateWorkerGuard::record(&self.install_dir, &self.app_id, &target_version) {
-            Ok(guard) => Some(guard),
-            Err(e) => {
-                warn!(error = %e, "Failed to persist update worker marker (continuing)");
-                None
-            }
-        };
+        let _worker_guard = UpdateWorkerGuard::record(&self.install_dir, &self.app_id, &target_version)?;
 
         let in_progress_record = UpdateStatusRecord::in_progress(
             &self.app_id,

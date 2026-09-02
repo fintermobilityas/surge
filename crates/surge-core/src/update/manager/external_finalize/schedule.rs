@@ -69,6 +69,9 @@ where
     }
 
     progress_emitter.emit_substep(6, update_phase::STARTING_EXTERNAL_FINALIZER, 90);
+    if plan.operations_dir().exists() {
+        std::fs::remove_dir_all(plan.operations_dir())?;
+    }
     std::fs::create_dir_all(plan.operation_dir())?;
 
     let current_helper = updater.active_app_dir.join(supervisor_binary_name());
@@ -99,6 +102,12 @@ where
         let _ = std::fs::remove_dir_all(plan.operation_dir());
         return Err(error);
     }
+    if let Err(error) = wait_for_helper_accepted(&plan, &mut helper).await {
+        let _ = helper.kill();
+        let _ = helper.wait();
+        let _ = std::fs::remove_dir_all(plan.operation_dir());
+        return Err(error);
+    }
 
     progress_emitter.emit_substep(6, update_phase::WAITING_FOR_UPDATER_EXIT, 91);
     info!(
@@ -107,6 +116,32 @@ where
         "Transferred update finalization to stable helper"
     );
     Ok(true)
+}
+
+async fn wait_for_helper_accepted(
+    plan: &ExternalFinalizePlan,
+    helper: &mut crate::platform::process::ProcessHandle,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + HELPER_READY_TIMEOUT;
+    loop {
+        if marker_matches(&plan.accepted_path(), &plan.operation_id)? {
+            return Ok(());
+        }
+        if !helper.poll_running() {
+            let result = helper.wait()?;
+            return Err(SurgeError::Update(format!(
+                "External finalizer helper exited before accepting ownership with code {}",
+                result.exit_code
+            )));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(SurgeError::Update(format!(
+                "Timed out after {}s waiting for the external finalizer helper to accept ownership",
+                HELPER_READY_TIMEOUT.as_secs()
+            )));
+        }
+        tokio::time::sleep(HANDSHAKE_POLL_INTERVAL).await;
+    }
 }
 
 fn self_hosted_updater(manager: &UpdateManager) -> Result<Option<SelfHostedUpdater>> {

@@ -9,8 +9,19 @@ use crate::platform::process::ProcessIdentity;
 use super::UpdateManager;
 use super::lifecycle::{self, SupervisorRestartOutcome};
 
+pub(super) fn prepare_active_app_before_supervisor_shutdown(
+    current_app_dir: &Path,
+    current_main_exe: &str,
+    current_supervisor_id: &str,
+    allow_in_process_swap: bool,
+) -> Result<Option<lifecycle::PreparedAppQuiescence>> {
+    let prepared = lifecycle::prepare_app_quiescence(current_app_dir, current_main_exe, None, allow_in_process_swap)?;
+    lifecycle::preflight_supervisor_recovery_paths(current_app_dir, current_main_exe, current_supervisor_id)?;
+    Ok(prepared)
+}
+
 #[allow(clippy::too_many_arguments)]
-pub(super) fn prepare_and_quiesce_active_app_before_swap(
+pub(super) fn quiesce_prepared_active_app_before_swap(
     install_dir: &Path,
     current_app_dir: &Path,
     current_version: &str,
@@ -19,15 +30,11 @@ pub(super) fn prepare_and_quiesce_active_app_before_swap(
     current_environment: Option<&BTreeMap<String, String>>,
     supervisor_requires_restoration: bool,
     supervised_child_identity: Option<ProcessIdentity>,
-    allow_in_process_swap: bool,
+    prepared: Option<lifecycle::PreparedAppQuiescence>,
 ) -> Result<Option<lifecycle::PreparedAppQuiescence>> {
     let result = (|| {
-        let prepared = lifecycle::prepare_app_quiescence(
-            current_app_dir,
-            current_main_exe,
-            supervised_child_identity,
-            allow_in_process_swap,
-        )?;
+        let prepared =
+            prepared.map(|prepared| lifecycle::with_supervised_child_identity(prepared, supervised_child_identity));
         if let Some(prepared) = &prepared {
             lifecycle::terminate_prepared_app_processes(prepared)?;
         }
@@ -114,17 +121,11 @@ pub(super) async fn prepare_and_quiesce_previous_swap_before_reuse(
         }
         Err(error) => return Err(restore_current(error)),
     };
-    let previous_supervised_child_identity =
-        match lifecycle::request_supervisor_shutdown(&manager.install_dir, &previous_swap_identity.supervisor_id).await
-        {
-            Ok(pid) => pid,
-            Err(error) => return Err(restore_current(error)),
-        };
-    let result = (|| {
+    let prepared = match (|| {
         let prepared = lifecycle::prepare_app_quiescence(
             previous_swap_dir,
             &previous_swap_identity.main_exe,
-            previous_supervised_child_identity,
+            None,
             manager.allow_in_process_swap,
         )?
         .ok_or_else(|| {
@@ -132,6 +133,24 @@ pub(super) async fn prepare_and_quiesce_previous_swap_before_reuse(
                 "Previous swap application entrypoint disappeared before it could be quiesced".to_string(),
             )
         })?;
+        lifecycle::preflight_supervisor_recovery_paths(
+            previous_swap_dir,
+            &previous_swap_identity.main_exe,
+            &previous_swap_identity.supervisor_id,
+        )?;
+        Ok::<_, SurgeError>(prepared)
+    })() {
+        Ok(prepared) => prepared,
+        Err(error) => return Err(restore_current(error)),
+    };
+    let previous_supervised_child_identity =
+        match lifecycle::request_supervisor_shutdown(&manager.install_dir, &previous_swap_identity.supervisor_id).await
+        {
+            Ok(pid) => pid,
+            Err(error) => return Err(restore_current(error)),
+        };
+    let result = (|| {
+        let prepared = lifecycle::with_supervised_child_identity(prepared, previous_supervised_child_identity);
         lifecycle::terminate_prepared_app_processes(&prepared)?;
         Ok::<_, SurgeError>(prepared)
     })();
@@ -257,7 +276,14 @@ mod tests {
         let current_environment = BTreeMap::from([("SURGE_TEST_MODE".to_string(), "preserved".to_string())]);
         let child_pid = child.id();
         let child_identity = crate::platform::process::process_identity(child_pid).unwrap().unwrap();
-        let result = prepare_and_quiesce_active_app_before_swap(
+        let prepared = prepare_active_app_before_supervisor_shutdown(
+            &active_app_dir,
+            "cwd-changing-demo-script",
+            "demo-supervisor",
+            false,
+        )
+        .unwrap();
+        let result = quiesce_prepared_active_app_before_swap(
             install_dir,
             &active_app_dir,
             "1.0.0",
@@ -266,7 +292,7 @@ mod tests {
             Some(&current_environment),
             true,
             Some(child_identity),
-            false,
+            prepared,
         );
         let child_still_running = child.try_wait().unwrap().is_none();
         if child_still_running {

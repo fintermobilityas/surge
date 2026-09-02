@@ -17,6 +17,7 @@ use self::discovery::AppProcess;
 use self::discovery::app_process_pids;
 #[cfg(unix)]
 use self::discovery::{app_process_identities, current_process_environment};
+pub(in crate::update::manager) use self::process_target::with_supervised_child_identity;
 #[cfg(unix)]
 use self::process_target::{ProcessTarget, add_process_targets, process_targets_are_running};
 use crate::error::Result;

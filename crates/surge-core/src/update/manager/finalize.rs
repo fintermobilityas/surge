@@ -31,8 +31,8 @@ use crate::supervisor::state::supervisor_pid_file;
 use super::current_install::ensure_captured_install_still_has_app_dir;
 #[cfg(unix)]
 use super::finalize_quiescence::{
-    prepare_and_quiesce_active_app_before_swap, prepare_and_quiesce_previous_swap_before_reuse,
-    restore_previous_supervisor_after_quiescence_failure,
+    prepare_active_app_before_supervisor_shutdown, prepare_and_quiesce_previous_swap_before_reuse,
+    quiesce_prepared_active_app_before_swap, restore_previous_supervisor_after_quiescence_failure,
 };
 use super::progress::{ProgressInfo, emit_progress};
 use super::progress_substep::{HEARTBEAT_INTERVAL, PhaseProgressEmitter, labels as finalize_phase};
@@ -186,6 +186,18 @@ where
     let supervisor_was_running = !current_supervisor_id.trim().is_empty()
         && supervisor_pid_file(&manager.install_dir, current_supervisor_id).is_file();
 
+    #[cfg(unix)]
+    let prepared_current_app = if let Some(current_app_dir) = current_app_dir {
+        prepare_active_app_before_supervisor_shutdown(
+            current_app_dir,
+            current_main_exe,
+            current_supervisor_id,
+            manager.allow_in_process_swap,
+        )?
+    } else {
+        None
+    };
+
     let supervised_child_identity = if supervisor_was_running {
         progress_emitter
             .run_with_heartbeat(
@@ -205,7 +217,7 @@ where
     progress_emitter.emit_substep(6, finalize_phase::QUIESCING_ACTIVE_APP, 92);
     #[cfg(unix)]
     let current_quiescence = if let Some(current_app_dir) = current_app_dir {
-        prepare_and_quiesce_active_app_before_swap(
+        quiesce_prepared_active_app_before_swap(
             &manager.install_dir,
             current_app_dir,
             current_version,
@@ -214,7 +226,7 @@ where
             current_environment,
             supervisor_requires_restoration,
             supervised_child_identity,
-            manager.allow_in_process_swap,
+            prepared_current_app,
         )?
     } else {
         None

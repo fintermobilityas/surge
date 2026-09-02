@@ -5,6 +5,8 @@ use crate::platform::process::StableProcessHandle;
 use crate::platform::process::process_identity_matches;
 use crate::platform::process::{ProcessIdentity, ProcessSignalOutcome};
 
+use super::PreparedAppQuiescence;
+
 #[derive(Debug)]
 pub(super) struct ProcessTarget {
     identity: ProcessIdentity,
@@ -34,6 +36,14 @@ pub(super) fn process_targets_are_running(targets: &[ProcessTarget]) -> Result<b
         }
     }
     Ok(false)
+}
+
+pub(in crate::update::manager) fn with_supervised_child_identity(
+    mut prepared: PreparedAppQuiescence,
+    supervised_child_identity: Option<ProcessIdentity>,
+) -> PreparedAppQuiescence {
+    prepared.supervised_child_identity = supervised_child_identity;
+    prepared
 }
 
 impl ProcessTarget {

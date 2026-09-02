@@ -3,9 +3,7 @@ use std::time::Duration;
 
 use tracing::{debug, info, warn};
 
-use crate::error::Result;
-#[cfg(not(unix))]
-use crate::error::SurgeError;
+use crate::error::{Result, SurgeError};
 #[cfg(unix)]
 use crate::platform::process::process_identity;
 use crate::platform::process::{
@@ -77,7 +75,7 @@ pub(super) use self::process_quiescence::terminate_active_app_processes_before_s
 pub(super) use self::process_quiescence::terminate_superseded_app_processes;
 #[cfg(unix)]
 pub(super) use self::process_quiescence::{
-    PreparedAppQuiescence, prepare_app_quiescence, terminate_prepared_app_processes,
+    PreparedAppQuiescence, prepare_app_quiescence, terminate_prepared_app_processes, with_supervised_child_identity,
 };
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 pub(in crate::update::manager) use self::process_quiescence::{spawn_native_test_app, wait_for_native_test_app};
@@ -107,6 +105,41 @@ pub(super) async fn request_supervisor_shutdown(
         Duration::from_millis(100),
     )
     .await
+}
+
+#[cfg(unix)]
+pub(super) fn preflight_supervisor_recovery_paths(
+    active_app_dir: &Path,
+    main_exe: &str,
+    supervisor_id: &str,
+) -> Result<()> {
+    if supervisor_id.trim().is_empty() {
+        return Ok(());
+    }
+
+    ensure_recovery_launch_path(
+        &active_app_dir.join(supervisor_binary_name()),
+        "bundled supervisor binary",
+    )?;
+    ensure_recovery_launch_path(&active_app_dir.join(main_exe), "application executable")
+}
+
+#[cfg(unix)]
+fn ensure_recovery_launch_path(path: &Path, description: &str) -> Result<()> {
+    use nix::unistd::{AccessFlags, access};
+
+    if !path.is_file() {
+        return Err(SurgeError::Update(format!(
+            "Cannot request supervisor shutdown because its recovery {description} is missing at {}",
+            path.display()
+        )));
+    }
+    access(path, AccessFlags::X_OK).map_err(|error| {
+        SurgeError::Update(format!(
+            "Cannot request supervisor shutdown because its recovery {description} is not executable at {}: {error}",
+            path.display()
+        ))
+    })
 }
 
 pub(super) async fn request_supervisor_shutdown_with_timeout(
@@ -640,6 +673,41 @@ mod tests {
         );
         assert!(!supervisor_takeover_request_file(dir.path(), supervisor_id).exists());
         assert!(supervisor_pid_file(dir.path(), supervisor_id).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supervisor_recovery_preflight_requires_every_launch_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let active_app_dir = dir.path().join("app");
+        std::fs::create_dir_all(&active_app_dir).unwrap();
+        let app_path = active_app_dir.join("demo-app");
+        std::fs::write(&app_path, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = std::fs::metadata(&app_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&app_path, permissions).unwrap();
+
+        let error = preflight_supervisor_recovery_paths(&active_app_dir, "demo-app", "demo-supervisor").unwrap_err();
+        assert!(error.to_string().contains("bundled supervisor binary is missing"));
+
+        let supervisor_path = active_app_dir.join(supervisor_binary_name());
+        std::fs::write(&supervisor_path, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = std::fs::metadata(&supervisor_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&supervisor_path, permissions).unwrap();
+        let mut permissions = std::fs::metadata(&app_path).unwrap().permissions();
+        permissions.set_mode(0o644);
+        std::fs::set_permissions(&app_path, permissions).unwrap();
+
+        let error = preflight_supervisor_recovery_paths(&active_app_dir, "demo-app", "demo-supervisor").unwrap_err();
+        assert!(error.to_string().contains("application executable is not executable"));
+
+        let mut permissions = std::fs::metadata(&app_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&app_path, permissions).unwrap();
+        preflight_supervisor_recovery_paths(&active_app_dir, "demo-app", "demo-supervisor").unwrap();
     }
 
     #[test]

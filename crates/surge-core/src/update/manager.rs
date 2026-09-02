@@ -4712,6 +4712,101 @@ echo started > new-child-started
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
+    async fn test_download_and_apply_preflights_entrypoint_before_consuming_supervisor_takeover() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use crate::platform::process::ProcessIdentity;
+        use crate::supervisor::state::{
+            SupervisorTakeoverAcknowledgement, SupervisorTakeoverCommit, SupervisorTakeoverInstance,
+            SupervisorTakeoverRequest, accept_supervisor_takeover_request, read_accepted_supervisor_takeover,
+            write_supervisor_takeover_acknowledgement, write_supervisor_takeover_commit,
+            write_supervisor_takeover_request,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("store");
+        let install_root = tmp.path().join("install");
+        let active_app_dir = install_root.join("app");
+        let app_id = "test-app";
+        let supervisor_id = "current-supervisor";
+        std::fs::create_dir_all(&store_root).unwrap();
+        std::fs::create_dir_all(&active_app_dir).unwrap();
+        write_runtime_identity(&active_app_dir, app_id, "1.0.0", "missing-app", supervisor_id);
+
+        let supervisor_path = active_app_dir.join(crate::platform::process::supervisor_binary_name());
+        std::fs::write(&supervisor_path, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = std::fs::metadata(&supervisor_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&supervisor_path, permissions).unwrap();
+
+        let instance = SupervisorTakeoverInstance::new(42);
+        let request = SupervisorTakeoverRequest::new(&instance, Duration::from_secs(5));
+        let acknowledgement =
+            SupervisorTakeoverAcknowledgement::new(&request, Some(ProcessIdentity { pid: 84, generation: 7 }));
+        let commit = SupervisorTakeoverCommit::new(&acknowledgement);
+        write_supervisor_takeover_request(&install_root, supervisor_id, &request).unwrap();
+        write_supervisor_takeover_acknowledgement(&install_root, supervisor_id, &acknowledgement).unwrap();
+        write_supervisor_takeover_commit(&install_root, supervisor_id, &commit).unwrap();
+        assert!(accept_supervisor_takeover_request(&install_root, supervisor_id, &request).unwrap());
+
+        let rid = current_rid();
+        let full_filename = format!("{app_id}-1.1.0-{rid}-full.tar.zst");
+        let full_path = app_scoped_store_root(&store_root, app_id).join(&full_filename);
+        let mut packer = ArchivePacker::new(3).unwrap();
+        packer.add_buffer("new-app", b"#!/bin/sh\nexit 0\n", 0o755).unwrap();
+        packer.finalize_to_file(&full_path).unwrap();
+
+        let mut latest = make_entry("1.1.0", "stable", &current_os_label_for_tests(), &rid);
+        latest.is_genesis = true;
+        latest.main_exe = "new-app".to_string();
+        latest.full_filename = full_filename;
+        latest.full_size = std::fs::metadata(&full_path).unwrap().len() as i64;
+        latest.full_sha256 = sha256_hex_file(&full_path).unwrap();
+        latest.deltas.clear();
+        latest.preferred_delta_id.clear();
+        write_app_scoped_release_index(
+            &store_root,
+            app_id,
+            &ReleaseIndex {
+                app_id: app_id.to_string(),
+                releases: vec![latest],
+                ..ReleaseIndex::default()
+            },
+        );
+
+        let ctx = Arc::new(Context::new());
+        ctx.set_storage(
+            StorageProvider::Filesystem,
+            store_root.to_str().unwrap(),
+            "",
+            "",
+            "",
+            "",
+        );
+        let mut manager = UpdateManager::new(ctx, app_id, "1.0.0", "stable", install_root.to_str().unwrap()).unwrap();
+        let info = manager.check_for_updates().await.unwrap().unwrap();
+
+        let error = manager
+            .download_and_apply(&info, None::<fn(ProgressInfo)>)
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("Failed to resolve active application executable before swap")
+        );
+        assert!(
+            read_accepted_supervisor_takeover(&install_root, supervisor_id)
+                .unwrap()
+                .is_some(),
+            "entrypoint preflight must fail before the accepted supervisor takeover is consumed"
+        );
+        assert!(!active_app_dir.join("new-app").exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
     async fn test_download_and_apply_quiesces_installed_executable_when_target_name_changes() {
         let tmp = tempfile::tempdir().unwrap();
         let store_root = tmp.path().join("store");

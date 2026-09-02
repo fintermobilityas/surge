@@ -378,7 +378,7 @@ pub(super) fn encode_sparse_file_ops_payload(manifest: &SparseFileDeltaManifest,
     Ok(encoded)
 }
 
-fn decode_sparse_file_ops_payload(data: &[u8]) -> Result<(SparseFileDeltaManifest, &[u8])> {
+pub(super) fn decode_sparse_file_ops_payload(data: &[u8]) -> Result<(SparseFileDeltaManifest, &[u8])> {
     if data.len() < SPARSE_FILE_OPS_HEADER_LEN {
         return Err(SurgeError::Update("Sparse delta payload is truncated".to_string()));
     }

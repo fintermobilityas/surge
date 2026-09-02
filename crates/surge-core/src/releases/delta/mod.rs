@@ -2,6 +2,8 @@ mod archive;
 mod format;
 mod fs_apply;
 mod sparse_diff;
+mod sparse_diff_dir;
+mod sparse_diff_pool;
 #[cfg(test)]
 mod sparse_equivalence;
 mod sparse_ops;
@@ -26,9 +28,8 @@ pub use self::format::{
     is_supported_delta, patch_format_from_magic_prefix,
 };
 pub(crate) use self::fs_apply::VerifiedFileHashes;
-pub use self::sparse_diff::{
-    SparseTreeReuse, build_sparse_file_patch_with_tree, build_sparse_file_patch_with_tree_from_directory,
-};
+pub use self::sparse_diff::{SparseTreeReuse, build_sparse_file_patch_with_tree};
+pub use self::sparse_diff_dir::build_sparse_file_patch_with_tree_from_directory;
 pub use self::sparse_ops::build_sparse_file_patch;
 pub(crate) use self::sparse_ops::{apply_sparse_step_in_place, sparse_step_units_for};
 

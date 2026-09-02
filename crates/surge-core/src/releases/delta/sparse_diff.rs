@@ -13,31 +13,35 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Component, PathBuf};
 
+#[cfg(test)]
 use crate::crypto::sha256::sha256_hex;
-use crate::diff::chunked::{ChunkedDiffOptions, chunked_bsdiff};
+use crate::diff::chunked::ChunkedDiffOptions;
 use crate::error::{Result, SurgeError};
 
+use super::sparse_diff_pool::{
+    FileWork, FileWorkResult, MAX_PARALLEL_FILE_PASSES, PathItem, file_work_pipeline, work_mode,
+};
 use super::sparse_ops::{
     SparseFileDeltaManifest, SparseFileOp, append_payload, encode_sparse_file_ops_payload, path_depth,
 };
-use super::tree::{TreeEntryKind, collect_tree_entries_with_executables};
+use super::tree::TreeEntryKind;
 
 /// One entry of a decoded sparse tree. File contents are referenced by
 /// offset into the decoded tar buffer instead of copied or borrowed, so the
 /// tree can outlive the function that collected it.
 #[derive(Debug)]
-struct SparseTreeEntry {
-    kind: TreeEntryKind,
-    mode: u32,
-    symlink_target: Option<String>,
-    data_start: usize,
-    content_len: usize,
+pub(super) struct SparseTreeEntry {
+    pub(super) kind: TreeEntryKind,
+    pub(super) mode: u32,
+    pub(super) symlink_target: Option<String>,
+    pub(super) data_start: usize,
+    pub(super) content_len: usize,
 }
 
 /// Borrowed view over one decoded tree: the tar buffer plus the entry map.
-struct SparseTree<'a> {
-    buffer: &'a [u8],
-    entries: &'a BTreeMap<String, SparseTreeEntry>,
+pub(super) struct SparseTree<'a> {
+    pub(super) buffer: &'a [u8],
+    pub(super) entries: &'a BTreeMap<String, SparseTreeEntry>,
 }
 
 impl SparseTree<'_> {
@@ -69,9 +73,9 @@ impl SparseTree<'_> {
 /// fails the match and falls back to a cold decode.
 #[derive(Debug)]
 pub struct SparseTreeReuse {
-    archive_sha256: String,
-    buffer: Vec<u8>,
-    entries: BTreeMap<String, SparseTreeEntry>,
+    pub(super) archive_sha256: String,
+    pub(super) buffer: Vec<u8>,
+    pub(super) entries: BTreeMap<String, SparseTreeEntry>,
 }
 
 impl SparseTreeReuse {
@@ -84,11 +88,11 @@ impl SparseTreeReuse {
         })
     }
 
-    fn matches(&self, archive_sha256: &str) -> bool {
+    pub(super) fn matches(&self, archive_sha256: &str) -> bool {
         self.archive_sha256 == archive_sha256
     }
 
-    fn tree(&self) -> SparseTree<'_> {
+    pub(super) fn tree(&self) -> SparseTree<'_> {
         SparseTree {
             buffer: &self.buffer,
             entries: &self.entries,
@@ -96,7 +100,7 @@ impl SparseTreeReuse {
     }
 }
 
-fn decode_tar(archive: &[u8]) -> Result<Vec<u8>> {
+pub(super) fn decode_tar(archive: &[u8]) -> Result<Vec<u8>> {
     let mut decoder =
         zstd::Decoder::new(archive).map_err(|e| SurgeError::Archive(format!("Failed to create zstd decoder: {e}")))?;
     let mut tar_bytes = Vec::new();
@@ -106,7 +110,7 @@ fn decode_tar(archive: &[u8]) -> Result<Vec<u8>> {
     Ok(tar_bytes)
 }
 
-fn collect_tree_entries_in_memory(tar_bytes: &[u8]) -> Result<BTreeMap<String, SparseTreeEntry>> {
+pub(super) fn collect_tree_entries_in_memory(tar_bytes: &[u8]) -> Result<BTreeMap<String, SparseTreeEntry>> {
     let mut entries = BTreeMap::new();
     let mut archive = tar::Archive::new(std::io::Cursor::new(tar_bytes));
     // Tar is a sequence of 512-byte header blocks followed by data rounded up
@@ -276,125 +280,28 @@ pub fn build_sparse_file_patch_with_tree(
     Ok((patch, next_tree))
 }
 
-/// Build the sparse delta patch using a packed staging directory as the
-/// newer side instead of decoding the newer archive.
-///
-/// The publisher just packed `newer_root` into the newer archive, so its
-/// tree is known without a zstd decode: the directory is walked the same
-/// way the packer packs it (including the executable-bit overrides) and
-/// file contents are read straight from disk (page cache, not zstd).
-/// The patch bytes are identical to the archive-based build because the
-/// archive was packed from these exact files in the same build; the
-/// client's full-archive SHA-256 check still guards the whole chain.
-pub fn build_sparse_file_patch_with_tree_from_directory(
-    older_tree: Option<&SparseTreeReuse>,
-    older_archive: &[u8],
-    older_archive_sha256: &str,
-    newer_root: &std::path::Path,
-    executable_paths: &std::collections::BTreeSet<String>,
-    newer_archive_sha256: &str,
-    compression_level: i32,
-    zstd_workers: u32,
-    diff_options: &ChunkedDiffOptions,
-) -> Result<(Vec<u8>, SparseTreeReuse)> {
-    let reuse = older_tree.filter(|tree| tree.matches(older_archive_sha256));
-    let older_buffer: Option<Vec<u8>> = match reuse {
-        Some(_) => None,
-        None => Some(decode_tar(older_archive)?),
-    };
-    let cold_older = older_buffer
-        .map(|buffer| collect_tree_entries_in_memory(&buffer).map(|entries| (buffer, entries)))
-        .transpose()?;
-    let older_tree = if let Some(tree) = reuse {
-        tree.tree()
-    } else {
-        match cold_older.as_ref() {
-            Some((buffer, entries)) => SparseTree { buffer, entries },
-            None => return Err(SurgeError::Archive("Missing older archive decode".to_string())),
-        }
-    };
-
-    let newer = collect_tree_from_directory(newer_root, executable_paths)?;
-    let newer_tree = SparseTree {
-        buffer: &newer.buffer,
-        entries: &newer.entries,
-    };
-
-    let patch = build_patch_from_trees(&older_tree, &newer_tree, compression_level, zstd_workers, diff_options)?;
-    let next_tree = SparseTreeReuse {
-        archive_sha256: newer_archive_sha256.to_string(),
-        buffer: newer.buffer,
-        entries: newer.entries,
-    };
-    Ok((patch, next_tree))
-}
-
-/// Walk the packed staging directory and materialize file contents into a
-/// single buffer so the newer side shares the in-memory tree representation
-/// (offset + length) with the decoded-archive path.
-fn collect_tree_from_directory(
-    root: &std::path::Path,
-    executable_paths: &std::collections::BTreeSet<String>,
-) -> Result<SparseTreeReuse> {
-    let disk_entries = collect_tree_entries_with_executables(root, executable_paths)?;
-    let mut buffer: Vec<u8> = Vec::new();
-    let mut entries = BTreeMap::new();
-    // BTreeMap iteration is sorted: deterministic materialization.
-    for (relative, entry) in &disk_entries {
-        let (data_start, content_len) = if entry.kind == TreeEntryKind::File {
-            let data_start = buffer.len();
-            let expected_len = std::fs::metadata(&entry.source_path)?.len();
-            let mut file = std::fs::File::open(&entry.source_path)
-                .map_err(|e| SurgeError::Archive(format!("Failed to read packed file '{relative}': {e}")))?;
-            std::io::Read::read_to_end(&mut file, &mut buffer)
-                .map_err(|e| SurgeError::Archive(format!("Failed to read packed file '{relative}': {e}")))?;
-            let content_len = buffer.len() - data_start;
-            if u64::try_from(content_len) != Ok(expected_len) {
-                return Err(SurgeError::Archive(format!(
-                    "Packed file '{relative}' changed size while reading"
-                )));
-            }
-            (data_start, content_len)
-        } else {
-            (0, 0)
-        };
-        entries.insert(
-            relative.clone(),
-            SparseTreeEntry {
-                kind: entry.kind,
-                mode: entry.mode,
-                symlink_target: entry.symlink_target.clone(),
-                data_start,
-                content_len,
-            },
-        );
-    }
-    Ok(SparseTreeReuse {
-        archive_sha256: String::new(),
-        buffer,
-        entries,
-    })
-}
-
-fn build_patch_from_trees(
+pub(super) fn build_patch_from_trees(
     older_tree: &SparseTree<'_>,
     newer_tree: &SparseTree<'_>,
     compression_level: i32,
     zstd_workers: u32,
     diff_options: &ChunkedDiffOptions,
 ) -> Result<Vec<u8>> {
-    let mut ops = Vec::new();
-    let mut payloads = Vec::new();
-
+    // Phase 1: classify entries sequentially. The heavy per-file pipeline
+    // (hashes + chunked diff) is queued as work; everything else yields its
+    // op immediately. Ops keep the historical order (deletes first, then
+    // path-sorted), so payload bytes stay identical to the sequential build.
     let mut delete_entries: Vec<(&String, &SparseTreeEntry)> = older_tree.iter().collect();
     delete_entries
         .sort_by(|(left, _), (right, _)| path_depth(right).cmp(&path_depth(left)).then_with(|| right.cmp(left)));
-    for (path, older_entry) in delete_entries {
-        if newer_tree.get(path).is_none_or(|newer| newer.kind != older_entry.kind) {
-            ops.push(SparseFileOp::Delete { path: (*path).clone() });
-        }
-    }
+    let mut ops: Vec<SparseFileOp> = delete_entries
+        .iter()
+        .filter(|(path, older_entry)| newer_tree.get(path).is_none_or(|newer| newer.kind != older_entry.kind))
+        .map(|(path, _)| SparseFileOp::Delete { path: (*path).clone() })
+        .collect();
+    let mut payloads: Vec<u8> = Vec::new();
 
+    let mut path_items: Vec<PathItem> = Vec::new();
     let mut new_paths: Vec<&String> = newer_tree.keys().collect();
     new_paths.sort();
     for path in new_paths {
@@ -402,91 +309,176 @@ fn build_patch_from_trees(
             continue; // collected key
         };
         let older = older_tree.get(path);
-        match newer.kind {
+        let (immediate, file_work) = match newer.kind {
             TreeEntryKind::Directory => {
                 if older.is_none_or(|entry| entry.kind != TreeEntryKind::Directory || entry.mode != newer.mode) {
-                    ops.push(SparseFileOp::EnsureDir {
-                        path: path.clone(),
-                        mode: newer.mode,
-                    });
+                    (
+                        Some(SparseFileOp::EnsureDir {
+                            path: path.clone(),
+                            mode: newer.mode,
+                        }),
+                        None,
+                    )
+                } else {
+                    (None, None)
                 }
             }
             TreeEntryKind::Symlink => {
                 if older.is_none_or(|entry| {
                     entry.kind != TreeEntryKind::Symlink || entry.symlink_target != newer.symlink_target
                 }) {
-                    ops.push(SparseFileOp::WriteSymlink {
-                        path: path.clone(),
-                        target: newer.symlink_target.clone().unwrap_or_default(),
-                    });
+                    (
+                        Some(SparseFileOp::WriteSymlink {
+                            path: path.clone(),
+                            target: newer.symlink_target.clone().unwrap_or_default(),
+                        }),
+                        None,
+                    )
+                } else {
+                    (None, None)
                 }
             }
             TreeEntryKind::File => {
                 let newer_content = newer_tree.content(newer);
-                let identical = older
-                    .filter(|entry| entry.kind == TreeEntryKind::File)
-                    .is_some_and(|entry| older_tree.content(entry) == newer_content);
-                if identical {
-                    if let Some(older) = older
-                        && older.mode != newer.mode
-                    {
-                        ops.push(SparseFileOp::SetMode {
-                            path: path.clone(),
-                            mode: newer.mode,
-                        });
+                let older_file = older.filter(|entry| entry.kind == TreeEntryKind::File);
+                match older_file {
+                    Some(older_entry) if older_tree.content(older_entry) == newer_content => {
+                        if newer.mode == older_entry.mode {
+                            (None, None)
+                        } else {
+                            (
+                                Some(SparseFileOp::SetMode {
+                                    path: path.clone(),
+                                    mode: newer.mode,
+                                }),
+                                None,
+                            )
+                        }
                     }
-                    continue;
-                }
-
-                let raw_len = newer_content.len();
-                // Hash both files on workers while the chunked diff runs on
-                // this thread: three independent CPU-bound passes over the
-                // same file, and the publisher machine has cores.
-                let (new_sha256, use_patch) = if let Some(older) = older
-                    && older.kind == TreeEntryKind::File
-                {
-                    let older_content = older_tree.content(older);
-                    let (new_sha256, basis_sha256, patch) =
-                        std::thread::scope(|s| -> Result<(String, String, Vec<u8>)> {
-                            let newer_handle = s.spawn(|| sha256_hex(newer_content));
-                            let basis_handle = s.spawn(|| sha256_hex(older_content));
-                            let patch = chunked_bsdiff(older_content, newer_content, diff_options)?;
-                            let new_sha256 = newer_handle
-                                .join()
-                                .map_err(|_| SurgeError::Archive("Hash worker panicked".to_string()))?;
-                            let basis_sha256 = basis_handle
-                                .join()
-                                .map_err(|_| SurgeError::Archive("Hash worker panicked".to_string()))?;
-                            Ok((new_sha256, basis_sha256, patch))
-                        })?;
-                    let use_patch = patch.len() < raw_len;
-                    if use_patch {
-                        let (payload_offset, payload_len) = append_payload(&mut payloads, &patch)?;
-                        ops.push(SparseFileOp::PatchFile {
-                            path: path.clone(),
+                    Some(older_entry) => (
+                        None,
+                        Some(FileWork::Changed {
                             mode: newer.mode,
-                            payload_offset,
-                            payload_len,
-                            basis_sha256,
-                            sha256: new_sha256.clone(),
-                        });
-                    }
-                    (new_sha256, use_patch)
-                } else {
-                    (sha256_hex(newer_content), false)
-                };
-
-                if !use_patch {
-                    let (payload_offset, payload_len) = append_payload(&mut payloads, newer_content)?;
-                    ops.push(SparseFileOp::WriteFile {
-                        path: path.clone(),
-                        mode: newer.mode,
-                        payload_offset,
-                        payload_len,
-                        sha256: new_sha256,
-                    });
+                            newer: newer_content,
+                            older: older_tree.content(older_entry),
+                        }),
+                    ),
+                    None => (
+                        None,
+                        Some(FileWork::New {
+                            mode: newer.mode,
+                            content: newer_content,
+                        }),
+                    ),
                 }
             }
+        };
+        path_items.push(PathItem {
+            path: path.clone(),
+            immediate,
+            file_work,
+        });
+    }
+
+    // Phase 2: run the per-file pipelines across a bounded worker pool.
+    // The chunked diff output is independent of its thread count (per-chunk
+    // results are serialized by chunk index), so splitting the budget across
+    // files keeps the patch bytes identical to the single-file build.
+    // Largest files first: the cold-cache cost of a big chunked diff
+    // (random chunk access while the page cache fills) should run on the
+    // full thread budget before smaller files share the machine.
+    let mut work_items: Vec<(usize, &FileWork<'_>)> = path_items
+        .iter()
+        .enumerate()
+        .filter_map(|(i, item)| item.file_work.as_ref().map(|work| (i, work)))
+        .collect();
+    work_items.sort_by_key(|(_, work)| {
+        std::cmp::Reverse(match work {
+            FileWork::Changed { newer, .. } => newer.len(),
+            FileWork::New { content, .. } => content.len(),
+        })
+    });
+    let budget = usize::try_from(zstd_workers).unwrap_or(1).max(1);
+    let parallelism = work_items.len().min(MAX_PARALLEL_FILE_PASSES).min(budget).max(1);
+    let split_options;
+    let file_diff_options: &ChunkedDiffOptions = if parallelism > 1 {
+        let cpu = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        let base = diff_options.max_threads.max(1);
+        let per_file = (base.min(cpu) / parallelism).max(1);
+        split_options = ChunkedDiffOptions {
+            chunk_size: diff_options.chunk_size,
+            max_threads: per_file,
+            format: diff_options.format,
+        };
+        &split_options
+    } else {
+        diff_options
+    };
+
+    let work_counter = std::sync::atomic::AtomicUsize::new(0);
+    let results: std::sync::Mutex<Vec<(usize, Result<FileWorkResult>)>> =
+        std::sync::Mutex::new(Vec::with_capacity(work_items.len()));
+    std::thread::scope(|s| {
+        for _ in 0..parallelism {
+            s.spawn(|| {
+                loop {
+                    let pos = work_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if pos >= work_items.len() {
+                        return;
+                    }
+                    let (index, work) = work_items[pos];
+                    let result = file_work_pipeline(work, file_diff_options);
+                    let mut guard = results.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    guard.push((index, result));
+                }
+            });
+        }
+    });
+    let mut results_by_index: std::collections::HashMap<usize, Result<FileWorkResult>> = results
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .into_iter()
+        .collect();
+
+    // Phase 3: assemble ops and payloads in path order.
+    for (item_index, item) in path_items.iter_mut().enumerate() {
+        if let Some(op) = item.immediate.take() {
+            ops.push(op);
+            continue;
+        }
+        let Some(work) = item.file_work.as_ref() else {
+            continue;
+        };
+        let Some(result) = results_by_index.remove(&item_index) else {
+            unreachable!("work result missing for '{}'", item.path);
+        };
+        match result {
+            Ok(FileWorkResult::WriteFile { payload, sha256 }) => {
+                let (payload_offset, payload_len) = append_payload(&mut payloads, &payload)?;
+                ops.push(SparseFileOp::WriteFile {
+                    path: item.path.clone(),
+                    mode: work_mode(work),
+                    payload_offset,
+                    payload_len,
+                    sha256,
+                });
+            }
+            Ok(FileWorkResult::PatchFile {
+                payload,
+                basis_sha256,
+                sha256,
+            }) => {
+                let (payload_offset, payload_len) = append_payload(&mut payloads, &payload)?;
+                ops.push(SparseFileOp::PatchFile {
+                    path: item.path.clone(),
+                    mode: work_mode(work),
+                    payload_offset,
+                    payload_len,
+                    basis_sha256,
+                    sha256,
+                });
+            }
+            Err(e) => return Err(e),
         }
     }
 

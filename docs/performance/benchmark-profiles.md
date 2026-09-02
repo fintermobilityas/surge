@@ -166,11 +166,11 @@ while the chunked diff executes. No archive is extracted to disk.
   serialized by chunk index), so patch bytes are identical to the
   sequential build (`parallel_file_passes_produce_identical_payloads`).
   The single-file canonical shape is untouched (pool of one). Same-
-  session A/B (scale 0.25, `full_release`, 10 deltas): 7,169/7,148 ->
-  5,407/5,512 ms/version (-21 to -25%); the cap was measured, not
-  picked: cap 4 and 8 make the cold first delta 2-4x slower (page-
-  cache fill + random chunk access contend) and lose the average,
-  while cap 2 never regresses the cold step.
+  session A/B (scale 0.25, `full_release`, 10 deltas): 7,022/6,935 ->
+  4,302/4,288 ms/version (-38%); the cap was measured, not picked: cap
+  4 and 8 make the cold first delta 2-4x slower (page-cache fill +
+  random chunk access contend) and lose the average, while cap 2 never
+  regresses the cold step.
 
 ## CI Tracking Guidance
 

@@ -18,7 +18,7 @@ use super::sparse_ops::SparseFileOp;
 /// hash, basis hash, chunked diff) with the thread budget split evenly,
 /// so the cap keeps a single large file on the full budget and avoids
 /// oversubscription on many-file changes.
-pub(super) const MAX_PARALLEL_FILE_PASSES: usize = 4;
+pub(super) const MAX_PARALLEL_FILE_PASSES: usize = 2;
 
 pub(super) enum FileWork<'a> {
     Changed {
@@ -39,11 +39,10 @@ pub(super) struct PathItem<'a> {
 }
 
 #[derive(Debug)]
-pub(super) enum FileWorkResult {
-    WriteFile {
-        payload: Vec<u8>,
-        sha256: String,
-    },
+pub(super) enum FileWorkResult<'a> {
+    /// The payload borrows the tree content: new files and changeless
+    /// rewrites need no intermediate copy before the payload assembly.
+    WriteFile { payload: &'a [u8], sha256: String },
     PatchFile {
         payload: Vec<u8>,
         basis_sha256: String,
@@ -57,12 +56,15 @@ pub(super) fn work_mode(work: &FileWork<'_>) -> u32 {
     }
 }
 
-pub(super) fn file_work_pipeline(work: &FileWork<'_>, diff_options: &ChunkedDiffOptions) -> Result<FileWorkResult> {
+pub(super) fn file_work_pipeline<'a>(
+    work: &FileWork<'a>,
+    diff_options: &ChunkedDiffOptions,
+) -> Result<FileWorkResult<'a>> {
     match work {
         FileWork::New { content, .. } => {
             let sha256 = sha256_hex(content);
             Ok(FileWorkResult::WriteFile {
-                payload: content.to_vec(),
+                payload: content,
                 sha256,
             })
         }
@@ -89,7 +91,7 @@ pub(super) fn file_work_pipeline(work: &FileWork<'_>, diff_options: &ChunkedDiff
                 })
             } else {
                 Ok(FileWorkResult::WriteFile {
-                    payload: newer.to_vec(),
+                    payload: newer,
                     sha256: new_sha256,
                 })
             }

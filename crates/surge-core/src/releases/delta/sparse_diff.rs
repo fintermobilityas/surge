@@ -403,8 +403,14 @@ pub(super) fn build_patch_from_trees(
     let split_options;
     let file_diff_options: &ChunkedDiffOptions = if parallelism > 1 {
         let cpu = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
-        let base = diff_options.max_threads.max(1);
-        let per_file = (base.min(cpu) / parallelism).max(1);
+        // max_threads == 0 is the documented memory-aware auto mode:
+        // base the split on the full CPU budget, not one thread.
+        let base = if diff_options.max_threads == 0 {
+            cpu
+        } else {
+            diff_options.max_threads.min(cpu)
+        };
+        let per_file = (base / parallelism).max(1);
         split_options = ChunkedDiffOptions {
             chunk_size: diff_options.chunk_size,
             max_threads: per_file,
@@ -416,7 +422,7 @@ pub(super) fn build_patch_from_trees(
     };
 
     let work_counter = std::sync::atomic::AtomicUsize::new(0);
-    let results: std::sync::Mutex<Vec<(usize, Result<FileWorkResult>)>> =
+    let results: std::sync::Mutex<Vec<(usize, Result<FileWorkResult<'_>>)>> =
         std::sync::Mutex::new(Vec::with_capacity(work_items.len()));
     std::thread::scope(|s| {
         for _ in 0..parallelism {
@@ -434,7 +440,7 @@ pub(super) fn build_patch_from_trees(
             });
         }
     });
-    let mut results_by_index: std::collections::HashMap<usize, Result<FileWorkResult>> = results
+    let mut results_by_index: std::collections::HashMap<usize, Result<FileWorkResult<'_>>> = results
         .into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .into_iter()
@@ -454,7 +460,7 @@ pub(super) fn build_patch_from_trees(
         };
         match result {
             Ok(FileWorkResult::WriteFile { payload, sha256 }) => {
-                let (payload_offset, payload_len) = append_payload(&mut payloads, &payload)?;
+                let (payload_offset, payload_len) = append_payload(&mut payloads, payload)?;
                 ops.push(SparseFileOp::WriteFile {
                     path: item.path.clone(),
                     mode: work_mode(work),

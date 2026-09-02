@@ -198,7 +198,9 @@ fn parallel_file_passes_produce_identical_payloads() {
         max_threads: 0,
         format: ChunkedPatchFormat::IdentityChunks,
     };
-    // 8 workers => up to 8 parallel file pipelines; 1 worker => sequential.
+    // 8-worker budget => the bounded pool runs several file pipelines at
+    // once; a 1-worker budget forces the sequential build. Both must
+    // produce the same ops and payload bytes.
     let patch_wide = build_sparse_file_patch(&old_archive, &new_archive, 3, 8, &opts).unwrap();
     let patch_narrow = build_sparse_file_patch(&old_archive, &new_archive, 3, 1, &opts).unwrap();
 

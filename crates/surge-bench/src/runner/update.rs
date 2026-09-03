@@ -13,7 +13,7 @@ use surge_core::install::{InstallProfile, RuntimeManifestMetadata, write_runtime
 use surge_core::pack::builder::{PackBuilder, TimedArtifact};
 use surge_core::platform::detect::current_rid;
 use surge_core::releases::delta::SparseTreeReuse;
-use surge_core::update::manager::{ApplyStrategy, ProgressInfo, UpdateManager};
+use surge_core::update::manager::{ApplyStrategy, ProgressInfo, UpdateApplyOutcome, UpdateManager};
 
 use crate::payload::{PayloadTemplate, ScenarioProfile};
 use crate::report::BenchmarkResult;
@@ -377,7 +377,7 @@ pub async fn run_update_scenario(
     let t0 = apply_started;
     let last_items = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(-1));
     let li = last_items.clone();
-    update_manager
+    let outcome = update_manager
         .download_and_apply(
             &info,
             Some(move |p: ProgressInfo| {
@@ -394,6 +394,11 @@ pub async fn run_update_scenario(
             }),
         )
         .await?;
+    if outcome == UpdateApplyOutcome::ExternalFinalizeScheduled {
+        return Err(SurgeError::Update(
+            "Benchmark update unexpectedly required external finalization".to_string(),
+        ));
+    }
     let apply_duration = apply_started.elapsed();
     assert_directories_match(&install_dir.join("app"), &artifacts_dir)?;
     results.push(BenchmarkResult {

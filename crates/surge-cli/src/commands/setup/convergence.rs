@@ -9,7 +9,7 @@ use surge_core::error::{Result, SurgeError};
 use surge_core::install::{self as core_install, InstallProfile};
 use surge_core::releases::version::compare_versions;
 use surge_core::storage_config::build_storage_config_from_installer_manifest;
-use surge_core::update::manager::{ApplyStrategy, ProgressInfo, UpdateInfo, UpdateManager};
+use surge_core::update::manager::{ApplyStrategy, ProgressInfo, UpdateApplyOutcome, UpdateInfo, UpdateManager};
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -120,7 +120,7 @@ async fn update_existing_install(
     apply_installer_runtime_environment(&mut update, manifest);
 
     let update_progress = Mutex::new(ProgressReporter::new("Applying update..."));
-    manager
+    let outcome = manager
         .download_and_apply(
             &update,
             Some(|progress: ProgressInfo| {
@@ -133,6 +133,12 @@ async fn update_existing_install(
             }),
         )
         .await?;
+    if outcome == UpdateApplyOutcome::ExternalFinalizeScheduled {
+        return Err(SurgeError::Update(
+            "Installer convergence unexpectedly required external finalization; exit before verifying the installed version"
+                .to_string(),
+        ));
+    }
 
     repair_runtime_metadata(manifest, install_root)?;
     logline::success(&format!(

@@ -58,6 +58,7 @@ namespace Surge
     internal static partial class NativeMethods
     {
         private const string LibName = "surge";
+        internal const int UpdateScheduled = 1;
 
 #if NET10_0_OR_GREATER
         // --- Lifecycle ---

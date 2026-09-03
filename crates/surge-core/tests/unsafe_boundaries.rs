@@ -32,6 +32,7 @@ fn unsafe_is_confined_to_boundary_modules() {
             "src/diff/bsdiff_sys.rs"
                 | "src/diff/wrapper.rs"
                 | "src/diff/mod.rs"
+                | "src/diff/chunked/surgepat.rs"
                 | "src/platform/process/descriptors.rs"
         );
 

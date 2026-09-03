@@ -84,7 +84,7 @@ pack:
     # apply path; 2 keeps the full-read verify, 1 the legacy payloads.
     # Publishing v3 requires clients that understand it (fleet gate, same
     # pattern as the v1 -> v2 cut, surge-core #267).
-    chunked_patch_format: 3
+    chunked_patch_format: 4
   compression:
     format: zstd
     level: {pack_zstd_level}

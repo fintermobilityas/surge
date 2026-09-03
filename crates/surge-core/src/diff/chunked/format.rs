@@ -36,6 +36,25 @@ const IDENTITY_VERSION: u8 = 2;
 /// Identity-chunk bitset plus per-chunk target SHA-256 digests.
 const TARGET_HASHES_VERSION: u8 = 3;
 
+/// SURGPAT1 fast-apply payload version.
+const SURGE_VERSION: u8 = 4;
+
+fn version_for_format(format: ChunkedPatchFormat) -> u8 {
+    match format {
+        ChunkedPatchFormat::ZstdRleIdentityChunksWithTargetHashes => SURGE_VERSION,
+        _ => TARGET_HASHES_VERSION,
+    }
+}
+
+/// Versions that carry a per-chunk SHA-256 target digest for every
+/// changed chunk.
+fn records_target_hashes(format: ChunkedPatchFormat) -> bool {
+    matches!(
+        format,
+        ChunkedPatchFormat::IdentityChunksWithTargetHashes | ChunkedPatchFormat::ZstdRleIdentityChunksWithTargetHashes
+    )
+}
+
 /// SHA-256 digest length for the per-chunk target digests.
 const DIGEST_LEN: usize = 32;
 
@@ -92,8 +111,9 @@ pub(super) fn serialize_patch(
     let (version, mut bitset) = match format {
         ChunkedPatchFormat::Legacy => (LEGACY_VERSION, Vec::new()),
         ChunkedPatchFormat::IdentityChunks => (IDENTITY_VERSION, vec![0u8; identity_bitset_len(num_chunks)]),
-        ChunkedPatchFormat::IdentityChunksWithTargetHashes => {
-            (TARGET_HASHES_VERSION, vec![0u8; identity_bitset_len(num_chunks)])
+        ChunkedPatchFormat::IdentityChunksWithTargetHashes
+        | ChunkedPatchFormat::ZstdRleIdentityChunksWithTargetHashes => {
+            (version_for_format(format), vec![0u8; identity_bitset_len(num_chunks)])
         }
     };
     for chunk in chunks {
@@ -103,19 +123,19 @@ pub(super) fn serialize_patch(
                     "identity chunk cannot be encoded in the legacy chunked patch format".into(),
                 ));
             }
-            if format == ChunkedPatchFormat::IdentityChunksWithTargetHashes && chunk.target_hash.is_some() {
+            if records_target_hashes(format) && chunk.target_hash.is_some() {
                 return Err(SurgeError::Diff("identity chunk must not carry a target digest".into()));
             }
             set_identity_bit(&mut bitset, chunk.idx);
-        } else if format == ChunkedPatchFormat::IdentityChunksWithTargetHashes && chunk.target_hash.is_none() {
+        } else if records_target_hashes(format) && chunk.target_hash.is_none() {
             return Err(SurgeError::Diff(
-                "changed chunk is missing its target digest in the v3 chunked patch format".into(),
+                "changed chunk is missing its target digest in the v3+ chunked patch format".into(),
             ));
         }
     }
 
     let header_size = header_size();
-    let with_hashes = format == ChunkedPatchFormat::IdentityChunksWithTargetHashes;
+    let with_hashes = records_target_hashes(format);
     let data_size: usize = chunks
         .iter()
         .map(|c| 8 + c.patch.len() + if with_hashes && !c.identity { DIGEST_LEN } else { 0 })
@@ -201,12 +221,12 @@ pub(super) fn deserialize_patch(data: &[u8]) -> Result<ChunkedPatchData<'_>> {
     }
     let version = data[4];
     let is_legacy = version == LEGACY_VERSION;
-    if !is_legacy && version != IDENTITY_VERSION && version != TARGET_HASHES_VERSION {
+    if !is_legacy && version != IDENTITY_VERSION && version != TARGET_HASHES_VERSION && version != SURGE_VERSION {
         return Err(SurgeError::Diff(format!(
             "unsupported chunked patch version: {version}"
         )));
     }
-    let with_hashes = version == TARGET_HASHES_VERSION;
+    let with_hashes = version == TARGET_HASHES_VERSION || version == SURGE_VERSION;
 
     let chunk_size = usize::try_from(read_u64_le(data, 5)?)
         .map_err(|_| SurgeError::Diff("chunk size exceeds platform limits".into()))?;
@@ -499,7 +519,7 @@ mod tests {
             format: ChunkedPatchFormat::Legacy,
         };
         let mut patch = chunked_bsdiff(&old, &new, &opts).expect("bsdiff");
-        patch[4] = 4;
+        patch[4] = 5;
         let err = chunked_bspatch(&old, &patch, &opts).unwrap_err();
         assert!(err.to_string().contains("unsupported chunked patch version"), "{err}");
     }

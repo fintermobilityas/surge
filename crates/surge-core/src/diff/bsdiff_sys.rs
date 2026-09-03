@@ -70,6 +70,15 @@ unsafe extern "C" {
         packer: *mut BsdiffPatchPacker,
     ) -> c_int;
 
+    pub fn BZ2_bzBuffToBuffDecompress(
+        dest: *mut u8,
+        destLen: *mut u32,
+        source: *const u8,
+        sourceLen: u32,
+        small: c_int,
+        blockSize100k: c_int,
+    ) -> c_int;
+
     pub fn bspatch(
         ctx: *mut BsdiffCtx,
         oldfile: *mut BsdiffStream,

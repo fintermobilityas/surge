@@ -78,13 +78,17 @@ tree still matches.
 
 - sparse file-ops deltas, zstd 3, `max_chain_length` 8,
   `checkpoint_every` 10, keep 2 latest fulls (pack-policy defaults)
-- localized 100-delta chain at large scale: download ≈ 510 KiB,
+- localized 100-delta chain at large scale: download ≈ 456 KiB,
   full-chain apply 657 s -> 489 s (carried tree) -> 221 s
   (identity chunks) -> ~157 s (verified-hash carry) -> ~154 s
   (streamed target hash + in-place patching) -> 74.6 s (2026-09-02,
-  lazy intermediate repacks) -> **~8.7-10.8 s (2026-09-03, CSDF v3
+  lazy intermediate repacks) -> ~8.7-10.8 s (2026-09-03, CSDF v3
   chunk-target digests: in-place apply verifies rewritten chunks in
-  memory and skips the full-file target re-read)** —
+  memory and skips the full-file target re-read) -> **~7.5-7.8 s
+  (2026-09-03, CSDF v4 SURGPAT1 payloads: changed chunks' diff blocks
+  stored as zstd(RLE(zero-runs)) so the per-chunk apply is a memcpy +
+  tiny add instead of a BZ2 decode + per-byte loop; pass-1 output
+  cache removes the second bsdiff derive of the two-phase verify)** —
   `docs/performance/update-chains.md`
 - **KEPT (this session): carried-tree chain apply.** The chain walker
   extracts the starting archive once and applies consecutive sparse

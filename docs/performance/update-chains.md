@@ -40,17 +40,18 @@ Large anonymized profile, `sdk_only`, `100` deltas, `sparse-file-ops`
   ~`4.8 s` after the carried-tree apply, ~`2.2 s` after identity-chunk
   patches, ~`1.6 s` after the verified-hash carry, ~`1.5-2.0 s` after
   the streamed target hash, ~`1.2-1.3 s` after lazy intermediate
-  repacks, and ~`0.09-0.11 s` after the v3 chunk-target digests
-  (loaded-host median; the range is host-load variance, not a
-  regression). Per-step cost is CPU/IO-bound and varies ~3x with
-  host load. After the two-phase verify, the in-place op caches its
+  repacks, ~`0.09-0.11 s` after the v3 chunk-target digests, and
+  ~`0.07 s` after the v4 SURGPAT1 payloads (loaded-host median; the
+  range is host-load variance, not a regression). Per-step cost is
+  CPU/IO-bound and varies ~3x with host load. The in-place op at the
+  canonical 4 MiB auto-sized chunk (the publisher sizes chunks from
+  the pack memory budget): read ~`0.7 ms`, chunk apply ~`3.2 ms`
+  (SURGPAT1; v3's C bsdiff was ~`10.6 ms`: BZ2 decompression of the
+  per-byte diff string ~`8.6 ms` + per-byte old-data add ~`2 ms`,
+  measured by disabling the add loop in a throwaway build), SHA-256
+  ~`1.9 ms`, write ~`0.7 ms` - and the two-phase verify caches its
   pass-1 derived chunks (bounded at 32 MiB) so pass 2 writes them
-  without re-deriving: the per-step in-place op is ~`14 ms` at the
-  canonical 4 MiB auto-sized chunk, of which ~`10.6 ms` is the bsdiff
-  apply itself (BZ2 decompression of the per-byte diff string ~`8.6
-  ms` + the per-byte old-data add ~`2 ms`, measured by disabling the
-  add loop); the read ~`0.7 ms`, SHA-256 ~`1.9 ms`, write ~`0.7 ms`
-  (phase-instrumented, scale 1.0, 2026-09-03)
+  without re-deriving (phase-instrumented, scale 1.0, 2026-09-03)
 - per-step cost breakdown (loaded host, scale 1.0, phase-instrumented):
   chunked `bspatch` over the 1 GB file ~`3.5-5.0 s` **before** the
   identity-chunk fix (15 of 16 unchanged 64 MiB chunks re-derived),
@@ -75,6 +76,31 @@ Large anonymized profile, `sdk_only`, `100` deltas, `sparse-file-ops`
   Same-session 100-delta A/B: `166.0 s` -> `74.6 s` (−55%); 10-delta
   interleaved pairs `1,988/1,849` -> `1,223/1,256 ms/step`
   (−32 to −39%); install tree byte-identical (1,214,024,073 B).
+- **SURGPAT1 fast-apply payloads (landed, CSDF v4)**: the bsdiff
+  apply of a changed chunk decompressed the entire per-byte diff
+  string under BZ2 and then added the old data byte by byte - ~`10.6
+  ms` for a 4 MiB chunk whose only change is 4 KiB. Chunked patch
+  format v4 re-encodes each changed chunk's classic BSDIFF40 payload
+  as SURGPAT1: the same (copy-add / extra-copy / old-seek) control
+  entries, but each entry's diff string is stored as
+  `zstd(RLE(zero-runs))` and its extra block as `zstd(extra)`. The
+  Rust applier expands zero runs as a plain copy from the old chunk
+  (vectorized) and adds only the raw runs' bytes, so the 4 MiB
+  zero-run cost is a memcpy instead of a BZ2 decode + per-byte loop.
+  The publisher re-encodes the C bsdiff output (decompress the three
+  BZ2 blocks, RLE, zstd) - flat in wall time (delta pack build
+  1,367 vs 1,362 ms same-session). Wire bytes shrink slightly
+  (100-delta download 503,524 -> 466,805 B, -7.3%; 10-delta 50,644 ->
+  46,742 B) because the RLE+zstd diff beats BZ2 on this workload.
+  Apply dispatches on the payload magic: SURGPAT1 runs the Rust
+  path, classic BSDIFF40 keeps the C path, and the C path fails
+  closed on SURGPAT1 (magic check) - so v4 is rejected by v3 readers
+  via the version check and a misrouted payload can never apply.
+  Same-session A/B vs `ba1dd6d`: 100-delta apply `9,952 ms` median
+  (9,619/9,952/11,822) -> `7,711 ms` (7,701/7,711/7,774, -22.5%,
+  including the pass-1 output cache from the previous round);
+  10-delta pairs `5,389/5,286` -> `5,123/5,164 ms`; install tree
+  byte-identical in every run (1,214,024,073 B at 100 deltas).
 - **Chunk-target-digest in-place verify (landed, CSDF v3)**: the
   full-file target re-read was still ~`0.59 s` of every in-place step
   (measured: chunk rewrite `~32 ms`, full-read hash `~586 ms` at

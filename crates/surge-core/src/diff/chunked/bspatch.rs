@@ -7,7 +7,6 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::crypto::sha256::sha256_raw;
-use crate::diff::wrapper;
 use crate::error::{Result, SurgeError};
 
 use super::format::{ChunkedPatchData, deserialize_patch};
@@ -178,7 +177,7 @@ fn bspatch_file(
         } else if chunk_patch.is_empty() {
             Vec::new()
         } else {
-            wrapper::bspatch_buffers(&old_chunk, chunk_patch)?
+            super::apply_chunk_patch(&old_chunk, chunk_patch)?
         };
         output.write_all(&new_chunk)?;
         if let Some(h) = hasher.as_mut() {
@@ -325,7 +324,7 @@ fn read_patched_chunk(
     file.seek(SeekFrom::Start(usize_to_u64_saturating(offset)))?;
     let mut old_chunk = vec![0u8; chunk_len];
     file.read_exact(&mut old_chunk)?;
-    let new_chunk = wrapper::bspatch_buffers(&old_chunk, chunk_patch)?;
+    let new_chunk = super::apply_chunk_patch(&old_chunk, chunk_patch)?;
     let verified = if let Some(expected) = recorded {
         let actual: [u8; 32] = sha256_raw(&new_chunk)
             .try_into()

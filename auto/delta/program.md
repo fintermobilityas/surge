@@ -154,6 +154,16 @@ starting any of these.
    decode still the top phase at the production payload shape (real
    native SDKs compress ~2-3:1, not the bench's 7:1)?
 
+2026-09-03 (round 18, update-surface change): CSDF v4 SURGPAT1
+re-encodes changed chunks' BSDIFF40 payloads at publish time as
+zstd(RLE(zero-runs)) diff blocks. Publisher side is flat (delta pack
+build 1,367 vs 1,362 ms same-session; the re-encode is one BZ2
+decompress + RLE + zstd per changed chunk, ~10-20 ms). Wire bytes
+SHRINK: 100-delta download 503,524 -> 466,805 B (-7.3%), 10-delta
+50,644 -> 46,742 B (-7.7%) - the RLE+zstd diff beats BZ2 on
+mostly-zero diff strings. Client apply drops accordingly (see
+auto/update/results.tsv).
+
 2026-09-03 (round 16, update-surface change): CSDF v3 chunk-target
 digests skip the client's full-file target re-read. Publisher side is
 flat: the per-chunk target digests are computed in the diff workers,

@@ -80,7 +80,7 @@ Accepted but not yet auto-tuned:
 
 - `pack.delta.max_chain_length`
 - `pack.retention.keep_latest_fulls`
-- `pack.delta.chunked_patch_format` — `1` (default) writes chunked patches every fielded client can read; `2` enables the identity-chunk bitset (unchanged chunks carry no payload — far cheaper for large files with small edits); `3` adds a SHA-256 target digest per changed chunk so the in-place applier verifies rewritten chunks in memory and skips the full-file target re-read. Versions 2 and 3 are rejected by older readers via the format version check, so switch only after the whole fleet runs a client that understands the target version.
+- `pack.delta.chunked_patch_format` — `1` (default) writes chunked patches every fielded client can read; `2` enables the identity-chunk bitset (unchanged chunks carry no payload — far cheaper for large files with small edits); `3` adds a SHA-256 target digest per changed chunk so the in-place applier verifies rewritten chunks in memory and skips the full-file target re-read; `4` re-encodes changed chunks' payloads as SURGPAT1 (`zstd(RLE(zero-runs))` diff blocks) so the per-chunk apply is a memcpy + tiny add instead of a BZ2 decode + per-byte loop (~10x faster per changed chunk; wire bytes comparable or slightly smaller). Versions 2, 3, and 4 are rejected by older readers via the format version check, so switch only after the whole fleet runs a client that understands the target version.
 - `pack.retention.checkpoint_every`
 
 Not allowed in the manifest:

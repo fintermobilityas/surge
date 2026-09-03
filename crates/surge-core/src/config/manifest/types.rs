@@ -378,6 +378,10 @@ pub enum PackChunkedPatchFormat {
     /// digests so the in-place applier skips the full-file target re-read;
     /// rejected by clients that predate it.
     V3,
+    /// Format version 4: v3 plus SURGPAT1 chunk payloads (zstd/RLE diff
+    /// blocks) for a much faster per-chunk apply; rejected by clients
+    /// that predate it.
+    V4,
 }
 
 impl PackChunkedPatchFormat {
@@ -387,6 +391,7 @@ impl PackChunkedPatchFormat {
             1 => Some(Self::V1),
             2 => Some(Self::V2),
             3 => Some(Self::V3),
+            4 => Some(Self::V4),
             _ => None,
         }
     }
@@ -398,6 +403,7 @@ impl From<PackChunkedPatchFormat> for crate::diff::chunked::ChunkedPatchFormat {
             PackChunkedPatchFormat::V1 => Self::Legacy,
             PackChunkedPatchFormat::V2 => Self::IdentityChunks,
             PackChunkedPatchFormat::V3 => Self::IdentityChunksWithTargetHashes,
+            PackChunkedPatchFormat::V4 => Self::ZstdRleIdentityChunksWithTargetHashes,
         }
     }
 }

@@ -7,6 +7,7 @@
 mod format;
 
 mod bspatch;
+mod surgepat;
 
 pub use bspatch::{
     ChunkedBspatchResult, chunked_bspatch_file, chunked_bspatch_file_with_progress,
@@ -22,6 +23,7 @@ use std::{
     io::{Read, Seek, SeekFrom},
     path::Path,
 };
+pub use surgepat::{apply_surgepat, bsdiff40_to_surgepat, is_surgepat};
 
 use crate::crypto::sha256::sha256_raw;
 use crate::error::{Result, SurgeError};
@@ -53,6 +55,13 @@ pub enum ChunkedPatchFormat {
     /// every changed chunk, letting the in-place applier verify rewritten
     /// chunks in memory instead of re-reading the whole target file.
     IdentityChunksWithTargetHashes,
+    /// Format version 4: v3 plus a faster-to-apply chunk payload (SURGPAT1:
+    /// `zstd(RLE(zero-runs))` diff blocks instead of BZ2 per-byte diff
+    /// strings), so the apply-side per-chunk cost drops from ~10 ms to
+    /// ~1 ms at the canonical 4 MiB chunk. Readers older than this version
+    /// reject the patch - publish it only once every client has been
+    /// upgraded.
+    ZstdRleIdentityChunksWithTargetHashes,
 }
 
 /// Options for chunked diff/patch operations.
@@ -141,7 +150,9 @@ fn into_inner<T>(m: Mutex<T>) -> T {
 fn identity_format_enabled(format: ChunkedPatchFormat) -> bool {
     matches!(
         format,
-        ChunkedPatchFormat::IdentityChunks | ChunkedPatchFormat::IdentityChunksWithTargetHashes
+        ChunkedPatchFormat::IdentityChunks
+            | ChunkedPatchFormat::IdentityChunksWithTargetHashes
+            | ChunkedPatchFormat::ZstdRleIdentityChunksWithTargetHashes
     )
 }
 
@@ -201,7 +212,13 @@ pub fn chunked_bsdiff(older: &[u8], newer: &[u8], opts: &ChunkedDiffOptions) -> 
                         (Vec::new(), true)
                     } else {
                         match wrapper::bsdiff_buffers(old_chunk, new_chunk) {
-                            Ok(p) => (p, false),
+                            Ok(p) => match encode_chunk_payload(opts.format, old_chunk, p) {
+                                Ok(p2) => (p2, false),
+                                Err(e) => {
+                                    *lock_mutex(&error) = Some(e);
+                                    return;
+                                }
+                            },
                             Err(e) => {
                                 *lock_mutex(&error) = Some(e);
                                 return;
@@ -212,8 +229,7 @@ pub fn chunked_bsdiff(older: &[u8], newer: &[u8], opts: &ChunkedDiffOptions) -> 
                     // v3 records the target digest of every changed chunk;
                     // the chunk's target content is `new_chunk` in all
                     // branches, so no extra read is needed.
-                    let target_hash = if opts.format == ChunkedPatchFormat::IdentityChunksWithTargetHashes && !identity
-                    {
+                    let target_hash = if format_records_target_hashes(opts.format) && !identity {
                         match sha256_raw(new_chunk).try_into() {
                             Ok(digest) => Some(digest),
                             Err(_) => {
@@ -248,6 +264,36 @@ pub fn chunked_bsdiff(older: &[u8], newer: &[u8], opts: &ChunkedDiffOptions) -> 
 }
 
 /// Apply a chunked patch to reconstruct the newer file.
+/// Versions that record a per-chunk target digest.
+fn format_records_target_hashes(format: ChunkedPatchFormat) -> bool {
+    matches!(
+        format,
+        ChunkedPatchFormat::IdentityChunksWithTargetHashes | ChunkedPatchFormat::ZstdRleIdentityChunksWithTargetHashes
+    )
+}
+
+/// Apply one chunk's patch payload, dispatching on its format: SURGPAT1
+/// payloads (v4) run through the Rust fast-apply path, classic BSDIFF40
+/// payloads (v1-v3) through the C bspatch.
+pub fn apply_chunk_patch(old: &[u8], chunk_patch: &[u8]) -> Result<Vec<u8>> {
+    if surgepat::is_surgepat(chunk_patch) {
+        surgepat::apply_surgepat(old, chunk_patch)
+    } else {
+        wrapper::bspatch_buffers(old, chunk_patch)
+    }
+}
+
+/// Encode a changed chunk's payload for the requested format. v4
+/// re-encodes the classic BSDIFF40 blob as SURGPAT1; other formats keep
+/// it as-is.
+fn encode_chunk_payload(format: ChunkedPatchFormat, old_chunk: &[u8], patch: Vec<u8>) -> Result<Vec<u8>> {
+    if format == ChunkedPatchFormat::ZstdRleIdentityChunksWithTargetHashes && !old_chunk.is_empty() {
+        surgepat::bsdiff40_to_surgepat(&patch)
+    } else {
+        Ok(patch)
+    }
+}
+
 pub fn chunked_bspatch(older: &[u8], patch: &[u8], opts: &ChunkedDiffOptions) -> Result<Vec<u8>> {
     let decoded = deserialize_patch(patch)?;
     let ChunkedPatchData {
@@ -312,7 +358,7 @@ pub fn chunked_bspatch(older: &[u8], patch: &[u8], opts: &ChunkedDiffOptions) ->
                     } else if chunk_patch.is_empty() {
                         Vec::new()
                     } else {
-                        match wrapper::bspatch_buffers(old_chunk, chunk_patch) {
+                        match apply_chunk_patch(old_chunk, chunk_patch) {
                             Ok(data) => data,
                             Err(e) => {
                                 *lock_mutex(&error) = Some(e);
@@ -441,15 +487,20 @@ pub fn chunked_bsdiff_files(older_path: &Path, newer_path: &Path, opts: &Chunked
                         (Vec::new(), true)
                     } else {
                         match wrapper::bsdiff_buffers(&old_chunk, &new_chunk) {
-                            Ok(patch) => (patch, false),
+                            Ok(patch) => match encode_chunk_payload(opts.format, &old_chunk, patch) {
+                                Ok(p2) => (p2, false),
+                                Err(err) => {
+                                    *lock_mutex(&error) = Some(err);
+                                    return;
+                                }
+                            },
                             Err(err) => {
                                 *lock_mutex(&error) = Some(err);
                                 return;
                             }
                         }
                     };
-                    let target_hash = if opts.format == ChunkedPatchFormat::IdentityChunksWithTargetHashes && !identity
-                    {
+                    let target_hash = if format_records_target_hashes(opts.format) && !identity {
                         match sha256_raw(&new_chunk).try_into() {
                             Ok(digest) => Some(digest),
                             Err(_) => {
@@ -944,6 +995,173 @@ mod tests {
             std::fs::read(&old_path).expect("read target"),
             old,
             "a stale digest on a later chunk must leave the target untouched"
+        );
+    }
+
+    #[test]
+    fn v4_round_trip_buffer_apply_is_byte_identical() {
+        let old: Vec<u8> = (0..300_000).map(|i| (i % 253) as u8).collect();
+        let mut new = old.clone();
+        new[10_000..10_016].copy_from_slice(&42u128.to_le_bytes());
+        new.push(7);
+
+        let opts = ChunkedDiffOptions {
+            chunk_size: 256 * 1024,
+            max_threads: 1,
+            format: ChunkedPatchFormat::ZstdRleIdentityChunksWithTargetHashes,
+        };
+        let patch = chunked_bsdiff(&old, &new, &opts).expect("build v4 patch");
+        assert_eq!(patch[4], 4, "v4 patches carry version byte 4");
+        let decoded = super::format::deserialize_patch(&patch).expect("decode");
+        assert!(
+            decoded
+                .chunks
+                .iter()
+                .zip(decoded.identity.iter())
+                .filter(|(_, identity)| !**identity)
+                .all(|(c, _)| super::is_surgepat(c))
+        );
+        let applied = chunked_bspatch(&old, &patch, &opts).expect("apply v4 patch");
+        assert_eq!(applied, new);
+    }
+
+    #[test]
+    fn v4_in_place_applies_and_verifies_digests() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let old_path = tmp.path().join("target.bin");
+        let new_path = tmp.path().join("new.bin");
+        let unused_output = tmp.path().join("unused.bin");
+
+        let old = vec![11u8; 1024 * 1024];
+        let mut new = old.clone();
+        new[70_000] = 200;
+
+        std::fs::write(&old_path, &old).expect("write target");
+        std::fs::write(&new_path, &new).expect("write new");
+
+        let patch = chunked_bsdiff_files(
+            &old_path,
+            &new_path,
+            &ChunkedDiffOptions {
+                chunk_size: 256 * 1024,
+                max_threads: 1,
+                format: ChunkedPatchFormat::ZstdRleIdentityChunksWithTargetHashes,
+            },
+        )
+        .expect("build v4 patch");
+
+        let result = chunked_bspatch_file_with_progress_and_sha256_in_place(&old_path, &patch, &unused_output, None)
+            .expect("apply v4 in place");
+        assert!(result.applied_in_place);
+        assert!(result.chunk_hashes_verified);
+        assert_eq!(result.target_hash, None, "digest-verified path skips the full read");
+        assert_eq!(std::fs::read(&old_path).expect("read target"), new);
+        assert!(!unused_output.exists(), "in-place patch must not write the output path");
+    }
+
+    #[test]
+    fn v4_multi_chunk_tamper_leaves_target_untouched() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let old_path = tmp.path().join("target.bin");
+        let new_path = tmp.path().join("new.bin");
+        let unused_output = tmp.path().join("unused.bin");
+
+        let chunk = 256 * 1024usize;
+        let old: Vec<u8> = (0..(4 * chunk)).map(|i| (i % 251) as u8).collect();
+        let mut new = old.clone();
+        new[chunk / 2] = 0xAA;
+        new[3 * chunk + 5] = 0xBB;
+        std::fs::write(&old_path, &old).expect("write target");
+        std::fs::write(&new_path, &new).expect("write new");
+
+        let patch = chunked_bsdiff_files(
+            &old_path,
+            &new_path,
+            &ChunkedDiffOptions {
+                chunk_size: chunk,
+                max_threads: 1,
+                format: ChunkedPatchFormat::ZstdRleIdentityChunksWithTargetHashes,
+            },
+        )
+        .expect("build v4 patch");
+
+        // Tamper with the second changed chunk's SURGPAT1 payload
+        // (inside its zstd diff block): the digest must reject it and the
+        // two-phase verify must leave the target untouched.
+        let decoded = super::format::deserialize_patch(&patch).expect("decode");
+        let header = 4 + 1 + 8 + 8 + 8 + 4;
+        let bitset = decoded.chunks.len().div_ceil(8);
+        let mut off = header + bitset;
+        let mut seen_changed = 0usize;
+        let mut payload_off = None;
+        for idx in 0..decoded.chunks.len() {
+            let len = u64::from_le_bytes(patch[off..off + 8].try_into().unwrap()) as usize;
+            off += 8;
+            if !decoded.identity[idx] {
+                seen_changed += 1;
+                if seen_changed == 2 {
+                    payload_off = Some(off);
+                }
+                off += len + 32;
+            }
+        }
+        let payload_off = payload_off.expect("second changed chunk payload");
+        let mut tampered = patch.clone();
+        tampered[payload_off + 30] ^= 0xFF;
+
+        let err = chunked_bspatch_file_with_progress_and_sha256_in_place(&old_path, &tampered, &unused_output, None)
+            .unwrap_err();
+        assert_eq!(
+            std::fs::read(&old_path).expect("read target"),
+            old,
+            "a corrupted payload must leave the target untouched ({err})"
+        );
+    }
+
+    #[test]
+    fn v4_publish_is_deterministic() {
+        let old: Vec<u8> = (0u32..100_000).map(|i| ((i * 7) % 251) as u8).collect();
+        let mut new = old.clone();
+        new[50_000] ^= 0x5A;
+        let opts = ChunkedDiffOptions {
+            chunk_size: 256 * 1024,
+            max_threads: 4,
+            format: ChunkedPatchFormat::ZstdRleIdentityChunksWithTargetHashes,
+        };
+        let a = chunked_bsdiff(&old, &new, &opts).expect("build a");
+        let b = chunked_bsdiff(&old, &new, &opts).expect("build b");
+        assert_eq!(a, b, "v4 patches must be byte-identical across builds");
+    }
+
+    #[test]
+    fn c_bspatch_rejects_surgepat_payloads() {
+        // The legacy C bsdiff apply path must fail closed on SURGPAT1
+        // payloads: a misrouted v4 chunk (or an older reader receiving v4
+        // bytes through the classic magic) must never produce output.
+        let old: Vec<u8> = (0..50_000).map(|i| (i % 253) as u8).collect();
+        let mut new = old.clone();
+        new[1000] ^= 0x3C;
+        let opts = ChunkedDiffOptions {
+            chunk_size: 256 * 1024,
+            max_threads: 1,
+            format: ChunkedPatchFormat::ZstdRleIdentityChunksWithTargetHashes,
+        };
+        let patch = chunked_bsdiff(&old, &new, &opts).expect("build v4 patch");
+        let decoded = super::format::deserialize_patch(&patch).expect("decode");
+        let payload = decoded
+            .chunks
+            .iter()
+            .zip(decoded.identity.iter())
+            .find(|(_, identity)| !**identity)
+            .expect("changed chunk")
+            .0
+            .to_vec();
+        assert!(super::is_surgepat(&payload));
+        let old_chunk = &old[..50_000];
+        let err = crate::diff::wrapper::bspatch_buffers(old_chunk, &payload).unwrap_err();
+        assert!(
+            !err.to_string().is_empty(),
+            "the C bsdiff path must reject SURGPAT1 payloads: {err}"
         );
     }
 }

@@ -193,7 +193,7 @@ mod chunked_patch_format_tests {
 
     #[test]
     fn unknown_chunked_patch_format_keeps_the_compatible_default() {
-        let policy = manifest(Some(4)).effective_pack_policy();
+        let policy = manifest(Some(5)).effective_pack_policy();
 
         assert_eq!(policy.chunked_patch_format, PackChunkedPatchFormat::V1);
     }

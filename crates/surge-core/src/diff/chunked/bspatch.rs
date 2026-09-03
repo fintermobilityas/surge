@@ -217,17 +217,26 @@ fn bspatch_file_in_place(
     chunk_hashes: Option<&[Option<[u8; 32]>]>,
     progress: Option<&ByteProgress<'_>>,
 ) -> Result<(usize, usize)> {
+    // The bsdiff apply (decompress the per-byte diff string + add the old
+    // chunk) is the expensive part of a chunk patch, so pass 1 keeps the
+    // derived chunks for pass 2 instead of re-deriving them - bounded by
+    // MAX_CACHED_IN_PLACE_BYTES so an all-changes patch cannot cache the
+    // whole file. Over the bound, pass 2 re-derives as before.
+    const MAX_CACHED_IN_PLACE_BYTES: usize = 32 * 1024 * 1024;
+
     let mut file = fs::OpenOptions::new().read(true).write(true).open(path)?;
 
     // Pass 1: read + patch + digest-check every changed chunk without
     // writing anything, so a digest failure fails closed before the first
     // byte of the target is modified.
     let mut changed_verified = 0usize;
+    let mut cached: Option<Vec<(usize, Vec<u8>)>> = Some(Vec::new());
+    let mut cached_bytes = 0usize;
     let mut offset = 0usize;
     for (idx, chunk_patch) in chunks.iter().enumerate() {
         let chunk_len = chunk_len_for_index(old_size, idx, chunk_size);
         if !identity[idx] {
-            let (_, verified) = read_patched_chunk(
+            let (new_chunk, verified) = read_patched_chunk(
                 &mut file,
                 idx,
                 offset,
@@ -238,26 +247,46 @@ fn bspatch_file_in_place(
             if verified {
                 changed_verified += 1;
             }
+            if cached.is_some() {
+                cached_bytes = cached_bytes.saturating_add(new_chunk.len());
+                if cached_bytes > MAX_CACHED_IN_PLACE_BYTES {
+                    cached = None;
+                } else if let Some(entries) = cached.as_mut() {
+                    entries.push((offset, new_chunk));
+                }
+            }
         }
         offset = offset.saturating_add(chunk_len);
     }
 
-    // Pass 2: re-derive and write every changed chunk. bspatch is a pure
-    // function of the old chunk and the patch, so the bytes written are
-    // exactly the bytes pass 1 verified.
+    // Pass 2: write every changed chunk. bspatch is a pure function of the
+    // old chunk and the patch, so the bytes written are exactly the bytes
+    // pass 1 verified (cached or re-derived).
     let mut changed_written = 0usize;
+    let mut cache_idx = 0usize;
     offset = 0usize;
     for (idx, chunk_patch) in chunks.iter().enumerate() {
         let chunk_len = chunk_len_for_index(old_size, idx, chunk_size);
         if !identity[idx] {
-            let (new_chunk, _) = read_patched_chunk(
-                &mut file,
-                idx,
-                offset,
-                chunk_len,
-                chunk_patch,
-                chunk_hashes.and_then(|hashes| hashes[idx]),
-            )?;
+            let new_chunk = match cached.as_ref() {
+                Some(entries) => {
+                    let (offset_, bytes) = entries[cache_idx].clone();
+                    cache_idx += 1;
+                    debug_assert_eq!(offset_, offset);
+                    bytes
+                }
+                None => {
+                    read_patched_chunk(
+                        &mut file,
+                        idx,
+                        offset,
+                        chunk_len,
+                        chunk_patch,
+                        chunk_hashes.and_then(|hashes| hashes[idx]),
+                    )?
+                    .0
+                }
+            };
             changed_written += 1;
             file.seek(SeekFrom::Start(usize_to_u64_saturating(offset)))?;
             file.write_all(&new_chunk)?;

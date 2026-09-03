@@ -288,10 +288,10 @@ fn read_patched_chunk(
                 "in-place patch carries a payload for an empty chunk".into(),
             ));
         }
-        return Ok((Vec::new(), recorded.is_some()));
+        return verify_empty_target(idx, recorded);
     }
     if chunk_patch.is_empty() {
-        return Ok((Vec::new(), recorded.is_some()));
+        return verify_empty_target(idx, recorded);
     }
     file.seek(SeekFrom::Start(usize_to_u64_saturating(offset)))?;
     let mut old_chunk = vec![0u8; chunk_len];
@@ -311,6 +311,23 @@ fn read_patched_chunk(
         false
     };
     Ok((new_chunk, verified))
+}
+
+/// An empty target chunk (trailing chunk or empty patch payload) must
+/// match the recorded empty digest when one is present.
+fn verify_empty_target(idx: usize, recorded: Option<[u8; 32]>) -> Result<(Vec<u8>, bool)> {
+    if let Some(expected) = recorded {
+        let actual: [u8; 32] = sha256_raw(b"")
+            .try_into()
+            .map_err(|_| SurgeError::Diff("chunk target digest has an invalid length".into()))?;
+        if actual != expected {
+            return Err(SurgeError::Diff(format!(
+                "chunk {idx} target digest mismatch: patch records a stale digest"
+            )));
+        }
+        return Ok((Vec::new(), true));
+    }
+    Ok((Vec::new(), false))
 }
 
 fn hash_entire_file_into(path: &Path, hasher: &mut Sha256) -> Result<()> {

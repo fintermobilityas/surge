@@ -43,8 +43,9 @@ pub struct PackDeltaManifestConfig {
     pub strategy: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_chain_length: Option<u32>,
-    /// Chunked patch format version to publish: `1` (default, readable by every client) or `2`
-    /// (identity-chunk bitset; requires clients that understand format version 2).
+    /// Chunked patch format version to publish: `1` (default, readable by every client),
+    /// `2` (identity-chunk bitset; requires clients that understand format version 2), or
+    /// `3` (per-chunk target digests; requires clients that understand format version 3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chunked_patch_format: Option<u8>,
 }

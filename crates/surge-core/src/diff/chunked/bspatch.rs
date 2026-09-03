@@ -65,14 +65,23 @@ pub struct ChunkedBspatchResult {
     pub chunk_hashes_verified: bool,
 }
 
-/// Like `chunked_bspatch_file_with_progress_and_sha256`, but first attempts
-/// an in-place patch: when the patch uses the format version 2 identity
-/// bitset and the reconstructed file has the same size as the source, the
-/// unchanged chunks are left untouched and only changed chunks are rewritten
-/// at their existing offsets (chunk boundaries align 1:1 at equal sizes).
-/// The target hash is then computed with one full read of the patched file.
-/// When in-place is not possible the standard write-to-`output_path` flow
-/// runs instead.
+/// Like `chunked_bspatch_file_with_progress_and_sha256`, but first
+/// attempts an in-place patch: when the patch uses an identity-bitset
+/// format (version 2 or 3) and the reconstructed file has the same size
+/// as the source, the unchanged chunks are left untouched and only
+/// changed chunks are rewritten at their existing offsets (chunk
+/// boundaries align 1:1 at equal sizes).
+///
+/// Target verification depends on the format: for version 3, every
+/// changed chunk is derived and verified against its recorded target
+/// digest **before the first write**, so a stale digest fails with the
+/// target untouched; `target_hash` is `None` and `chunk_hashes_verified`
+/// is `true`, and the caller pins the file via the per-chunk digests plus
+/// the verified basis hash. For version 2 (no digests) the target is
+/// computed with one full read of the patched file and returned as
+/// `target_hash`. When in-place is not possible the standard
+/// write-to-`output_path` flow runs instead (always with a `Some` target
+/// hash).
 pub fn chunked_bspatch_file_with_progress_and_sha256_in_place(
     target_path: &Path,
     patch: &[u8],
@@ -194,10 +203,10 @@ fn bspatch_file(
     Ok((false, false))
 }
 
-/// Rewrite the changed chunks in place. Returns
-/// `(changed_written, changed_verified)`: every rewritten chunk counts as
-/// written, and as verified when it also matched the patch's recorded
-/// target digest (format version 3).
+/// Rewrite the changed chunks in place, in two passes: first derive and
+/// digest-check **every** changed chunk (no writes), then re-derive and
+/// write them. A stale digest therefore never leaves the target partially
+/// patched. Returns `(changed_written, changed_verified)`.
 fn bspatch_file_in_place(
     path: &Path,
     old_size: usize,
@@ -209,45 +218,49 @@ fn bspatch_file_in_place(
     progress: Option<&ByteProgress<'_>>,
 ) -> Result<(usize, usize)> {
     let mut file = fs::OpenOptions::new().read(true).write(true).open(path)?;
-    let mut offset = 0usize;
-    let mut changed_written = 0usize;
+
+    // Pass 1: read + patch + digest-check every changed chunk without
+    // writing anything, so a digest failure fails closed before the first
+    // byte of the target is modified.
     let mut changed_verified = 0usize;
+    let mut offset = 0usize;
     for (idx, chunk_patch) in chunks.iter().enumerate() {
         let chunk_len = chunk_len_for_index(old_size, idx, chunk_size);
-        let new_chunk = if identity[idx] {
-            None
-        } else if chunk_len == 0 {
-            if !chunk_patch.is_empty() {
-                return Err(SurgeError::Diff(
-                    "in-place patch carries a payload for an empty chunk".into(),
-                ));
-            }
-            Some(Vec::new())
-        } else {
-            file.seek(SeekFrom::Start(usize_to_u64_saturating(offset)))?;
-            let mut old_chunk = vec![0u8; chunk_len];
-            file.read_exact(&mut old_chunk)?;
-            Some(if chunk_patch.is_empty() {
-                Vec::new()
-            } else {
-                wrapper::bspatch_buffers(&old_chunk, chunk_patch)?
-            })
-        };
-        if let Some(bytes) = &new_chunk {
-            if let Some(recorded) = chunk_hashes.and_then(|hashes| hashes[idx]).as_ref() {
-                let actual: [u8; 32] = sha256_raw(bytes)
-                    .try_into()
-                    .map_err(|_| SurgeError::Diff(format!("chunk {idx} target digest has an invalid length")))?;
-                if actual != *recorded {
-                    return Err(SurgeError::Diff(format!(
-                        "chunk {idx} target digest mismatch: patch records a stale digest"
-                    )));
-                }
+        if !identity[idx] {
+            let (_, verified) = read_patched_chunk(
+                &mut file,
+                idx,
+                offset,
+                chunk_len,
+                chunk_patch,
+                chunk_hashes.and_then(|hashes| hashes[idx]),
+            )?;
+            if verified {
                 changed_verified += 1;
             }
+        }
+        offset = offset.saturating_add(chunk_len);
+    }
+
+    // Pass 2: re-derive and write every changed chunk. bspatch is a pure
+    // function of the old chunk and the patch, so the bytes written are
+    // exactly the bytes pass 1 verified.
+    let mut changed_written = 0usize;
+    offset = 0usize;
+    for (idx, chunk_patch) in chunks.iter().enumerate() {
+        let chunk_len = chunk_len_for_index(old_size, idx, chunk_size);
+        if !identity[idx] {
+            let (new_chunk, _) = read_patched_chunk(
+                &mut file,
+                idx,
+                offset,
+                chunk_len,
+                chunk_patch,
+                chunk_hashes.and_then(|hashes| hashes[idx]),
+            )?;
             changed_written += 1;
             file.seek(SeekFrom::Start(usize_to_u64_saturating(offset)))?;
-            file.write_all(bytes)?;
+            file.write_all(&new_chunk)?;
         }
         offset = offset.saturating_add(chunk_len);
         if let Some(cb) = progress {
@@ -256,6 +269,48 @@ fn bspatch_file_in_place(
     }
     file.flush()?;
     Ok((changed_written, changed_verified))
+}
+
+/// Read the old chunk at `offset`, apply its patch, and verify the result
+/// against the patch's recorded target digest when one is present. Returns
+/// the new chunk and whether a recorded digest was verified.
+fn read_patched_chunk(
+    file: &mut fs::File,
+    idx: usize,
+    offset: usize,
+    chunk_len: usize,
+    chunk_patch: &[u8],
+    recorded: Option<[u8; 32]>,
+) -> Result<(Vec<u8>, bool)> {
+    if chunk_len == 0 {
+        if !chunk_patch.is_empty() {
+            return Err(SurgeError::Diff(
+                "in-place patch carries a payload for an empty chunk".into(),
+            ));
+        }
+        return Ok((Vec::new(), recorded.is_some()));
+    }
+    if chunk_patch.is_empty() {
+        return Ok((Vec::new(), recorded.is_some()));
+    }
+    file.seek(SeekFrom::Start(usize_to_u64_saturating(offset)))?;
+    let mut old_chunk = vec![0u8; chunk_len];
+    file.read_exact(&mut old_chunk)?;
+    let new_chunk = wrapper::bspatch_buffers(&old_chunk, chunk_patch)?;
+    let verified = if let Some(expected) = recorded {
+        let actual: [u8; 32] = sha256_raw(&new_chunk)
+            .try_into()
+            .map_err(|_| SurgeError::Diff("chunk target digest has an invalid length".into()))?;
+        if actual != expected {
+            return Err(SurgeError::Diff(format!(
+                "chunk {idx} target digest mismatch: patch records a stale digest"
+            )));
+        }
+        true
+    } else {
+        false
+    };
+    Ok((new_chunk, verified))
 }
 
 fn hash_entire_file_into(path: &Path, hasher: &mut Sha256) -> Result<()> {

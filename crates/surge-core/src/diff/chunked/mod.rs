@@ -690,7 +690,7 @@ mod tests {
 
         let old = vec![11u8; 1024 * 1024];
         let mut new = old.clone();
-        new[70_000] = 200; // inside the second 256 KiB chunk
+        new[70_000] = 200; // inside the first 256 KiB chunk
         std::fs::write(&old_path, &old).expect("write target");
         std::fs::write(&new_path, &new).expect("write new");
 
@@ -829,7 +829,7 @@ mod tests {
 
         let old = vec![11u8; 1024 * 1024];
         let mut new = old.clone();
-        new[70_000] = 200; // inside the second 256 KiB chunk
+        new[70_000] = 200; // inside the first 256 KiB chunk
 
         std::fs::write(&old_path, &old).expect("write target");
         std::fs::write(&new_path, &new).expect("write new");
@@ -882,5 +882,68 @@ mod tests {
             "failed apply must leave the target untouched"
         );
         let _ = sha256_hex(&old);
+    }
+
+    #[test]
+    fn in_place_bspatch_v3_multi_chunk_tamper_leaves_target_untouched() {
+        // Two changed chunks with a stale digest on the SECOND one: the
+        // first chunk must not have been written when the failure trips
+        // (two-pass verify-before-write).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let old_path = tmp.path().join("target.bin");
+        let new_path = tmp.path().join("new.bin");
+        let unused_output = tmp.path().join("unused.bin");
+
+        let chunk = 256 * 1024usize;
+        let old: Vec<u8> = (0..(4 * chunk)).map(|i| (i % 251) as u8).collect();
+        let mut new = old.clone();
+        new[chunk / 2] = 0xAA; // changed chunk 1
+        new[3 * chunk + 5] = 0xBB; // changed chunk 3
+        std::fs::write(&old_path, &old).expect("write target");
+        std::fs::write(&new_path, &new).expect("write new");
+
+        let patch = chunked_bsdiff_files(
+            &old_path,
+            &new_path,
+            &ChunkedDiffOptions {
+                chunk_size: chunk,
+                max_threads: 1,
+                format: ChunkedPatchFormat::IdentityChunksWithTargetHashes,
+            },
+        )
+        .expect("build patch");
+
+        // Walk the patch to the second changed chunk's digest (it follows
+        // that chunk's payload; identity chunks carry an empty payload and
+        // no digest).
+        let decoded = super::format::deserialize_patch(&patch).expect("decode");
+        let header = 4 + 1 + 8 + 8 + 8 + 4;
+        let bitset = decoded.chunks.len().div_ceil(8);
+        let mut off = header + bitset;
+        let mut seen_changed = 0usize;
+        let mut target_off = None;
+        for idx in 0..decoded.chunks.len() {
+            let len = u64::from_le_bytes(patch[off..off + 8].try_into().unwrap()) as usize;
+            off += 8 + len;
+            if !decoded.identity[idx] {
+                seen_changed += 1;
+                if seen_changed == 2 {
+                    target_off = Some(off);
+                }
+                off += 32;
+            }
+        }
+        let target_off = target_off.expect("second changed chunk digest");
+        let mut tampered = patch.clone();
+        tampered[target_off] ^= 0xFF;
+
+        let err = chunked_bspatch_file_with_progress_and_sha256_in_place(&old_path, &tampered, &unused_output, None)
+            .unwrap_err();
+        assert!(err.to_string().contains("target digest mismatch"), "{err}");
+        assert_eq!(
+            std::fs::read(&old_path).expect("read target"),
+            old,
+            "a stale digest on a later chunk must leave the target untouched"
+        );
     }
 }

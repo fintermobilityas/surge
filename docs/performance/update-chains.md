@@ -74,8 +74,10 @@ Large anonymized profile, `sdk_only`, `100` deltas, `sparse-file-ops`
   scale 1.0). Chunked patch format v3 records a SHA-256 target digest
   for every changed chunk (identity chunks carry none — they are
   delimited by the v2 bitset and pinned by the verified basis hash).
-  The in-place applier verifies each rewritten chunk **in memory**
-  right after patching it (zero extra I/O) and skips the full read;
+  The in-place applier verifies each changed chunk **before the first
+  write** (two passes: derive + digest-check every changed chunk, then
+  re-derive and write; the extra pass is one read + bspatch per changed
+  chunk) and skips the full read;
   `target_hash` comes back `None` + `chunk_hashes_verified = true`
   and the caller pins the file via the per-chunk digests plus the
   basis hash, with the chain's final step still passing the

@@ -79,9 +79,11 @@ storage:
 pack:
   delta:
     strategy: {pack_strategy}
-    # Format version 2 (identity-chunk bitset) keeps the canonical update
-    # baseline on the identity-chunk apply path; 1 is the safe default for
-    # fleets with pre-v2 readers (surge-core #267).
+    # Format version 3 (identity-chunk bitset + per-chunk target digests)
+    # keeps the canonical update baseline on the digest-verified in-place
+    # apply path; 2 keeps the full-read verify, 1 the legacy payloads.
+    # Publishing v3 requires clients that understand it (fleet gate, same
+    # pattern as the v1 -> v2 cut, surge-core #267).
     chunked_patch_format: 3
   compression:
     format: zstd

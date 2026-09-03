@@ -43,7 +43,14 @@ Large anonymized profile, `sdk_only`, `100` deltas, `sparse-file-ops`
   repacks, and ~`0.09-0.11 s` after the v3 chunk-target digests
   (loaded-host median; the range is host-load variance, not a
   regression). Per-step cost is CPU/IO-bound and varies ~3x with
-  host load
+  host load. After the two-phase verify, the in-place op caches its
+  pass-1 derived chunks (bounded at 32 MiB) so pass 2 writes them
+  without re-deriving: the per-step in-place op is ~`14 ms` at the
+  canonical 4 MiB auto-sized chunk, of which ~`10.6 ms` is the bsdiff
+  apply itself (BZ2 decompression of the per-byte diff string ~`8.6
+  ms` + the per-byte old-data add ~`2 ms`, measured by disabling the
+  add loop); the read ~`0.7 ms`, SHA-256 ~`1.9 ms`, write ~`0.7 ms`
+  (phase-instrumented, scale 1.0, 2026-09-03)
 - per-step cost breakdown (loaded host, scale 1.0, phase-instrumented):
   chunked `bspatch` over the 1 GB file ~`3.5-5.0 s` **before** the
   identity-chunk fix (15 of 16 unchanged 64 MiB chunks re-derived),

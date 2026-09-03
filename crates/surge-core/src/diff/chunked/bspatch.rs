@@ -6,6 +6,7 @@ use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
+use crate::crypto::sha256::sha256_raw;
 use crate::diff::wrapper;
 use crate::error::{Result, SurgeError};
 
@@ -27,7 +28,7 @@ pub fn chunked_bspatch_file_with_progress(
     output_path: &Path,
     progress: Option<&ByteProgress<'_>>,
 ) -> Result<()> {
-    bspatch_file(older_path, patch, output_path, progress, None, false)?;
+    let (_, _) = bspatch_file(older_path, patch, output_path, progress, None, false)?;
     Ok(())
 }
 
@@ -41,19 +42,27 @@ pub fn chunked_bspatch_file_with_progress_and_sha256(
     progress: Option<&ByteProgress<'_>>,
 ) -> Result<String> {
     let mut hasher = Sha256::new();
-    bspatch_file(older_path, patch, output_path, progress, Some(&mut hasher), false)?;
+    let (_, _) = bspatch_file(older_path, patch, output_path, progress, Some(&mut hasher), false)?;
     Ok(hex::encode(hasher.finalize()))
 }
 
 /// Outcome of a bspatch that may patch the target file in place.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChunkedBspatchResult {
-    /// SHA-256 (hex) of the reconstructed file.
-    pub target_hash: String,
+    /// SHA-256 (hex) of the reconstructed file. `None` when the in-place
+    /// verify path proved the target from the patch's per-chunk target
+    /// digests instead (see `chunk_hashes_verified`); the caller then pins
+    /// the file via those digests plus the verified basis hash and the
+    /// chain's final full-archive check.
+    pub target_hash: Option<String>,
     /// `true` when `older_path` was patched in place and `output_path` was
     /// left untouched; `false` when the reconstructed file was written to
     /// `output_path` and the caller must move it into place.
     pub applied_in_place: bool,
+    /// `true` when every rewritten chunk was verified against the patch's
+    /// recorded target digest (format version 3); the carried chunks are
+    /// pinned by the basis hash and the file hash was not re-read.
+    pub chunk_hashes_verified: bool,
 }
 
 /// Like `chunked_bspatch_file_with_progress_and_sha256`, but first attempts
@@ -71,13 +80,25 @@ pub fn chunked_bspatch_file_with_progress_and_sha256_in_place(
     progress: Option<&ByteProgress<'_>>,
 ) -> Result<ChunkedBspatchResult> {
     let mut hasher = Sha256::new();
-    let applied_in_place = bspatch_file(target_path, patch, output_path, progress, Some(&mut hasher), true)?;
+    let (applied_in_place, chunk_hashes_verified) =
+        bspatch_file(target_path, patch, output_path, progress, Some(&mut hasher), true)?;
+    let target_hash = if applied_in_place && chunk_hashes_verified {
+        // Every rewritten chunk matched its recorded target digest in
+        // memory; the full-file re-read is skipped.
+        None
+    } else {
+        Some(hex::encode(hasher.finalize()))
+    };
     Ok(ChunkedBspatchResult {
-        target_hash: hex::encode(hasher.finalize()),
+        target_hash,
         applied_in_place,
+        chunk_hashes_verified,
     })
 }
 
+/// `(applied_in_place, chunk_hashes_verified)`: when the in-place path
+/// verified every rewritten chunk against its recorded target digest, the
+/// caller skips the full-file target re-read.
 fn bspatch_file(
     older_path: &Path,
     patch: &[u8],
@@ -85,7 +106,7 @@ fn bspatch_file(
     progress: Option<&ByteProgress<'_>>,
     mut hasher: Option<&mut Sha256>,
     allow_in_place: bool,
-) -> Result<bool> {
+) -> Result<(bool, bool)> {
     let decoded = deserialize_patch(patch)?;
     let ChunkedPatchData {
         old_size,
@@ -93,6 +114,7 @@ fn bspatch_file(
         chunk_size,
         chunks: chunk_patches,
         identity,
+        chunk_hashes,
     } = decoded;
     let actual_old_size = usize::try_from(fs::metadata(older_path)?.len())
         .map_err(|_| SurgeError::Diff("old file exceeds platform limits".into()))?;
@@ -102,22 +124,28 @@ fn bspatch_file(
         )));
     }
 
-    // Same-size format v2 patches rewrite only the changed chunks in place,
-    // skipping the full read + write of the unchanged 64 MiB chunks.
+    // Same-size identity-bitset patches rewrite only the changed chunks in
+    // place, skipping the full read + write of the unchanged 64 MiB chunks.
     if allow_in_place && old_size == new_size && identity.iter().any(|marked| *marked) {
-        bspatch_file_in_place(
+        let (changed_written, changed_verified) = bspatch_file_in_place(
             older_path,
             old_size,
             new_size,
             chunk_size,
             &chunk_patches,
             &identity,
+            Some(chunk_hashes.as_slice()),
             progress,
         )?;
-        if let Some(h) = hasher.as_mut() {
+        // Format version 3 digests prove every rewritten chunk in memory;
+        // the carried chunks are pinned by the verified basis hash and the
+        // chain's final full-archive check, so the full-file target re-read
+        // is skipped. v1/v2 patches (no digests) keep the full read.
+        let digests_verified = changed_written > 0 && changed_verified == changed_written;
+        if let Some(h) = hasher.as_mut().filter(|_| !digests_verified) {
             hash_entire_file_into(older_path, h)?;
         }
-        return Ok(true);
+        return Ok((true, digests_verified));
     }
 
     if let Some(parent) = output_path.parent() {
@@ -163,9 +191,13 @@ fn bspatch_file(
         )));
     }
 
-    Ok(false)
+    Ok((false, false))
 }
 
+/// Rewrite the changed chunks in place. Returns
+/// `(changed_written, changed_verified)`: every rewritten chunk counts as
+/// written, and as verified when it also matched the patch's recorded
+/// target digest (format version 3).
 fn bspatch_file_in_place(
     path: &Path,
     old_size: usize,
@@ -173,10 +205,13 @@ fn bspatch_file_in_place(
     chunk_size: usize,
     chunks: &[&[u8]],
     identity: &[bool],
+    chunk_hashes: Option<&[Option<[u8; 32]>]>,
     progress: Option<&ByteProgress<'_>>,
-) -> Result<()> {
+) -> Result<(usize, usize)> {
     let mut file = fs::OpenOptions::new().read(true).write(true).open(path)?;
     let mut offset = 0usize;
+    let mut changed_written = 0usize;
+    let mut changed_verified = 0usize;
     for (idx, chunk_patch) in chunks.iter().enumerate() {
         let chunk_len = chunk_len_for_index(old_size, idx, chunk_size);
         let new_chunk = if identity[idx] {
@@ -187,7 +222,7 @@ fn bspatch_file_in_place(
                     "in-place patch carries a payload for an empty chunk".into(),
                 ));
             }
-            None
+            Some(Vec::new())
         } else {
             file.seek(SeekFrom::Start(usize_to_u64_saturating(offset)))?;
             let mut old_chunk = vec![0u8; chunk_len];
@@ -199,6 +234,18 @@ fn bspatch_file_in_place(
             })
         };
         if let Some(bytes) = &new_chunk {
+            if let Some(recorded) = chunk_hashes.and_then(|hashes| hashes[idx]).as_ref() {
+                let actual: [u8; 32] = sha256_raw(bytes)
+                    .try_into()
+                    .map_err(|_| SurgeError::Diff(format!("chunk {idx} target digest has an invalid length")))?;
+                if actual != *recorded {
+                    return Err(SurgeError::Diff(format!(
+                        "chunk {idx} target digest mismatch: patch records a stale digest"
+                    )));
+                }
+                changed_verified += 1;
+            }
+            changed_written += 1;
             file.seek(SeekFrom::Start(usize_to_u64_saturating(offset)))?;
             file.write_all(bytes)?;
         }
@@ -208,7 +255,7 @@ fn bspatch_file_in_place(
         }
     }
     file.flush()?;
-    Ok(())
+    Ok((changed_written, changed_verified))
 }
 
 fn hash_entire_file_into(path: &Path, hasher: &mut Sha256) -> Result<()> {

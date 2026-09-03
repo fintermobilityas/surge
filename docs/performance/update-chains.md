@@ -39,8 +39,10 @@ Large anonymized profile, `sdk_only`, `100` deltas, `sparse-file-ops`
   instrumentation, every step took a constant ~`6.4 s` originally,
   ~`4.8 s` after the carried-tree apply, ~`2.2 s` after identity-chunk
   patches, ~`1.6 s` after the verified-hash carry, ~`1.5-2.0 s` after
-  the streamed target hash, and ~`1.2-1.3 s` after lazy intermediate
-  repacks (the range is host-load variance, not a regression). Per-step cost is CPU/IO-bound and varies ~3x with
+  the streamed target hash, ~`1.2-1.3 s` after lazy intermediate
+  repacks, and ~`0.09-0.11 s` after the v3 chunk-target digests
+  (loaded-host median; the range is host-load variance, not a
+  regression). Per-step cost is CPU/IO-bound and varies ~3x with
   host load
 - per-step cost breakdown (loaded host, scale 1.0, phase-instrumented):
   chunked `bspatch` over the 1 GB file ~`3.5-5.0 s` **before** the
@@ -66,6 +68,26 @@ Large anonymized profile, `sdk_only`, `100` deltas, `sparse-file-ops`
   Same-session 100-delta A/B: `166.0 s` -> `74.6 s` (−55%); 10-delta
   interleaved pairs `1,988/1,849` -> `1,223/1,256 ms/step`
   (−32 to −39%); install tree byte-identical (1,214,024,073 B).
+- **Chunk-target-digest in-place verify (landed, CSDF v3)**: the
+  full-file target re-read was still ~`0.59 s` of every in-place step
+  (measured: chunk rewrite `~32 ms`, full-read hash `~586 ms` at
+  scale 1.0). Chunked patch format v3 records a SHA-256 target digest
+  for every changed chunk (identity chunks carry none — they are
+  delimited by the v2 bitset and pinned by the verified basis hash).
+  The in-place applier verifies each rewritten chunk **in memory**
+  right after patching it (zero extra I/O) and skips the full read;
+  `target_hash` comes back `None` + `chunk_hashes_verified = true`
+  and the caller pins the file via the per-chunk digests plus the
+  basis hash, with the chain's final step still passing the
+  full-archive SHA-256 check. The digests are computed in the diff
+  workers, which already hold each changed chunk's target content, so
+  the publisher cost is flat (delta pack build 1,343/1,349 vs
+  1,348/1,343 ms same-session). v1/v2 patches keep the full-read path
+  (fail-closed); v3 is rejected by v2 readers via the version check.
+  Same-session 100-delta A/B (interleaved vs `b4a1f52`):
+  `68.1 s`/`70.0 s` -> `8.7 s`/`10.8 s` (−87% / −85%); 10-delta pairs
+  `11.8 s`/`11.5 s` -> `6.5 s`/`5.4 s` (−44% / −53%); install tree
+  byte-identical in every run (1,214,024,073 B at 100 deltas).
 - **Identity-chunk chunked patches (landed)**: chunked bsdiff format
   v2 (`CSDF`) marks unchanged chunks in a per-chunk bitset instead of
   carrying a whole-chunk identity bsdiff. The diff side skips the

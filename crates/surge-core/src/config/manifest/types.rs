@@ -373,6 +373,10 @@ pub enum PackChunkedPatchFormat {
     V1,
     /// Format version 2: identity-chunk bitset; rejected by clients that predate it.
     V2,
+    /// Format version 3: identity-chunk bitset plus per-chunk target
+    /// digests so the in-place applier skips the full-file target re-read;
+    /// rejected by clients that predate it.
+    V3,
 }
 
 impl PackChunkedPatchFormat {
@@ -381,6 +385,7 @@ impl PackChunkedPatchFormat {
         match raw {
             1 => Some(Self::V1),
             2 => Some(Self::V2),
+            3 => Some(Self::V3),
             _ => None,
         }
     }
@@ -391,6 +396,7 @@ impl From<PackChunkedPatchFormat> for crate::diff::chunked::ChunkedPatchFormat {
         match format {
             PackChunkedPatchFormat::V1 => Self::Legacy,
             PackChunkedPatchFormat::V2 => Self::IdentityChunks,
+            PackChunkedPatchFormat::V3 => Self::IdentityChunksWithTargetHashes,
         }
     }
 }

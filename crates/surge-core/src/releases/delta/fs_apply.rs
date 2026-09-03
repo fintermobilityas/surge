@@ -134,11 +134,24 @@ pub(super) fn apply_sparse_file_ops_with_progress(
                     fs::rename(&temp_path, &target)?;
                 }
                 set_mode(&target, *mode)?;
-                if result.target_hash != sha256.trim() {
-                    return Err(SurgeError::Update(format!(
-                        "Sparse delta file hash mismatch for '{path}': expected {sha256}, got {}",
-                        result.target_hash
-                    )));
+                match result.target_hash {
+                    // The target was re-read and hashed: compare directly.
+                    Some(hash) if hash != sha256.trim() => {
+                        return Err(SurgeError::Update(format!(
+                            "Sparse delta file hash mismatch for '{path}': expected {sha256}, got {hash}"
+                        )));
+                    }
+                    // In-place verify path (format version 3 digests): every
+                    // rewritten chunk matched its recorded target digest in
+                    // memory and the carried chunks are pinned by the
+                    // verified basis hash; the chain's final step still pins
+                    // the whole archive. Record the op hash for the carry.
+                    None if !result.chunk_hashes_verified => {
+                        return Err(SurgeError::Update(format!(
+                            "Sparse delta in-place apply for '{path}' could not verify the target"
+                        )));
+                    }
+                    _ => {}
                 }
                 verified.record(path, sha256);
             }

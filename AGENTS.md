@@ -118,6 +118,10 @@ If the local environment cannot run a listed command, document the exact gap in 
 - App repos should expose wrapper scripts for local filesystem smoke and Windows Azure smoke. Agents should use those wrappers instead of ad hoc `surge pack` / `surge push` commands.
 - If a Rust app temporarily overrides `surge-core`, prefer a local `file://` Git source pinned to the exact Surge commit instead of a raw crate path. This preserves workspace dependency resolution in clean and cross-platform smoke runs.
 - If a failure is in Surge itself, fix it upstream in this repo first, release a new tag, then update the app repo. Do not normalize long-lived downstream patches.
+- Treat release workflow success, NuGet availability, crates.io availability, downloadable artifacts/checksums, downstream dependency restore, and live update convergence as separate gates. Report the exact last completed gate; a tag alone is not a consumable release.
+- Artifact transport can discard Unix mode bits. Pack/install changes must verify executable mode after download/extraction and prove the installed application and supervisor actually launch; successful archive extraction is not sufficient.
+- A cache hit must restore both the CLI files and their directory on `PATH`. `chmod +x` makes a file executable but does not make `surge` discoverable by later matrix steps.
+- When a change is specifically meant to prove Surge can update itself, use two complete downstream test waves across the agreed app set. Wave 2 starts only after every Wave 1 target reports the expected installed/runtime version, fresh readiness, converged update state, correct supervisor/runtime, and no release-caused restart candidate. Stable publishing, each test dispatch, and production promotion remain separately authorized actions.
 
 ## CLI Logging Output
 - For `surge-cli` command output (including progress/status updates), use the existing `logline` facility in `crates/surge-cli/src/logline.rs`.

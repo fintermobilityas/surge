@@ -280,7 +280,7 @@ jobs:
           submodules: true
       - uses: actions/setup-dotnet@v6
         with:
-          dotnet-version: '10.0.401'
+          dotnet-version: '11.0.100-rc.1.26425.128'
       - uses: actions/cache@v6
         with:
           path: ~/.nuget/packages
@@ -294,7 +294,7 @@ jobs:
         run: >
           dotnet restore Surge.NET.AotSmoke/Surge.NET.AotSmoke.csproj
           --runtime linux-x64
-          -p:TargetFramework=net10.0
+          -p:TargetFramework=net11.0
           -p:PublishAot=true
           -p:PublishTrimmed=true
           -p:SelfContained=true
@@ -305,7 +305,7 @@ jobs:
           --no-restore
           --configuration Release
           --runtime linux-x64
-          -p:TargetFramework=net10.0
+          -p:TargetFramework=net11.0
           -p:PublishAot=true
           -p:PublishTrimmed=true
           -p:SelfContained=true
@@ -327,7 +327,7 @@ jobs:
           submodules: true
       - uses: actions/setup-dotnet@v6
         with:
-          dotnet-version: '10.0.401'
+          dotnet-version: '11.0.100-rc.1.26425.128'
       - uses: actions/cache@v6
         with:
           path: ~/.nuget/packages
@@ -340,7 +340,7 @@ jobs:
         run: >
           dotnet restore Surge.NET.AotSmoke/Surge.NET.AotSmoke.csproj
           --runtime linux-x64
-          -p:TargetFramework=net10.0
+          -p:TargetFramework=net11.0
           -p:PublishAot=true
           -p:PublishTrimmed=true
           -p:SelfContained=true
@@ -351,7 +351,7 @@ jobs:
           --no-restore
           --configuration Release
           --runtime linux-x64
-          -p:TargetFramework=net10.0
+          -p:TargetFramework=net11.0
           -p:Version=${SYNTHETIC_VERSION}
           -p:PublishAot=true
           -p:PublishTrimmed=true
@@ -361,7 +361,7 @@ jobs:
           -m:1
       - name: Verify prerelease version survives AOT and trimming
         run: |
-          output="$(Surge.NET.AotSmoke/bin/Release/net10.0/linux-x64/publish/Surge.NET.AotSmoke)"
+          output="$(Surge.NET.AotSmoke/bin/Release/net11.0/linux-x64/publish/Surge.NET.AotSmoke)"
           if [[ "${output}" != "${SYNTHETIC_VERSION}:"* ]]; then
             echo "::error::Unexpected AOT smoke output: ${output}"
             exit 1

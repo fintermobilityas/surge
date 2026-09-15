@@ -554,7 +554,7 @@ Surge is a native shared library (`libsurge.so` / `surge.dll` / `libsurge.dylib`
 The [`Surge.NET`](dotnet/Surge.NET/) NuGet package provides the full API:
 
 - **netstandard2.0** &mdash; `[DllImport]` for .NET Framework 4.6.1+, .NET Core, Mono, Xamarin
-- **net10.0** &mdash; `[LibraryImport]` with full AOT and trimming support
+- **net11.0** &mdash; `[LibraryImport]` with full AOT and trimming support
 - Zero external managed dependencies; ship the matching native Surge library
   from the same version and runtime identifier with the application
 - `SurgeUpdateManager.UpdateToLatestReleaseAsync()` &mdash; one call that checks, downloads, verifies, extracts, and applies

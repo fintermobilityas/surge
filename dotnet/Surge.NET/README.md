@@ -7,7 +7,7 @@
 | Target | Binding | Compatibility |
 |---|---|---|
 | `netstandard2.0` | `[DllImport]` | .NET Framework 4.6.1+, .NET Core, Mono, Xamarin |
-| `net10.0` | `[LibraryImport]` | AOT/trim-compatible; CI publishes a Native AOT smoke app |
+| `net11.0` | `[LibraryImport]` | AOT/trim-compatible; CI publishes a Native AOT smoke app |
 
 ## Quick Start
 

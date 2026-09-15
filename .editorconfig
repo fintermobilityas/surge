@@ -14,25 +14,47 @@ root = true
 # Revisit deliberately, one rule at a time, rather than on an SDK bump.
 
 [*.cs]
-dotnet_diagnostic.IDE0005.severity = silent  # remove unnecessary usings
-dotnet_diagnostic.IDE0008.severity = silent  # use explicit type instead of var
-dotnet_diagnostic.IDE0011.severity = silent  # add braces
-dotnet_diagnostic.IDE0021.severity = silent  # use block body for constructor
-dotnet_diagnostic.IDE0022.severity = silent  # use expression body for method
-dotnet_diagnostic.IDE0028.severity = silent  # collection initialization can be simplified
-dotnet_diagnostic.IDE0032.severity = silent  # use auto property
-dotnet_diagnostic.IDE0046.severity = silent  # convert to conditional expression
-dotnet_diagnostic.IDE0056.severity = silent  # use index operator
-dotnet_diagnostic.IDE0057.severity = silent  # use range operator
-dotnet_diagnostic.IDE0061.severity = silent  # use block body for local function
-dotnet_diagnostic.IDE0062.severity = silent  # local function can be made static
-dotnet_diagnostic.IDE0065.severity = silent  # using directive placement
-dotnet_diagnostic.IDE0074.severity = silent  # use compound assignment
-dotnet_diagnostic.IDE0078.severity = silent  # use pattern matching
-dotnet_diagnostic.IDE0090.severity = silent  # simplify new expression
-dotnet_diagnostic.IDE0130.severity = silent  # namespace does not match folder structure
-dotnet_diagnostic.IDE0270.severity = silent  # null check can be simplified
-dotnet_diagnostic.IDE0290.severity = silent  # use primary constructor
-dotnet_diagnostic.IDE0300.severity = silent  # collection initialization can be simplified
-dotnet_diagnostic.IDE0301.severity = silent  # use collection expression for empty
-dotnet_diagnostic.IDE0330.severity = silent  # use System.Threading.Lock
+# remove unnecessary usings
+dotnet_diagnostic.IDE0005.severity = silent
+# use explicit type instead of var
+dotnet_diagnostic.IDE0008.severity = silent
+# add braces
+dotnet_diagnostic.IDE0011.severity = silent
+# use block body for constructor
+dotnet_diagnostic.IDE0021.severity = silent
+# use expression body for method
+dotnet_diagnostic.IDE0022.severity = silent
+# collection initialization can be simplified
+dotnet_diagnostic.IDE0028.severity = silent
+# use auto property
+dotnet_diagnostic.IDE0032.severity = silent
+# convert to conditional expression
+dotnet_diagnostic.IDE0046.severity = silent
+# use index operator
+dotnet_diagnostic.IDE0056.severity = silent
+# use range operator
+dotnet_diagnostic.IDE0057.severity = silent
+# use block body for local function
+dotnet_diagnostic.IDE0061.severity = silent
+# local function can be made static
+dotnet_diagnostic.IDE0062.severity = silent
+# using directive placement
+dotnet_diagnostic.IDE0065.severity = silent
+# use compound assignment
+dotnet_diagnostic.IDE0074.severity = silent
+# use pattern matching
+dotnet_diagnostic.IDE0078.severity = silent
+# simplify new expression
+dotnet_diagnostic.IDE0090.severity = silent
+# namespace does not match folder structure
+dotnet_diagnostic.IDE0130.severity = silent
+# null check can be simplified
+dotnet_diagnostic.IDE0270.severity = silent
+# use primary constructor
+dotnet_diagnostic.IDE0290.severity = silent
+# collection initialization can be simplified
+dotnet_diagnostic.IDE0300.severity = silent
+# use collection expression for empty
+dotnet_diagnostic.IDE0301.severity = silent
+# use System.Threading.Lock
+dotnet_diagnostic.IDE0330.severity = silent

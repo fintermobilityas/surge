@@ -2,7 +2,8 @@ use std::path::Path;
 use std::process::ExitStatus;
 
 use surge_core::update::status::{
-    RESTART_HANDOFF_TARGET_CHILD_EXITED_PHASE, mark_restart_handoff_converged, mark_restart_handoff_pending,
+    RESTART_HANDOFF_INVALID_EXECUTABLE_PHASE, RESTART_HANDOFF_TARGET_CHILD_EXITED_PHASE,
+    mark_restart_handoff_converged, mark_restart_handoff_pending,
 };
 
 pub(super) fn pending_restart_handoff_version(
@@ -112,6 +113,38 @@ pub(super) fn record_restart_handoff_child_exited(install_dir: &Path, version: &
     }
 }
 
+pub(super) fn record_restart_handoff_unusable_executable(install_dir: &Path, version: Option<&str>, reason: &str) {
+    let Some(version) = version.map(str::trim).filter(|version| !version.is_empty()) else {
+        return;
+    };
+
+    match mark_restart_handoff_pending(install_dir, version, reason, RESTART_HANDOFF_INVALID_EXECUTABLE_PHASE) {
+        Ok(Some(_)) => {
+            tracing::error!(
+                version,
+                reason,
+                "Restart handoff target executable is invalid or corrupt"
+            );
+        }
+        Ok(None) => {
+            tracing::warn!(
+                install_root = %install_dir.display(),
+                version,
+                reason = "no matching pending restart handoff status record",
+                "Failed to record unusable executable against restart handoff"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                install_root = %install_dir.display(),
+                version,
+                reason = %e,
+                "Failed to record unusable executable against restart handoff"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,5 +190,59 @@ mod tests {
         let retained = without_lifecycle_args(&args);
 
         assert_eq!(retained, vec!["--app-mode", "service", "--tail"]);
+    }
+
+    #[test]
+    fn unusable_executable_keeps_pending_restart_and_does_not_converge() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = surge_core::update::status::UpdateStatusRecord::pending_restart_with_failure_phase(
+            "demo-app",
+            "2.0.0",
+            "2.0.0",
+            "stable",
+            "2026-05-20T10:00:00Z".to_string(),
+            "2026-05-20T10:00:01Z".to_string(),
+            "waiting for old child",
+            surge_core::update::status::RESTART_HANDOFF_WAITING_FOR_OLD_CHILD_PHASE,
+        );
+        surge_core::update::status::write_update_status(dir.path(), &record).unwrap();
+
+        record_restart_handoff_unusable_executable(
+            dir.path(),
+            Some(" 2.0.0 "),
+            "Invalid or corrupt executable '/tmp/demo-app': file is empty (0 bytes) and cannot be started. Replace it with a valid application executable",
+        );
+
+        let status = surge_core::update::status::read_update_status(dir.path())
+            .unwrap()
+            .expect("status record should remain present");
+        assert_eq!(
+            status.state,
+            surge_core::update::status::UpdateConvergenceState::PendingRestart
+        );
+        assert!(!status.supervisor_restart_confirmed);
+        assert_eq!(
+            status.failure_phase.as_deref(),
+            Some(RESTART_HANDOFF_INVALID_EXECUTABLE_PHASE)
+        );
+        assert!(
+            status
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("empty (0 bytes)"))
+        );
+    }
+
+    #[test]
+    fn unusable_executable_without_handoff_version_does_not_write_status() {
+        let dir = tempfile::tempdir().unwrap();
+
+        record_restart_handoff_unusable_executable(dir.path(), None, "unused");
+
+        assert!(
+            surge_core::update::status::read_update_status(dir.path())
+                .unwrap()
+                .is_none()
+        );
     }
 }

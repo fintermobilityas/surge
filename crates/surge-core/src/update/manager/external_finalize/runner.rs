@@ -366,7 +366,8 @@ fn restart_previous_runtime(plan: &ExternalFinalizePlan, previous_app_dir: &Path
         None,
     ) {
         SupervisorRestartOutcome::PendingRestart { failure_phase, reason }
-            if failure_phase == status::RESTART_HANDOFF_FAILED_PHASE =>
+            if failure_phase == status::RESTART_HANDOFF_FAILED_PHASE
+                || failure_phase == status::RESTART_HANDOFF_INVALID_EXECUTABLE_PHASE =>
         {
             Err(SurgeError::Supervisor(reason))
         }

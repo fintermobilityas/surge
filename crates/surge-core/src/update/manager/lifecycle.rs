@@ -12,7 +12,8 @@ use crate::supervisor::state::{
     read_restart_args, supervisor_pid_file, supervisor_stop_file, write_supervisor_exe_path,
 };
 use crate::update::status::{
-    RESTART_HANDOFF_FAILED_PHASE, RESTART_HANDOFF_WAITING_FOR_OLD_CHILD_PHASE, confirm_supervisor_restart,
+    RESTART_HANDOFF_FAILED_PHASE, RESTART_HANDOFF_INVALID_EXECUTABLE_PHASE,
+    RESTART_HANDOFF_WAITING_FOR_OLD_CHILD_PHASE, confirm_supervisor_restart,
 };
 
 const SUPERVISOR_RESTART_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
@@ -256,6 +257,16 @@ fn restart_supervisor_after_update_with_config(
             failure_phase: RESTART_HANDOFF_FAILED_PHASE,
         };
     }
+    if std::fs::metadata(&exe_path).is_ok_and(|metadata| metadata.len() == 0) {
+        warn!(
+            exe = %exe_path.display(),
+            "Cannot restart supervisor after update because the application executable is empty"
+        );
+        return SupervisorRestartOutcome::PendingRestart {
+            reason: format!("application executable is empty (0 bytes) at {}", exe_path.display()),
+            failure_phase: RESTART_HANDOFF_INVALID_EXECUTABLE_PHASE,
+        };
+    }
 
     if let Err(e) = write_supervisor_exe_path(install_dir, supervisor_id, &exe_path) {
         warn!(
@@ -490,5 +501,94 @@ mod tests {
             attempts, 2,
             "restart should spawn the supervisor exactly twice (one retry)"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restart_supervisor_classifies_an_empty_target_executable_without_spawning() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let install_dir = tmp.path();
+        let active_app_dir = install_dir.join("app");
+        std::fs::create_dir_all(&active_app_dir).unwrap();
+
+        let attempts_log = install_dir.join("supervisor-attempts.log");
+        let supervisor_path = active_app_dir.join(crate::platform::process::supervisor_binary_name());
+        std::fs::write(
+            &supervisor_path,
+            format!("#!/bin/sh\necho attempt >> '{}'\nexit 0\n", attempts_log.display()),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&supervisor_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&supervisor_path, permissions).unwrap();
+
+        let app_path = active_app_dir.join("demo-app");
+        std::fs::write(&app_path, b"").unwrap();
+        let mut permissions = std::fs::metadata(&app_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&app_path, permissions).unwrap();
+
+        let latest = ReleaseEntry {
+            version: "2.0.0".to_string(),
+            main_exe: "demo-app".to_string(),
+            supervisor_id: "demo-supervisor".to_string(),
+            ..ReleaseEntry::default()
+        };
+
+        let in_progress = crate::update::status::UpdateStatusRecord::in_progress(
+            "demo-app",
+            "1.0.0",
+            "2.0.0",
+            "stable",
+            "2026-05-20T10:00:00Z".to_string(),
+        );
+        crate::update::status::write_update_status(install_dir, &in_progress).unwrap();
+
+        let outcome = restart_supervisor_after_update_with_config(
+            install_dir,
+            &active_app_dir,
+            &latest,
+            std::process::id(),
+            None,
+            Some(&latest.version),
+            Duration::from_millis(200),
+            2,
+            Duration::from_millis(10),
+        );
+
+        let SupervisorRestartOutcome::PendingRestart { reason, failure_phase } = outcome else {
+            panic!("expected PendingRestart for an empty target executable, got {outcome:?}");
+        };
+        assert_eq!(failure_phase, RESTART_HANDOFF_INVALID_EXECUTABLE_PHASE);
+        assert!(reason.contains("empty (0 bytes)"));
+
+        let completed_at_utc = crate::update::status::now_utc_rfc3339();
+        let persisted = crate::update::status::UpdateStatusRecord::pending_restart_with_failure_phase(
+            "demo-app",
+            "2.0.0",
+            "2.0.0",
+            "stable",
+            "2026-05-20T10:00:00Z".to_string(),
+            completed_at_utc,
+            &reason,
+            failure_phase,
+        );
+        crate::update::status::write_update_status(install_dir, &persisted).unwrap();
+
+        let status = crate::update::status::read_update_status(install_dir)
+            .unwrap()
+            .expect("status record should remain present");
+        assert_eq!(
+            status.state,
+            crate::update::status::UpdateConvergenceState::PendingRestart
+        );
+        assert!(!status.supervisor_restart_confirmed);
+        assert_eq!(
+            status.failure_phase.as_deref(),
+            Some(RESTART_HANDOFF_INVALID_EXECUTABLE_PHASE)
+        );
+        assert!(!attempts_log.exists(), "empty executable must not spawn the supervisor");
     }
 }

@@ -13,7 +13,8 @@ mod handoff;
 mod ownership;
 
 use child::{
-    WaitOutcome, spawn_supervised_child, wait_before_restart, wait_for_pid_or_stop, wait_for_supervised_child,
+    WaitOutcome, spawn_supervised_child, validate_supervised_executable, wait_before_restart, wait_for_pid_or_stop,
+    wait_for_supervised_child,
 };
 #[cfg(all(test, unix))]
 use ownership::current_supervisor_owns_pid_file;
@@ -121,6 +122,11 @@ enum Commands {
 enum SupervisorError {
     #[error("Executable not found: {0}")]
     ExecutableNotFound(String),
+
+    #[error(
+        "Invalid or corrupt executable '{0}': file is empty (0 bytes) and cannot be started. Replace it with a valid application executable"
+    )]
+    InvalidExecutable(String),
 
     #[error("No executable path: pass --exe or write the supervisor exe state file for id '{0}' in {1}")]
     MissingExecutablePath(String, String),
@@ -257,12 +263,18 @@ fn run_supervisor(
         exe_path.display()
     );
 
-    if !exe_path.is_file() {
-        return Err(SupervisorError::ExecutableNotFound(exe_path.display().to_string()));
-    }
-
     let pid_file = supervisor_pid_file(install_dir, supervisor_id);
     let stop_file = supervisor_stop_file(install_dir, supervisor_id);
+    let mut pending_handoff_version = handoff::pending_restart_handoff_version(watched_pid, handoff_version, args);
+
+    if let Err(error) = validate_supervised_executable(exe_path) {
+        handoff::record_restart_handoff_unusable_executable(
+            install_dir,
+            pending_handoff_version.as_deref(),
+            &error.to_string(),
+        );
+        return Err(error);
+    }
 
     if stop_file.exists() {
         let _ = std::fs::remove_file(&stop_file);
@@ -278,7 +290,6 @@ fn run_supervisor(
     let first_child_args = args.to_vec();
     let restart_args = handoff::without_lifecycle_args(args);
     let mut next_child_args = Some(first_child_args);
-    let mut pending_handoff_version = handoff::pending_restart_handoff_version(watched_pid, handoff_version, args);
     let mut watched_pid = watched_pid;
     let mut watched_pid_start_time = watched_pid_start_time;
 
@@ -328,7 +339,19 @@ fn run_supervisor(
         }
 
         let child_args = next_child_args.take().unwrap_or_else(|| restart_args.clone());
-        let mut child = spawn_supervised_child(exe_path, install_dir, &child_args)?;
+        let mut child = match spawn_supervised_child(exe_path, install_dir, &child_args) {
+            Ok(child) => child,
+            Err(error) => {
+                handoff::record_restart_handoff_unusable_executable(
+                    install_dir,
+                    pending_handoff_version.as_deref(),
+                    &error.to_string(),
+                );
+                remove_owned_supervisor_state(&pid_file, &stop_file, own_pid);
+                tracing::info!("Supervisor '{supervisor_id}' exiting");
+                return Err(error);
+            }
+        };
 
         let Some(status) = wait_for_supervised_child(
             &mut child,
@@ -828,6 +851,103 @@ mod tests {
             restarted,
             "supervisor must relaunch a child that exits cleanly (code 0) instead of stopping supervision"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn empty_executable_is_rejected_before_spawn() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TestInstallDir::new("surge-supervisor-empty-exe");
+        let install_dir = tmp.path();
+        let exe_path = install_dir.join("target-child");
+        std::fs::write(&exe_path, b"").unwrap();
+        let mut permissions = std::fs::metadata(&exe_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&exe_path, permissions).unwrap();
+
+        let started = std::time::Instant::now();
+        let err = run_supervisor("demo-supervisor", install_dir, &exe_path, &[], None, None, None).unwrap_err();
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "an empty executable must fail immediately instead of cycling successful exits"
+        );
+        assert!(matches!(err, SupervisorError::InvalidExecutable(_)));
+        assert!(err.to_string().contains("empty (0 bytes)"));
+        assert!(!supervisor_pid_file(install_dir, "demo-supervisor").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn empty_executable_does_not_converge_pending_restart_handoff() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TestInstallDir::new("surge-supervisor-empty-exe-handoff");
+        let install_dir = tmp.path();
+        let exe_path = install_dir.join("target-child");
+        std::fs::write(&exe_path, b"").unwrap();
+        let mut permissions = std::fs::metadata(&exe_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&exe_path, permissions).unwrap();
+
+        let pending = surge_core::update::status::UpdateStatusRecord::pending_restart_with_failure_phase(
+            "demo-app",
+            "2.0.0",
+            "2.0.0",
+            "stable",
+            "2026-05-20T10:00:00Z".to_string(),
+            "2026-05-20T10:00:01Z".to_string(),
+            "waiting for old child",
+            surge_core::update::status::RESTART_HANDOFF_WAITING_FOR_OLD_CHILD_PHASE,
+        );
+        surge_core::update::status::write_update_status(install_dir, &pending).unwrap();
+
+        let err = run_supervisor(
+            "demo-supervisor",
+            install_dir,
+            &exe_path,
+            &[],
+            None,
+            None,
+            Some("2.0.0"),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, SupervisorError::InvalidExecutable(_)));
+        let status = surge_core::update::status::read_update_status(install_dir)
+            .unwrap()
+            .expect("status record should remain present");
+        assert_eq!(
+            status.state,
+            surge_core::update::status::UpdateConvergenceState::PendingRestart
+        );
+        assert!(!status.supervisor_restart_confirmed);
+        assert_eq!(
+            status.failure_phase.as_deref(),
+            Some(surge_core::update::status::RESTART_HANDOFF_INVALID_EXECUTABLE_PHASE)
+        );
+        assert!(
+            status
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("empty (0 bytes)"))
+        );
+    }
+
+    #[test]
+    fn run_supervisor_rejects_a_missing_executable() {
+        let err = run_supervisor(
+            "demo-supervisor",
+            Path::new("/tmp/surge-missing-install"),
+            Path::new("/no/such/surge-supervised-executable"),
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, SupervisorError::ExecutableNotFound(_)));
     }
 
     #[test]

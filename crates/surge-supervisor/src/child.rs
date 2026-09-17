@@ -11,11 +11,34 @@ use surge_core::platform::process::{PidLiveness, probe_process_identity};
 
 const RESTART_HANDOFF_STABILITY_WINDOW: std::time::Duration = std::time::Duration::from_secs(4);
 
+pub(crate) fn validate_supervised_executable(exe_path: &Path) -> Result<(), SupervisorError> {
+    let metadata = match std::fs::metadata(exe_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(SupervisorError::ExecutableNotFound(exe_path.display().to_string()));
+        }
+        Err(error) => return Err(error.into()),
+    };
+
+    if !metadata.is_file() {
+        return Err(SupervisorError::ExecutableNotFound(exe_path.display().to_string()));
+    }
+
+    // Unix treats a zero-byte +x file as an empty shell program, so spawn
+    // succeeds and the child exits 0 immediately. Reject it before launch.
+    if metadata.len() == 0 {
+        return Err(SupervisorError::InvalidExecutable(exe_path.display().to_string()));
+    }
+
+    Ok(())
+}
+
 pub(crate) fn spawn_supervised_child(
     exe_path: &Path,
     install_dir: &Path,
     child_args: &[String],
 ) -> Result<Child, SupervisorError> {
+    validate_supervised_executable(exe_path)?;
     tracing::info!("Starting child process: {}", exe_path.display());
 
     let mut command = Command::new(exe_path);
@@ -306,6 +329,42 @@ mod tests {
 
         assert!(is_process_identity_running(pid, Some(start_time)));
         assert!(!is_process_identity_running(pid, Some(start_time ^ 1)));
+    }
+
+    #[test]
+    fn validate_supervised_executable_rejects_a_missing_path() {
+        let err = validate_supervised_executable(Path::new("/no/such/surge-supervised-executable")).unwrap_err();
+        assert!(matches!(err, SupervisorError::ExecutableNotFound(_)));
+    }
+
+    #[test]
+    fn validate_supervised_executable_rejects_an_empty_file() {
+        let path = unique_temp_path("surge-empty-exe");
+        std::fs::write(&path, b"").unwrap();
+        let err = validate_supervised_executable(&path).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(err, SupervisorError::InvalidExecutable(_)));
+        assert!(err.to_string().contains("empty (0 bytes)"));
+    }
+
+    #[test]
+    fn validate_supervised_executable_accepts_a_non_empty_script() {
+        let path = unique_temp_path("surge-script-exe");
+        std::fs::write(&path, b"#!/bin/sh\nexit 0\n").unwrap();
+        let result = validate_supervised_executable(&path);
+        let _ = std::fs::remove_file(&path);
+        result.expect("a non-empty script is a valid supervised executable");
+    }
+
+    fn unique_temp_path(prefix: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
     }
 }
 

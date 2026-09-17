@@ -7,6 +7,7 @@ use super::{UpdateConvergenceState, UpdateStatusRecord, now_utc_rfc3339, read_up
 pub const RESTART_HANDOFF_FAILED_PHASE: &str = "restart handoff failed";
 pub const RESTART_HANDOFF_WAITING_FOR_OLD_CHILD_PHASE: &str = "restart handoff waiting for old child";
 pub const RESTART_HANDOFF_TARGET_CHILD_EXITED_PHASE: &str = "restart handoff target child exited";
+pub const RESTART_HANDOFF_INVALID_EXECUTABLE_PHASE: &str = "restart handoff invalid executable";
 
 pub fn mark_restart_handoff_pending(
     install_dir: &Path,
@@ -162,5 +163,37 @@ mod tests {
             .expect("matching record should converge");
         assert_eq!(converged.attempted_at_utc.as_deref(), Some("2026-05-11T14:00:00Z"));
         assert_eq!(converged.completed_at_utc.as_deref(), Some("2026-05-11T14:04:00Z"));
+    }
+
+    #[test]
+    fn restart_handoff_can_classify_an_invalid_executable() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = UpdateStatusRecord::pending_restart_with_failure_phase(
+            "demo-app",
+            "9999.0.0",
+            "9999.0.0",
+            "stable",
+            "2026-05-11T14:00:00Z".to_string(),
+            "2026-05-11T14:05:00Z".to_string(),
+            "waiting for previous child to exit",
+            RESTART_HANDOFF_WAITING_FOR_OLD_CHILD_PHASE,
+        );
+        write_update_status(dir.path(), &record).unwrap();
+
+        let invalid = mark_restart_handoff_pending(
+            dir.path(),
+            "9999.0.0",
+            "target executable is empty (0 bytes)",
+            RESTART_HANDOFF_INVALID_EXECUTABLE_PHASE,
+        )
+        .unwrap()
+        .expect("matching record should update");
+        assert_eq!(invalid.state, UpdateConvergenceState::PendingRestart);
+        assert!(!invalid.supervisor_restart_confirmed);
+        assert_eq!(
+            invalid.failure_phase.as_deref(),
+            Some(RESTART_HANDOFF_INVALID_EXECUTABLE_PHASE)
+        );
+        assert_eq!(invalid.reason.as_deref(), Some("target executable is empty (0 bytes)"));
     }
 }

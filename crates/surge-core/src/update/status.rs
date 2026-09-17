@@ -28,7 +28,7 @@ mod handoff;
 mod worker;
 
 pub use handoff::{
-    RESTART_HANDOFF_FAILED_PHASE, RESTART_HANDOFF_TARGET_CHILD_EXITED_PHASE,
+    RESTART_HANDOFF_FAILED_PHASE, RESTART_HANDOFF_INVALID_EXECUTABLE_PHASE, RESTART_HANDOFF_TARGET_CHILD_EXITED_PHASE,
     RESTART_HANDOFF_WAITING_FOR_OLD_CHILD_PHASE, mark_restart_handoff_converged, mark_restart_handoff_pending,
 };
 pub use worker::{UpdateWorkerGuard, fail_abandoned_in_progress_update};

@@ -5,9 +5,14 @@ on:
     types: [published]
   workflow_dispatch:
     inputs:
+      auth_only:
+        description: Verify NuGet trusted publishing without releasing
+        required: false
+        default: false
+        type: boolean
       tag_name:
         description: Existing published release tag to recover
-        required: true
+        required: false
         type: string
       recovery_mode:
         description: Work to run for an existing release
@@ -31,6 +36,7 @@ permissions:
 
 jobs:
   validate-release:
+    if: ${{ !inputs.auth_only }}
     name: Validate Release
     runs-on: ubuntu-latest
     outputs:
@@ -428,12 +434,14 @@ jobs:
 
   publish-nuget:
     name: Publish NuGet
+    environment: nuget-publishing
     if: ${{ !cancelled() && needs.validate-release.result == 'success' && needs.package-nuget.result == 'success' }}
     needs: [validate-release, package-nuget]
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+      id-token: write
     steps:
       - uses: actions/setup-dotnet@v6
         with:
@@ -467,12 +475,17 @@ jobs:
             echo "::error::Downloaded workflow artifact does not match the immutable NuGet package."
             exit 1
           fi
+      - name: Authenticate to NuGet.org
+        id: nuget-login
+        uses: NuGet/login@v1 # Organization allow-list permits version tags only.
+        with:
+          user: petersunde
       - name: Push to NuGet.org
         env:
-          NUGET_API_KEY: ${{ secrets.PETERSUNDE_NUGET_ORG_API_KEY }}
+          NUGET_API_KEY: ${{ steps.nuget-login.outputs.NUGET_API_KEY }}
         run: |
           if [ -z "${NUGET_API_KEY}" ]; then
-            echo "::error::PETERSUNDE_NUGET_ORG_API_KEY is not available to this workflow."
+            echo "::error::NuGet trusted publishing returned no temporary API key."
             exit 1
           fi
           dotnet nuget push "nupkgs/${{ needs.package-nuget.outputs.package_name }}" \
@@ -752,3 +765,24 @@ jobs:
           for asset in "${immutable_assets[@]}"; do
             publish_immutable_asset "${asset}"
           done
+
+  verify-nuget-auth:
+    name: Verify NuGet trusted publishing
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.auth_only }}
+    runs-on: ubuntu-latest
+    environment: nuget-publishing
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Authenticate to NuGet.org
+        id: nuget-login
+        uses: NuGet/login@v1 # Organization allow-list permits version tags only.
+        with:
+          user: petersunde
+      - name: Verify temporary credential issuance
+        env:
+          NUGET_API_KEY: ${{ steps.nuget-login.outputs.NUGET_API_KEY }}
+        run: |
+          test -n "$NUGET_API_KEY"
+          echo "NuGet trusted publishing issued a temporary credential."

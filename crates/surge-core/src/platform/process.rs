@@ -248,7 +248,7 @@ pub fn probe_pid_liveness(pid: u32) -> PidLiveness {
 /// can fail closed.
 #[must_use]
 pub fn probe_process_identity(pid: u32, expected_start_time: u64) -> PidLiveness {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     let known_liveness = descriptors::process_identity_is_alive(pid, expected_start_time).map(|is_alive| {
         if is_alive {
             PidLiveness::Alive
@@ -256,7 +256,7 @@ pub fn probe_process_identity(pid: u32, expected_start_time: u64) -> PidLiveness
             PidLiveness::Dead
         }
     });
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let known_liveness = process_start_time(pid).map(|actual_start_time| {
         if actual_start_time == expected_start_time {
             PidLiveness::Alive
@@ -271,7 +271,7 @@ pub fn probe_process_identity(pid: u32, expected_start_time: u64) -> PidLiveness
     })
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 fn wait_for_identity_to_exit(pid: u32, start_time: u64) -> PidLiveness {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
@@ -410,7 +410,7 @@ mod tests {
         assert_eq!(probe_process_identity(pid, start_time ^ 1), PidLiveness::Dead);
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn process_identity_reports_an_unreaped_zombie_dead() {
         let mut child = std::process::Command::new("/bin/sleep")

@@ -1,10 +1,10 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use sysinfo::{Pid, ProcessStatus, ProcessesToUpdate, System};
+use sysinfo::{Pid, Process, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System, UpdateKind};
 
 use crate::error::{Result, SurgeError};
-use crate::platform::process::{PidLiveness, probe_process_identity, process_start_time};
+use crate::platform::process::{PidLiveness, probe_pid_liveness, probe_process_identity, process_start_time};
 
 const UPDATER_EXIT_GRACE: Duration = Duration::from_secs(20);
 const TERMINATE_GRACE: Duration = Duration::from_secs(5);
@@ -100,7 +100,7 @@ fn include_running_identity(processes: &mut Vec<ProcessIdentity>, identity: &Pro
 
 fn matching_processes(expected_executable: &Path) -> Result<Vec<ProcessIdentity>> {
     let mut system = System::new();
-    let _ = system.refresh_processes(ProcessesToUpdate::All, true);
+    let _ = system.refresh_processes_specifics(ProcessesToUpdate::All, true, process_refresh_kind());
     let own_pid = std::process::id();
     let mut matching = Vec::new();
     for (pid, process) in system.processes() {
@@ -108,22 +108,28 @@ fn matching_processes(expected_executable: &Path) -> Result<Vec<ProcessIdentity>
         if pid == own_pid {
             continue;
         }
-        let Some(executable) = process.exe().map(normalize_executable) else {
+        let Some(executable) = process_executable(process) else {
             continue;
         };
         if !executable_paths_equal(&executable, expected_executable) {
             continue;
         }
-        let start_time = process_start_time(pid).ok_or_else(|| {
-            SurgeError::Supervisor(format!(
+        let Some(start_time) = process_start_time(pid) else {
+            if probe_pid_liveness(pid) == PidLiveness::Dead {
+                continue;
+            }
+            return Err(SurgeError::Supervisor(format!(
                 "Could not resolve creation identity for application process {pid}"
-            ))
-        })?;
-        matching.push(ProcessIdentity {
+            )));
+        };
+        let identity = ProcessIdentity {
             pid,
             start_time,
             executable,
-        });
+        };
+        if identity_is_running(&identity)? {
+            matching.push(identity);
+        }
     }
     Ok(matching)
 }
@@ -167,43 +173,86 @@ fn wait_until_no_matching_processes(
     }
 }
 
-fn identity_is_running(identity: &ProcessIdentity) -> Result<bool> {
-    match probe_process_identity(identity.pid, identity.start_time) {
-        PidLiveness::Dead => return Ok(false),
-        PidLiveness::Unknown => {
-            return Err(SurgeError::Supervisor(format!(
-                "Could not revalidate creation identity for process {}",
-                identity.pid
-            )));
-        }
-        PidLiveness::Alive => {}
-    }
+fn process_refresh_kind() -> ProcessRefreshKind {
+    ProcessRefreshKind::nothing()
+        .with_exe(UpdateKind::Always)
+        .without_tasks()
+}
 
+fn identity_is_running(identity: &ProcessIdentity) -> Result<bool> {
+    identity_is_running_with_metadata(identity, || read_process_metadata(identity))
+}
+
+fn identity_is_running_with_metadata(
+    identity: &ProcessIdentity,
+    read_metadata: impl FnOnce() -> Result<bool>,
+) -> Result<bool> {
+    if !require_live_identity(identity)? {
+        return Ok(false);
+    }
+    let metadata = read_metadata();
+    // Metadata and liveness are separate observations; an exit invalidates even an error.
+    if !require_live_identity(identity)? {
+        return Ok(false);
+    }
+    metadata
+}
+
+fn require_live_identity(identity: &ProcessIdentity) -> Result<bool> {
+    match probe_process_identity(identity.pid, identity.start_time) {
+        PidLiveness::Dead => Ok(false),
+        PidLiveness::Alive => Ok(true),
+        PidLiveness::Unknown => Err(SurgeError::Supervisor(format!(
+            "Could not revalidate creation identity for process {}",
+            identity.pid
+        ))),
+    }
+}
+
+fn read_process_metadata(identity: &ProcessIdentity) -> Result<bool> {
     let system_pid = Pid::from_u32(identity.pid);
     let mut system = System::new();
-    let _ = system.refresh_processes(ProcessesToUpdate::Some(&[system_pid]), true);
+    let _ = system.refresh_processes_specifics(ProcessesToUpdate::Some(&[system_pid]), true, process_refresh_kind());
     let process = system.process(system_pid).ok_or_else(|| {
         SurgeError::Supervisor(format!(
             "Process {} is alive but missing from the process metadata snapshot",
             identity.pid
         ))
     })?;
-    if matches!(process.status(), ProcessStatus::Dead | ProcessStatus::Zombie) {
+    if !cfg!(target_os = "linux") && matches!(process.status(), ProcessStatus::Dead | ProcessStatus::Zombie) {
         return Ok(false);
     }
-    let executable = process.exe().ok_or_else(|| {
+    let executable = process_executable(process).ok_or_else(|| {
         SurgeError::Supervisor(format!(
             "Could not resolve executable for live process {}",
             identity.pid
         ))
     })?;
-    if !executable_paths_equal(&normalize_executable(executable), &identity.executable) {
+    if !executable_paths_equal(&executable, &identity.executable) {
         return Err(SurgeError::Supervisor(format!(
             "Executable identity changed for live process {}",
             identity.pid
         )));
     }
     Ok(true)
+}
+
+fn process_executable(process: &Process) -> Option<PathBuf> {
+    if let Some(executable) = process.exe() {
+        return Some(normalize_executable(executable));
+    }
+    #[cfg(target_os = "linux")]
+    if matches!(process.status(), ProcessStatus::Dead | ProcessStatus::Zombie) {
+        // An exited leader loses /proc/<pid>/exe; surviving threads share its executable.
+        let pid = process.pid().as_u32();
+        for task in std::fs::read_dir(format!("/proc/{pid}/task")).ok()? {
+            let executable = task.ok()?.path().join("exe");
+            if let Ok(executable) = std::fs::read_link(executable) {
+                return Some(normalize_executable(&executable));
+            }
+        }
+    }
+    None
 }
 
 #[cfg(unix)]
@@ -234,7 +283,7 @@ fn signal_process(identity: &ProcessIdentity, _force: bool) -> Result<()> {
     }
     let system_pid = Pid::from_u32(identity.pid);
     let mut system = System::new();
-    let _ = system.refresh_processes(ProcessesToUpdate::Some(&[system_pid]), true);
+    let _ = system.refresh_processes_specifics(ProcessesToUpdate::Some(&[system_pid]), true, process_refresh_kind());
     let Some(process) = system.process(system_pid) else {
         return Ok(());
     };
@@ -326,3 +375,6 @@ mod tests {
         child.wait().unwrap();
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests;

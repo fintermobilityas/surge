@@ -47,6 +47,14 @@ fn run_self_update() {
     let install_root = required_path("SURGE_EXTERNAL_FINALIZE_INSTALL");
     let returned_marker = required_path("SURGE_EXTERNAL_FINALIZE_RETURNED");
     let allow_exit_marker = required_path("SURGE_EXTERNAL_FINALIZE_ALLOW_EXIT");
+    let workers: Vec<_> = (0..8)
+        .map(|_| {
+            let allow_exit_marker = allow_exit_marker.clone();
+            std::thread::spawn(move || {
+                assert!(wait_until(Duration::from_secs(30), || allow_exit_marker.is_file()));
+            })
+        })
+        .collect();
     let context = Arc::new(Context::new());
     context.set_storage(
         StorageProvider::Filesystem,
@@ -72,6 +80,9 @@ fn run_self_update() {
     });
     std::fs::write(returned_marker, "scheduled").unwrap();
     assert!(wait_until(Duration::from_secs(10), || allow_exit_marker.is_file()));
+    for worker in workers {
+        worker.join().unwrap();
+    }
 }
 
 fn run_target() {

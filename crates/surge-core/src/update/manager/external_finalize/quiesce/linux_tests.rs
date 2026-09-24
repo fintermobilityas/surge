@@ -162,3 +162,62 @@ fn repeated_scans_tolerate_multithreaded_shutdown() {
     }
     assert!(app.child.wait().unwrap().success());
 }
+
+#[test]
+fn exited_leader_with_live_worker_is_force_stopped_before_activation() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("exited_leader.c");
+    let executable = directory.path().join("exited-leader");
+    std::fs::write(&source, include_str!("exited_leader.c")).unwrap();
+    let compile = Command::new("cc")
+        .arg("-pthread")
+        .arg(&source)
+        .arg("-o")
+        .arg(&executable)
+        .output()
+        .unwrap();
+    assert!(compile.status.success(), "{}", String::from_utf8_lossy(&compile.stderr));
+    let child = Command::new(&executable).spawn().unwrap();
+    let identity = ProcessIdentity {
+        pid: child.id(),
+        start_time: process_start_time(child.id()).unwrap(),
+        executable,
+    };
+    let mut app = TestApplication {
+        child,
+        identity,
+        directory,
+    };
+    let mut unrelated = TestApplication::start();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let stat = std::fs::read_to_string(format!("/proc/{}/stat", app.identity.pid)).unwrap();
+        if stat.rsplit_once(')').unwrap().1.trim_start().starts_with('Z') {
+            break;
+        }
+        assert!(Instant::now() < deadline, "leader did not exit");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        probe_process_identity(app.identity.pid, app.identity.start_time),
+        PidLiveness::Alive
+    );
+    assert!(identity_is_running(&app.identity).unwrap());
+    assert_eq!(
+        matching_processes(&app.identity.executable).unwrap(),
+        [app.identity.clone()]
+    );
+    quiesce_updating_application_with_timeouts(
+        app.identity.pid,
+        app.identity.start_time,
+        &app.identity.executable,
+        Duration::ZERO,
+        Duration::from_millis(100),
+        Duration::from_secs(2),
+    )
+    .unwrap();
+    assert_eq!(app.child.wait().unwrap().signal(), Some(nix::libc::SIGKILL));
+    assert!(unrelated.child.try_wait().unwrap().is_none());
+}

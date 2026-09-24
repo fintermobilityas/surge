@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System, UpdateKind};
+use sysinfo::{Pid, Process, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System, UpdateKind};
 
 use crate::error::{Result, SurgeError};
 use crate::platform::process::{PidLiveness, probe_pid_liveness, probe_process_identity, process_start_time};
@@ -108,7 +108,7 @@ fn matching_processes(expected_executable: &Path) -> Result<Vec<ProcessIdentity>
         if pid == own_pid {
             continue;
         }
-        let Some(executable) = process.exe().map(normalize_executable) else {
+        let Some(executable) = process_executable(process) else {
             continue;
         };
         if !executable_paths_equal(&executable, expected_executable) {
@@ -219,25 +219,40 @@ fn read_process_metadata(identity: &ProcessIdentity) -> Result<bool> {
             identity.pid
         ))
     })?;
-    if matches!(process.status(), ProcessStatus::Dead | ProcessStatus::Zombie) {
-        return Err(SurgeError::Supervisor(format!(
-            "Process {} has terminal metadata but its application identity is still live",
-            identity.pid
-        )));
+    if !cfg!(target_os = "linux") && matches!(process.status(), ProcessStatus::Dead | ProcessStatus::Zombie) {
+        return Ok(false);
     }
-    let executable = process.exe().ok_or_else(|| {
+    let executable = process_executable(process).ok_or_else(|| {
         SurgeError::Supervisor(format!(
             "Could not resolve executable for live process {}",
             identity.pid
         ))
     })?;
-    if !executable_paths_equal(&normalize_executable(executable), &identity.executable) {
+    if !executable_paths_equal(&executable, &identity.executable) {
         return Err(SurgeError::Supervisor(format!(
             "Executable identity changed for live process {}",
             identity.pid
         )));
     }
     Ok(true)
+}
+
+fn process_executable(process: &Process) -> Option<PathBuf> {
+    if let Some(executable) = process.exe() {
+        return Some(normalize_executable(executable));
+    }
+    #[cfg(target_os = "linux")]
+    if matches!(process.status(), ProcessStatus::Dead | ProcessStatus::Zombie) {
+        // An exited leader loses /proc/<pid>/exe; surviving threads share its executable.
+        let pid = process.pid().as_u32();
+        for task in std::fs::read_dir(format!("/proc/{pid}/task")).ok()? {
+            let executable = task.ok()?.path().join("exe");
+            if let Ok(executable) = std::fs::read_link(executable) {
+                return Some(normalize_executable(&executable));
+            }
+        }
+    }
+    None
 }
 
 #[cfg(unix)]

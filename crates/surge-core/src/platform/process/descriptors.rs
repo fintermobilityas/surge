@@ -98,6 +98,30 @@ fn parse_linux_process_start_time(stat: &[u8]) -> Option<u64> {
     fields_after_command.split_ascii_whitespace().nth(19)?.parse().ok()
 }
 
+#[cfg(target_os = "linux")]
+pub(super) fn process_identity_is_alive(pid: u32, expected_start_time: u64) -> Option<bool> {
+    let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
+    let actual_start_time = parse_linux_process_start_time(&stat)?;
+    let command_end = stat.iter().rposition(|byte| *byte == b')')?;
+    let state = stat
+        .get(command_end + 1..)?
+        .iter()
+        .find(|byte| !byte.is_ascii_whitespace())?;
+    if actual_start_time != expected_start_time {
+        return Some(false);
+    }
+    if !matches!(state, b'Z' | b'X' | b'x') {
+        return Some(true);
+    }
+    // A Linux thread-group leader can exit while other application threads still run.
+    for task in std::fs::read_dir(format!("/proc/{pid}/task")).ok()? {
+        if task.ok()?.file_name() != pid.to_string().as_str() {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
 #[cfg(target_os = "macos")]
 pub(super) fn process_start_time(pid: u32) -> Option<u64> {
     macos_process_info(pid, false).and_then(|info| macos_process_start_time(&info))

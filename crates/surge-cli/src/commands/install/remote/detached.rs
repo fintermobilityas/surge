@@ -124,10 +124,13 @@ if command -v setsid >/dev/null 2>&1; then \
 else \
   nohup sh -c \"$inner\" >> {REMOTE_INSTALLER_LOG_PATH} 2>&1 < /dev/null & \
 fi; \
-sleep 0.3; \
-if [ -f {REMOTE_INSTALLER_PID_PATH} ]; then \
-  echo \"launched $(tr -d '[:space:]' < {REMOTE_INSTALLER_PID_PATH})\"; \
-else echo launched; fi",
+attempt=0; \
+while [ \"$attempt\" -lt 300 ]; do \
+  pid=\"$(cat {REMOTE_INSTALLER_PID_PATH} 2>/dev/null || true)\"; \
+  case \"$pid\" in ''|*[!0-9]*) ;; *) echo \"launched $pid\"; exit 0 ;; esac; \
+  attempt=$((attempt + 1)); sleep 0.1; \
+done; \
+echo 'detached installer did not publish its PID within 30 seconds' >&2; exit 1",
         shell_single_quote(operation),
         shell_single_quote(&inner)
     )
@@ -459,7 +462,7 @@ mod tests {
         assert!(command.contains("echo $$ > /tmp/.surge-installer.pid"));
         assert!(command.contains("/tmp/.surge-installer --no-start --reinstall; result=$?"));
         assert!(command.contains("2>&1 < /dev/null &"));
-        assert!(command.contains("echo \"launched $(tr -d '[:space:]' < /tmp/.surge-installer.pid)\""));
+        assert!(command.contains("echo \"launched $pid\""));
     }
 
     #[test]
@@ -519,6 +522,33 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn detached_launch_fails_when_the_child_never_publishes_a_pid() {
+        let temp = tempfile::tempdir().unwrap();
+        let (script, bin, _, pid) = script_for_temp_paths(
+            &build_remote_detached_install_launch_command("", "test-operation"),
+            temp.path(),
+        );
+        for (path, body) in [
+            (bin, "#!/bin/sh\nexit 0\n"),
+            (temp.path().join("setsid"), "#!/bin/sh\nexit 7\n"),
+            (temp.path().join("sleep"), "#!/bin/sh\nexit 0\n"),
+        ] {
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let output = std::process::Command::new("sh")
+            .args(["-c", &script])
+            .env("PATH", format!("{}:/usr/bin:/bin", temp.path().display()))
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("did not publish its PID"));
+        assert!(!pid.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn detached_launch_command_runs_installer_detached_and_reports_pid() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let (script, bin_path, log_path, pid_path) = script_for_temp_paths(
@@ -534,10 +564,16 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&bin_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        // The parent exits immediately after launch, like an ending SSH session.
+        let shim = temp_dir.path().join("setsid");
+        std::fs::write(&shim, "#!/bin/sh\nsleep 1\nexec /usr/bin/setsid \"$@\"\n").unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!("{}:/usr/bin:/bin", temp_dir.path().display());
+
+        // The parent exits after PID publication, like an ending SSH session.
         let output = std::process::Command::new("sh")
             .arg("-c")
             .arg(&script)
+            .env("PATH", path)
             .output()
             .expect("run launch script");
         let stdout = String::from_utf8_lossy(&output.stdout);

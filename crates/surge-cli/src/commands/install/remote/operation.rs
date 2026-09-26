@@ -20,7 +20,6 @@ pub(super) fn request_fingerprint(
             &release.icon,
             &release.name,
         ),
-        &storage.prefix,
         behavior.no_start,
         behavior.mode.is_stage(),
         behavior.force,

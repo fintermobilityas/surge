@@ -230,29 +230,48 @@ fn process_probe_rejects_unrelated_supervisor_with_target_first_run_argument() {
     assert_ne!(run_probe(root.path()), "ready");
 }
 
-#[test]
-fn process_probe_accepts_original_watched_app() {
+fn probe_original_watched_app(valid_start_time: Option<bool>) -> String {
     let root = fixture();
     let mut processes = Processes(Vec::new());
     let app = spawn(Command::new(root.path().join("app/demoapp")).arg("30"));
-    let app_pid = app.id().to_string();
+    let app_pid = app.id();
     processes.0.push(app);
+    let mut supervisor = Command::new(root.path().join("app/surge-supervisor"));
+    supervisor.args([
+        "-c",
+        "read answer",
+        "watch",
+        "--id",
+        "demo-supervisor",
+        "--pid",
+        &app_pid.to_string(),
+    ]);
+    if let Some(valid) = valid_start_time {
+        let start = surge_core::platform::process::process_start_time(app_pid).unwrap();
+        supervisor.args(["--pid-start-time", &(if valid { start } else { start + 1 }).to_string()]);
+    }
     processes.0.push(spawn(
-        Command::new(root.path().join("app/surge-supervisor"))
-            .args([
-                "-c",
-                "read answer",
-                "watch",
-                "--id",
-                "demo-supervisor",
-                "--pid",
-                &app_pid,
-            ])
+        supervisor
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null()),
     ));
-    assert_eq!(run_probe(root.path()), "ready");
+    run_probe(root.path())
+}
+
+#[test]
+fn process_probe_accepts_original_watched_app() {
+    assert_eq!(probe_original_watched_app(Some(true)), "ready");
+}
+
+#[test]
+fn process_probe_rejects_reused_watched_pid_identity() {
+    assert_ne!(probe_original_watched_app(Some(false)), "ready");
+}
+
+#[test]
+fn process_probe_requires_parent_proof_for_legacy_watch_without_start_time() {
+    assert!(probe_original_watched_app(None).contains("lacks start-time identity"));
 }
 
 #[test]

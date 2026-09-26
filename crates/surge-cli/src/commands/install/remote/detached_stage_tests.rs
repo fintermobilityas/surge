@@ -229,6 +229,7 @@ async fn isolated_stage_monitor_worker() {
     let storage = StorageConfig {
         provider: Some(surge_core::context::StorageProvider::S3),
         bucket: "fixture".to_string(),
+        prefix: "tenant-a".to_string(),
         ..StorageConfig::default()
     };
     let target = RemoteInstallTarget {
@@ -395,6 +396,46 @@ async fn isolated_stage_monitor_worker() {
         &storage,
     )
     .await
+    .unwrap();
+    let mut wrong_storage = storage.clone();
+    wrong_storage.prefix = "tenant-b".into();
+    assert!(
+        super::super::state::verify_remote_stage_readiness(
+            "fixture",
+            "fixture",
+            "demoapp",
+            "linux-x64",
+            &release,
+            "test",
+            &wrong_storage,
+        )
+        .await
+        .is_err()
+    );
+    let mut legacy_identity = serde_json::to_value(&identity).unwrap();
+    legacy_identity.as_object_mut().unwrap().remove("storage_prefix");
+    fs::write(
+        cache.join(".surge-staged-release.json"),
+        serde_json::to_vec(&legacy_identity).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        super::super::state::verify_remote_stage_readiness(
+            "fixture",
+            "fixture",
+            "demoapp",
+            "linux-x64",
+            &release,
+            "test",
+            &storage,
+        )
+        .await
+        .is_err()
+    );
+    fs::write(
+        cache.join(".surge-staged-release.json"),
+        serde_json::to_vec(&identity).unwrap(),
+    )
     .unwrap();
     fs::write(
         install.join(".surge-update-status.json"),

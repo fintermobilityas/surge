@@ -181,6 +181,8 @@ pub(crate) struct RemoteStagedPayloadIdentity {
     pub(crate) storage_bucket: String,
     pub(crate) storage_region: String,
     pub(crate) storage_endpoint: String,
+    #[serde(default)]
+    pub(crate) storage_prefix: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

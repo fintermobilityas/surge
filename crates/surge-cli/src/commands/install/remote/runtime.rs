@@ -296,7 +296,7 @@ pub(crate) fn build_remote_process_verification_probe(
 ) -> String {
     format!(
         r#"install_root={}; main_exe={}; supervisor_id={}; version={};
-active_exe="$install_root/app/$main_exe"; status_file="$install_root/.surge-update-status.json"; app_seen=0; target_app_seen=0; stale_app_seen=0; stale_retained_app_seen=0; supervisor_seen=0; stale_supervisor_seen=0; waiting_supervisor_seen=0; target_supervisor_seen=0; target_app_pids=""; watched_pids=""; supervisor_pids=""; parent_supervisor_pids=""; status_converged=0;
+active_exe="$install_root/app/$main_exe"; status_file="$install_root/.surge-update-status.json"; app_seen=0; target_app_seen=0; stale_app_seen=0; stale_retained_app_seen=0; supervisor_seen=0; stale_supervisor_seen=0; waiting_supervisor_seen=0; target_supervisor_seen=0; unverifiable_watch_seen=0; target_app_pids=""; watched_pids=""; supervisor_pids=""; parent_supervisor_pids=""; status_converged=0;
 active_app_dir="$(readlink -f "$install_root/app" 2>/dev/null || true)";
 active_exe_resolved="$(readlink -f "$active_exe" 2>/dev/null || true)";
 case "$active_exe_resolved" in "$active_app_dir"/*) ;; *) echo 'active executable does not resolve inside the active app directory'; exit 0 ;; esac;
@@ -320,6 +320,8 @@ process_exe_matches_active() {{ actual="$(process_exe_path "$1")"; [ "$actual" =
 process_exe_is_retained_app() {{ actual="$(process_exe_path "$1")"; case "$actual" in "$resolved_install_root"/app-*/*|"$resolved_install_root"/.surge-app-prev/*|"$resolved_install_root"/"$main_exe") return 0 ;; esac; return 1; }}
 process_supervisor_matches_active() {{ actual="$(process_exe_path "$1")"; case "$actual" in "$active_supervisor"|"$resolved_install_root/.surge-supervisor-$supervisor_id.exe") [ -n "$actual" ] && return 0 ;; esac; return 1; }}
 process_parent_pid() {{ awk '/^PPid:/ {{ print $2 }}' "/proc/$1/status" 2>/dev/null; }}
+process_start_ticks() {{ proc_stat="$(cat "/proc/$1/stat" 2>/dev/null)" || return 1; printf '%s\n' "${{proc_stat##*) }}" | awk '{{ print $20 }}'; }}
+watched_identity_matches() {{ case "$2" in ''|*[!0-9]*) return 1 ;; esac; [ "$(process_start_ticks "$1")" = "$2" ]; }}
 supervisor_option() {{ SURGE_PROBE_OPTION="$2" awk -v RS='\0' 'NR == 1 {{ next }} $0 == "--" {{ exit }} take {{ print; exit }} $0 == ENVIRON["SURGE_PROBE_OPTION"] {{ take=1; next }} index($0, ENVIRON["SURGE_PROBE_OPTION"] "=") == 1 {{ print substr($0, length(ENVIRON["SURGE_PROBE_OPTION"]) + 2); exit }}' "/proc/$1/cmdline" 2>/dev/null; }}
 for cmdline in /proc/[0-9]*/cmdline; do
   [ -r "$cmdline" ] || continue;
@@ -336,7 +338,9 @@ for cmdline in /proc/[0-9]*/cmdline; do
     supervisor_seen=1;
     supervisor_pids="${{supervisor_pids}}${{pid}} ";
     watched_pid="$(supervisor_option "$pid" --pid)";
-    case "$watched_pid" in ''|*[!0-9]*) : ;; *) watched_pids="${{watched_pids}}${{pid}}:${{watched_pid}} " ;; esac;
+    watched_start_time="$(supervisor_option "$pid" --pid-start-time)";
+    case "$watched_start_time" in ''|*[!0-9]*) watched_start_time='' ;; esac;
+    case "$watched_pid" in ''|*[!0-9]*) : ;; *) watched_pids="${{watched_pids}}${{pid}}:${{watched_pid}}:${{watched_start_time}} " ;; esac;
     case " $cmd " in *" --surge-first-run "*) if ! contains_target_first_run "$cmd"; then stale_supervisor_seen=1; fi ;; esac;
   fi;
 done;
@@ -348,9 +352,12 @@ for supervisor_pid in $supervisor_pids; do
   done;
 done;
 for watched in $watched_pids; do
-  supervisor_pid="${{watched%%:*}}"; watched_pid="${{watched#*:}}";
+  supervisor_pid="${{watched%%:*}}"; watched_identity="${{watched#*:}}"; watched_pid="${{watched_identity%%:*}}"; watched_start_time="${{watched_identity#*:}}";
   case " $parent_supervisor_pids " in *" $supervisor_pid "*) continue ;; esac;
-  case " $target_app_pids " in *" $watched_pid "*) if process_exe_matches_active "$watched_pid"; then target_supervisor_seen=1; fi ;; *) if kill -0 "$watched_pid" 2>/dev/null; then waiting_supervisor_seen=1; fi ;; esac;
+  if [ -z "$watched_start_time" ]; then unverifiable_watch_seen=1; continue; fi;
+  if watched_identity_matches "$watched_pid" "$watched_start_time"; then
+    case " $target_app_pids " in *" $watched_pid "*) if process_exe_matches_active "$watched_pid"; then target_supervisor_seen=1; fi ;; *) if kill -0 "$watched_pid" 2>/dev/null; then waiting_supervisor_seen=1; fi ;; esac;
+  fi;
 done;
 if [ "$target_app_seen" -ne 1 ]; then
   if [ "$app_seen" -eq 1 ]; then echo "app process for $active_exe is running without target proof for $version"; else echo "app process for $active_exe was not found"; fi;
@@ -361,6 +368,7 @@ if [ "$stale_retained_app_seen" -eq 1 ]; then echo "stale app process for $main_
 if [ -n "$supervisor_id" ] && [ "$waiting_supervisor_seen" -eq 1 ]; then echo "supervisor process '$supervisor_id' is still waiting for the previous child"; exit 0; fi;
 if [ -n "$supervisor_id" ] && [ "$stale_supervisor_seen" -eq 1 ]; then echo "supervisor process '$supervisor_id' is running with stale first-run proof"; exit 0; fi;
 if [ -n "$supervisor_id" ] && [ "$supervisor_seen" -ne 1 ]; then echo "supervisor process '$supervisor_id' was not found"; exit 0; fi;
+if [ -n "$supervisor_id" ] && [ "$target_supervisor_seen" -ne 1 ] && [ "$unverifiable_watch_seen" -eq 1 ]; then echo "legacy watched PID lacks start-time identity and no current parent relationship was proven"; exit 0; fi;
 if [ -n "$supervisor_id" ] && [ "$target_supervisor_seen" -ne 1 ]; then echo "supervisor process '$supervisor_id' is not watching target app process for $version"; exit 0; fi;
 echo ready"#,
         shell_single_quote(&install_root.to_string_lossy()),

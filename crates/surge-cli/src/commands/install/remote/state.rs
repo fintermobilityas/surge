@@ -305,6 +305,7 @@ pub(crate) fn remote_staged_payload_identity(
         storage_bucket: storage_config.bucket.trim().to_string(),
         storage_region: storage_config.region.trim().to_string(),
         storage_endpoint: storage_config.endpoint.trim().to_string(),
+        storage_prefix: storage_config.prefix.trim().to_string(),
     }
 }
 

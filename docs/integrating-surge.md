@@ -264,7 +264,9 @@ A remote `install --stage` waits for the detached installer to exit successfully
 then checks the same version/channel/storage identity and payload files as
 `--verify-stage`. An application's earlier `converged` or `failed` update status does
 not describe this staging operation. Quiet polling allows the full progress deadline;
-installer output renews it. Installation also waits for its current installer result
+installer output renews it. Staged identity includes the storage prefix; legacy
+markers without a prefix match only the empty namespace and otherwise require
+restaging with an installer that records the prefix. Installation also waits for its current installer result
 and requires the requested target/installed version before accepting convergence.
 
 A node-local `flock` is acquired before inspecting installed state and is held
@@ -292,7 +294,9 @@ active app directory, matching device/inode identity, and the actual
 parent relationship to the expected supervisor. Only its own arguments before `--` identify it; forwarded
 child arguments cannot supply its ID or watched PID. Version arguments never
 substitute for executable identity, including for the original watched PID. Its original `watch --pid` argument
-may refer to an exited child. Unrelated processes, other supervisor identities and
+may refer to an exited child. The original watched PID must also match its recorded
+`--pid-start-time`; a legacy watch without that option requires a current parent
+relationship, otherwise verification reports the missing identity. Unrelated processes, other supervisor identities and
 processes still running from a superseded application directory remain failures,
 including when executable symlink targets changed between releases. Retained-directory
 checks cover all executable paths there, even after old symlinks have been removed.

@@ -107,7 +107,7 @@ pub(crate) fn build_remote_detached_install_launch_command(flags: &str, operatio
     let inner = format!(
         "{}; identity=\"$(process_identity \"$$\")\" || exit 1; \
          printf '%s\\n' \"$identity\" > /tmp/.surge-installer.identity; \
-         echo $$ > {REMOTE_INSTALLER_PID_PATH}; {REMOTE_INSTALLER_FINAL_PATH} {flags}; result=$?; \
+         echo $$ > {REMOTE_INSTALLER_PID_PATH}.partial; mv {REMOTE_INSTALLER_PID_PATH}.partial {REMOTE_INSTALLER_PID_PATH}; {REMOTE_INSTALLER_FINAL_PATH} {flags}; result=$?; \
          printf '%s\\n' \"$result\" > /tmp/.surge-installer.result.partial; \
          mv /tmp/.surge-installer.result.partial /tmp/.surge-installer.result; exit \"$result\"",
         process_identity_function()
@@ -115,7 +115,7 @@ pub(crate) fn build_remote_detached_install_launch_command(flags: &str, operatio
     format!(
         "set -eu; \
 if [ ! -x {REMOTE_INSTALLER_FINAL_PATH} ]; then echo 'remote installer binary is missing or not executable' >&2; exit 1; fi; \
-rm -f /tmp/.surge-installer.result /tmp/.surge-installer.result.partial {REMOTE_INSTALLER_PID_PATH}; \
+rm -f /tmp/.surge-installer.result /tmp/.surge-installer.result.partial {REMOTE_INSTALLER_PID_PATH} {REMOTE_INSTALLER_PID_PATH}.partial; \
 printf '%s\\n' {} > /tmp/.surge-installer.operation; \
 : > {REMOTE_INSTALLER_LOG_PATH}; \
 inner={}; \
@@ -146,8 +146,8 @@ pub(crate) fn build_remote_detached_install_cleanup_command(operation: &str) -> 
     format!(
         "set -eu; current=\"$(cat /tmp/.surge-installer.operation 2>/dev/null || true)\"; \
          [ \"$current\" = {} ] || {{ echo 'installer operation changed; refusing cleanup' >&2; exit 1; }}; \
-         {}; if [ \"$alive\" = yes ] || [ \"$unverified\" = yes ]; then exit 0; fi; \
-         rm -f {REMOTE_INSTALLER_FINAL_PATH} {REMOTE_INSTALLER_PID_PATH} {REMOTE_INSTALLER_FINAL_PATH}.partial {REMOTE_INSTALLER_FINAL_PATH}.partial.meta /tmp/.surge-installer.operation /tmp/.surge-installer.result /tmp/.surge-installer.result.partial /tmp/.surge-installer.identity",
+         {}; if [ \"$alive\" = yes ] || [ \"$unverified\" = yes ] || {{ [ -z \"$pid\" ] && [ ! -s /tmp/.surge-installer.result ]; }}; then exit 0; fi; \
+         rm -f {REMOTE_INSTALLER_FINAL_PATH} {REMOTE_INSTALLER_PID_PATH} {REMOTE_INSTALLER_FINAL_PATH}.partial {REMOTE_INSTALLER_FINAL_PATH}.partial.meta {REMOTE_INSTALLER_PID_PATH}.partial /tmp/.surge-installer.operation /tmp/.surge-installer.result /tmp/.surge-installer.result.partial /tmp/.surge-installer.identity",
         shell_single_quote(operation),
         installer_process_probe()
     )
@@ -161,6 +161,27 @@ async fn run_remote_detached_install_script(ssh_target: &str, script: &str) -> R
 pub(crate) async fn probe_remote_detached_install(ssh_target: &str) -> Result<RemoteDetachedInstallProbe> {
     let raw = run_remote_detached_install_script(ssh_target, &build_remote_detached_install_probe_command()).await?;
     parse_remote_detached_install_probe(raw.trim())
+}
+
+pub(crate) async fn probe_remote_install_before_transfer(
+    ssh_target: &str,
+    installer_lock: &mut super::lock::RemoteInstallerLock,
+    timeout: Duration,
+) -> Result<RemoteDetachedInstallProbe> {
+    let started = Instant::now();
+    loop {
+        installer_lock.ensure_held()?;
+        let probe = probe_remote_detached_install(ssh_target).await?;
+        if probe.operation.is_none() || probe.pid.is_some() || probe.exit_code.is_some() {
+            return Ok(probe);
+        }
+        if started.elapsed() >= timeout {
+            return Err(SurgeError::Platform(
+                "A detached installer launch has not published its PID or result; preserving the operation and refusing transfer cleanup. Retry after startup completes or inspect the remote installer log.".to_string(),
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }
 
 pub(crate) async fn cleanup_remote_detached_install(ssh_target: &str, operation: &str) -> Result<()> {
@@ -459,7 +480,7 @@ mod tests {
         let command = build_remote_detached_install_launch_command("--no-start --reinstall", "test-operation");
         assert!(command.contains("setsid sh -c \"$inner\""));
         assert!(command.contains("nohup sh -c \"$inner\""));
-        assert!(command.contains("echo $$ > /tmp/.surge-installer.pid"));
+        assert!(command.contains("echo $$ > /tmp/.surge-installer.pid.partial"));
         assert!(command.contains("/tmp/.surge-installer --no-start --reinstall; result=$?"));
         assert!(command.contains("2>&1 < /dev/null &"));
         assert!(command.contains("echo \"launched $pid\""));
@@ -515,6 +536,9 @@ mod tests {
         assert!(run().status.success());
         assert!(bin.exists());
         std::fs::remove_file(pid).unwrap();
+        assert!(run().status.success());
+        assert!(bin.exists(), "a launch without a published PID must survive cleanup");
+        std::fs::write(temp.path().join(".surge-installer.result"), "0").unwrap();
         assert!(run().status.success());
         assert!(!bin.exists());
         assert!(!operation.exists());

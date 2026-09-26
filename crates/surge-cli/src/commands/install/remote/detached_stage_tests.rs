@@ -52,6 +52,39 @@ async fn isolated_stage_monitor_worker() {
             .await
             .is_err()
     );
+    let pending = root.join(".surge-installer.operation");
+    let installer = root.join(".surge-installer");
+    fs::write(&pending, "starting-operation").unwrap();
+    fs::write(&installer, "preserve-starting-installer").unwrap();
+    drop(controller_lock);
+    let mut controller_lock = super::super::lock::RemoteInstallerLock::acquire("fixture")
+        .await
+        .unwrap();
+    let result = probe_remote_install_before_transfer("fixture", &mut controller_lock, Duration::ZERO).await;
+    assert!(result.is_err());
+    assert_eq!(fs::read_to_string(&pending).unwrap(), "starting-operation");
+    assert_eq!(fs::read_to_string(&installer).unwrap(), "preserve-starting-installer");
+    let publish_root = root.clone();
+    let publisher = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        fs::write(
+            publish_root.join(".surge-installer.identity"),
+            super::super::detached_identity::current_process_identity(),
+        )
+        .unwrap();
+        fs::write(
+            publish_root.join(".surge-installer.pid"),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+    });
+    let probe = probe_remote_install_before_transfer("fixture", &mut controller_lock, Duration::from_secs(5))
+        .await
+        .unwrap();
+    publisher.join().unwrap();
+    assert!(probe.alive);
+    assert_eq!(probe.operation.as_deref(), Some("starting-operation"));
+    assert_eq!(fs::read_to_string(&installer).unwrap(), "preserve-starting-installer");
     let install = root.join(".local/share/demoapp");
     fs::create_dir_all(&install).unwrap();
     let release = ReleaseEntry {

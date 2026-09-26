@@ -271,7 +271,10 @@ A node-local `flock` serializes detached controllers across probe, transfer, lau
 monitoring and cleanup. Disconnecting the controller releases that lock while the
 installer keeps running. Re-running an identical installer and flag set then
 reattaches to its detached operation. Another connected controller is reported as
-busy. Cleanup checks ownership and leaves live installer helpers in place.
+busy. If a disconnect happens before PID publication, the next controller waits up
+to 30 seconds for publication before any transfer cleanup. An unresolved launch is
+left untouched and reported; inspect its log before attempting manual recovery.
+Cleanup checks ownership and leaves live or still-starting installer helpers in place.
 A different or legacy operation still running on the node is reported instead of
 being stopped or overwritten. Wait for it to finish before starting another operation.
 An interrupted stage without a completion result cannot report success. Installer PID

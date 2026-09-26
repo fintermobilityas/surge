@@ -415,7 +415,12 @@ pub(super) async fn install_release_via_tailscale(
     let mut installer_lock = lock::RemoteInstallerLock::acquire(ssh_target).await?;
     let mut watch_log_offset = 0_u64;
     let mut reattached = false;
-    let probe = detached::probe_remote_detached_install(ssh_target).await?;
+    let probe = detached::probe_remote_install_before_transfer(
+        ssh_target,
+        &mut installer_lock,
+        std::time::Duration::from_secs(30),
+    )
+    .await?;
     if probe.unverified_alive {
         return Err(SurgeError::Platform("A legacy installer PID is alive without verifiable process identity; leave it running and retry after it exits".to_string()));
     }

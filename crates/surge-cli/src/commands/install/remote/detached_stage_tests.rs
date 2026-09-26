@@ -58,6 +58,24 @@ fn current_fixture_storage(root: &Path) -> StorageConfig {
 
 async fn invoke_current_fixture_install(root: &Path, plan_only: bool, force: bool, stage: bool) -> Result<()> {
     use crate::commands::install::{InstallBehavior, InstallMode};
+    invoke_fixture_install(
+        root,
+        InstallBehavior {
+            plan_only,
+            force,
+            no_start: true,
+            mode: if stage {
+                InstallMode::StageOnly
+            } else {
+                InstallMode::Install
+            },
+            ..InstallBehavior::default()
+        },
+    )
+    .await
+}
+
+async fn invoke_fixture_install(root: &Path, behavior: crate::commands::install::InstallBehavior) -> Result<()> {
     let release = current_fixture_release();
     let storage = current_fixture_storage(root);
     let backend = surge_core::storage::filesystem::FilesystemBackend::new(root.to_str().unwrap(), "");
@@ -75,17 +93,7 @@ async fn invoke_current_fixture_install(root: &Path, plan_only: bool, force: boo
         "test",
         &storage,
         &release.full_filename,
-        InstallBehavior {
-            plan_only,
-            force,
-            no_start: true,
-            mode: if stage {
-                InstallMode::StageOnly
-            } else {
-                InstallMode::Install
-            },
-            ..InstallBehavior::default()
-        },
+        behavior,
     )
     .await
 }
@@ -183,13 +191,14 @@ async fn isolated_stage_monitor_worker() {
         &current_fixture_release(),
         "test",
         &current_fixture_storage(&root),
-        crate::commands::install::InstallBehavior {
-            no_start: true,
-            ..Default::default()
-        },
+        crate::commands::install::InstallBehavior::default(),
     )
     .unwrap();
     fs::write(&pending, request).unwrap();
+    let missing_intent = invoke_fixture_install(&root, crate::commands::install::InstallBehavior::default()).await;
+    assert!(missing_intent.unwrap_err().to_string().contains("verification intent"));
+    assert!(installer.exists());
+    fs::write(root.join(".surge-installer.verify-started"), "false").unwrap();
     let finish_root = root.clone();
     let finisher = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(200));
@@ -202,7 +211,7 @@ async fn isolated_stage_monitor_worker() {
         fs::write(finish_root.join(".surge-installer.result"), "0").unwrap();
         fs::remove_file(finish_root.join(".surge-installer.pid")).unwrap();
     });
-    let completion = invoke_current_fixture_install(&root, false, false, false).await;
+    let completion = invoke_fixture_install(&root, crate::commands::install::InstallBehavior::default()).await;
     let finished_before_return = root.join("job-finished").exists();
     finisher.join().unwrap();
     completion.unwrap();

@@ -34,6 +34,15 @@ pub(crate) struct RemoteDetachedInstallProbe {
     pub log_size: u64,
     pub operation: Option<String>,
     pub exit_code: Option<i32>,
+    pub verify_started_process: Option<bool>,
+}
+
+impl RemoteDetachedInstallProbe {
+    pub fn verification_intent(&self) -> Result<bool> {
+        self.verify_started_process.ok_or_else(|| SurgeError::Platform(
+            "Detached installer lacks its original process-verification intent; preserving the operation. Retry after it finishes.".to_string(),
+        ))
+    }
 }
 
 pub(crate) fn build_remote_detached_install_probe_command() -> String {
@@ -43,6 +52,8 @@ log={REMOTE_INSTALLER_LOG_PATH}; \
 logsize=0; \
 if [ -f \"$log\" ]; then logsize=\"$(wc -c < \"$log\" | tr -d '[:space:]')\"; fi; \
 operation=\"$(cat /tmp/.surge-installer.operation 2>/dev/null || true)\"; \
+verify_started=\"$(cat /tmp/.surge-installer.verify-started 2>/dev/null || true)\"; \
+printf 'verify_started=%s\\n' \"$verify_started\"; \
 result=\"$(cat /tmp/.surge-installer.result 2>/dev/null || true)\"; \
 printf 'operation=%s\\nresult=%s\\n' \"$operation\" \"$result\"; \
 printf 'pid=%s\\nalive=%s\\nlogsize=%s\\nunverified=%s\\n' \"$pid\" \"$alive\" \"$logsize\" \"$unverified\"",
@@ -57,6 +68,7 @@ pub(crate) fn parse_remote_detached_install_probe(output: &str) -> Result<Remote
     let mut log_size = 0_u64;
     let mut operation = None;
     let mut exit_code = None;
+    let mut verify_started_process = None;
     for line in output.lines() {
         let line = line.trim();
         if let Some(value) = line.strip_prefix("pid=") {
@@ -75,6 +87,12 @@ pub(crate) fn parse_remote_detached_install_probe(output: &str) -> Result<Remote
                         .map_err(|e| SurgeError::Platform(format!("Invalid detached installer result: {e}")))?,
                 );
             }
+        } else if let Some(value) = line.strip_prefix("verify_started=") {
+            verify_started_process = match value {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => None,
+            };
         } else if let Some(value) = line.strip_prefix("alive=") {
             alive = value == "yes";
         } else if let Some(value) = line.strip_prefix("unverified=") {
@@ -92,6 +110,7 @@ pub(crate) fn parse_remote_detached_install_probe(output: &str) -> Result<Remote
         log_size,
         operation,
         exit_code,
+        verify_started_process,
     })
 }
 
@@ -102,7 +121,11 @@ pub(crate) fn parse_remote_detached_install_probe(output: &str) -> Result<Remote
 /// `flags` must contain only the fixed CLI flag tokens (`--no-start`,
 /// `--stage`, `--reinstall`); it is interpolated unquoted into the inner
 /// command on purpose.
-pub(crate) fn build_remote_detached_install_launch_command(flags: &str, operation: &str) -> String {
+pub(crate) fn build_remote_detached_install_launch_command(
+    flags: &str,
+    operation: &str,
+    verify_started: bool,
+) -> String {
     let flags = flags.trim();
     let inner = format!(
         "{}; identity=\"$(process_identity \"$$\")\" || exit 1; \
@@ -116,6 +139,7 @@ pub(crate) fn build_remote_detached_install_launch_command(flags: &str, operatio
         "set -eu; \
 if [ ! -x {REMOTE_INSTALLER_FINAL_PATH} ]; then echo 'remote installer binary is missing or not executable' >&2; exit 1; fi; \
 rm -f /tmp/.surge-installer.result /tmp/.surge-installer.result.partial {REMOTE_INSTALLER_PID_PATH} {REMOTE_INSTALLER_PID_PATH}.partial; \
+printf '%s\\n' {verify_started} > /tmp/.surge-installer.verify-started; \
 printf '%s\\n' {} > /tmp/.surge-installer.operation; \
 : > {REMOTE_INSTALLER_LOG_PATH}; \
 inner={}; \
@@ -147,7 +171,7 @@ pub(crate) fn build_remote_detached_install_cleanup_command(operation: &str) -> 
         "set -eu; current=\"$(cat /tmp/.surge-installer.operation 2>/dev/null || true)\"; \
          [ \"$current\" = {} ] || {{ echo 'installer operation changed; refusing cleanup' >&2; exit 1; }}; \
          {}; if [ \"$alive\" = yes ] || [ \"$unverified\" = yes ] || {{ [ -z \"$pid\" ] && [ ! -s /tmp/.surge-installer.result ]; }}; then exit 0; fi; \
-         rm -f {REMOTE_INSTALLER_FINAL_PATH} {REMOTE_INSTALLER_PID_PATH} {REMOTE_INSTALLER_FINAL_PATH}.partial {REMOTE_INSTALLER_FINAL_PATH}.partial.meta {REMOTE_INSTALLER_PID_PATH}.partial /tmp/.surge-installer.operation /tmp/.surge-installer.result /tmp/.surge-installer.result.partial /tmp/.surge-installer.identity",
+         rm -f {REMOTE_INSTALLER_FINAL_PATH} {REMOTE_INSTALLER_PID_PATH} {REMOTE_INSTALLER_FINAL_PATH}.partial {REMOTE_INSTALLER_FINAL_PATH}.partial.meta {REMOTE_INSTALLER_PID_PATH}.partial /tmp/.surge-installer.operation /tmp/.surge-installer.result /tmp/.surge-installer.result.partial /tmp/.surge-installer.identity /tmp/.surge-installer.verify-started",
         shell_single_quote(operation),
         installer_process_probe()
     )
@@ -477,7 +501,7 @@ mod tests {
 
     #[test]
     fn launch_command_detaches_and_reports_pid() {
-        let command = build_remote_detached_install_launch_command("--no-start --reinstall", "test-operation");
+        let command = build_remote_detached_install_launch_command("--no-start --reinstall", "test-operation", false);
         assert!(command.contains("setsid sh -c \"$inner\""));
         assert!(command.contains("nohup sh -c \"$inner\""));
         assert!(command.contains("echo $$ > /tmp/.surge-installer.pid.partial"));
@@ -488,7 +512,7 @@ mod tests {
 
     #[test]
     fn launch_command_without_flags() {
-        let command = build_remote_detached_install_launch_command("", "test-operation");
+        let command = build_remote_detached_install_launch_command("", "test-operation", true);
         assert!(command.contains("/tmp/.surge-installer ; result=$?"));
         assert!(!command.contains("--no-start"));
     }
@@ -549,7 +573,7 @@ mod tests {
     fn detached_launch_fails_when_the_child_never_publishes_a_pid() {
         let temp = tempfile::tempdir().unwrap();
         let (script, bin, _, pid) = script_for_temp_paths(
-            &build_remote_detached_install_launch_command("", "test-operation"),
+            &build_remote_detached_install_launch_command("", "test-operation", true),
             temp.path(),
         );
         for (path, body) in [
@@ -576,7 +600,7 @@ mod tests {
     fn detached_launch_command_runs_installer_detached_and_reports_pid() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let (script, bin_path, log_path, pid_path) = script_for_temp_paths(
-            &build_remote_detached_install_launch_command("", "test-operation"),
+            &build_remote_detached_install_launch_command("", "test-operation", true),
             temp_dir.path(),
         );
 
@@ -603,6 +627,16 @@ mod tests {
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(output.status.success(), "script failed: {stdout}");
         assert!(stdout.contains("launched "), "expected a launched pid, got: {stdout}");
+
+        let (probe_script, _, _, _) =
+            script_for_temp_paths(&build_remote_detached_install_probe_command(), temp_dir.path());
+        let probe_output = std::process::Command::new("sh")
+            .args(["-c", &probe_script])
+            .output()
+            .unwrap();
+        assert!(probe_output.status.success());
+        let probe = parse_remote_detached_install_probe(&String::from_utf8_lossy(&probe_output.stdout)).unwrap();
+        assert!(probe.verification_intent().unwrap());
 
         let pid = std::fs::read_to_string(&pid_path)
             .expect("pidfile written")

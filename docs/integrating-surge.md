@@ -269,6 +269,11 @@ markers without a prefix match only the empty namespace and otherwise require
 restaging with an installer that records the prefix. Installation also waits for its current installer result
 and requires the requested target/installed version before accepting convergence.
 
+The detached job records whether its original convergence plan requires a running
+process. Reattachment preserves that intent: metadata-only repair does not require
+starting a previously stopped application. A live job missing that record is left
+untouched and reported until it finishes.
+
 A node-local `flock` is acquired before inspecting installed state and is held
 through runtime convergence, app-copy/cache activation, transfer, launch, monitoring
 and cleanup. A live detached operation prevents package-current early success and

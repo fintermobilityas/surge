@@ -137,7 +137,7 @@ pub(super) async fn install_release_via_tailscale(
                 &install_target,
                 &operation,
                 &mut lock,
-                !behavior.no_start,
+                probe.verification_intent()?,
             )
             .await;
         }
@@ -448,6 +448,11 @@ pub(super) async fn install_release_via_tailscale(
     let install_flags = format!("{no_start_flag}{stage_flag}{reinstall_flag}");
 
     let mut watch_log_offset = 0_u64;
+    let mut verify_started_process = !behavior.no_start
+        && matches!(
+            convergence_plan.action,
+            RemoteConvergenceAction::CleanInstall | RemoteConvergenceAction::Reinstall
+        );
     let mut reattached = false;
     let probe = detached::probe_remote_install_before_transfer(
         ssh_target,
@@ -465,6 +470,7 @@ pub(super) async fn install_release_via_tailscale(
                 probe.pid.as_deref().unwrap_or("unknown")
             ));
             watch_log_offset = probe.log_size;
+            verify_started_process = probe.verification_intent()?;
             reattached = true;
         } else {
             return Err(SurgeError::Platform(format!(
@@ -508,7 +514,8 @@ pub(super) async fn install_release_via_tailscale(
         // orchestrator death cannot strand the node: the installer keeps
         // running node-locally and this process only watches it.
         installer_lock.ensure_held()?;
-        let launch_script = detached::build_remote_detached_install_launch_command(&install_flags, &operation);
+        let launch_script =
+            detached::build_remote_detached_install_launch_command(&install_flags, &operation, verify_started_process);
         let ssh_command = format!("sh -lc {}", shell_single_quote(&launch_script));
         let launch_output = execution::run_tailscale_capture(&["ssh", ssh_target, ssh_command.as_str()]).await?;
         logline::info(&format!(
@@ -525,11 +532,7 @@ pub(super) async fn install_release_via_tailscale(
         &install_target,
         &operation,
         &mut installer_lock,
-        !behavior.no_start
-            && matches!(
-                convergence_plan.action,
-                RemoteConvergenceAction::CleanInstall | RemoteConvergenceAction::Reinstall
-            ),
+        verify_started_process,
     )
     .await
 }

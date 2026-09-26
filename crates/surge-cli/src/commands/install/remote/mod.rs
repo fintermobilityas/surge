@@ -4,6 +4,7 @@ mod activation;
 mod detached;
 mod execution;
 mod installer_stage;
+mod lock;
 mod published_installer;
 mod reporting;
 mod runtime;
@@ -401,14 +402,16 @@ pub(super) async fn install_release_via_tailscale(
 
     let install_flags = format!("{no_start_flag}{stage_flag}{reinstall_flag}");
     let operation = surge_core::crypto::sha256::sha256_hex(format!("{installer_sha256}:{install_flags}").as_bytes());
-    let stage_target = behavior.mode.is_stage().then_some(detached::RemoteStageTarget {
+    let install_target = detached::RemoteInstallTarget {
+        is_stage: behavior.mode.is_stage(),
         app_id,
         rid: selected_rid,
         release,
         channel,
         storage: storage_config,
-    });
+    };
 
+    let mut installer_lock = lock::RemoteInstallerLock::acquire(ssh_target).await?;
     let mut watch_log_offset = 0_u64;
     let mut reattached = false;
     let probe = detached::probe_remote_detached_install(ssh_target).await?;
@@ -461,6 +464,7 @@ pub(super) async fn install_release_via_tailscale(
         // Launch the installer detached from this SSH session so a local
         // orchestrator death cannot strand the node: the installer keeps
         // running node-locally and this process only watches it.
+        installer_lock.ensure_held()?;
         let launch_script = detached::build_remote_detached_install_launch_command(&install_flags, &operation);
         let ssh_command = format!("sh -lc {}", shell_single_quote(&launch_script));
         let launch_output = execution::run_tailscale_capture(&["ssh", ssh_target, ssh_command.as_str()]).await?;
@@ -475,11 +479,13 @@ pub(super) async fn install_release_via_tailscale(
         file_target,
         &install_root_for_watchdog,
         watch_log_offset,
-        stage_target.as_ref(),
+        &install_target,
         &operation,
+        &mut installer_lock,
     )
     .await?;
-    if let Err(error) = detached::cleanup_remote_detached_install(ssh_target).await {
+    installer_lock.ensure_held()?;
+    if let Err(error) = detached::cleanup_remote_detached_install(ssh_target, &operation).await {
         logline::warn(&format!("Could not remove remote installer transfer helpers: {error}"));
     }
     if !behavior.mode.is_stage() {

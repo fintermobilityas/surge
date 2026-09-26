@@ -17,7 +17,8 @@ pub(crate) const DETACHED_INSTALL_POLL_INTERVAL: Duration = Duration::from_secs(
 pub(crate) const DETACHED_INSTALL_STALE_PROGRESS_TIMEOUT: Duration = Duration::from_mins(5);
 const DETACHED_INSTALL_LOG_TAIL_CAP: u64 = 256 * 1024;
 
-pub(crate) struct RemoteStageTarget<'a> {
+pub(crate) struct RemoteInstallTarget<'a> {
+    pub is_stage: bool,
     pub app_id: &'a str,
     pub rid: &'a str,
     pub release: &'a ReleaseEntry,
@@ -138,9 +139,14 @@ pub(crate) fn build_remote_detached_install_log_tail_command(offset: u64) -> Str
     )
 }
 
-pub(crate) fn build_remote_detached_install_cleanup_command() -> String {
+pub(crate) fn build_remote_detached_install_cleanup_command(operation: &str) -> String {
     format!(
-        "rm -f {REMOTE_INSTALLER_FINAL_PATH} {REMOTE_INSTALLER_PID_PATH} {REMOTE_INSTALLER_FINAL_PATH}.partial {REMOTE_INSTALLER_FINAL_PATH}.partial.meta /tmp/.surge-installer.operation /tmp/.surge-installer.result /tmp/.surge-installer.result.partial"
+        "set -eu; current=\"$(cat /tmp/.surge-installer.operation 2>/dev/null || true)\"; \
+         [ \"$current\" = {} ] || {{ echo 'installer operation changed; refusing cleanup' >&2; exit 1; }}; \
+         pid=\"$(cat {REMOTE_INSTALLER_PID_PATH} 2>/dev/null || true)\"; \
+         case \"$pid\" in ''|*[!0-9]*) : ;; *) if kill -0 \"$pid\" 2>/dev/null; then exit 0; fi ;; esac; \
+         rm -f {REMOTE_INSTALLER_FINAL_PATH} {REMOTE_INSTALLER_PID_PATH} {REMOTE_INSTALLER_FINAL_PATH}.partial {REMOTE_INSTALLER_FINAL_PATH}.partial.meta /tmp/.surge-installer.operation /tmp/.surge-installer.result /tmp/.surge-installer.result.partial",
+        shell_single_quote(operation)
     )
 }
 
@@ -154,8 +160,8 @@ pub(crate) async fn probe_remote_detached_install(ssh_target: &str) -> Result<Re
     parse_remote_detached_install_probe(raw.trim())
 }
 
-pub(crate) async fn cleanup_remote_detached_install(ssh_target: &str) -> Result<()> {
-    run_remote_detached_install_script(ssh_target, &build_remote_detached_install_cleanup_command()).await?;
+pub(crate) async fn cleanup_remote_detached_install(ssh_target: &str, operation: &str) -> Result<()> {
+    run_remote_detached_install_script(ssh_target, &build_remote_detached_install_cleanup_command(operation)).await?;
     Ok(())
 }
 
@@ -188,7 +194,7 @@ async fn poll_remote_detached_install_once(
     install_root: &Path,
     log_offset: &mut u64,
     last_progress: &mut Instant,
-    stage: Option<&RemoteStageTarget<'_>>,
+    target: &RemoteInstallTarget<'_>,
     operation: &str,
 ) -> Result<WatchOutcome> {
     // Relay any new installer output first so the local console mirrors the
@@ -214,32 +220,41 @@ async fn poll_remote_detached_install_once(
             "Remote installer operation changed while watching".to_string(),
         ));
     }
-    if let Some(stage) = stage {
+    if target.is_stage {
         let outcome = stage_process_outcome(&probe, last_progress.elapsed())?;
         if outcome == WatchOutcome::Converged {
             super::state::verify_remote_stage_readiness(
                 ssh_target,
                 file_target,
-                stage.app_id,
-                stage.rid,
-                stage.release,
-                stage.channel,
-                stage.storage,
+                target.app_id,
+                target.rid,
+                target.release,
+                target.channel,
+                target.storage,
             )
             .await?;
         }
         return Ok(outcome);
     }
-    let status = read_remote_update_status_file(ssh_target, install_root).await?;
+    if probe.exit_code.is_some_and(|code| code != 0) || (!probe.alive && probe.exit_code.is_none()) {
+        return Err(SurgeError::Platform(format!(
+            "Remote installer exited without success (result {:?})",
+            probe.exit_code
+        )));
+    }
+    let installer_finished = !probe.alive && probe.exit_code == Some(0);
+    let status = read_remote_update_status_file(ssh_target, install_root)
+        .await?
+        .filter(|status| status.target_version == target.release.version);
 
     if let Some(status) = &status {
-        if status.state == "failed" {
+        if installer_finished && status.state == "failed" {
             return Err(SurgeError::Platform(format!(
                 "Remote setup failed on '{file_target}'{}",
                 status.format_context()
             )));
         }
-        if status.is_terminal_success() {
+        if installer_finished && status.is_terminal_success() && status.installed_version == target.release.version {
             return Ok(WatchOutcome::Converged);
         }
         if status.has_recent_progress(DETACHED_INSTALL_STALE_PROGRESS_TIMEOUT) {
@@ -251,14 +266,17 @@ async fn poll_remote_detached_install_once(
         // The installer can exit right before the final status write; give
         // the status file one grace re-read before declaring failure.
         tokio::time::sleep(DETACHED_INSTALL_POLL_INTERVAL).await;
-        if let Some(status) = read_remote_update_status_file(ssh_target, install_root).await? {
+        if let Some(status) = read_remote_update_status_file(ssh_target, install_root)
+            .await?
+            .filter(|status| status.target_version == target.release.version)
+        {
             if status.state == "failed" {
                 return Err(SurgeError::Platform(format!(
                     "Remote setup failed on '{file_target}'{}",
                     status.format_context()
                 )));
             }
-            if status.is_terminal_success() {
+            if status.is_terminal_success() && status.installed_version == target.release.version {
                 return Ok(WatchOutcome::Converged);
             }
             // Restart handoff in progress: the new process owns the status
@@ -312,14 +330,16 @@ pub(crate) async fn watch_remote_detached_install(
     file_target: &str,
     install_root: &Path,
     start_log_offset: u64,
-    stage: Option<&RemoteStageTarget<'_>>,
+    target: &RemoteInstallTarget<'_>,
     operation: &str,
+    installer_lock: &mut super::lock::RemoteInstallerLock,
 ) -> Result<()> {
     let started_at = Instant::now();
     let mut log_offset = start_log_offset;
     let mut last_progress = started_at;
 
     loop {
+        installer_lock.ensure_held()?;
         if started_at.elapsed() >= DETACHED_INSTALL_MONITOR_TIMEOUT {
             return Err(SurgeError::Platform(format!(
                 "Timed out after {}s waiting for the detached remote installer on '{file_target}' to converge",
@@ -333,7 +353,7 @@ pub(crate) async fn watch_remote_detached_install(
             install_root,
             &mut log_offset,
             &mut last_progress,
-            stage,
+            target,
             operation,
         )
         .await
@@ -458,7 +478,7 @@ printf 'pid=%s\\nalive=%s\\nlogsize=%s\\n'"
 
     #[test]
     fn cleanup_command_targets_expected_paths() {
-        let cleanup = build_remote_detached_install_cleanup_command();
+        let cleanup = build_remote_detached_install_cleanup_command("test-operation");
         assert!(cleanup.contains("rm -f /tmp/.surge-installer /tmp/.surge-installer.pid"));
     }
 
@@ -472,6 +492,29 @@ printf 'pid=%s\\nalive=%s\\nlogsize=%s\\n'"
         let bin_path = base.join(".surge-installer");
         let script = script.replace("/tmp/.surge-installer", &bin_path.to_string_lossy());
         (script, bin_path, log_path, pid_path)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_preserves_a_different_operation_and_live_installer() {
+        let temp = tempfile::tempdir().unwrap();
+        let (script, bin, _, pid) =
+            script_for_temp_paths(&build_remote_detached_install_cleanup_command("owned"), temp.path());
+        let operation = temp.path().join(".surge-installer.operation");
+        std::fs::write(&bin, "installer").unwrap();
+        std::fs::write(&operation, "different").unwrap();
+        let run = || std::process::Command::new("sh").args(["-c", &script]).output().unwrap();
+        assert!(!run().status.success());
+        assert!(bin.exists());
+        assert_eq!(std::fs::read_to_string(&operation).unwrap(), "different");
+        std::fs::write(&operation, "owned").unwrap();
+        std::fs::write(&pid, std::process::id().to_string()).unwrap();
+        assert!(run().status.success());
+        assert!(bin.exists());
+        std::fs::remove_file(pid).unwrap();
+        assert!(run().status.success());
+        assert!(!bin.exists());
+        assert!(!operation.exists());
     }
 
     #[cfg(unix)]

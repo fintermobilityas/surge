@@ -135,7 +135,7 @@ async fn cleanup_remote_installer_transfer_helpers(ssh_target: &str, file_target
     Ok(())
 }
 
-fn build_remote_installer_transfer_cleanup_command() -> String {
+pub(super) fn build_remote_installer_transfer_cleanup_command() -> String {
     "set -eu; \
 partial=/tmp/.surge-installer.partial; \
 pattern='[.]surge-installer|[.]surge-transfer-stage'; \

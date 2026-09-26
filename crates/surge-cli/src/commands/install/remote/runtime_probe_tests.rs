@@ -50,6 +50,16 @@ fn fixture() -> tempfile::TempDir {
 }
 
 fn spawn_supervisor(root: &Path, id: &str, watched: u32, processes: &mut Processes) -> u32 {
+    spawn_supervisor_with_args(root, id, watched, &[], processes)
+}
+
+fn spawn_supervisor_with_args(
+    root: &Path,
+    id: &str,
+    watched: u32,
+    child_args: &[&str],
+    processes: &mut Processes,
+) -> u32 {
     let child_pid = root.join("child.pid");
     let child = spawn(
         Command::new(root.join("app/surge-supervisor"))
@@ -59,6 +69,7 @@ fn spawn_supervisor(root: &Path, id: &str, watched: u32, processes: &mut Process
             .arg(root.join("app/demoapp"))
             .arg(&child_pid)
             .args(["--id", id, "--pid", &watched.to_string()])
+            .args(child_args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null()),
@@ -166,4 +177,71 @@ fn process_probe_rejects_supervisor_id_prefix_match() {
     let result = run_probe(root.path());
     stop_spawned_child(root.path());
     assert_ne!(result, "ready");
+}
+
+#[test]
+fn process_probe_rejects_supervisor_id_in_forwarded_child_arguments() {
+    let root = fixture();
+    let mut processes = Processes(Vec::new());
+    spawn_supervisor_with_args(
+        root.path(),
+        "other-supervisor",
+        999_999,
+        &["--", "--id", "demo-supervisor"],
+        &mut processes,
+    );
+    let result = run_probe(root.path());
+    stop_spawned_child(root.path());
+    assert_ne!(result, "ready");
+}
+
+#[test]
+fn process_probe_rejects_unrelated_supervisor_with_target_first_run_argument() {
+    let root = fixture();
+    let mut processes = Processes(Vec::new());
+    processes
+        .0
+        .push(spawn(Command::new(root.path().join("app/demoapp")).arg("30")));
+    processes.0.push(spawn(
+        Command::new(root.path().join("app/surge-supervisor"))
+            .args([
+                "-c",
+                "read answer",
+                "run",
+                "--id",
+                "demo-supervisor",
+                "--",
+                "--surge-first-run",
+                "1.2.3",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    ));
+    assert_ne!(run_probe(root.path()), "ready");
+}
+
+#[test]
+fn process_probe_accepts_original_watched_app() {
+    let root = fixture();
+    let mut processes = Processes(Vec::new());
+    let app = spawn(Command::new(root.path().join("app/demoapp")).arg("30"));
+    let app_pid = app.id().to_string();
+    processes.0.push(app);
+    processes.0.push(spawn(
+        Command::new(root.path().join("app/surge-supervisor"))
+            .args([
+                "-c",
+                "read answer",
+                "watch",
+                "--id",
+                "demo-supervisor",
+                "--pid",
+                &app_pid,
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    ));
+    assert_eq!(run_probe(root.path()), "ready");
 }

@@ -109,6 +109,10 @@ pub(crate) async fn read_remote_update_status_file(
 pub(crate) struct RemoteUpdateStatusSnapshot {
     pub(crate) state: String,
     #[serde(default)]
+    pub(crate) target_version: String,
+    #[serde(default)]
+    pub(crate) installed_version: String,
+    #[serde(default)]
     reason: Option<String>,
     #[serde(default)]
     last_progress_at_utc: Option<String>,

@@ -313,7 +313,7 @@ process_exe_matches_active() {{ actual="$(process_exe_path "$1")"; [ "$actual" =
 process_exe_is_retained_app() {{ actual="$(process_exe_path "$1")"; case "$actual" in "$install_root"/app-*/"$main_exe"|"$install_root"/.surge-app-prev/"$main_exe"|"$install_root"/"$main_exe") return 0 ;; esac; return 1; }}
 process_supervisor_matches_active() {{ actual="$(process_exe_path "$1")"; case "$actual" in "$install_root/app/surge-supervisor"|"$install_root/.surge-supervisor-$supervisor_id.exe") return 0 ;; esac; return 1; }}
 process_parent_pid() {{ awk '/^PPid:/ {{ print $2 }}' "/proc/$1/status" 2>/dev/null; }}
-extract_watched_pid() {{ case "$1" in *" watch "*" --pid "*) rest="${{1#* --pid }}"; watched_pid="${{rest%% *}}"; case "$watched_pid" in ""|*[!0-9]*) return 1 ;; esac; printf '%s\n' "$watched_pid"; return 0 ;; esac; return 1; }}
+supervisor_option() {{ SURGE_PROBE_OPTION="$2" awk -v RS='\0' 'NR == 1 {{ next }} $0 == "--" {{ exit }} take {{ print; exit }} $0 == ENVIRON["SURGE_PROBE_OPTION"] {{ take=1; next }} index($0, ENVIRON["SURGE_PROBE_OPTION"] "=") == 1 {{ print substr($0, length(ENVIRON["SURGE_PROBE_OPTION"]) + 2); exit }}' "/proc/$1/cmdline" 2>/dev/null; }}
 for cmdline in /proc/[0-9]*/cmdline; do
   [ -r "$cmdline" ] || continue;
   pid="${{cmdline%/cmdline}}"; pid="${{pid##*/}}";
@@ -322,13 +322,12 @@ for cmdline in /proc/[0-9]*/cmdline; do
   if process_exe_is_retained_app "$pid"; then stale_retained_app_seen=1; fi;
   [ -n "$cmd" ] || continue;
   case "$cmd" in *"surge-supervisor"*) ;; *"$active_exe"*) app_seen=1; if contains_target_proof "$cmd" || {{ [ "$status_converged" -eq 1 ] && process_exe_matches_active "$pid"; }}; then target_app_seen=1; target_app_pids="${{target_app_pids}}${{pid}} "; else stale_app_seen=1; fi ;; esac;
-  if [ -n "$supervisor_id" ]; then
-    case " $cmd " in *"surge-supervisor"*" --id $supervisor_id "*)
-      supervisor_seen=1;
-      if process_supervisor_matches_active "$pid"; then supervisor_pids="${{supervisor_pids}}${{pid}} "; fi;
-      if watched_pid="$(extract_watched_pid "$cmd")"; then watched_pids="${{watched_pids}}${{pid}}:${{watched_pid}} "; fi;
-      case " $cmd " in *" --surge-first-run "*) if contains_target_first_run "$cmd"; then target_supervisor_seen=1; else stale_supervisor_seen=1; fi ;; esac
-    ;; esac;
+  if [ -n "$supervisor_id" ] && process_supervisor_matches_active "$pid" && [ "$(supervisor_option "$pid" --id)" = "$supervisor_id" ]; then
+    supervisor_seen=1;
+    supervisor_pids="${{supervisor_pids}}${{pid}} ";
+    watched_pid="$(supervisor_option "$pid" --pid)";
+    case "$watched_pid" in ''|*[!0-9]*) : ;; *) watched_pids="${{watched_pids}}${{pid}}:${{watched_pid}} " ;; esac;
+    case " $cmd " in *" --surge-first-run "*) if ! contains_target_first_run "$cmd"; then stale_supervisor_seen=1; fi ;; esac;
   fi;
 done;
 for supervisor_pid in $supervisor_pids; do

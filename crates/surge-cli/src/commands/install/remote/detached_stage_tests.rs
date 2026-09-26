@@ -43,6 +43,15 @@ async fn isolated_stage_monitor_worker() {
         return;
     };
     let root = std::path::PathBuf::from(root);
+    let mut controller_lock = super::super::lock::RemoteInstallerLock::acquire("fixture")
+        .await
+        .unwrap();
+    controller_lock.ensure_held().unwrap();
+    assert!(
+        super::super::lock::RemoteInstallerLock::acquire("fixture")
+            .await
+            .is_err()
+    );
     let install = root.join(".local/share/demoapp");
     fs::create_dir_all(&install).unwrap();
     let release = ReleaseEntry {
@@ -57,7 +66,8 @@ async fn isolated_stage_monitor_worker() {
         bucket: "fixture".to_string(),
         ..StorageConfig::default()
     };
-    let target = RemoteStageTarget {
+    let target = RemoteInstallTarget {
+        is_stage: true,
         app_id: "demoapp",
         rid: "linux-x64",
         release: &release,
@@ -78,7 +88,7 @@ async fn isolated_stage_monitor_worker() {
             &install,
             &mut offset,
             &mut progress,
-            Some(&target),
+            &target,
             operation,
         )
         .await
@@ -93,6 +103,33 @@ async fn isolated_stage_monitor_worker() {
             previous
         );
     }
+    let install_target = RemoteInstallTarget {
+        is_stage: false,
+        ..target
+    };
+    for state in ["converged", "failed"] {
+        for version in ["1.2.2", "1.2.3"] {
+            fs::write(
+                install.join(".surge-update-status.json"),
+                format!(r#"{{"state":"{state}","installed_version":"{version}","target_version":"{version}"}}"#),
+            )
+            .unwrap();
+            assert_eq!(
+                poll_remote_detached_install_once(
+                    "fixture",
+                    "fixture",
+                    &install,
+                    &mut offset,
+                    &mut progress,
+                    &install_target,
+                    operation
+                )
+                .await
+                .unwrap(),
+                WatchOutcome::InProgress
+            );
+        }
+    }
     fs::write(root.join(".surge-installer.operation"), "another-operation").unwrap();
     assert!(
         poll_remote_detached_install_once(
@@ -101,7 +138,7 @@ async fn isolated_stage_monitor_worker() {
             &install,
             &mut offset,
             &mut progress,
-            Some(&target),
+            &target,
             operation
         )
         .await
@@ -116,7 +153,7 @@ async fn isolated_stage_monitor_worker() {
             &install,
             &mut offset,
             &mut progress,
-            Some(&target),
+            &target,
             operation
         )
         .await
@@ -130,7 +167,7 @@ async fn isolated_stage_monitor_worker() {
             &install,
             &mut offset,
             &mut progress,
-            Some(&target),
+            &target,
             operation
         )
         .await,
@@ -154,7 +191,7 @@ async fn isolated_stage_monitor_worker() {
             &install,
             &mut offset,
             &mut progress,
-            Some(&target),
+            &target,
             operation
         )
         .await,
@@ -171,7 +208,7 @@ async fn isolated_stage_monitor_worker() {
             &install,
             &mut offset,
             &mut progress,
-            Some(&target),
+            &target,
             operation
         )
         .await
@@ -189,7 +226,44 @@ async fn isolated_stage_monitor_worker() {
     )
     .await
     .unwrap();
-    let wrong_target = RemoteStageTarget {
+    fs::write(
+        install.join(".surge-update-status.json"),
+        r#"{"state":"converged","installed_version":"1.2.3","target_version":"1.2.3"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        poll_remote_detached_install_once(
+            "fixture",
+            "fixture",
+            &install,
+            &mut offset,
+            &mut progress,
+            &install_target,
+            operation
+        )
+        .await
+        .unwrap(),
+        WatchOutcome::Converged
+    );
+    fs::write(
+        install.join(".surge-update-status.json"),
+        r#"{"state":"converged","installed_version":"1.2.2","target_version":"1.2.2"}"#,
+    )
+    .unwrap();
+    assert!(
+        poll_remote_detached_install_once(
+            "fixture",
+            "fixture",
+            &install,
+            &mut offset,
+            &mut progress,
+            &install_target,
+            operation
+        )
+        .await
+        .is_err()
+    );
+    let wrong_target = RemoteInstallTarget {
         channel: "another-channel",
         ..target
     };
@@ -200,7 +274,7 @@ async fn isolated_stage_monitor_worker() {
             &install,
             &mut offset,
             &mut progress,
-            Some(&wrong_target),
+            &wrong_target,
             operation
         )
         .await,

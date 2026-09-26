@@ -264,15 +264,21 @@ A remote `install --stage` waits for the detached installer to exit successfully
 then checks the same version/channel/storage identity and payload files as
 `--verify-stage`. An application's earlier `converged` or `failed` update status does
 not describe this staging operation. Quiet polling allows the full progress deadline;
-installer output renews it.
+installer output renews it. Installation also waits for its current installer result
+and requires the requested target/installed version before accepting convergence.
 
-Re-running an identical installer and flag set reattaches to its detached operation.
+A node-local `flock` serializes detached controllers across probe, transfer, launch,
+monitoring and cleanup. Disconnecting the controller releases that lock while the
+installer keeps running. Re-running an identical installer and flag set then
+reattaches to its detached operation. Another connected controller is reported as
+busy. Cleanup checks ownership and leaves live installer helpers in place.
 A different or legacy operation still running on the node is reported instead of
 being stopped or overwritten. Wait for it to finish before starting another operation.
 An interrupted stage without a completion result cannot report success.
 
 After a supervisor respawns its child, remote process verification accepts the current
 child only with target-version proof, the expected active executable and the actual
-parent relationship to the expected supervisor. Its original `watch --pid` argument
+parent relationship to the expected supervisor. Only its own arguments before `--` identify it; forwarded
+child arguments cannot supply its ID or watched PID. Its original `watch --pid` argument
 may refer to an exited child. Unrelated processes, other supervisor identities and
 processes still running from a superseded application directory remain failures.

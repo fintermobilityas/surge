@@ -283,19 +283,20 @@ fn process_probe_rejects_out_of_tree_symlink() {
 }
 
 #[test]
-fn process_probe_rejects_retained_symlink_target() {
+fn process_probe_rejects_retained_symlink_target_changed_between_releases() {
     let root = fixture();
     let app = root.path().join("app");
-    let retained = root.path().join("app-1.2.2/bin");
+    let retained = root.path().join("app-1.2.2/lib");
     fs::create_dir(app.join("bin")).unwrap();
     fs::create_dir_all(&retained).unwrap();
     fs::rename(app.join("demoapp"), app.join("bin/actual-app")).unwrap();
-    fs::copy("/bin/sleep", retained.join("actual-app")).unwrap();
+    fs::copy("/bin/sleep", retained.join("old-app")).unwrap();
+    std::os::unix::fs::symlink("lib/old-app", root.path().join("app-1.2.2/demoapp")).unwrap();
     std::os::unix::fs::symlink("bin/actual-app", app.join("demoapp")).unwrap();
     let mut processes = Processes(Vec::new());
     processes
         .0
-        .push(spawn(Command::new(retained.join("actual-app")).arg("30")));
+        .push(spawn(Command::new(retained.join("old-app")).arg("30")));
     spawn_supervisor(root.path(), "demo-supervisor", 999_999, &mut processes);
     let result = run_probe(root.path());
     stop_spawned_child(root.path());

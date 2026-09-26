@@ -292,4 +292,6 @@ active app directory and the actual
 parent relationship to the expected supervisor. Only its own arguments before `--` identify it; forwarded
 child arguments cannot supply its ID or watched PID. Its original `watch --pid` argument
 may refer to an exited child. Unrelated processes, other supervisor identities and
-processes still running from a superseded application directory remain failures.
+processes still running from a superseded application directory remain failures,
+including when executable symlink targets changed between releases. Retained-directory
+checks cover all executable paths there, even after old symlinks have been removed.

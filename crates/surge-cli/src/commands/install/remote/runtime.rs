@@ -301,7 +301,6 @@ active_app_dir="$(readlink -f "$install_root/app" 2>/dev/null || true)";
 active_exe_resolved="$(readlink -f "$active_exe" 2>/dev/null || true)";
 case "$active_exe_resolved" in "$active_app_dir"/*) ;; *) echo 'active executable does not resolve inside the active app directory'; exit 0 ;; esac;
 [ -n "$active_app_dir" ] && [ -f "$active_exe_resolved" ] || {{ echo 'active executable is missing'; exit 0; }};
-resolved_main_relative="${{active_exe_resolved#"$active_app_dir/"}}";
 resolved_install_root="$(readlink -f "$install_root" 2>/dev/null || true)";
 active_supervisor="$(readlink -f "$install_root/app/surge-supervisor" 2>/dev/null || true)";
 case "$active_supervisor" in "$active_app_dir"/*) ;; *) active_supervisor='' ;; esac;
@@ -318,7 +317,7 @@ contains_target_version_arg() {{ cmd_tokens=" $1 "; case "$cmd_tokens" in *" $ve
 contains_target_proof() {{ contains_target_first_run "$1" || contains_target_version_arg "$1"; }}
 process_exe_path() {{ actual="$(readlink "/proc/$1/exe" 2>/dev/null || true)"; case "$actual" in *" (deleted)") actual="${{actual% (deleted)}}" ;; esac; printf '%s\n' "$actual"; }}
 process_exe_matches_active() {{ actual="$(process_exe_path "$1")"; [ "$actual" = "$active_exe_resolved" ]; }}
-process_exe_is_retained_app() {{ actual="$(process_exe_path "$1")"; case "$actual" in "$install_root"/app-*/"$main_exe"|"$install_root"/.surge-app-prev/"$main_exe"|"$install_root"/"$main_exe"|"$resolved_install_root"/app-*/"$resolved_main_relative"|"$resolved_install_root"/.surge-app-prev/"$resolved_main_relative") return 0 ;; esac; return 1; }}
+process_exe_is_retained_app() {{ actual="$(process_exe_path "$1")"; case "$actual" in "$resolved_install_root"/app-*/*|"$resolved_install_root"/.surge-app-prev/*|"$resolved_install_root"/"$main_exe") return 0 ;; esac; return 1; }}
 process_supervisor_matches_active() {{ actual="$(process_exe_path "$1")"; case "$actual" in "$active_supervisor"|"$resolved_install_root/.surge-supervisor-$supervisor_id.exe") [ -n "$actual" ] && return 0 ;; esac; return 1; }}
 process_parent_pid() {{ awk '/^PPid:/ {{ print $2 }}' "/proc/$1/status" 2>/dev/null; }}
 supervisor_option() {{ SURGE_PROBE_OPTION="$2" awk -v RS='\0' 'NR == 1 {{ next }} $0 == "--" {{ exit }} take {{ print; exit }} $0 == ENVIRON["SURGE_PROBE_OPTION"] {{ take=1; next }} index($0, ENVIRON["SURGE_PROBE_OPTION"] "=") == 1 {{ print substr($0, length(ENVIRON["SURGE_PROBE_OPTION"]) + 2); exit }}' "/proc/$1/cmdline" 2>/dev/null; }}

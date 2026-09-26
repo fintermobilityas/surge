@@ -444,6 +444,7 @@ fn persist_staged_installer_cache(dir: &Path, manifest: &InstallerManifest, inst
         "storage_bucket": manifest.storage.bucket.trim(),
         "storage_region": manifest.storage.region.trim(),
         "storage_endpoint": manifest.storage.endpoint.trim(),
+        "storage_prefix": manifest.storage.prefix.trim(),
     });
     std::fs::write(
         staged_installer_dir.join(".surge-staged-release.json"),
@@ -1445,6 +1446,28 @@ mod tests {
             !install_root.join("app").exists(),
             "stage mode should not activate the install"
         );
+    }
+
+    #[test]
+    fn staged_installer_identity_preserves_storage_prefix() {
+        let temp = tempfile::tempdir().unwrap();
+        let installer = temp.path().join("installer");
+        let install_root = temp.path().join("installed");
+        std::fs::create_dir(&installer).unwrap();
+        let mut manifest = make_manifest(&install_root, temp.path(), "demo.tar.zst", "online");
+        manifest.storage.prefix = "tenant-a".into();
+        std::fs::write(installer.join(staged_installer_binary_name()), "fixture").unwrap();
+        std::fs::write(
+            installer.join("installer.yml"),
+            serde_yaml::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
+        persist_staged_installer_cache(&installer, &manifest, &install_root).unwrap();
+        let identity: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(install_root.join(".surge-cache/staged-installer/.surge-staged-release.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(identity["storage_prefix"], "tenant-a");
     }
 
     #[tokio::test]

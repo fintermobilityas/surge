@@ -1182,15 +1182,14 @@ mod tests {
         assert!(probe.contains("process_exe_matches_active()"));
         assert!(probe.contains("process_exe_path()"));
         assert!(probe.contains("process_exe_is_retained_app()"));
-        assert!(probe.contains("extract_watched_pid()"));
+        assert!(probe.contains("supervisor_option()"));
         assert!(probe.contains("*\" --surge-first-run $version \"*|*\" $version --surge-first-run \"*"));
         assert!(probe.contains("*'\"state\":\"converged\"'*"));
         assert!(probe.contains("*'\"installed_version\":\"'\"$version\"'\"'*"));
-        assert!(probe.contains("[ \"$status_converged\" -eq 1 ] && process_exe_matches_active \"$pid\""));
         assert!(probe.contains("target_app_pids"));
         assert!(probe.contains("target_supervisor_seen"));
         assert!(probe.contains("surge-supervisor"));
-        assert!(probe.contains("--id $supervisor_id"));
+        assert!(probe.contains("supervisor_option \"$pid\" --id"));
         assert!(probe.contains("app process for $active_exe was not found"));
         assert!(probe.contains("app process for $active_exe is running without target proof for $version"));
         assert!(probe.contains("stale app process for $active_exe is still running without target proof for $version"));

@@ -257,3 +257,51 @@ Recommended rules:
 - if Surge itself is broken, fix Surge upstream first
 
 This document provides the human-readable context. The app repo `AGENTS.md` should point back to it and restate only the hard rules.
+
+### Detached remote staging and supervisor verification
+
+A remote `install --stage` waits for the detached installer to exit successfully and
+then checks the same version/channel/storage identity and payload files as
+`--verify-stage`. An application's earlier `converged` or `failed` update status does
+not describe this staging operation. Quiet polling allows the full progress deadline;
+installer output renews it. Staged identity includes the storage prefix; legacy
+markers without a prefix match only the empty namespace and otherwise require
+restaging with an installer that records the prefix. Installation also waits for its current installer result
+and requires the requested target/installed version before accepting convergence.
+
+The detached job records whether its original convergence plan requires a running
+process. Reattachment preserves that intent: metadata-only repair does not require
+starting a previously stopped application. A live job missing that record is left
+untouched and reported until it finishes.
+
+A node-local `flock` is acquired before inspecting installed state and is held
+through runtime convergence, app-copy/cache activation, transfer, launch, monitoring
+and cleanup. A live detached operation prevents package-current early success and
+takes the ownership/reattachment path. `--plan-only` remains read-only.
+Staging a package-current version still prepares and verifies its cache. Disconnecting the controller releases that lock while the
+installer keeps running. Re-running the same target artifact, destination and explicit request options
+reattaches before reading installed state or rebuilding an installer. The operation
+fingerprint excludes the state-derived reinstall flag, generated installer bytes,
+credential rotation and unrelated release-index metadata. Another connected controller is reported as
+busy. If a disconnect happens before PID publication, the next controller waits up
+to 30 seconds for publication before any transfer cleanup. An unresolved launch is
+left untouched and reported; inspect its log before attempting manual recovery.
+Cleanup checks ownership and leaves live or still-starting installer helpers in place.
+A different or legacy operation still running on the node is reported instead of
+being stopped or overwritten. Wait for it to finish before starting another operation.
+An interrupted stage without a completion result cannot report success. Installer PID
+records include Linux boot ID and process start ticks, so a reused PID is not treated
+as the original job. A live legacy PID without that identity is left untouched.
+
+After a supervisor respawns its child, remote process verification accepts the current
+child only with target-version proof, the canonical active executable inside the
+active app directory, matching device/inode identity, and the actual
+parent relationship to the expected supervisor. Only its own arguments before `--` identify it; forwarded
+child arguments cannot supply its ID or watched PID. Version arguments never
+substitute for executable identity, including for the original watched PID. Its original `watch --pid` argument
+may refer to an exited child. The original watched PID must also match its recorded
+`--pid-start-time`; a legacy watch without that option requires a current parent
+relationship, otherwise verification reports the missing identity. Unrelated processes, other supervisor identities and
+processes still running from a superseded application directory remain failures,
+including when executable symlink targets changed between releases. Retained-directory
+checks cover all executable paths there, even after old symlinks have been removed.

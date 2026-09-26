@@ -302,3 +302,44 @@ fn process_probe_rejects_retained_symlink_target_changed_between_releases() {
     stop_spawned_child(root.path());
     assert_ne!(result, "ready");
 }
+
+#[test]
+fn process_probe_rejects_watched_process_with_spoofed_app_arguments() {
+    let root = fixture();
+    let mut processes = Processes(Vec::new());
+    let unrelated = spawn(
+        Command::new("/bin/sh")
+            .args(["-c", "read answer"])
+            .arg(root.path().join("app/demoapp"))
+            .args(["--surge-first-run", "1.2.3"])
+            .stdin(Stdio::piped()),
+    );
+    let watched = unrelated.id().to_string();
+    processes.0.push(unrelated);
+    processes.0.push(spawn(
+        Command::new(root.path().join("app/surge-supervisor"))
+            .args([
+                "-c",
+                "read answer",
+                "watch",
+                "--id",
+                "demo-supervisor",
+                "--pid",
+                &watched,
+            ])
+            .stdin(Stdio::piped()),
+    ));
+    assert_ne!(run_probe(root.path()), "ready");
+}
+
+#[test]
+fn process_probe_rejects_process_using_replaced_active_executable() {
+    let root = fixture();
+    let mut processes = Processes(Vec::new());
+    spawn_supervisor(root.path(), "demo-supervisor", 999_999, &mut processes);
+    fs::remove_file(root.path().join("app/demoapp")).unwrap();
+    fs::copy("/bin/sleep", root.path().join("app/demoapp")).unwrap();
+    let result = run_probe(root.path());
+    stop_spawned_child(root.path());
+    assert_ne!(result, "ready");
+}

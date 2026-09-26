@@ -1186,7 +1186,6 @@ mod tests {
         assert!(probe.contains("*\" --surge-first-run $version \"*|*\" $version --surge-first-run \"*"));
         assert!(probe.contains("*'\"state\":\"converged\"'*"));
         assert!(probe.contains("*'\"installed_version\":\"'\"$version\"'\"'*"));
-        assert!(probe.contains("[ \"$status_converged\" -eq 1 ] && process_exe_matches_active \"$pid\""));
         assert!(probe.contains("target_app_pids"));
         assert!(probe.contains("target_supervisor_seen"));
         assert!(probe.contains("surge-supervisor"));

@@ -316,7 +316,7 @@ contains_target_first_run() {{ cmd_tokens=" $1 "; case "$cmd_tokens" in *" --sur
 contains_target_version_arg() {{ cmd_tokens=" $1 "; case "$cmd_tokens" in *" $version "*) return 0 ;; esac; return 1; }}
 contains_target_proof() {{ contains_target_first_run "$1" || contains_target_version_arg "$1"; }}
 process_exe_path() {{ actual="$(readlink "/proc/$1/exe" 2>/dev/null || true)"; case "$actual" in *" (deleted)") actual="${{actual% (deleted)}}" ;; esac; printf '%s\n' "$actual"; }}
-process_exe_matches_active() {{ actual="$(process_exe_path "$1")"; [ "$actual" = "$active_exe_resolved" ]; }}
+process_exe_matches_active() {{ actual="$(process_exe_path "$1")"; [ "$actual" = "$active_exe_resolved" ] || return 1; expected_identity="$(stat -Lc '%d:%i' "$active_exe_resolved" 2>/dev/null || true)"; actual_identity="$(stat -Lc '%d:%i' "/proc/$1/exe" 2>/dev/null || true)"; [ -n "$expected_identity" ] && [ "$actual_identity" = "$expected_identity" ]; }}
 process_exe_is_retained_app() {{ actual="$(process_exe_path "$1")"; case "$actual" in "$resolved_install_root"/app-*/*|"$resolved_install_root"/.surge-app-prev/*|"$resolved_install_root"/"$main_exe") return 0 ;; esac; return 1; }}
 process_supervisor_matches_active() {{ actual="$(process_exe_path "$1")"; case "$actual" in "$active_supervisor"|"$resolved_install_root/.surge-supervisor-$supervisor_id.exe") [ -n "$actual" ] && return 0 ;; esac; return 1; }}
 process_parent_pid() {{ awk '/^PPid:/ {{ print $2 }}' "/proc/$1/status" 2>/dev/null; }}
@@ -328,7 +328,10 @@ for cmdline in /proc/[0-9]*/cmdline; do
   cmd="$(tr '\0' ' ' < "$cmdline" 2>/dev/null || true)";
   if process_exe_is_retained_app "$pid"; then stale_retained_app_seen=1; fi;
   [ -n "$cmd" ] || continue;
-  case "$cmd" in *"surge-supervisor"*) ;; *"$active_exe"*|*"$active_exe_resolved"*) app_seen=1; if contains_target_proof "$cmd" || {{ [ "$status_converged" -eq 1 ] && process_exe_matches_active "$pid"; }}; then target_app_seen=1; target_app_pids="${{target_app_pids}}${{pid}} "; else stale_app_seen=1; fi ;; esac;
+  if process_exe_matches_active "$pid"; then
+    app_seen=1;
+    if contains_target_proof "$cmd" || [ "$status_converged" -eq 1 ]; then target_app_seen=1; target_app_pids="${{target_app_pids}}${{pid}} "; else stale_app_seen=1; fi;
+  fi;
   if [ -n "$supervisor_id" ] && process_supervisor_matches_active "$pid" && [ "$(supervisor_option "$pid" --id)" = "$supervisor_id" ]; then
     supervisor_seen=1;
     supervisor_pids="${{supervisor_pids}}${{pid}} ";
@@ -347,7 +350,7 @@ done;
 for watched in $watched_pids; do
   supervisor_pid="${{watched%%:*}}"; watched_pid="${{watched#*:}}";
   case " $parent_supervisor_pids " in *" $supervisor_pid "*) continue ;; esac;
-  case " $target_app_pids " in *" $watched_pid "*) target_supervisor_seen=1 ;; *) if kill -0 "$watched_pid" 2>/dev/null; then waiting_supervisor_seen=1; fi ;; esac;
+  case " $target_app_pids " in *" $watched_pid "*) if process_exe_matches_active "$watched_pid"; then target_supervisor_seen=1; fi ;; *) if kill -0 "$watched_pid" 2>/dev/null; then waiting_supervisor_seen=1; fi ;; esac;
 done;
 if [ "$target_app_seen" -ne 1 ]; then
   if [ "$app_seen" -eq 1 ]; then echo "app process for $active_exe is running without target proof for $version"; else echo "app process for $active_exe was not found"; fi;

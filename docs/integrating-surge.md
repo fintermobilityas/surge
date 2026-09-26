@@ -288,9 +288,10 @@ as the original job. A live legacy PID without that identity is left untouched.
 
 After a supervisor respawns its child, remote process verification accepts the current
 child only with target-version proof, the canonical active executable inside the
-active app directory and the actual
+active app directory, matching device/inode identity, and the actual
 parent relationship to the expected supervisor. Only its own arguments before `--` identify it; forwarded
-child arguments cannot supply its ID or watched PID. Its original `watch --pid` argument
+child arguments cannot supply its ID or watched PID. Version arguments never
+substitute for executable identity, including for the original watched PID. Its original `watch --pid` argument
 may refer to an exited child. Unrelated processes, other supervisor identities and
 processes still running from a superseded application directory remain failures,
 including when executable symlink targets changed between releases. Retained-directory

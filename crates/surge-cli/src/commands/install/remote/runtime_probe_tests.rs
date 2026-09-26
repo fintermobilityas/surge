@@ -64,7 +64,7 @@ fn spawn_supervisor_with_args(
     let child = spawn(
         Command::new(root.join("app/surge-supervisor"))
             .arg("-c")
-            .arg(r#""$1" 30 & child=$!; echo "$child" > "$2"; wait "$child""#)
+            .arg(r#"bash -c 'shopt -s execfail; for attempt in {1..200}; do exec "$1" 30; sleep 0.01; done; exit 1' child "$1" & child=$!; echo "$child" > "$2"; wait "$child""#)
             .arg("watch")
             .arg(root.join("app/demoapp"))
             .arg(&child_pid)
@@ -77,8 +77,17 @@ fn spawn_supervisor_with_args(
     let pid = child.id();
     processes.0.push(child);
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !child_pid.exists() {
-        assert!(Instant::now() < deadline, "child did not start");
+    let expected_exe = root.join("app/demoapp");
+    loop {
+        let ready = fs::read_to_string(&child_pid)
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .and_then(|pid| fs::read_link(format!("/proc/{pid}/exe")).ok())
+            .is_some_and(|exe| exe == expected_exe);
+        if ready {
+            break;
+        }
+        assert!(Instant::now() < deadline, "child did not exec the fixture app");
         std::thread::sleep(Duration::from_millis(10));
     }
     pid

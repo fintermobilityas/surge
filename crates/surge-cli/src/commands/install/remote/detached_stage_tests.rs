@@ -12,7 +12,7 @@ fn stage_monitor_uses_job_result_and_exact_cache_in_isolated_transport() {
         r"#!/usr/bin/python3
 import os, sys
 assert sys.argv[1:3] == ['ssh', 'fixture']
-command = sys.argv[3].replace('/tmp/.surge-installer', os.environ['SURGE_STAGE_TEST_ROOT'] + '/.surge-installer')
+command = sys.argv[3].replace('/tmp/.surge-', os.environ['SURGE_STAGE_TEST_ROOT'] + '/.surge-')
 os.execv('/bin/sh', ['sh', '-c', command])
 ",
     )
@@ -37,6 +37,51 @@ os.execv('/bin/sh', ['sh', '-c', command])
     );
 }
 
+async fn invoke_current_fixture_install(root: &Path, plan_only: bool, force: bool, stage: bool) -> Result<()> {
+    use crate::commands::install::{InstallBehavior, InstallMode};
+    let release = ReleaseEntry {
+        version: "1.2.3".to_string(),
+        rid: "linux-x64".to_string(),
+        full_filename: "demoapp-1.2.3.tar.zst".to_string(),
+        install_directory: "demoapp".to_string(),
+        main_exe: "demoapp".to_string(),
+        ..ReleaseEntry::default()
+    };
+    let storage = StorageConfig {
+        provider: Some(surge_core::context::StorageProvider::Filesystem),
+        bucket: root.to_str().unwrap().to_string(),
+        ..StorageConfig::default()
+    };
+    let backend = surge_core::storage::filesystem::FilesystemBackend::new(root.to_str().unwrap(), "");
+    super::super::install_release_via_tailscale(
+        None,
+        &backend,
+        &super::super::ReleaseIndex::default(),
+        &root.join("downloads"),
+        "fixture",
+        "fixture",
+        "demoapp",
+        "linux-x64",
+        &["linux-x64".to_string()],
+        &release,
+        "test",
+        &storage,
+        &release.full_filename,
+        InstallBehavior {
+            plan_only,
+            force,
+            no_start: true,
+            mode: if stage {
+                InstallMode::StageOnly
+            } else {
+                InstallMode::Install
+            },
+            ..InstallBehavior::default()
+        },
+    )
+    .await
+}
+
 #[tokio::test]
 async fn isolated_stage_monitor_worker() {
     let Ok(root) = std::env::var("SURGE_STAGE_TEST_ROOT") else {
@@ -52,6 +97,35 @@ async fn isolated_stage_monitor_worker() {
             .await
             .is_err()
     );
+    let app = root.join(".local/share/demoapp/app");
+    fs::create_dir_all(app.join(".surge")).unwrap();
+    fs::write(app.join("demoapp"), "fixture").unwrap();
+    fs::write(
+        app.join(".surge/runtime.yml"),
+        format!(
+            "id: demoapp\nversion: 1.2.3\nchannel: test\nprovider: filesystem\nbucket: {}\n",
+            root.display()
+        ),
+    )
+    .unwrap();
+    for force in [false, true] {
+        let result = invoke_current_fixture_install(&root, false, force, false).await;
+        assert!(result.unwrap_err().to_string().contains("node-local installer lock"));
+    }
+    invoke_current_fixture_install(&root, true, false, false).await.unwrap();
+    drop(controller_lock);
+    invoke_current_fixture_install(&root, false, false, false)
+        .await
+        .unwrap();
+    for force in [false, true] {
+        assert!(
+            invoke_current_fixture_install(&root, false, force, true).await.is_err(),
+            "already-installed metadata must not report stage success without its archive"
+        );
+    }
+    let controller_lock = super::super::lock::RemoteInstallerLock::acquire("fixture")
+        .await
+        .unwrap();
     let pending = root.join(".surge-installer.operation");
     let installer = root.join(".surge-installer");
     fs::write(&pending, "starting-operation").unwrap();
@@ -85,6 +159,19 @@ async fn isolated_stage_monitor_worker() {
     assert!(probe.alive);
     assert_eq!(probe.operation.as_deref(), Some("starting-operation"));
     assert_eq!(fs::read_to_string(&installer).unwrap(), "preserve-starting-installer");
+    drop(controller_lock);
+    for force in [false, true] {
+        assert!(
+            invoke_current_fixture_install(&root, false, force, false)
+                .await
+                .is_err(),
+            "a live detached job must prevent package-current early success"
+        );
+    }
+    assert_eq!(fs::read_to_string(&installer).unwrap(), "preserve-starting-installer");
+    let _controller_lock = super::super::lock::RemoteInstallerLock::acquire("fixture")
+        .await
+        .unwrap();
     let install = root.join(".local/share/demoapp");
     fs::create_dir_all(&install).unwrap();
     let release = ReleaseEntry {

@@ -267,8 +267,11 @@ not describe this staging operation. Quiet polling allows the full progress dead
 installer output renews it. Installation also waits for its current installer result
 and requires the requested target/installed version before accepting convergence.
 
-A node-local `flock` serializes detached controllers across probe, transfer, launch,
-monitoring and cleanup. Disconnecting the controller releases that lock while the
+A node-local `flock` is acquired before inspecting installed state and is held
+through runtime convergence, app-copy/cache activation, transfer, launch, monitoring
+and cleanup. A live detached operation prevents package-current early success and
+forces the installer ownership/reattachment path. `--plan-only` remains read-only.
+Staging a package-current version still prepares and verifies its cache. Disconnecting the controller releases that lock while the
 installer keeps running. Re-running an identical installer and flag set then
 reattaches to its detached operation. Another connected controller is reported as
 busy. If a disconnect happens before PID publication, the next controller waits up

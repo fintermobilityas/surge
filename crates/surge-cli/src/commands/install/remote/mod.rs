@@ -99,6 +99,18 @@ pub(super) async fn install_release_via_tailscale(
     } else {
         release.main_exe.trim()
     };
+    let control = if behavior.plan_only {
+        None
+    } else {
+        let mut lock = lock::RemoteInstallerLock::acquire(ssh_target).await?;
+        let probe =
+            detached::probe_remote_install_before_transfer(ssh_target, &mut lock, std::time::Duration::from_secs(30))
+                .await?;
+        if probe.unverified_alive {
+            return Err(SurgeError::Platform("A legacy installer PID is alive without verifiable process identity; leave it running and retry after it exits".to_string()));
+        }
+        Some((lock, probe.alive))
+    };
     let remote_state = check_remote_install_state(ssh_target, install_dir, main_exe_name).await?;
     let convergence_plan = state::plan_remote_convergence(
         remote_state.as_ref(),
@@ -113,7 +125,12 @@ pub(super) async fn install_release_via_tailscale(
     )?;
     reporting::log_remote_convergence_plan(file_target, app_id, channel, release, &convergence_plan);
 
-    if convergence_plan.action == RemoteConvergenceAction::Skip {
+    let Some((mut installer_lock, detached_running)) = control else {
+        return Ok(());
+    };
+    installer_lock.ensure_held()?;
+
+    if !detached_running && !behavior.mode.is_stage() && convergence_plan.action == RemoteConvergenceAction::Skip {
         logline::success(&format!(
             "'{app_id}' v{} ({channel}) is already installed on '{file_target}', skipping.",
             release.version
@@ -121,10 +138,10 @@ pub(super) async fn install_release_via_tailscale(
         return Ok(());
     }
 
-    if convergence_plan.action == RemoteConvergenceAction::ConvergeRuntime {
-        if behavior.plan_only {
-            return Ok(());
-        }
+    if !detached_running
+        && !behavior.mode.is_stage()
+        && convergence_plan.action == RemoteConvergenceAction::ConvergeRuntime
+    {
         if behavior.no_start {
             logline::success(&format!(
                 "'{app_id}' v{} ({channel}) is package-current on '{file_target}'; runtime convergence was skipped because --no-start was supplied.",
@@ -153,10 +170,6 @@ pub(super) async fn install_release_via_tailscale(
         ));
     }
 
-    if behavior.plan_only {
-        return Ok(());
-    }
-
     let prefer_update_setup = matches!(
         convergence_plan.action,
         RemoteConvergenceAction::Update | RemoteConvergenceAction::RepairMetadata
@@ -177,7 +190,8 @@ pub(super) async fn install_release_via_tailscale(
     }
 
     let host_can_build_installer = host_can_build_installer_locally(selected_rid);
-    let has_matching_pre_staged_app_copy_payload = if !prefer_update_setup
+    let has_matching_pre_staged_app_copy_payload = if !detached_running
+        && !prefer_update_setup
         && host_can_build_installer
         && installer_mode == RemoteInstallerMode::Offline
         && !behavior.mode.is_stage()
@@ -186,13 +200,16 @@ pub(super) async fn install_release_via_tailscale(
     } else {
         false
     };
-    let has_matching_pre_staged_installer_cache =
-        if !prefer_update_setup && installer_mode == RemoteInstallerMode::Online && !behavior.mode.is_stage() {
-            remote_staged_installer_matches_release(ssh_target, app_id, release, channel, storage_config).await?
-        } else {
-            false
-        };
-    let transfer_strategy = if prefer_update_setup {
+    let has_matching_pre_staged_installer_cache = if !detached_running
+        && !prefer_update_setup
+        && installer_mode == RemoteInstallerMode::Online
+        && !behavior.mode.is_stage()
+    {
+        remote_staged_installer_matches_release(ssh_target, app_id, release, channel, storage_config).await?
+    } else {
+        false
+    };
+    let transfer_strategy = if detached_running || prefer_update_setup {
         RemoteTailscaleTransferStrategy::Installer { prefer_published: true }
     } else {
         select_remote_tailscale_transfer_strategy_for_convergence(
@@ -220,6 +237,7 @@ pub(super) async fn install_release_via_tailscale(
         )
     };
     if matches!(transfer_strategy, RemoteTailscaleTransferStrategy::AppCopy) {
+        installer_lock.ensure_held()?;
         deploy_remote_app_copy_for_tailscale(
             backend,
             index,
@@ -264,6 +282,7 @@ pub(super) async fn install_release_via_tailscale(
     }
 
     if matches!(transfer_strategy, RemoteTailscaleTransferStrategy::StagedInstallerCache) {
+        installer_lock.ensure_held()?;
         run_remote_staged_installer_setup(ssh_target, file_target, app_id, release, behavior.no_start).await?;
         verify_remote_runtime_after_install(
             ssh_target,
@@ -412,7 +431,6 @@ pub(super) async fn install_release_via_tailscale(
         storage: storage_config,
     };
 
-    let mut installer_lock = lock::RemoteInstallerLock::acquire(ssh_target).await?;
     let mut watch_log_offset = 0_u64;
     let mut reattached = false;
     let probe = detached::probe_remote_install_before_transfer(

@@ -389,15 +389,6 @@ pub(super) async fn install_release_via_tailscale(
         crate::formatters::format_bytes(installer_size),
         &installer_sha256[..installer_sha256.len().min(12)],
     ));
-    stage_installer_file_for_tailscale(
-        ssh_target,
-        file_target,
-        &installer_path,
-        installer_size,
-        &installer_sha256,
-    )
-    .await?;
-
     let no_start_flag = if behavior.no_start { " --no-start" } else { "" };
     let stage_flag = if behavior.mode.is_stage() { " --stage" } else { "" };
     let reinstall_flag = if matches!(convergence_plan.action, RemoteConvergenceAction::Reinstall) || behavior.force {
@@ -408,18 +399,21 @@ pub(super) async fn install_release_via_tailscale(
     let remote_home = execution::detect_remote_home_directory(ssh_target).await?;
     let install_root_for_watchdog = staging::remote_install_root(&remote_home, app_id, &release.install_directory)?;
 
-    // Reattach before staging: if a previously launched detached installer is
-    // still running, watch that install instead of starting a new one. This
-    // is what makes "re-run the same command" recover an install whose local
-    // orchestrator died instead of discarding progress.
+    let install_flags = format!("{no_start_flag}{stage_flag}{reinstall_flag}");
+    let operation = surge_core::crypto::sha256::sha256_hex(format!("{installer_sha256}:{install_flags}").as_bytes());
+    let stage_target = behavior.mode.is_stage().then_some(detached::RemoteStageTarget {
+        app_id,
+        rid: selected_rid,
+        release,
+        channel,
+        storage: storage_config,
+    });
+
     let mut watch_log_offset = 0_u64;
     let mut reattached = false;
     let probe = detached::probe_remote_detached_install(ssh_target).await?;
     if probe.alive {
-        let status_in_progress = read_remote_update_status_file(ssh_target, &install_root_for_watchdog)
-            .await?
-            .is_some_and(|status| status.state == "in_progress");
-        if status_in_progress {
+        if probe.operation.as_deref() == Some(operation.as_str()) {
             logline::info(&format!(
                 "Detected a detached remote installer still running on '{file_target}' (pid {}); reattaching instead of starting a new install.",
                 probe.pid.as_deref().unwrap_or("unknown")
@@ -427,10 +421,9 @@ pub(super) async fn install_release_via_tailscale(
             watch_log_offset = probe.log_size;
             reattached = true;
         } else {
-            logline::warn(&format!(
-                "Found a leftover remote installer process on '{file_target}' without an in-progress install; stopping it before a fresh install."
-            ));
-            detached::stop_remote_detached_install(ssh_target).await?;
+            return Err(SurgeError::Platform(format!(
+                "Another detached installer is running on '{file_target}'; wait for it to finish before starting a different operation."
+            )));
         }
     } else if let Some(status) = read_remote_update_status_file(ssh_target, &install_root_for_watchdog).await?
         && status.state == "in_progress"
@@ -468,8 +461,7 @@ pub(super) async fn install_release_via_tailscale(
         // Launch the installer detached from this SSH session so a local
         // orchestrator death cannot strand the node: the installer keeps
         // running node-locally and this process only watches it.
-        let install_flags = format!("{no_start_flag}{stage_flag}{reinstall_flag}");
-        let launch_script = detached::build_remote_detached_install_launch_command(&install_flags);
+        let launch_script = detached::build_remote_detached_install_launch_command(&install_flags, &operation);
         let ssh_command = format!("sh -lc {}", shell_single_quote(&launch_script));
         let launch_output = execution::run_tailscale_capture(&["ssh", ssh_target, ssh_command.as_str()]).await?;
         logline::info(&format!(
@@ -478,8 +470,15 @@ pub(super) async fn install_release_via_tailscale(
         ));
     }
 
-    detached::watch_remote_detached_install(ssh_target, file_target, &install_root_for_watchdog, watch_log_offset)
-        .await?;
+    detached::watch_remote_detached_install(
+        ssh_target,
+        file_target,
+        &install_root_for_watchdog,
+        watch_log_offset,
+        stage_target.as_ref(),
+        &operation,
+    )
+    .await?;
     if let Err(error) = detached::cleanup_remote_detached_install(ssh_target).await {
         logline::warn(&format!("Could not remove remote installer transfer helpers: {error}"));
     }

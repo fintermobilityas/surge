@@ -1,6 +1,10 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "runtime_probe_tests.rs"]
+mod runtime_probe_tests;
+
 use super::{
     ReleaseEntry, Result, SurgeError, activation, check_remote_install_state, execution, logline, published_installer,
     run_tailscale_streaming, shell_single_quote, staging, types,
@@ -292,7 +296,7 @@ pub(crate) fn build_remote_process_verification_probe(
 ) -> String {
     format!(
         r#"install_root={}; main_exe={}; supervisor_id={}; version={};
-active_exe="$install_root/app/$main_exe"; status_file="$install_root/.surge-update-status.json"; app_seen=0; target_app_seen=0; stale_app_seen=0; stale_retained_app_seen=0; supervisor_seen=0; stale_supervisor_seen=0; waiting_supervisor_seen=0; target_supervisor_seen=0; target_app_pids=""; watched_pids=""; status_converged=0;
+active_exe="$install_root/app/$main_exe"; status_file="$install_root/.surge-update-status.json"; app_seen=0; target_app_seen=0; stale_app_seen=0; stale_retained_app_seen=0; supervisor_seen=0; stale_supervisor_seen=0; waiting_supervisor_seen=0; target_supervisor_seen=0; target_app_pids=""; watched_pids=""; supervisor_pids=""; parent_supervisor_pids=""; status_converged=0;
 if [ -r "$status_file" ]; then
   status_compact="$(tr -d '[:space:]' < "$status_file" 2>/dev/null || true)";
   status_has_state=0; status_has_installed=0; status_has_target=0;
@@ -307,6 +311,8 @@ contains_target_proof() {{ contains_target_first_run "$1" || contains_target_ver
 process_exe_path() {{ actual="$(readlink "/proc/$1/exe" 2>/dev/null || true)"; case "$actual" in *" (deleted)") actual="${{actual% (deleted)}}" ;; esac; printf '%s\n' "$actual"; }}
 process_exe_matches_active() {{ actual="$(process_exe_path "$1")"; [ "$actual" = "$active_exe" ]; }}
 process_exe_is_retained_app() {{ actual="$(process_exe_path "$1")"; case "$actual" in "$install_root"/app-*/"$main_exe"|"$install_root"/.surge-app-prev/"$main_exe"|"$install_root"/"$main_exe") return 0 ;; esac; return 1; }}
+process_supervisor_matches_active() {{ actual="$(process_exe_path "$1")"; case "$actual" in "$install_root/app/surge-supervisor"|"$install_root/.surge-supervisor-$supervisor_id.exe") return 0 ;; esac; return 1; }}
+process_parent_pid() {{ awk '/^PPid:/ {{ print $2 }}' "/proc/$1/status" 2>/dev/null; }}
 extract_watched_pid() {{ case "$1" in *" watch "*" --pid "*) rest="${{1#* --pid }}"; watched_pid="${{rest%% *}}"; case "$watched_pid" in ""|*[!0-9]*) return 1 ;; esac; printf '%s\n' "$watched_pid"; return 0 ;; esac; return 1; }}
 for cmdline in /proc/[0-9]*/cmdline; do
   [ -r "$cmdline" ] || continue;
@@ -317,14 +323,24 @@ for cmdline in /proc/[0-9]*/cmdline; do
   [ -n "$cmd" ] || continue;
   case "$cmd" in *"surge-supervisor"*) ;; *"$active_exe"*) app_seen=1; if contains_target_proof "$cmd" || {{ [ "$status_converged" -eq 1 ] && process_exe_matches_active "$pid"; }}; then target_app_seen=1; target_app_pids="${{target_app_pids}}${{pid}} "; else stale_app_seen=1; fi ;; esac;
   if [ -n "$supervisor_id" ]; then
-    case "$cmd" in *"surge-supervisor"*"--id $supervisor_id"*)
+    case " $cmd " in *"surge-supervisor"*" --id $supervisor_id "*)
       supervisor_seen=1;
-      if watched_pid="$(extract_watched_pid "$cmd")"; then watched_pids="${{watched_pids}}${{watched_pid}} "; fi;
+      if process_supervisor_matches_active "$pid"; then supervisor_pids="${{supervisor_pids}}${{pid}} "; fi;
+      if watched_pid="$(extract_watched_pid "$cmd")"; then watched_pids="${{watched_pids}}${{pid}}:${{watched_pid}} "; fi;
       case " $cmd " in *" --surge-first-run "*) if contains_target_first_run "$cmd"; then target_supervisor_seen=1; else stale_supervisor_seen=1; fi ;; esac
     ;; esac;
   fi;
 done;
-for watched_pid in $watched_pids; do
+for supervisor_pid in $supervisor_pids; do
+  for app_pid in $target_app_pids; do
+    if process_exe_matches_active "$app_pid" && [ "$(process_parent_pid "$app_pid")" = "$supervisor_pid" ]; then
+      target_supervisor_seen=1; parent_supervisor_pids="${{parent_supervisor_pids}}${{supervisor_pid}} "; break;
+    fi;
+  done;
+done;
+for watched in $watched_pids; do
+  supervisor_pid="${{watched%%:*}}"; watched_pid="${{watched#*:}}";
+  case " $parent_supervisor_pids " in *" $supervisor_pid "*) continue ;; esac;
   case " $target_app_pids " in *" $watched_pid "*) target_supervisor_seen=1 ;; *) if kill -0 "$watched_pid" 2>/dev/null; then waiting_supervisor_seen=1; fi ;; esac;
 done;
 if [ "$target_app_seen" -ne 1 ]; then

@@ -1,0 +1,209 @@
+use super::*;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::process::Command;
+
+#[test]
+fn stage_monitor_uses_job_result_and_exact_cache_in_isolated_transport() {
+    let temp = tempfile::tempdir().unwrap();
+    let transport = temp.path().join("tailscale");
+    fs::write(
+        &transport,
+        r"#!/usr/bin/python3
+import os, sys
+assert sys.argv[1:3] == ['ssh', 'fixture']
+command = sys.argv[3].replace('/tmp/.surge-installer', os.environ['SURGE_STAGE_TEST_ROOT'] + '/.surge-installer')
+os.execv('/bin/sh', ['sh', '-c', command])
+",
+    )
+    .unwrap();
+    fs::set_permissions(&transport, fs::Permissions::from_mode(0o755)).unwrap();
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "commands::install::remote::detached::stage_tests::isolated_stage_monitor_worker",
+            "--nocapture",
+        ])
+        .env("SURGE_STAGE_TEST_ROOT", temp.path())
+        .env("HOME", temp.path())
+        .env("PATH", format!("{}:/usr/bin:/bin", temp.path().display()))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
+async fn isolated_stage_monitor_worker() {
+    let Ok(root) = std::env::var("SURGE_STAGE_TEST_ROOT") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    let install = root.join(".local/share/demoapp");
+    fs::create_dir_all(&install).unwrap();
+    let release = ReleaseEntry {
+        version: "1.2.3".to_string(),
+        rid: "linux-x64".to_string(),
+        full_filename: "demoapp-1.2.3.tar.zst".to_string(),
+        full_sha256: "expected-hash".to_string(),
+        ..ReleaseEntry::default()
+    };
+    let storage = StorageConfig {
+        provider: Some(surge_core::context::StorageProvider::S3),
+        bucket: "fixture".to_string(),
+        ..StorageConfig::default()
+    };
+    let target = RemoteStageTarget {
+        app_id: "demoapp",
+        rid: "linux-x64",
+        release: &release,
+        channel: "test",
+        storage: &storage,
+    };
+    let operation = "fixture-stage";
+    fs::write(root.join(".surge-installer.operation"), operation).unwrap();
+    fs::write(root.join(".surge-installer.pid"), std::process::id().to_string()).unwrap();
+    let mut offset = 0;
+    let mut progress = Instant::now();
+    for state in ["converged", "failed", "in_progress"] {
+        let previous = format!(r#"{{"state":"{state}","installed_version":"1.2.2","target_version":"1.2.2"}}"#);
+        fs::write(install.join(".surge-update-status.json"), &previous).unwrap();
+        let outcome = poll_remote_detached_install_once(
+            "fixture",
+            "fixture",
+            &install,
+            &mut offset,
+            &mut progress,
+            Some(&target),
+            operation,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome,
+            WatchOutcome::InProgress,
+            "old app status {state} must not describe staging"
+        );
+        assert_eq!(
+            fs::read_to_string(install.join(".surge-update-status.json")).unwrap(),
+            previous
+        );
+    }
+    fs::write(root.join(".surge-installer.operation"), "another-operation").unwrap();
+    assert!(
+        poll_remote_detached_install_once(
+            "fixture",
+            "fixture",
+            &install,
+            &mut offset,
+            &mut progress,
+            Some(&target),
+            operation
+        )
+        .await
+        .is_err()
+    );
+    fs::write(root.join(".surge-installer.operation"), operation).unwrap();
+    fs::remove_file(root.join(".surge-installer.pid")).unwrap();
+    assert!(
+        poll_remote_detached_install_once(
+            "fixture",
+            "fixture",
+            &install,
+            &mut offset,
+            &mut progress,
+            Some(&target),
+            operation
+        )
+        .await
+        .is_err()
+    );
+    fs::write(root.join(".surge-installer.result"), "0").unwrap();
+    assert!(matches!(
+        poll_remote_detached_install_once(
+            "fixture",
+            "fixture",
+            &install,
+            &mut offset,
+            &mut progress,
+            Some(&target),
+            operation
+        )
+        .await,
+        Err(SurgeError::NotFound(_))
+    ));
+
+    let cache = install.join(".surge-cache/staged-installer");
+    fs::create_dir_all(&cache).unwrap();
+    let identity = super::super::state::remote_staged_payload_identity("demoapp", &release, "test", &storage);
+    fs::write(
+        cache.join(".surge-staged-release.json"),
+        serde_json::to_vec(&identity).unwrap(),
+    )
+    .unwrap();
+    fs::write(cache.join("installer.yml"), "fixture").unwrap();
+    fs::write(cache.join("surge"), "fixture").unwrap();
+    assert!(matches!(
+        poll_remote_detached_install_once(
+            "fixture",
+            "fixture",
+            &install,
+            &mut offset,
+            &mut progress,
+            Some(&target),
+            operation
+        )
+        .await,
+        Err(SurgeError::NotFound(_))
+    ));
+    let artifact =
+        super::super::cache_path_for_key(&install.join(".surge-cache/artifacts"), &release.full_filename).unwrap();
+    fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+    fs::write(&artifact, "fixture").unwrap();
+    assert_eq!(
+        poll_remote_detached_install_once(
+            "fixture",
+            "fixture",
+            &install,
+            &mut offset,
+            &mut progress,
+            Some(&target),
+            operation
+        )
+        .await
+        .unwrap(),
+        WatchOutcome::Converged
+    );
+    super::super::state::verify_remote_stage_readiness(
+        "fixture",
+        "fixture",
+        "demoapp",
+        "linux-x64",
+        &release,
+        "test",
+        &storage,
+    )
+    .await
+    .unwrap();
+    let wrong_target = RemoteStageTarget {
+        channel: "another-channel",
+        ..target
+    };
+    assert!(matches!(
+        poll_remote_detached_install_once(
+            "fixture",
+            "fixture",
+            &install,
+            &mut offset,
+            &mut progress,
+            Some(&wrong_target),
+            operation
+        )
+        .await,
+        Err(SurgeError::NotFound(_))
+    ));
+}

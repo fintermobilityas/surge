@@ -1,8 +1,10 @@
 use std::time::{Duration, Instant};
 
+use super::ReleaseEntry;
 use super::execution::{REMOTE_INSTALLER_FINAL_PATH, run_tailscale_capture};
 use super::watchdog::read_remote_update_status_file;
 use super::{Path, Result, SurgeError, logline, shell_single_quote};
+use surge_core::context::StorageConfig;
 
 pub(crate) const REMOTE_INSTALLER_LOG_PATH: &str = "/tmp/.surge-installer.log";
 pub(crate) const REMOTE_INSTALLER_PID_PATH: &str = "/tmp/.surge-installer.pid";
@@ -11,16 +13,24 @@ pub(crate) const REMOTE_INSTALLER_PID_PATH: &str = "/tmp/.surge-installer.pid";
 /// detached monitor must outlive the interactive 30-minute stream timeout.
 pub(crate) const DETACHED_INSTALL_MONITOR_TIMEOUT: Duration = Duration::from_hours(6);
 pub(crate) const DETACHED_INSTALL_POLL_INTERVAL: Duration = Duration::from_secs(2);
-/// The status file is the authoritative liveness signal; allow more slack
-/// than the interactive watchdog because every check is a fresh SSH round
-/// trip and slow links slow both down.
+/// Remote log/status checks each require a fresh SSH round trip.
 pub(crate) const DETACHED_INSTALL_STALE_PROGRESS_TIMEOUT: Duration = Duration::from_mins(5);
 const DETACHED_INSTALL_LOG_TAIL_CAP: u64 = 256 * 1024;
+
+pub(crate) struct RemoteStageTarget<'a> {
+    pub app_id: &'a str,
+    pub rid: &'a str,
+    pub release: &'a ReleaseEntry,
+    pub channel: &'a str,
+    pub storage: &'a StorageConfig,
+}
 
 pub(crate) struct RemoteDetachedInstallProbe {
     pub pid: Option<String>,
     pub alive: bool,
     pub log_size: u64,
+    pub operation: Option<String>,
+    pub exit_code: Option<i32>,
 }
 
 pub(crate) fn build_remote_detached_install_probe_command() -> String {
@@ -39,6 +49,9 @@ if [ -n \"$pid\" ]; then \
 fi; \
 logsize=0; \
 if [ -f \"$log\" ]; then logsize=\"$(wc -c < \"$log\" | tr -d '[:space:]')\"; fi; \
+operation=\"$(cat /tmp/.surge-installer.operation 2>/dev/null || true)\"; \
+result=\"$(cat /tmp/.surge-installer.result 2>/dev/null || true)\"; \
+printf 'operation=%s\\nresult=%s\\n' \"$operation\" \"$result\"; \
 printf 'pid=%s\\nalive=%s\\nlogsize=%s\\n' \"$pid\" \"$alive\" \"$logsize\""
     )
 }
@@ -47,6 +60,8 @@ pub(crate) fn parse_remote_detached_install_probe(output: &str) -> Result<Remote
     let mut pid: Option<String> = None;
     let mut alive = false;
     let mut log_size = 0_u64;
+    let mut operation = None;
+    let mut exit_code = None;
     for line in output.lines() {
         let line = line.trim();
         if let Some(value) = line.strip_prefix("pid=") {
@@ -55,6 +70,16 @@ pub(crate) fn parse_remote_detached_install_probe(output: &str) -> Result<Remote
             } else {
                 Some(value.to_string())
             };
+        } else if let Some(value) = line.strip_prefix("operation=") {
+            operation = (!value.is_empty()).then(|| value.to_string());
+        } else if let Some(value) = line.strip_prefix("result=") {
+            if !value.is_empty() {
+                exit_code = Some(
+                    value
+                        .parse::<i32>()
+                        .map_err(|e| SurgeError::Platform(format!("Invalid detached installer result: {e}")))?,
+                );
+            }
         } else if let Some(value) = line.strip_prefix("alive=") {
             alive = value == "yes";
         } else if let Some(value) = line.strip_prefix("logsize=") {
@@ -63,7 +88,13 @@ pub(crate) fn parse_remote_detached_install_probe(output: &str) -> Result<Remote
             })?;
         }
     }
-    Ok(RemoteDetachedInstallProbe { pid, alive, log_size })
+    Ok(RemoteDetachedInstallProbe {
+        pid,
+        alive,
+        log_size,
+        operation,
+        exit_code,
+    })
 }
 
 /// Build the command that launches the staged installer as a detached
@@ -73,18 +104,20 @@ pub(crate) fn parse_remote_detached_install_probe(output: &str) -> Result<Remote
 /// `flags` must contain only the fixed CLI flag tokens (`--no-start`,
 /// `--stage`, `--reinstall`); it is interpolated unquoted into the inner
 /// command on purpose.
-pub(crate) fn build_remote_detached_install_launch_command(flags: &str) -> String {
+pub(crate) fn build_remote_detached_install_launch_command(flags: &str, operation: &str) -> String {
     let flags = flags.trim();
-    let inner = if flags.is_empty() {
-        format!("echo $$ > {REMOTE_INSTALLER_PID_PATH}; exec {REMOTE_INSTALLER_FINAL_PATH}")
-    } else {
-        format!("echo $$ > {REMOTE_INSTALLER_PID_PATH}; exec {REMOTE_INSTALLER_FINAL_PATH} {flags}")
-    };
+    let inner = format!(
+        "echo $$ > {REMOTE_INSTALLER_PID_PATH}; {REMOTE_INSTALLER_FINAL_PATH} {flags}; result=$?; \
+         printf '%s\\n' \"$result\" > /tmp/.surge-installer.result.partial; \
+         mv /tmp/.surge-installer.result.partial /tmp/.surge-installer.result; exit \"$result\""
+    );
     format!(
         "set -eu; \
 if [ ! -x {REMOTE_INSTALLER_FINAL_PATH} ]; then echo 'remote installer binary is missing or not executable' >&2; exit 1; fi; \
+rm -f /tmp/.surge-installer.result /tmp/.surge-installer.result.partial {REMOTE_INSTALLER_PID_PATH}; \
+printf '%s\\n' {} > /tmp/.surge-installer.operation; \
 : > {REMOTE_INSTALLER_LOG_PATH}; \
-inner='{inner}'; \
+inner={}; \
 if command -v setsid >/dev/null 2>&1; then \
   setsid sh -c \"$inner\" >> {REMOTE_INSTALLER_LOG_PATH} 2>&1 < /dev/null & \
 else \
@@ -93,9 +126,9 @@ fi; \
 sleep 0.3; \
 if [ -f {REMOTE_INSTALLER_PID_PATH} ]; then \
   echo \"launched $(tr -d '[:space:]' < {REMOTE_INSTALLER_PID_PATH})\"; \
-else \
-  echo launched; \
-fi"
+else echo launched; fi",
+        shell_single_quote(operation),
+        shell_single_quote(&inner)
     )
 }
 
@@ -105,24 +138,9 @@ pub(crate) fn build_remote_detached_install_log_tail_command(offset: u64) -> Str
     )
 }
 
-pub(crate) fn build_remote_detached_install_stop_command() -> String {
-    format!(
-        "pidfile={REMOTE_INSTALLER_PID_PATH}; \
-pid=\"$(tr -d '[:space:]' < \"$pidfile\" 2>/dev/null || true)\"; \
-case \"$pid\" in \
-  ''|*[!0-9]*) rm -f \"$pidfile\"; echo none ;; \
-  *) kill \"$pid\" 2>/dev/null || true; \
-    i=0; \
-    while kill -0 \"$pid\" 2>/dev/null && [ \"$i\" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done; \
-    kill -KILL \"$pid\" 2>/dev/null || true; \
-    rm -f \"$pidfile\"; echo stopped ;; \
-esac"
-    )
-}
-
 pub(crate) fn build_remote_detached_install_cleanup_command() -> String {
     format!(
-        "rm -f {REMOTE_INSTALLER_FINAL_PATH} {REMOTE_INSTALLER_PID_PATH} {REMOTE_INSTALLER_FINAL_PATH}.partial {REMOTE_INSTALLER_FINAL_PATH}.partial.meta"
+        "rm -f {REMOTE_INSTALLER_FINAL_PATH} {REMOTE_INSTALLER_PID_PATH} {REMOTE_INSTALLER_FINAL_PATH}.partial {REMOTE_INSTALLER_FINAL_PATH}.partial.meta /tmp/.surge-installer.operation /tmp/.surge-installer.result /tmp/.surge-installer.result.partial"
     )
 }
 
@@ -134,11 +152,6 @@ async fn run_remote_detached_install_script(ssh_target: &str, script: &str) -> R
 pub(crate) async fn probe_remote_detached_install(ssh_target: &str) -> Result<RemoteDetachedInstallProbe> {
     let raw = run_remote_detached_install_script(ssh_target, &build_remote_detached_install_probe_command()).await?;
     parse_remote_detached_install_probe(raw.trim())
-}
-
-pub(crate) async fn stop_remote_detached_install(ssh_target: &str) -> Result<()> {
-    run_remote_detached_install_script(ssh_target, &build_remote_detached_install_stop_command()).await?;
-    Ok(())
 }
 
 pub(crate) async fn cleanup_remote_detached_install(ssh_target: &str) -> Result<()> {
@@ -163,6 +176,7 @@ async fn read_remote_detached_install_log_tail(ssh_target: &str) -> Option<Strin
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum WatchOutcome {
     Converged,
     InProgress,
@@ -173,6 +187,9 @@ async fn poll_remote_detached_install_once(
     file_target: &str,
     install_root: &Path,
     log_offset: &mut u64,
+    last_progress: &mut Instant,
+    stage: Option<&RemoteStageTarget<'_>>,
+    operation: &str,
 ) -> Result<WatchOutcome> {
     // Relay any new installer output first so the local console mirrors the
     // node even when the status file is quiet.
@@ -181,6 +198,7 @@ async fn poll_remote_detached_install_once(
             .await?;
     let had_log_output = !tail_raw.is_empty();
     if had_log_output {
+        *last_progress = Instant::now();
         *log_offset = log_offset.saturating_add(tail_raw.len() as u64);
         for line in tail_raw.lines() {
             let trimmed = line.trim();
@@ -191,6 +209,27 @@ async fn poll_remote_detached_install_once(
     }
 
     let probe = probe_remote_detached_install(ssh_target).await?;
+    if probe.operation.as_deref() != Some(operation) {
+        return Err(SurgeError::Platform(
+            "Remote installer operation changed while watching".to_string(),
+        ));
+    }
+    if let Some(stage) = stage {
+        let outcome = stage_process_outcome(&probe, last_progress.elapsed())?;
+        if outcome == WatchOutcome::Converged {
+            super::state::verify_remote_stage_readiness(
+                ssh_target,
+                file_target,
+                stage.app_id,
+                stage.rid,
+                stage.release,
+                stage.channel,
+                stage.storage,
+            )
+            .await?;
+        }
+        return Ok(outcome);
+    }
     let status = read_remote_update_status_file(ssh_target, install_root).await?;
 
     if let Some(status) = &status {
@@ -234,21 +273,38 @@ async fn poll_remote_detached_install_once(
         )));
     }
 
-    if had_log_output {
+    if last_progress.elapsed() < DETACHED_INSTALL_STALE_PROGRESS_TIMEOUT {
         return Ok(WatchOutcome::InProgress);
     }
 
     Err(SurgeError::Platform(format!(
-        "Timed out after {}s without fresh remote installer progress on '{file_target}{}",
+        "Timed out after {}s without fresh remote installer progress on '{file_target}'{}",
         DETACHED_INSTALL_STALE_PROGRESS_TIMEOUT.as_secs(),
         status.map_or_else(String::new, |status| format!(": {}", status.format_context()))
     )))
 }
 
+fn stage_process_outcome(probe: &RemoteDetachedInstallProbe, quiet_for: Duration) -> Result<WatchOutcome> {
+    match probe.exit_code {
+        Some(0) if !probe.alive => Ok(WatchOutcome::Converged),
+        Some(code) if code != 0 => Err(SurgeError::Platform(format!(
+            "Detached staging installer failed with exit code {code}"
+        ))),
+        _ if !probe.alive => Err(SurgeError::Platform(
+            "Detached staging installer exited without a completion result".to_string(),
+        )),
+        _ if quiet_for < DETACHED_INSTALL_STALE_PROGRESS_TIMEOUT => Ok(WatchOutcome::InProgress),
+        _ => Err(SurgeError::Platform(format!(
+            "Timed out after {}s without fresh staging progress",
+            DETACHED_INSTALL_STALE_PROGRESS_TIMEOUT.as_secs()
+        ))),
+    }
+}
+
 /// Watch a detached node-local installer until it converges or fails.
 ///
-/// Relays new installer log bytes to the local console, treats the node's
-/// update status file as the authoritative outcome, and fails when the
+/// Relays installer output and verifies the requested operation: staged cache
+/// readiness for staging, application status for installation. Fails when the
 /// process exits without converging, when progress goes stale, or when the
 /// overall monitor timeout elapses.
 pub(crate) async fn watch_remote_detached_install(
@@ -256,9 +312,12 @@ pub(crate) async fn watch_remote_detached_install(
     file_target: &str,
     install_root: &Path,
     start_log_offset: u64,
+    stage: Option<&RemoteStageTarget<'_>>,
+    operation: &str,
 ) -> Result<()> {
     let started_at = Instant::now();
     let mut log_offset = start_log_offset;
+    let mut last_progress = started_at;
 
     loop {
         if started_at.elapsed() >= DETACHED_INSTALL_MONITOR_TIMEOUT {
@@ -268,7 +327,17 @@ pub(crate) async fn watch_remote_detached_install(
             )));
         }
 
-        match poll_remote_detached_install_once(ssh_target, file_target, install_root, &mut log_offset).await {
+        match poll_remote_detached_install_once(
+            ssh_target,
+            file_target,
+            install_root,
+            &mut log_offset,
+            &mut last_progress,
+            stage,
+            operation,
+        )
+        .await
+        {
             Ok(WatchOutcome::Converged) => {
                 logline::success(&format!(
                     "Detached remote installer on '{file_target}' converged ({}s).",
@@ -294,6 +363,56 @@ pub(crate) async fn watch_remote_detached_install(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn stage_waits_for_its_installer_result() {
+        let mut probe = parse_remote_detached_install_probe("pid=1234\nalive=yes\noperation=stage-job\n").unwrap();
+        assert_eq!(
+            stage_process_outcome(&probe, Duration::from_secs(2)).unwrap(),
+            WatchOutcome::InProgress
+        );
+        probe.exit_code = Some(0);
+        assert_eq!(
+            stage_process_outcome(&probe, Duration::from_secs(2)).unwrap(),
+            WatchOutcome::InProgress
+        );
+        probe.alive = false;
+        assert_eq!(
+            stage_process_outcome(&probe, Duration::from_secs(2)).unwrap(),
+            WatchOutcome::Converged
+        );
+    }
+
+    #[test]
+    fn stage_rejects_failed_or_missing_installer_result() {
+        for result in ["", "1", "127"] {
+            let probe = parse_remote_detached_install_probe(&format!("alive=no\nresult={result}\n")).unwrap();
+            assert!(stage_process_outcome(&probe, Duration::ZERO).is_err());
+        }
+    }
+
+    #[test]
+    fn quiet_stage_gets_the_full_progress_timeout() {
+        let probe = parse_remote_detached_install_probe("alive=yes\n").unwrap();
+        assert_eq!(
+            stage_process_outcome(
+                &probe,
+                DETACHED_INSTALL_STALE_PROGRESS_TIMEOUT
+                    .checked_sub(Duration::from_secs(1))
+                    .unwrap()
+            )
+            .unwrap(),
+            WatchOutcome::InProgress
+        );
+        assert!(stage_process_outcome(&probe, DETACHED_INSTALL_STALE_PROGRESS_TIMEOUT).is_err());
+    }
+
+    #[test]
+    fn probe_rejects_invalid_result() {
+        assert!(parse_remote_detached_install_probe("result=not-a-code\n").is_err());
+    }
 
     #[test]
     fn parse_remote_detached_install_probe_reads_fields() {
@@ -309,19 +428,19 @@ mod tests {
 
     #[test]
     fn launch_command_detaches_and_reports_pid() {
-        let command = build_remote_detached_install_launch_command("--no-start --reinstall");
+        let command = build_remote_detached_install_launch_command("--no-start --reinstall", "test-operation");
         assert!(command.contains("setsid sh -c \"$inner\""));
         assert!(command.contains("nohup sh -c \"$inner\""));
         assert!(command.contains("echo $$ > /tmp/.surge-installer.pid"));
-        assert!(command.contains("exec /tmp/.surge-installer --no-start --reinstall"));
+        assert!(command.contains("/tmp/.surge-installer --no-start --reinstall; result=$?"));
         assert!(command.contains("2>&1 < /dev/null &"));
         assert!(command.contains("echo \"launched $(tr -d '[:space:]' < /tmp/.surge-installer.pid)\""));
     }
 
     #[test]
     fn launch_command_without_flags() {
-        let command = build_remote_detached_install_launch_command("");
-        assert!(command.contains("exec /tmp/.surge-installer'"));
+        let command = build_remote_detached_install_launch_command("", "test-operation");
+        assert!(command.contains("/tmp/.surge-installer ; result=$?"));
         assert!(!command.contains("--no-start"));
     }
 
@@ -329,16 +448,16 @@ mod tests {
     fn probe_command_reports_pid_aliveness_and_log_size() {
         let command = build_remote_detached_install_probe_command();
         assert!(command.contains("kill -0 \"$pid\""));
-        assert!(command.contains("printf 'pid=%s\\nalive=%s\\nlogsize=%s\\n'"));
+        assert!(command.contains(
+            "operation=\"$(cat /tmp/.surge-installer.operation 2>/dev/null || true)\"; \
+result=\"$(cat /tmp/.surge-installer.result 2>/dev/null || true)\"; \
+printf 'operation=%s\\nresult=%s\\n' \"$operation\" \"$result\"; \
+printf 'pid=%s\\nalive=%s\\nlogsize=%s\\n'"
+        ));
     }
 
     #[test]
-    fn stop_and_cleanup_commands_target_expected_paths() {
-        let stop = build_remote_detached_install_stop_command();
-        assert!(stop.contains("kill \"$pid\""));
-        assert!(stop.contains("kill -KILL \"$pid\""));
-        assert!(stop.contains("rm -f \"$pidfile\""));
-
+    fn cleanup_command_targets_expected_paths() {
         let cleanup = build_remote_detached_install_cleanup_command();
         assert!(cleanup.contains("rm -f /tmp/.surge-installer /tmp/.surge-installer.pid"));
     }
@@ -351,10 +470,7 @@ mod tests {
         let log_path = base.join(".surge-installer.log");
         let pid_path = base.join(".surge-installer.pid");
         let bin_path = base.join(".surge-installer");
-        let script = script
-            .replace("/tmp/.surge-installer.log", &log_path.to_string_lossy())
-            .replace("/tmp/.surge-installer.pid", &pid_path.to_string_lossy())
-            .replace("/tmp/.surge-installer", &bin_path.to_string_lossy());
+        let script = script.replace("/tmp/.surge-installer", &bin_path.to_string_lossy());
         (script, bin_path, log_path, pid_path)
     }
 
@@ -362,8 +478,10 @@ mod tests {
     #[test]
     fn detached_launch_command_runs_installer_detached_and_reports_pid() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        let (script, bin_path, log_path, pid_path) =
-            script_for_temp_paths(&build_remote_detached_install_launch_command(""), temp_dir.path());
+        let (script, bin_path, log_path, pid_path) = script_for_temp_paths(
+            &build_remote_detached_install_launch_command("", "test-operation"),
+            temp_dir.path(),
+        );
 
         // Fake installer: reports start/end and stays alive long enough to probe.
         std::fs::write(
@@ -371,7 +489,6 @@ mod tests {
             "#!/bin/sh\necho installer-started\nsleep 1\necho installer-done\n",
         )
         .unwrap();
-        use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&bin_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         // The parent exits immediately after launch, like an ending SSH session.
@@ -405,5 +522,19 @@ mod tests {
         let log = std::fs::read_to_string(&log_path).expect("log written");
         assert!(log.contains("installer-started"), "log was: {log}");
         assert!(log.contains("installer-done"), "log was: {log}");
+        let (probe_script, _, _, _) =
+            script_for_temp_paths(&build_remote_detached_install_probe_command(), temp_dir.path());
+        let output = std::process::Command::new("sh")
+            .args(["-c", &probe_script])
+            .output()
+            .unwrap();
+        let probe = parse_remote_detached_install_probe(&String::from_utf8(output.stdout).unwrap()).unwrap();
+        assert_eq!(probe.operation.as_deref(), Some("test-operation"));
+        assert_eq!(probe.exit_code, Some(0));
+        assert!(!probe.alive);
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "detached_stage_tests.rs"]
+mod stage_tests;

@@ -1,11 +1,13 @@
 #![allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 
 mod activation;
+mod completion;
 mod detached;
 mod detached_identity;
 mod execution;
 mod installer_stage;
 mod lock;
+mod operation;
 mod published_installer;
 mod reporting;
 mod runtime;
@@ -99,6 +101,15 @@ pub(super) async fn install_release_via_tailscale(
     } else {
         release.main_exe.trim()
     };
+    let operation = operation::request_fingerprint(app_id, selected_rid, release, channel, storage_config, behavior)?;
+    let install_target = detached::RemoteInstallTarget {
+        is_stage: behavior.mode.is_stage(),
+        app_id,
+        rid: selected_rid,
+        release,
+        channel,
+        storage: storage_config,
+    };
     let control = if behavior.plan_only {
         None
     } else {
@@ -109,7 +120,28 @@ pub(super) async fn install_release_via_tailscale(
         if probe.unverified_alive {
             return Err(SurgeError::Platform("A legacy installer PID is alive without verifiable process identity; leave it running and retry after it exits".to_string()));
         }
-        Some((lock, probe.alive))
+        if probe.alive {
+            if probe.operation.as_deref() != Some(operation.as_str()) {
+                return Err(SurgeError::Platform(format!(
+                    "Another detached installer is running on '{file_target}'; wait for it to finish before starting a different operation."
+                )));
+            }
+            let remote_home = execution::detect_remote_home_directory(ssh_target).await?;
+            let install_root = staging::remote_install_root(&remote_home, app_id, &release.install_directory)?;
+            logline::info("Reattaching to the matching detached install operation before inspecting installed state.");
+            return completion::finish_detached_install(
+                ssh_target,
+                file_target,
+                &install_root,
+                probe.log_size,
+                &install_target,
+                &operation,
+                &mut lock,
+                !behavior.no_start,
+            )
+            .await;
+        }
+        Some(lock)
     };
     let remote_state = check_remote_install_state(ssh_target, install_dir, main_exe_name).await?;
     let convergence_plan = state::plan_remote_convergence(
@@ -125,12 +157,12 @@ pub(super) async fn install_release_via_tailscale(
     )?;
     reporting::log_remote_convergence_plan(file_target, app_id, channel, release, &convergence_plan);
 
-    let Some((mut installer_lock, detached_running)) = control else {
+    let Some(mut installer_lock) = control else {
         return Ok(());
     };
     installer_lock.ensure_held()?;
 
-    if !detached_running && !behavior.mode.is_stage() && convergence_plan.action == RemoteConvergenceAction::Skip {
+    if !behavior.mode.is_stage() && convergence_plan.action == RemoteConvergenceAction::Skip {
         logline::success(&format!(
             "'{app_id}' v{} ({channel}) is already installed on '{file_target}', skipping.",
             release.version
@@ -138,10 +170,7 @@ pub(super) async fn install_release_via_tailscale(
         return Ok(());
     }
 
-    if !detached_running
-        && !behavior.mode.is_stage()
-        && convergence_plan.action == RemoteConvergenceAction::ConvergeRuntime
-    {
+    if !behavior.mode.is_stage() && convergence_plan.action == RemoteConvergenceAction::ConvergeRuntime {
         if behavior.no_start {
             logline::success(&format!(
                 "'{app_id}' v{} ({channel}) is package-current on '{file_target}'; runtime convergence was skipped because --no-start was supplied.",
@@ -190,8 +219,7 @@ pub(super) async fn install_release_via_tailscale(
     }
 
     let host_can_build_installer = host_can_build_installer_locally(selected_rid);
-    let has_matching_pre_staged_app_copy_payload = if !detached_running
-        && !prefer_update_setup
+    let has_matching_pre_staged_app_copy_payload = if !prefer_update_setup
         && host_can_build_installer
         && installer_mode == RemoteInstallerMode::Offline
         && !behavior.mode.is_stage()
@@ -200,16 +228,13 @@ pub(super) async fn install_release_via_tailscale(
     } else {
         false
     };
-    let has_matching_pre_staged_installer_cache = if !detached_running
-        && !prefer_update_setup
-        && installer_mode == RemoteInstallerMode::Online
-        && !behavior.mode.is_stage()
-    {
-        remote_staged_installer_matches_release(ssh_target, app_id, release, channel, storage_config).await?
-    } else {
-        false
-    };
-    let transfer_strategy = if detached_running || prefer_update_setup {
+    let has_matching_pre_staged_installer_cache =
+        if !prefer_update_setup && installer_mode == RemoteInstallerMode::Online && !behavior.mode.is_stage() {
+            remote_staged_installer_matches_release(ssh_target, app_id, release, channel, storage_config).await?
+        } else {
+            false
+        };
+    let transfer_strategy = if prefer_update_setup {
         RemoteTailscaleTransferStrategy::Installer { prefer_published: true }
     } else {
         select_remote_tailscale_transfer_strategy_for_convergence(
@@ -421,15 +446,6 @@ pub(super) async fn install_release_via_tailscale(
     let install_root_for_watchdog = staging::remote_install_root(&remote_home, app_id, &release.install_directory)?;
 
     let install_flags = format!("{no_start_flag}{stage_flag}{reinstall_flag}");
-    let operation = surge_core::crypto::sha256::sha256_hex(format!("{installer_sha256}:{install_flags}").as_bytes());
-    let install_target = detached::RemoteInstallTarget {
-        is_stage: behavior.mode.is_stage(),
-        app_id,
-        rid: selected_rid,
-        release,
-        channel,
-        storage: storage_config,
-    };
 
     let mut watch_log_offset = 0_u64;
     let mut reattached = false;
@@ -501,7 +517,7 @@ pub(super) async fn install_release_via_tailscale(
         ));
     }
 
-    detached::watch_remote_detached_install(
+    completion::finish_detached_install(
         ssh_target,
         file_target,
         &install_root_for_watchdog,
@@ -509,38 +525,11 @@ pub(super) async fn install_release_via_tailscale(
         &install_target,
         &operation,
         &mut installer_lock,
+        !behavior.no_start
+            && matches!(
+                convergence_plan.action,
+                RemoteConvergenceAction::CleanInstall | RemoteConvergenceAction::Reinstall
+            ),
     )
-    .await?;
-    installer_lock.ensure_held()?;
-    if let Err(error) = detached::cleanup_remote_detached_install(ssh_target, &operation).await {
-        logline::warn(&format!("Could not remove remote installer transfer helpers: {error}"));
-    }
-    if !behavior.mode.is_stage() {
-        warn_if_remote_stage_cleanup_fails(ssh_target, app_id, release).await;
-        verify_remote_runtime_after_install(
-            ssh_target,
-            file_target,
-            install_dir,
-            app_id,
-            release,
-            channel,
-            storage_config,
-            !behavior.no_start
-                && matches!(
-                    convergence_plan.action,
-                    RemoteConvergenceAction::CleanInstall | RemoteConvergenceAction::Reinstall
-                ),
-        )
-        .await?;
-    }
-    if behavior.mode.is_stage() {
-        logline::success(&format!(
-            "Staged '{app_id}' v{} on tailscale node '{file_target}'.",
-            release.version
-        ));
-    } else {
-        logline::success(&format!("Installed '{app_id}' on tailscale node '{file_target}'."));
-    }
-
-    Ok(())
+    .await
 }

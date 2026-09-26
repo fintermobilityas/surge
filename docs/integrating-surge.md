@@ -270,10 +270,12 @@ and requires the requested target/installed version before accepting convergence
 A node-local `flock` is acquired before inspecting installed state and is held
 through runtime convergence, app-copy/cache activation, transfer, launch, monitoring
 and cleanup. A live detached operation prevents package-current early success and
-forces the installer ownership/reattachment path. `--plan-only` remains read-only.
+takes the ownership/reattachment path. `--plan-only` remains read-only.
 Staging a package-current version still prepares and verifies its cache. Disconnecting the controller releases that lock while the
-installer keeps running. Re-running an identical installer and flag set then
-reattaches to its detached operation. Another connected controller is reported as
+installer keeps running. Re-running the same target artifact, destination and explicit request options
+reattaches before reading installed state or rebuilding an installer. The operation
+fingerprint excludes the state-derived reinstall flag, generated installer bytes,
+credential rotation and unrelated release-index metadata. Another connected controller is reported as
 busy. If a disconnect happens before PID publication, the next controller waits up
 to 30 seconds for publication before any transfer cleanup. An unresolved launch is
 left untouched and reported; inspect its log before attempting manual recovery.
@@ -285,7 +287,8 @@ records include Linux boot ID and process start ticks, so a reused PID is not tr
 as the original job. A live legacy PID without that identity is left untouched.
 
 After a supervisor respawns its child, remote process verification accepts the current
-child only with target-version proof, the expected active executable and the actual
+child only with target-version proof, the canonical active executable inside the
+active app directory and the actual
 parent relationship to the expected supervisor. Only its own arguments before `--` identify it; forwarded
 child arguments cannot supply its ID or watched PID. Its original `watch --pid` argument
 may refer to an exited child. Unrelated processes, other supervisor identities and

@@ -297,6 +297,14 @@ pub(crate) fn build_remote_process_verification_probe(
     format!(
         r#"install_root={}; main_exe={}; supervisor_id={}; version={};
 active_exe="$install_root/app/$main_exe"; status_file="$install_root/.surge-update-status.json"; app_seen=0; target_app_seen=0; stale_app_seen=0; stale_retained_app_seen=0; supervisor_seen=0; stale_supervisor_seen=0; waiting_supervisor_seen=0; target_supervisor_seen=0; target_app_pids=""; watched_pids=""; supervisor_pids=""; parent_supervisor_pids=""; status_converged=0;
+active_app_dir="$(readlink -f "$install_root/app" 2>/dev/null || true)";
+active_exe_resolved="$(readlink -f "$active_exe" 2>/dev/null || true)";
+case "$active_exe_resolved" in "$active_app_dir"/*) ;; *) echo 'active executable does not resolve inside the active app directory'; exit 0 ;; esac;
+[ -n "$active_app_dir" ] && [ -f "$active_exe_resolved" ] || {{ echo 'active executable is missing'; exit 0; }};
+resolved_main_relative="${{active_exe_resolved#"$active_app_dir/"}}";
+resolved_install_root="$(readlink -f "$install_root" 2>/dev/null || true)";
+active_supervisor="$(readlink -f "$install_root/app/surge-supervisor" 2>/dev/null || true)";
+case "$active_supervisor" in "$active_app_dir"/*) ;; *) active_supervisor='' ;; esac;
 if [ -r "$status_file" ]; then
   status_compact="$(tr -d '[:space:]' < "$status_file" 2>/dev/null || true)";
   status_has_state=0; status_has_installed=0; status_has_target=0;
@@ -309,9 +317,9 @@ contains_target_first_run() {{ cmd_tokens=" $1 "; case "$cmd_tokens" in *" --sur
 contains_target_version_arg() {{ cmd_tokens=" $1 "; case "$cmd_tokens" in *" $version "*) return 0 ;; esac; return 1; }}
 contains_target_proof() {{ contains_target_first_run "$1" || contains_target_version_arg "$1"; }}
 process_exe_path() {{ actual="$(readlink "/proc/$1/exe" 2>/dev/null || true)"; case "$actual" in *" (deleted)") actual="${{actual% (deleted)}}" ;; esac; printf '%s\n' "$actual"; }}
-process_exe_matches_active() {{ actual="$(process_exe_path "$1")"; [ "$actual" = "$active_exe" ]; }}
-process_exe_is_retained_app() {{ actual="$(process_exe_path "$1")"; case "$actual" in "$install_root"/app-*/"$main_exe"|"$install_root"/.surge-app-prev/"$main_exe"|"$install_root"/"$main_exe") return 0 ;; esac; return 1; }}
-process_supervisor_matches_active() {{ actual="$(process_exe_path "$1")"; case "$actual" in "$install_root/app/surge-supervisor"|"$install_root/.surge-supervisor-$supervisor_id.exe") return 0 ;; esac; return 1; }}
+process_exe_matches_active() {{ actual="$(process_exe_path "$1")"; [ "$actual" = "$active_exe_resolved" ]; }}
+process_exe_is_retained_app() {{ actual="$(process_exe_path "$1")"; case "$actual" in "$install_root"/app-*/"$main_exe"|"$install_root"/.surge-app-prev/"$main_exe"|"$install_root"/"$main_exe"|"$resolved_install_root"/app-*/"$resolved_main_relative"|"$resolved_install_root"/.surge-app-prev/"$resolved_main_relative") return 0 ;; esac; return 1; }}
+process_supervisor_matches_active() {{ actual="$(process_exe_path "$1")"; case "$actual" in "$active_supervisor"|"$resolved_install_root/.surge-supervisor-$supervisor_id.exe") [ -n "$actual" ] && return 0 ;; esac; return 1; }}
 process_parent_pid() {{ awk '/^PPid:/ {{ print $2 }}' "/proc/$1/status" 2>/dev/null; }}
 supervisor_option() {{ SURGE_PROBE_OPTION="$2" awk -v RS='\0' 'NR == 1 {{ next }} $0 == "--" {{ exit }} take {{ print; exit }} $0 == ENVIRON["SURGE_PROBE_OPTION"] {{ take=1; next }} index($0, ENVIRON["SURGE_PROBE_OPTION"] "=") == 1 {{ print substr($0, length(ENVIRON["SURGE_PROBE_OPTION"]) + 2); exit }}' "/proc/$1/cmdline" 2>/dev/null; }}
 for cmdline in /proc/[0-9]*/cmdline; do
@@ -321,7 +329,7 @@ for cmdline in /proc/[0-9]*/cmdline; do
   cmd="$(tr '\0' ' ' < "$cmdline" 2>/dev/null || true)";
   if process_exe_is_retained_app "$pid"; then stale_retained_app_seen=1; fi;
   [ -n "$cmd" ] || continue;
-  case "$cmd" in *"surge-supervisor"*) ;; *"$active_exe"*) app_seen=1; if contains_target_proof "$cmd" || {{ [ "$status_converged" -eq 1 ] && process_exe_matches_active "$pid"; }}; then target_app_seen=1; target_app_pids="${{target_app_pids}}${{pid}} "; else stale_app_seen=1; fi ;; esac;
+  case "$cmd" in *"surge-supervisor"*) ;; *"$active_exe"*|*"$active_exe_resolved"*) app_seen=1; if contains_target_proof "$cmd" || {{ [ "$status_converged" -eq 1 ] && process_exe_matches_active "$pid"; }}; then target_app_seen=1; target_app_pids="${{target_app_pids}}${{pid}} "; else stale_app_seen=1; fi ;; esac;
   if [ -n "$supervisor_id" ] && process_supervisor_matches_active "$pid" && [ "$(supervisor_option "$pid" --id)" = "$supervisor_id" ]; then
     supervisor_seen=1;
     supervisor_pids="${{supervisor_pids}}${{pid}} ";

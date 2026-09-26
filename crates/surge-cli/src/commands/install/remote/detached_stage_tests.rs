@@ -37,21 +37,29 @@ os.execv('/bin/sh', ['sh', '-c', command])
     );
 }
 
-async fn invoke_current_fixture_install(root: &Path, plan_only: bool, force: bool, stage: bool) -> Result<()> {
-    use crate::commands::install::{InstallBehavior, InstallMode};
-    let release = ReleaseEntry {
+fn current_fixture_release() -> ReleaseEntry {
+    ReleaseEntry {
         version: "1.2.3".to_string(),
         rid: "linux-x64".to_string(),
         full_filename: "demoapp-1.2.3.tar.zst".to_string(),
         install_directory: "demoapp".to_string(),
         main_exe: "demoapp".to_string(),
         ..ReleaseEntry::default()
-    };
-    let storage = StorageConfig {
+    }
+}
+
+fn current_fixture_storage(root: &Path) -> StorageConfig {
+    StorageConfig {
         provider: Some(surge_core::context::StorageProvider::Filesystem),
         bucket: root.to_str().unwrap().to_string(),
         ..StorageConfig::default()
-    };
+    }
+}
+
+async fn invoke_current_fixture_install(root: &Path, plan_only: bool, force: bool, stage: bool) -> Result<()> {
+    use crate::commands::install::{InstallBehavior, InstallMode};
+    let release = current_fixture_release();
+    let storage = current_fixture_storage(root);
     let backend = surge_core::storage::filesystem::FilesystemBackend::new(root.to_str().unwrap(), "");
     super::super::install_release_via_tailscale(
         None,
@@ -169,6 +177,43 @@ async fn isolated_stage_monitor_worker() {
         );
     }
     assert_eq!(fs::read_to_string(&installer).unwrap(), "preserve-starting-installer");
+    let request = super::super::operation::request_fingerprint(
+        "demoapp",
+        "linux-x64",
+        &current_fixture_release(),
+        "test",
+        &current_fixture_storage(&root),
+        crate::commands::install::InstallBehavior {
+            no_start: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    fs::write(&pending, request).unwrap();
+    let finish_root = root.clone();
+    let finisher = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        fs::write(
+            finish_root.join(".local/share/demoapp/.surge-update-status.json"),
+            r#"{"state":"converged","installed_version":"1.2.3","target_version":"1.2.3"}"#,
+        )
+        .unwrap();
+        fs::write(finish_root.join("job-finished"), "complete").unwrap();
+        fs::write(finish_root.join(".surge-installer.result"), "0").unwrap();
+        fs::remove_file(finish_root.join(".surge-installer.pid")).unwrap();
+    });
+    let completion = invoke_current_fixture_install(&root, false, false, false).await;
+    let finished_before_return = root.join("job-finished").exists();
+    finisher.join().unwrap();
+    completion.unwrap();
+    assert!(
+        finished_before_return,
+        "current metadata must not bypass the matching detached job"
+    );
+    assert!(
+        !installer.exists(),
+        "successful reattachment must clean up the completed owned helper"
+    );
     let _controller_lock = super::super::lock::RemoteInstallerLock::acquire("fixture")
         .await
         .unwrap();

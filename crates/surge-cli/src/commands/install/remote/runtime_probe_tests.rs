@@ -66,7 +66,7 @@ fn spawn_supervisor_with_args(
             .arg("-c")
             .arg(r#"bash -c 'shopt -s execfail; for attempt in {1..200}; do exec "$1" 30; sleep 0.01; done; exit 1' child "$1" & child=$!; echo "$child" > "$2"; wait "$child""#)
             .arg("watch")
-            .arg(root.join("app/demoapp"))
+            .arg(fs::canonicalize(root.join("app/demoapp")).unwrap())
             .arg(&child_pid)
             .args(["--id", id, "--pid", &watched.to_string()])
             .args(child_args)
@@ -77,7 +77,7 @@ fn spawn_supervisor_with_args(
     let pid = child.id();
     processes.0.push(child);
     let deadline = Instant::now() + Duration::from_secs(5);
-    let expected_exe = root.join("app/demoapp");
+    let expected_exe = fs::canonicalize(root.join("app/demoapp")).unwrap();
     loop {
         let ready = fs::read_to_string(&child_pid)
             .ok()
@@ -253,4 +253,51 @@ fn process_probe_accepts_original_watched_app() {
             .stderr(Stdio::null()),
     ));
     assert_eq!(run_probe(root.path()), "ready");
+}
+
+#[test]
+fn process_probe_accepts_in_tree_symlink_after_respawn() {
+    let root = fixture();
+    let app = root.path().join("app");
+    fs::create_dir(app.join("bin")).unwrap();
+    fs::rename(app.join("demoapp"), app.join("bin/actual-app")).unwrap();
+    std::os::unix::fs::symlink("bin/actual-app", app.join("demoapp")).unwrap();
+    let mut processes = Processes(Vec::new());
+    spawn_supervisor(root.path(), "demo-supervisor", 999_999, &mut processes);
+    let result = run_probe(root.path());
+    stop_spawned_child(root.path());
+    assert_eq!(result, "ready");
+}
+
+#[test]
+fn process_probe_rejects_out_of_tree_symlink() {
+    let root = fixture();
+    let app = root.path().join("app");
+    fs::rename(app.join("demoapp"), root.path().join("outside-app")).unwrap();
+    std::os::unix::fs::symlink("../outside-app", app.join("demoapp")).unwrap();
+    let mut processes = Processes(Vec::new());
+    spawn_supervisor(root.path(), "demo-supervisor", 999_999, &mut processes);
+    let result = run_probe(root.path());
+    stop_spawned_child(root.path());
+    assert_ne!(result, "ready");
+}
+
+#[test]
+fn process_probe_rejects_retained_symlink_target() {
+    let root = fixture();
+    let app = root.path().join("app");
+    let retained = root.path().join("app-1.2.2/bin");
+    fs::create_dir(app.join("bin")).unwrap();
+    fs::create_dir_all(&retained).unwrap();
+    fs::rename(app.join("demoapp"), app.join("bin/actual-app")).unwrap();
+    fs::copy("/bin/sleep", retained.join("actual-app")).unwrap();
+    std::os::unix::fs::symlink("bin/actual-app", app.join("demoapp")).unwrap();
+    let mut processes = Processes(Vec::new());
+    processes
+        .0
+        .push(spawn(Command::new(retained.join("actual-app")).arg("30")));
+    spawn_supervisor(root.path(), "demo-supervisor", 999_999, &mut processes);
+    let result = run_probe(root.path());
+    stop_spawned_child(root.path());
+    assert_ne!(result, "ready");
 }

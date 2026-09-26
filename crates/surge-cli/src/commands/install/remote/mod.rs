@@ -2,6 +2,7 @@
 
 mod activation;
 mod detached;
+mod detached_identity;
 mod execution;
 mod installer_stage;
 mod lock;
@@ -415,6 +416,9 @@ pub(super) async fn install_release_via_tailscale(
     let mut watch_log_offset = 0_u64;
     let mut reattached = false;
     let probe = detached::probe_remote_detached_install(ssh_target).await?;
+    if probe.unverified_alive {
+        return Err(SurgeError::Platform("A legacy installer PID is alive without verifiable process identity; leave it running and retry after it exits".to_string()));
+    }
     if probe.alive {
         if probe.operation.as_deref() == Some(operation.as_str()) {
             logline::info(&format!(

@@ -274,7 +274,9 @@ reattaches to its detached operation. Another connected controller is reported a
 busy. Cleanup checks ownership and leaves live installer helpers in place.
 A different or legacy operation still running on the node is reported instead of
 being stopped or overwritten. Wait for it to finish before starting another operation.
-An interrupted stage without a completion result cannot report success.
+An interrupted stage without a completion result cannot report success. Installer PID
+records include Linux boot ID and process start ticks, so a reused PID is not treated
+as the original job. A live legacy PID without that identity is left untouched.
 
 After a supervisor respawns its child, remote process verification accepts the current
 child only with target-version proof, the expected active executable and the actual

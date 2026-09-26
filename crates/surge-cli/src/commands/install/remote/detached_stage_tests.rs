@@ -77,6 +77,11 @@ async fn isolated_stage_monitor_worker() {
     let operation = "fixture-stage";
     fs::write(root.join(".surge-installer.operation"), operation).unwrap();
     fs::write(root.join(".surge-installer.pid"), std::process::id().to_string()).unwrap();
+    fs::write(
+        root.join(".surge-installer.identity"),
+        super::super::detached_identity::current_process_identity(),
+    )
+    .unwrap();
     let mut offset = 0;
     let mut progress = Instant::now();
     for state in ["converged", "failed", "in_progress"] {

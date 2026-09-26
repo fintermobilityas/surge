@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
 use super::ReleaseEntry;
+use super::detached_identity::{installer_process_probe, process_identity_function};
 use super::execution::{REMOTE_INSTALLER_FINAL_PATH, run_tailscale_capture};
 use super::watchdog::read_remote_update_status_file;
 use super::{Path, Result, SurgeError, logline, shell_single_quote};
@@ -29,6 +30,7 @@ pub(crate) struct RemoteInstallTarget<'a> {
 pub(crate) struct RemoteDetachedInstallProbe {
     pub pid: Option<String>,
     pub alive: bool,
+    pub unverified_alive: bool,
     pub log_size: u64,
     pub operation: Option<String>,
     pub exit_code: Option<i32>,
@@ -36,30 +38,22 @@ pub(crate) struct RemoteDetachedInstallProbe {
 
 pub(crate) fn build_remote_detached_install_probe_command() -> String {
     format!(
-        "set -eu; \
-pidfile={REMOTE_INSTALLER_PID_PATH}; \
+        "set -eu; {}; \
 log={REMOTE_INSTALLER_LOG_PATH}; \
-pid=''; \
-if [ -f \"$pidfile\" ]; then pid=\"$(tr -d '[:space:]' < \"$pidfile\")\"; fi; \
-alive=no; \
-if [ -n \"$pid\" ]; then \
-  case \"$pid\" in \
-    ''|*[!0-9]*) : ;; \
-    *) if kill -0 \"$pid\" 2>/dev/null; then alive=yes; fi ;; \
-  esac; \
-fi; \
 logsize=0; \
 if [ -f \"$log\" ]; then logsize=\"$(wc -c < \"$log\" | tr -d '[:space:]')\"; fi; \
 operation=\"$(cat /tmp/.surge-installer.operation 2>/dev/null || true)\"; \
 result=\"$(cat /tmp/.surge-installer.result 2>/dev/null || true)\"; \
 printf 'operation=%s\\nresult=%s\\n' \"$operation\" \"$result\"; \
-printf 'pid=%s\\nalive=%s\\nlogsize=%s\\n' \"$pid\" \"$alive\" \"$logsize\""
+printf 'pid=%s\\nalive=%s\\nlogsize=%s\\nunverified=%s\\n' \"$pid\" \"$alive\" \"$logsize\" \"$unverified\"",
+        installer_process_probe()
     )
 }
 
 pub(crate) fn parse_remote_detached_install_probe(output: &str) -> Result<RemoteDetachedInstallProbe> {
     let mut pid: Option<String> = None;
     let mut alive = false;
+    let mut unverified_alive = false;
     let mut log_size = 0_u64;
     let mut operation = None;
     let mut exit_code = None;
@@ -83,6 +77,8 @@ pub(crate) fn parse_remote_detached_install_probe(output: &str) -> Result<Remote
             }
         } else if let Some(value) = line.strip_prefix("alive=") {
             alive = value == "yes";
+        } else if let Some(value) = line.strip_prefix("unverified=") {
+            unverified_alive = value == "yes";
         } else if let Some(value) = line.strip_prefix("logsize=") {
             log_size = value.trim().parse::<u64>().map_err(|e| {
                 SurgeError::Platform(format!("Remote detached install probe returned invalid log size: {e}"))
@@ -92,6 +88,7 @@ pub(crate) fn parse_remote_detached_install_probe(output: &str) -> Result<Remote
     Ok(RemoteDetachedInstallProbe {
         pid,
         alive,
+        unverified_alive,
         log_size,
         operation,
         exit_code,
@@ -108,9 +105,12 @@ pub(crate) fn parse_remote_detached_install_probe(output: &str) -> Result<Remote
 pub(crate) fn build_remote_detached_install_launch_command(flags: &str, operation: &str) -> String {
     let flags = flags.trim();
     let inner = format!(
-        "echo $$ > {REMOTE_INSTALLER_PID_PATH}; {REMOTE_INSTALLER_FINAL_PATH} {flags}; result=$?; \
+        "{}; identity=\"$(process_identity \"$$\")\" || exit 1; \
+         printf '%s\\n' \"$identity\" > /tmp/.surge-installer.identity; \
+         echo $$ > {REMOTE_INSTALLER_PID_PATH}; {REMOTE_INSTALLER_FINAL_PATH} {flags}; result=$?; \
          printf '%s\\n' \"$result\" > /tmp/.surge-installer.result.partial; \
-         mv /tmp/.surge-installer.result.partial /tmp/.surge-installer.result; exit \"$result\""
+         mv /tmp/.surge-installer.result.partial /tmp/.surge-installer.result; exit \"$result\"",
+        process_identity_function()
     );
     format!(
         "set -eu; \
@@ -143,10 +143,10 @@ pub(crate) fn build_remote_detached_install_cleanup_command(operation: &str) -> 
     format!(
         "set -eu; current=\"$(cat /tmp/.surge-installer.operation 2>/dev/null || true)\"; \
          [ \"$current\" = {} ] || {{ echo 'installer operation changed; refusing cleanup' >&2; exit 1; }}; \
-         pid=\"$(cat {REMOTE_INSTALLER_PID_PATH} 2>/dev/null || true)\"; \
-         case \"$pid\" in ''|*[!0-9]*) : ;; *) if kill -0 \"$pid\" 2>/dev/null; then exit 0; fi ;; esac; \
-         rm -f {REMOTE_INSTALLER_FINAL_PATH} {REMOTE_INSTALLER_PID_PATH} {REMOTE_INSTALLER_FINAL_PATH}.partial {REMOTE_INSTALLER_FINAL_PATH}.partial.meta /tmp/.surge-installer.operation /tmp/.surge-installer.result /tmp/.surge-installer.result.partial",
-        shell_single_quote(operation)
+         {}; if [ \"$alive\" = yes ] || [ \"$unverified\" = yes ]; then exit 0; fi; \
+         rm -f {REMOTE_INSTALLER_FINAL_PATH} {REMOTE_INSTALLER_PID_PATH} {REMOTE_INSTALLER_FINAL_PATH}.partial {REMOTE_INSTALLER_FINAL_PATH}.partial.meta /tmp/.surge-installer.operation /tmp/.surge-installer.result /tmp/.surge-installer.result.partial /tmp/.surge-installer.identity",
+        shell_single_quote(operation),
+        installer_process_probe()
     )
 }
 
@@ -215,6 +215,11 @@ async fn poll_remote_detached_install_once(
     }
 
     let probe = probe_remote_detached_install(ssh_target).await?;
+    if probe.unverified_alive {
+        return Err(SurgeError::Platform(
+            "Installer process identity is missing; refusing to watch an unverified PID".to_string(),
+        ));
+    }
     if probe.operation.as_deref() != Some(operation) {
         return Err(SurgeError::Platform(
             "Remote installer operation changed while watching".to_string(),
@@ -383,7 +388,7 @@ pub(crate) async fn watch_remote_detached_install(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
@@ -468,12 +473,7 @@ mod tests {
     fn probe_command_reports_pid_aliveness_and_log_size() {
         let command = build_remote_detached_install_probe_command();
         assert!(command.contains("kill -0 \"$pid\""));
-        assert!(command.contains(
-            "operation=\"$(cat /tmp/.surge-installer.operation 2>/dev/null || true)\"; \
-result=\"$(cat /tmp/.surge-installer.result 2>/dev/null || true)\"; \
-printf 'operation=%s\\nresult=%s\\n' \"$operation\" \"$result\"; \
-printf 'pid=%s\\nalive=%s\\nlogsize=%s\\n'"
-        ));
+        assert!(command.contains("unverified=%s"));
     }
 
     #[test]
@@ -482,7 +482,7 @@ printf 'pid=%s\\nalive=%s\\nlogsize=%s\\n'"
         assert!(cleanup.contains("rm -f /tmp/.surge-installer /tmp/.surge-installer.pid"));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     fn script_for_temp_paths(
         script: &str,
         base: &Path,
@@ -494,7 +494,7 @@ printf 'pid=%s\\nalive=%s\\nlogsize=%s\\n'"
         (script, bin_path, log_path, pid_path)
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn cleanup_preserves_a_different_operation_and_live_installer() {
         let temp = tempfile::tempdir().unwrap();
@@ -517,7 +517,7 @@ printf 'pid=%s\\nalive=%s\\nlogsize=%s\\n'"
         assert!(!operation.exists());
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn detached_launch_command_runs_installer_detached_and_reports_pid() {
         let temp_dir = tempfile::tempdir().expect("tempdir");

@@ -113,10 +113,7 @@ pub(super) fn decode_tar(archive: &[u8]) -> Result<Vec<u8>> {
 pub(super) fn collect_tree_entries_in_memory(tar_bytes: &[u8]) -> Result<BTreeMap<String, SparseTreeEntry>> {
     let mut entries = BTreeMap::new();
     let mut archive = tar::Archive::new(std::io::Cursor::new(tar_bytes));
-    // Tar is a sequence of 512-byte header blocks followed by data rounded up
-    // to 512-byte blocks. Track the header offset manually so file contents
-    // can be referenced by offset into `tar_bytes` instead of copied.
-    let mut block_pos = 0usize;
+    // File contents are referenced by offset into `tar_bytes` instead of copied.
     for entry in archive
         .entries()
         .map_err(|e| SurgeError::Archive(format!("Failed to read archive entries: {e}")))?
@@ -124,8 +121,11 @@ pub(super) fn collect_tree_entries_in_memory(tar_bytes: &[u8]) -> Result<BTreeMa
         let entry = entry.map_err(|e| SurgeError::Archive(format!("Bad archive entry: {e}")))?;
         let size = usize::try_from(entry.size())
             .map_err(|_| SurgeError::Archive("Archive entry size exceeds supported limits".into()))?;
-        let data_start = block_pos + 512;
-        block_pos = data_start + size + (512 - (size % 512)) % 512;
+        // Take the payload offset from the reader: the iterator folds GNU
+        // long-name / PAX extension headers (paths over 100 bytes) into the
+        // following entry, so counting the yielded headers drifts after them.
+        let data_start = usize::try_from(entry.raw_file_position())
+            .map_err(|_| SurgeError::Archive("Archive entry offset exceeds supported limits".into()))?;
         let relative = normalize_entry_path(entry.path()?.as_ref())?;
         if relative.is_empty() {
             continue; // archive root
@@ -588,6 +588,30 @@ mod tests {
         let buffer = &tar_bytes[..];
         let view = SparseTree { buffer, entries: &tree };
         assert_eq!(view.content(&tree["bin/tool"]), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn in_memory_tree_collect_reads_contents_after_long_paths() {
+        let long_a = format!("goldens/{}-a.json", "x".repeat(120));
+        let long_b = format!("goldens/{}-b.json", "y".repeat(120));
+        let archive = pack_tree(&[
+            ("goldens", vec![], 0o755, true),
+            (long_a.as_str(), b"first long".to_vec(), 0o644, false),
+            (long_b.as_str(), vec![b'L'; 700], 0o644, false),
+            ("runtime/lib.so", vec![7u8; 1500], 0o755, false),
+            ("youpay.dll", b"after the long names".to_vec(), 0o644, false),
+        ]);
+        let tar_bytes = decode_tar(&archive).expect("decode");
+        let tree = collect_tree_entries_in_memory(&tar_bytes).expect("collect");
+        assert_eq!(tree.len(), 5);
+        let view = SparseTree {
+            buffer: &tar_bytes[..],
+            entries: &tree,
+        };
+        assert_eq!(view.content(&tree[&long_a]), b"first long");
+        assert_eq!(view.content(&tree[&long_b]), &[b'L'; 700][..]);
+        assert_eq!(view.content(&tree["runtime/lib.so"]), &[7u8; 1500][..]);
+        assert_eq!(view.content(&tree["youpay.dll"]), b"after the long names");
     }
 
     #[test]

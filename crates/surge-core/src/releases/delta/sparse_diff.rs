@@ -615,6 +615,64 @@ mod tests {
     }
 
     #[test]
+    fn sparse_patch_round_trips_archives_with_long_paths() {
+        // Paths over 100 bytes are stored with GNU long-name headers, which the tar
+        // iterator folds into the next entry; later files must keep their contents.
+        let long = |n: usize| format!("fixtures/{}-{n:03}.json", "z".repeat(110));
+        let dir = tempfile::tempdir().unwrap();
+        let mut release = 0;
+        let mut pack = |files: &[(String, Vec<u8>)]| {
+            release += 1;
+            let root = dir.path().join(format!("v{release}"));
+            for (path, data) in files {
+                let file = root.join(path);
+                std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+                std::fs::write(file, data).unwrap();
+            }
+            let mut packer = crate::archive::packer::ArchivePacker::new(3).unwrap();
+            packer.add_directory(&root, "").unwrap();
+            packer.finalize().unwrap()
+        };
+        let full_v1 = pack(&[
+            (long(1), b"old fixture".to_vec()),
+            ("lib/native.so".to_string(), vec![0x42u8; 300_000]),
+            ("app.dll".to_string(), b"app v1".to_vec()),
+        ]);
+        let full_v2 = pack(&[
+            (long(1), b"new fixture".to_vec()),
+            (long(2), b"added fixture".to_vec()),
+            ("lib/native.so".to_string(), vec![0x42u8; 300_000]),
+            ("app.dll".to_string(), b"app v2".to_vec()),
+        ]);
+        let options = ChunkedDiffOptions {
+            chunk_size: 128 * 1024,
+            max_threads: 1,
+            format: crate::diff::chunked::ChunkedPatchFormat::Legacy,
+        };
+        let delta = crate::releases::manifest::DeltaArtifact::sparse_file_ops_zstd("roundtrip", "1.0.0", "", 0, "");
+
+        // Long paths on the newer side (promote rebuilding a channel delta).
+        let patch = super::super::build_sparse_file_patch(&full_v1, &full_v2, 3, 0, &options).unwrap();
+        assert_eq!(
+            super::super::apply_delta_patch(&full_v1, &patch, &delta).unwrap(),
+            full_v2
+        );
+
+        // Long paths on the older side (pack against a previous release).
+        let full_v3 = pack(&[
+            (long(1), b"new fixture".to_vec()),
+            (long(2), b"added fixture".to_vec()),
+            ("lib/native.so".to_string(), vec![0x42u8; 300_000]),
+            ("app.dll".to_string(), b"app v3".to_vec()),
+        ]);
+        let patch = super::super::build_sparse_file_patch(&full_v2, &full_v3, 3, 0, &options).unwrap();
+        assert_eq!(
+            super::super::apply_delta_patch(&full_v2, &patch, &delta).unwrap(),
+            full_v3
+        );
+    }
+
+    #[test]
     fn reused_tree_builds_byte_identical_patch() {
         let opts = ChunkedDiffOptions {
             chunk_size: 256 * 1024,

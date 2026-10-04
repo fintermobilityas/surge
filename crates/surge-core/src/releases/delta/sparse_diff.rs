@@ -599,7 +599,7 @@ mod tests {
             (long_a.as_str(), b"first long".to_vec(), 0o644, false),
             (long_b.as_str(), vec![b'L'; 700], 0o644, false),
             ("runtime/lib.so", vec![7u8; 1500], 0o755, false),
-            ("youpay.dll", b"after the long names".to_vec(), 0o644, false),
+            ("main.dll", b"after the long names".to_vec(), 0o644, false),
         ]);
         let tar_bytes = decode_tar(&archive).expect("decode");
         let tree = collect_tree_entries_in_memory(&tar_bytes).expect("collect");
@@ -611,7 +611,7 @@ mod tests {
         assert_eq!(view.content(&tree[&long_a]), b"first long");
         assert_eq!(view.content(&tree[&long_b]), &[b'L'; 700][..]);
         assert_eq!(view.content(&tree["runtime/lib.so"]), &[7u8; 1500][..]);
-        assert_eq!(view.content(&tree["youpay.dll"]), b"after the long names");
+        assert_eq!(view.content(&tree["main.dll"]), b"after the long names");
     }
 
     #[test]

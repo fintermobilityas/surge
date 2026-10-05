@@ -1,5 +1,22 @@
 # Repository Guidelines
 
+<!-- company-products:begin -->
+## Company and products
+
+`surge` is one of Finter Mobility's repositories. Before changing anything that another repo depends on, read the shared map in the private `fintermobilityas/company` repo, checked out beside this one as `../company`:
+
+- What every repo does and how they connect: `../company/docs/products.md` (machine-readable: `../company/docs/products.json`).
+- This repo's page: `../company/docs/products/surge.md`.
+- Shared maintenance rules (Dependabot, .NET, MongoDB, PRs, native packages, rollout order): `../company/AGENTS.md`.
+
+Companions of `surge`:
+
+- Uses: `company` (shared maintenance procedures).
+- Used by: `accesspad` (Surge.NET + surge CLI); `desktop-migration` (surge CLI install flags); `finter_ansible` (Surge installer storage and log text); `freevisitkiosk` (Surge.NET + surge CLI (0.4.0-preview line)); `jetpack-migration` (surge CLI install); `operator` (releases.yml.zst release index); `youpark` (Surge.NET + surge CLI); `youpayv2` (Surge.NET + surge CLI); `horizon` (surge-core).
+
+When you change a contract shared with a companion (API, package, model files, fixtures, deploy order), check that repo too and update `../company/docs/products.json` if the link itself changes.
+<!-- company-products:end -->
+
 ## Project Structure & Module Organization
 Surge is a Cargo workspace plus a .NET wrapper:
 - `crates/surge-core/`: update engine (storage, releases, diff, pack, update, supervisor).

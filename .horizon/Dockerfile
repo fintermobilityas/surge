@@ -29,8 +29,8 @@ RUN curl -fsSL https://static.rust-lang.org/rustup/archive/1.29.1/x86_64-unknown
 
 # Exact actions/setup-dotnet pin from both .NET CI jobs. SHA512: Microsoft metadata.
 RUN mkdir -p /opt/surge/dotnet \
-    && curl -fsSL https://builds.dotnet.microsoft.com/dotnet/Sdk/11.0.100-rc.1.26425.128/dotnet-sdk-11.0.100-rc.1.26425.128-linux-x64.tar.gz -o /tmp/dotnet.tar.gz \
-    && echo '608518577aab9db33db92ebd74f0fc9bfbcc7b3d473619f4731aca2edba80af6c571a38d5be6994862fc4679f6f3d13db767712fcb6f70a7683974a18824a0cc  /tmp/dotnet.tar.gz' | sha512sum -c - \
+    && curl -fsSL https://builds.dotnet.microsoft.com/dotnet/Sdk/11.0.100-rc.2.26504.105/dotnet-sdk-11.0.100-rc.2.26504.105-linux-x64.tar.gz -o /tmp/dotnet.tar.gz \
+    && echo '54e9463339337cef68f455e97dadac0a9e1b49416a3b15504b577144b24ae4b4eed4e7ba3bac507650b61edf704e977b4627d3804f4c2688cc5bd69b4f2eecdd  /tmp/dotnet.tar.gz' | sha512sum -c - \
     && tar -xzf /tmp/dotnet.tar.gz -C /opt/surge/dotnet \
     && rm /tmp/dotnet.tar.gz
 

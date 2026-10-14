@@ -287,7 +287,7 @@ jobs:
           ref: ${{ needs.validate-release.outputs.tag_commit }}
       - uses: actions/setup-dotnet@v6
         with:
-          dotnet-version: '11.0.100-rc.1.26425.128'
+          dotnet-version: '11.0.100-rc.2.26504.105'
       - uses: actions/cache@v6
         with:
           path: ~/.nuget/packages
@@ -445,7 +445,7 @@ jobs:
     steps:
       - uses: actions/setup-dotnet@v6
         with:
-          dotnet-version: '11.0.100-rc.1.26425.128'
+          dotnet-version: '11.0.100-rc.2.26504.105'
       - name: Download immutable NuGet package
         uses: actions/download-artifact@v8
         with:

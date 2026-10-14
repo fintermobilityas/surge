@@ -11,7 +11,7 @@ The provider is selected in Horizon's New cloud dialog.
 | --- | --- | --- |
 | Rust, Cargo, rustfmt, Clippy | 1.95.0 | `rust-toolchain.toml`; CI `msrv` job |
 | rustup bootstrap | 1.29.1 | Official rustup release metadata and SHA256 |
-| .NET SDK | 11.0.100-rc.1.26425.128 | Both setup-dotnet steps in `ci.yml`; Microsoft release metadata SHA512 |
+| .NET SDK | 11.0.100-rc.2.26504.105 | Both setup-dotnet steps in `ci.yml`; Microsoft release metadata SHA512 |
 | GCC / G++ | 13 | Ubuntu 24.04 native compiler packages |
 | Clang for Native AOT | 18 | Ubuntu 24.04 native compiler package |
 | localci | 0.1.0 | Latest public release at setup; musl x64 archive checked against SHA256SUMS and a fixed digest |

@@ -112,7 +112,7 @@ impl InstallerApp {
 
         let animated = ui
             .ctx()
-            .animate_value_with_time(Id::new("install_progress"), target, 0.3);
+            .animate_value_with_time(Id::unique("install_progress"), target, 0.3);
 
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(BG))

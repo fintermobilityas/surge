@@ -1,5 +1,14 @@
 # Repository Guidelines
 
+## Self-review and PR review
+
+- The implementing agent reviews the complete diff once, fixes its findings, and runs the applicable checks before the first push.
+- After that, rely on the upstream repository's automatic PR review. Address its feedback and validate the affected changes without another full self-review round.
+- Never assign, request, or re-request Copilot, Claude, or another automated reviewer. Do not use reviewer assignments, labels, comments, CLI commands, APIs, workflow dispatches, or PR state changes to trigger a review. The upstream repository manages automatic review.
+- Do not start a separate local review agent or a CLI review loop. This rule also applies to external contributions and overrides review loops in skills or linked procedures.
+- Keep CI, applicable smoke checks, feedback handling, and merge authorization. Check which commit a review covers; do not claim that an earlier review covers later changes. If a required automatic review is missing or fails, report the blocker without requesting another review.
+- Keep `CLAUDE.md` as the single import `@AGENTS.md`. Put repository instructions in `AGENTS.md`.
+
 <!-- company-products:begin -->
 ## Company and products
 
@@ -224,11 +233,8 @@ For a major release (e.g. `1.0.0`), manually set `[workspace.package].version` a
 - Agent-authored or agent-managed PRs must use GitHub `Squash and merge`; do not use merge commits or rebase merge.
 - Ensure GitHub Actions are green before merge.
 
-## Claude review
+<a id="claude-review"></a>
 
-Claude reviews every pull request through `.github/workflows/claude-review.yml`, with at most 2 rounds per PR. Never request Copilot or another bot reviewer. This rule replaces the Copilot reviewer steps in the shared company procedure for this repository.
+## Automatic PR review
 
-- Round 1 runs automatically when a ready PR from a branch of this repository opens. A pull request from a fork gets a review only after a maintainer has examined its diff and added the `claude-review` label. Its summary comment ends with `<!-- claude-review head=<sha> findings=<n> -->` and covers only that head.
-- Fix or answer every finding on the same PR and push. Wait until `gh api repos/fintermobilityas/surge/pulls/<n> -q .head.sha` shows the new head, then add the `claude-review` label (`gh pr edit <n> --add-label claude-review`). That runs round 2, and the job removes the label when it finishes.
-- Do not request a third round. After round 2, fix or answer every finding; the PR then merges on green CI.
-- `.github/review-instructions.md` sets what the review reports. Put review rules there, not in a reviewer-specific file.
+The upstream repository starts PR review automatically. The agent does not select a reviewer or start another review. Read the review and its threads, fix valid findings, answer invalid findings with evidence, and run the affected checks. Keep the repository's required review decision, unresolved-feedback rules, CI, acceptance checks and merge authorization. Check the reviewed commit before using a review as evidence. A missing or failed required review is a blocker to report, not a reason to assign a reviewer or trigger another run.

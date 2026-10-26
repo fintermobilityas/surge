@@ -24,7 +24,7 @@ concurrency:
 
 jobs:
   review:
-    uses: fintermobilityas/company/.github/workflows/claude-review-shared.yml@main
+    uses: fintermobilityas/review/.github/workflows/claude-review.yml@main
     permissions:
       contents: read
       pull-requests: write

@@ -280,7 +280,7 @@ jobs:
           submodules: true
       - uses: actions/setup-dotnet@v6
         with:
-          dotnet-version: '11.0.100-rc.2.26504.105'
+          dotnet-version: '11.0.100-rc.3.26522.148'
       - uses: actions/cache@v6
         with:
           path: ~/.nuget/packages
@@ -327,7 +327,7 @@ jobs:
           submodules: true
       - uses: actions/setup-dotnet@v6
         with:
-          dotnet-version: '11.0.100-rc.2.26504.105'
+          dotnet-version: '11.0.100-rc.3.26522.148'
       - uses: actions/cache@v6
         with:
           path: ~/.nuget/packages

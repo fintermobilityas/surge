@@ -43,6 +43,21 @@ it exists. Rust tests run
 with `RUST_TEST_THREADS=1` to reduce concurrent process churn around `/proc`
 lifecycle probes; every test still runs, while Cargo builds use four jobs.
 
+## Dependency maintenance
+
+Dependabot checks Docker references in `/.horizon` weekly with a three-day
+cooldown. This covers image references in `Dockerfile`; it does not cover the
+Rust, rustup, .NET SDK or localci versions installed by `RUN` commands.
+
+For images whose tags are derived from `ARG` values, check that Dependabot can
+resolve the complete reference. Toolchain versions supplied through `ARG` or
+build arguments still need the release tasks in the
+[shared maintenance procedures](https://github.com/fintermobilityas/company/blob/main/AGENTS.md#daily-maintenance).
+Do not treat a Docker update entry as proof that those toolchain pins are covered.
+Keep the Dockerfile pins and checksums, the tool table above, and the repository
+and CI pins aligned when updating a toolchain. If an update needs a workflow
+edit, a person must make that change; Upkeep task runs cannot edit workflows.
+
 ## Image proof
 
 Horizon runs these `ci.yml` targets for the push event:

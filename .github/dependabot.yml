@@ -29,3 +29,10 @@ updates:
     schedule:
       interval: "daily"
       time: "04:00"
+
+  - package-ecosystem: docker
+    cooldown:
+      default-days: 3
+    directory: "/.horizon"
+    schedule:
+      interval: weekly

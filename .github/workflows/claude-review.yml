@@ -25,7 +25,7 @@ jobs:
     concurrency:
       group: claude-review-${{ github.event.pull_request.number }}
       cancel-in-progress: false
-    uses: fintermobilityas/review/.github/workflows/claude-review.yml@3df2a13620889c358e9839088f14e19ccac95f1b
+    uses: fintermobilityas/review/.github/workflows/claude-review.yml@a00561c601744f1e43aa9457553f902574809e7a
     permissions:
       contents: read
       pull-requests: write

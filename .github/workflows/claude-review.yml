@@ -8,7 +8,8 @@ name: Claude Review
 # Keep this file identical in every repository and change the review itself in
 # fintermobilityas/review/.github/workflows/claude-review.yml, which this file
 # calls. The call below is pinned to a commit of that repository, so a change
-# there arrives here only when that line moves.
+# there arrives here only when that line moves. This caller holds only the
+# event, the concurrency group and one `uses:` line.
 
 on:
   pull_request_target:

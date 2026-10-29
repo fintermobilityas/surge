@@ -109,7 +109,10 @@ fn enumeration_excludes_threads_and_quiescence_waits_for_application_exit() {
 
     assert!(app.child.wait().unwrap().success());
     assert!(!identity_is_running(&app.identity).unwrap());
-    assert!(matching_processes(&app.identity.executable).unwrap().is_empty());
+    assert_eq!(
+        matching_processes(&app.identity.executable).unwrap(),
+        [] as [ProcessIdentity; 0]
+    );
     assert!(unrelated.child.try_wait().unwrap().is_none());
 }
 

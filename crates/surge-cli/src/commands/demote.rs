@@ -173,7 +173,7 @@ mod tests {
 
         let index = read_index(&store_dir);
         assert_eq!(index.releases[0].channels, vec!["stable".to_string()]);
-        assert!(!index.last_write_utc.is_empty());
+        assert_ne!(index.last_write_utc, "");
     }
 
     #[tokio::test]

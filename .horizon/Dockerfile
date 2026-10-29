@@ -18,12 +18,12 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
       libxkbcommon-dev libxkbcommon-x11-0 libxrandr-dev libxxf86vm-dev \
       fonts-dejavu-core fonts-liberation
 
-# rust-toolchain.toml and the MSRV job both require 1.95.0.
+# Match rust-toolchain.toml; the CI MSRV job stays on 1.95.0.
 ENV RUSTUP_HOME=/opt/surge/rustup
 RUN curl -fsSL https://static.rust-lang.org/rustup/archive/1.29.1/x86_64-unknown-linux-gnu/rustup-init -o /tmp/rustup-init \
     && echo 'dda7234360b7f578ca8b0ddcb80145646fa61a67c1720a5abc7051b35c9fcb71  /tmp/rustup-init' | sha256sum -c - \
     && chmod +x /tmp/rustup-init \
-    && CARGO_HOME=/opt/surge/cargo /tmp/rustup-init -y --no-modify-path --profile minimal --default-toolchain 1.95.0 --component rustfmt,clippy \
+    && CARGO_HOME=/opt/surge/cargo /tmp/rustup-init -y --no-modify-path --profile minimal --default-toolchain 1.99.1 --component rustfmt,clippy \
     && chown -R 10001:10001 /opt/surge/rustup \
     && rm /tmp/rustup-init
 

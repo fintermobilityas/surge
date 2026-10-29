@@ -456,7 +456,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let missing_dir = temp_dir.path().join("missing");
         let files = app_env_files_for_directory(&missing_dir).expect("missing directories should be skipped");
-        assert!(files.is_empty());
+        assert_eq!(files, [] as [(std::string::String, std::path::PathBuf); 0]);
     }
 
     #[test]

@@ -219,7 +219,7 @@ mod tests {
         assert_eq!(info.state, ProcessState::Stopped);
         assert_eq!(info.pid, 0);
         assert_eq!(info.exit_code, 0);
-        assert!(info.version.is_empty());
+        assert_eq!(info.version, "");
     }
 
     #[test]

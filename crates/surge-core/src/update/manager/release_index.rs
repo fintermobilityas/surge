@@ -333,7 +333,7 @@ mod tests {
 
         let resolved = resolve_delta_chain_for_current_install(&[&release], "1.0.0").expect("legacy chain resolves");
         assert_eq!(resolved[0].deltas.len(), 1);
-        assert!(resolved[0].deltas[0].from_version.is_empty());
+        assert_eq!(resolved[0].deltas[0].from_version, "");
     }
 
     #[test]

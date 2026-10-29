@@ -521,7 +521,7 @@ mod tests {
         let index = make_index(vec![make_entry("1.0.0", &["stable"], false)]);
 
         let compressed = compress_release_index(&index, crate::config::constants::DEFAULT_ZSTD_LEVEL).unwrap();
-        assert!(!compressed.is_empty());
+        assert_ne!(compressed, [] as [u8; 0]);
 
         let decompressed = decompress_release_index(&compressed).unwrap();
         assert_eq!(decompressed.app_id, "test-app");

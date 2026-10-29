@@ -590,7 +590,7 @@ mod tests {
             .output()
             .unwrap();
         assert!(!output.status.success());
-        assert!(output.stdout.is_empty());
+        assert_eq!(output.stdout, [] as [u8; 0]);
         assert!(String::from_utf8_lossy(&output.stderr).contains("did not publish its PID"));
         assert!(!pid.exists());
     }
@@ -642,7 +642,7 @@ mod tests {
             .expect("pidfile written")
             .trim()
             .to_string();
-        assert!(!pid.is_empty());
+        assert_ne!(pid, "");
         let pid_alive = |pid: &str| {
             std::process::Command::new("kill")
                 .args(["-0", pid])

@@ -195,7 +195,7 @@ mod tests {
     fn test_list_channels_empty() {
         let index = make_index(vec![]);
         let channels = ChannelManager::list_channels(&index);
-        assert!(channels.is_empty());
+        assert_eq!(channels, [] as [std::string::String; 0]);
     }
 
     #[test]

@@ -520,7 +520,7 @@ apps:
         let mut env = BTreeMap::new();
         env.insert("GITHUB_TOKEN".to_string(), "ghp_test".to_string());
         let creds = storage_credentials_from_lookup(StorageProvider::GitHubReleases, |key| env.get(key).cloned());
-        assert!(creds.access_key.is_empty());
+        assert_eq!(creds.access_key, "");
         assert_eq!(creds.secret_key, "ghp_test");
     }
 

@@ -164,7 +164,7 @@ mod tests {
         let new = b"Hello, World! This is the NEW version of the file with changes.";
 
         let patch = bsdiff_buffers(old, new).unwrap();
-        assert!(!patch.is_empty());
+        assert_ne!(patch, [] as [u8; 0]);
 
         let reconstructed = bspatch_buffers(old, &patch).unwrap();
         assert_eq!(reconstructed, new);

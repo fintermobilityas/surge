@@ -102,7 +102,7 @@ mod tests {
             .output()
             .unwrap();
         assert_eq!(contender.status.code(), Some(75));
-        assert!(contender.stdout.is_empty());
+        assert_eq!(contender.stdout, [] as [u8; 0]);
         drop(owner.stdin.take());
         assert!(owner.wait().unwrap().success());
         let next = std::process::Command::new("sh")

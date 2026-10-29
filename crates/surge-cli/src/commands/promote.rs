@@ -416,7 +416,7 @@ mod tests {
             index.releases[0].channels,
             vec!["beta".to_string(), "stable".to_string()]
         );
-        assert!(!index.last_write_utc.is_empty());
+        assert_ne!(index.last_write_utc, "");
     }
 
     #[tokio::test]

@@ -338,7 +338,7 @@ mod tests {
         let mut packer = ArchivePacker::new(3).unwrap();
         packer.add_buffer("test.txt", b"hello world", 0o644).unwrap();
         let data = packer.finalize().unwrap();
-        assert!(!data.is_empty());
+        assert_ne!(data, [] as [u8; 0]);
     }
 
     #[test]

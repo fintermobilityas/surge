@@ -112,7 +112,7 @@ mod tests {
     fn restart_args_missing_file_returns_empty() {
         let dir = tempfile::tempdir().unwrap();
         let restored = read_restart_args(dir.path(), "demo-supervisor").unwrap();
-        assert!(restored.is_empty());
+        assert_eq!(restored, [] as [std::string::String; 0]);
     }
 
     #[test]

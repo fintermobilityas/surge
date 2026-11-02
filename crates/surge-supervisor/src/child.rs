@@ -371,7 +371,10 @@ mod tests {
 #[cfg(windows)]
 fn is_process_running(pid: u32) -> bool {
     let watched_pid = Pid::from_u32(pid);
-    let mut system = System::new();
+    let Ok(mut system) = System::new() else {
+        // An unreadable process table is unknown liveness, which callers treat as running.
+        return true;
+    };
     let _ = system.refresh_processes(ProcessesToUpdate::Some(&[watched_pid]), true);
     system.process(watched_pid).is_some()
 }

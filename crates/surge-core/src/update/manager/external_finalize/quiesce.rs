@@ -98,8 +98,12 @@ fn include_running_identity(processes: &mut Vec<ProcessIdentity>, identity: &Pro
     Ok(())
 }
 
+fn process_table() -> Result<System> {
+    System::new().map_err(|e| SurgeError::Supervisor(format!("Failed to read the process table: {e}")))
+}
+
 fn matching_processes(expected_executable: &Path) -> Result<Vec<ProcessIdentity>> {
-    let mut system = System::new();
+    let mut system = process_table()?;
     let _ = system.refresh_processes_specifics(ProcessesToUpdate::All, true, process_refresh_kind());
     let own_pid = std::process::id();
     let mut matching = Vec::new();
@@ -211,7 +215,7 @@ fn require_live_identity(identity: &ProcessIdentity) -> Result<bool> {
 
 fn read_process_metadata(identity: &ProcessIdentity) -> Result<bool> {
     let system_pid = Pid::from_u32(identity.pid);
-    let mut system = System::new();
+    let mut system = process_table()?;
     let _ = system.refresh_processes_specifics(ProcessesToUpdate::Some(&[system_pid]), true, process_refresh_kind());
     let process = system.process(system_pid).ok_or_else(|| {
         SurgeError::Supervisor(format!(
@@ -282,7 +286,7 @@ fn signal_process(identity: &ProcessIdentity, _force: bool) -> Result<()> {
         return Ok(());
     }
     let system_pid = Pid::from_u32(identity.pid);
-    let mut system = System::new();
+    let mut system = process_table()?;
     let _ = system.refresh_processes_specifics(ProcessesToUpdate::Some(&[system_pid]), true, process_refresh_kind());
     let Some(process) = system.process(system_pid) else {
         return Ok(());

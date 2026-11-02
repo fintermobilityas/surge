@@ -64,9 +64,11 @@ pub(super) fn app_process_pids<F>(protected_pid: u32, matches_exe: &F) -> Result
 where
     F: Fn(&AppProcess) -> bool,
 {
+    use crate::error::SurgeError;
     use sysinfo::{ProcessesToUpdate, System};
 
-    let mut system = System::new();
+    let mut system =
+        System::new().map_err(|e| SurgeError::Platform(format!("Failed to read the process table: {e}")))?;
     let _ = system.refresh_processes(ProcessesToUpdate::All, true);
     Ok(system
         .processes()

@@ -190,20 +190,34 @@ terminate_stale_app_processes() {{\n\
   return 1\n\
 }}\n\
 \n\
+if [ ! -d \"$stage_dir/app\" ]; then\n\
+  echo \"Remote install stage is missing app payload\" >&2\n\
+  exit 1\n\
+fi\n\
+if [ -n \"$main_exe\" ] && [ ! -s \"$stage_dir/app/$main_exe\" ]; then\n\
+  echo \"Remote install stage payload is unusable: '$main_exe' is missing or 0 bytes\" >&2\n\
+  exit 1\n\
+fi\n\
 kill_matching \"$install_root/$main_exe\"\n\
 kill_matching \"$install_root/app-\"\n\
 kill_matching \"$install_root/app/\"\n\
 terminate_stale_app_processes\n\
 rm -rf \"$next_app_dir\" \"$previous_app_dir\"\n\
-if [ ! -d \"$stage_dir/app\" ]; then\n\
-  echo \"Remote install stage is missing app payload\" >&2\n\
-  exit 1\n\
-fi\n\
 mv \"$stage_dir/app\" \"$next_app_dir\"\n\
 if [ -d \"$active_app_dir\" ]; then\n\
   mv \"$active_app_dir\" \"$previous_app_dir\"\n\
 fi\n\
 mv \"$next_app_dir\" \"$active_app_dir\"\n\
+if [ -n \"$main_exe\" ] && [ ! -s \"$active_app_dir/$main_exe\" ]; then\n\
+  echo \"Activated app directory is unusable: '$main_exe' is missing or 0 bytes\" >&2\n\
+  if [ -d \"$previous_app_dir\" ]; then\n\
+    rm -rf \"$next_app_dir\"\n\
+    mv \"$active_app_dir\" \"$next_app_dir\"\n\
+    mv \"$previous_app_dir\" \"$active_app_dir\"\n\
+    echo \"Rolled back to the previous app directory\" >&2\n\
+  fi\n\
+  exit 1\n\
+fi\n\
 terminate_stale_app_processes\n\
 \n\
 if [ -n \"${{legacy_app_dir:-}}\" ] && [ -d \"$legacy_app_dir\" ] && [ ! -d \"$previous_app_dir\" ]; then\n\

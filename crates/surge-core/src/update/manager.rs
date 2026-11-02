@@ -704,6 +704,25 @@ mod tests {
         bytes
     }
 
+    const MAIN_EXE_PAYLOAD: &[u8] = b"#!/bin/sh\nexit 0\n";
+    const MAIN_EXE_MODE: u32 = 0o755;
+
+    /// Pack the fixture's declared main executable so the assembled payload can be activated.
+    fn pack_main_exe(packer: &mut ArchivePacker, main_exe: &str) {
+        packer.add_buffer(main_exe, MAIN_EXE_PAYLOAD, MAIN_EXE_MODE).unwrap();
+    }
+
+    /// Write the same main executable into a fixture source or installed-app tree.
+    fn write_main_exe(dir: &Path, main_exe: &str) {
+        let path = dir.join(main_exe);
+        std::fs::write(&path, MAIN_EXE_PAYLOAD).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(MAIN_EXE_MODE)).unwrap();
+        }
+    }
+
     #[test]
     fn test_progress_info_default() {
         let p = ProgressInfo::default();
@@ -2013,6 +2032,7 @@ echo started > new-child-started
         packer.add_buffer("payload.txt", b"new payload", 0o644).unwrap();
         packer.add_buffer("settings.json", b"packaged settings", 0o644).unwrap();
         packer.add_buffer("state/default.db", b"packaged state", 0o644).unwrap();
+        pack_main_exe(&mut packer, app_id);
         packer.finalize_to_file(&full_path).unwrap();
 
         let full_size = std::fs::metadata(&full_path).unwrap().len() as i64;
@@ -2108,6 +2128,7 @@ echo started > new-child-started
                 .add_buffer(&format!("payload-{index}.bin"), &payload, 0o644)
                 .unwrap();
         }
+        pack_main_exe(&mut packer, app_id);
         packer.finalize_to_file(&full_path).unwrap();
 
         let full_size = std::fs::metadata(&full_path).unwrap().len() as i64;
@@ -2264,6 +2285,7 @@ echo started > new-child-started
 
         let mut packer = ArchivePacker::new(3).unwrap();
         packer.add_buffer("payload.txt", b"new payload", 0o644).unwrap();
+        pack_main_exe(&mut packer, app_id);
         packer.finalize_to_file(&full_path).unwrap();
 
         let full_size = std::fs::metadata(&full_path).unwrap().len() as i64;
@@ -2482,18 +2504,22 @@ echo started > new-child-started
 
         let mut packer_v1 = ArchivePacker::new(3).unwrap();
         packer_v1.add_buffer("payload.txt", b"v1 payload", 0o644).unwrap();
+        pack_main_exe(&mut packer_v1, app_id);
         let full_v1 = packer_v1.finalize().unwrap();
 
         let mut packer_v2 = ArchivePacker::new(3).unwrap();
         packer_v2.add_buffer("payload.txt", b"v2 payload", 0o644).unwrap();
+        pack_main_exe(&mut packer_v2, app_id);
         let full_v2 = packer_v2.finalize().unwrap();
 
         let mut packer_v3 = ArchivePacker::new(3).unwrap();
         packer_v3.add_buffer("payload.txt", b"v3 payload", 0o644).unwrap();
+        pack_main_exe(&mut packer_v3, app_id);
         let full_v3 = packer_v3.finalize().unwrap();
 
         let mut packer_v4 = ArchivePacker::new(3).unwrap();
         packer_v4.add_buffer("payload.txt", b"v4 payload", 0o644).unwrap();
+        pack_main_exe(&mut packer_v4, app_id);
         let full_v4 = packer_v4.finalize().unwrap();
 
         let patch_v2 = bsdiff_buffers(&full_v1, &full_v2).unwrap();
@@ -2722,6 +2748,8 @@ echo started > new-child-started
             pseudo_random_bytes(256 * 1024),
         )
         .unwrap();
+        write_main_exe(&source_v1, app_id);
+        write_main_exe(&source_v2, app_id);
 
         let mut packer_v1 = ArchivePacker::new(3).unwrap();
         packer_v1.add_directory(&source_v1, "").unwrap();
@@ -2875,14 +2903,17 @@ echo started > new-child-started
 
         let mut packer_v1 = ArchivePacker::new(3).unwrap();
         packer_v1.add_buffer("payload.txt", b"v1 payload", 0o644).unwrap();
+        pack_main_exe(&mut packer_v1, app_id);
         let full_v1 = packer_v1.finalize().unwrap();
 
         let mut packer_v2 = ArchivePacker::new(3).unwrap();
         packer_v2.add_buffer("payload.txt", b"v2 payload", 0o644).unwrap();
+        pack_main_exe(&mut packer_v2, app_id);
         let full_v2 = packer_v2.finalize().unwrap();
 
         let mut packer_v3 = ArchivePacker::new(3).unwrap();
         packer_v3.add_buffer("payload.txt", b"v3 payload", 0o644).unwrap();
+        pack_main_exe(&mut packer_v3, app_id);
         let full_v3 = packer_v3.finalize().unwrap();
 
         let patch_v2 = bsdiff_buffers(&full_v1, &full_v2).unwrap();
@@ -3178,16 +3209,19 @@ echo started > new-child-started
 
         let mut packer_v1 = ArchivePacker::new(3).unwrap();
         packer_v1.add_buffer("payload.txt", b"v1 payload", 0o644).unwrap();
+        pack_main_exe(&mut packer_v1, app_id);
         let full_v1 = packer_v1.finalize().unwrap();
 
         let mut packer_v2 = ArchivePacker::new(3).unwrap();
         packer_v2.add_buffer("payload.txt", b"v2 payload", 0o644).unwrap();
+        pack_main_exe(&mut packer_v2, app_id);
         let full_v2 = packer_v2.finalize().unwrap();
 
         let mut packer_wrong_v2 = ArchivePacker::new(3).unwrap();
         packer_wrong_v2
             .add_buffer("payload.txt", b"wrong v2 payload", 0o644)
             .unwrap();
+        pack_main_exe(&mut packer_wrong_v2, app_id);
         let wrong_full_v2 = packer_wrong_v2.finalize().unwrap();
 
         let patch_wrong_v2 = bsdiff_buffers(&full_v1, &wrong_full_v2).unwrap();
@@ -3317,10 +3351,12 @@ echo started > new-child-started
 
         let mut packer_v2 = ArchivePacker::new(3).unwrap();
         packer_v2.add_buffer("payload.txt", b"v2 payload", 0o644).unwrap();
+        pack_main_exe(&mut packer_v2, app_id);
         let full_v2 = packer_v2.finalize().unwrap();
 
         let mut packer_v3 = ArchivePacker::new(3).unwrap();
         packer_v3.add_buffer("payload.txt", b"v3 payload", 0o644).unwrap();
+        pack_main_exe(&mut packer_v3, app_id);
         let full_v3 = packer_v3.finalize().unwrap();
 
         let delta_v3 = zstd::encode_all(bsdiff_buffers(&full_v2, &full_v3).unwrap().as_slice(), 3).unwrap();
@@ -3428,6 +3464,8 @@ echo started > new-child-started
         std::fs::create_dir_all(&source_v3).unwrap();
         std::fs::write(source_v2.join("payload.txt"), "v2 payload").unwrap();
         std::fs::write(source_v3.join("payload.txt"), "v3 payload").unwrap();
+        write_main_exe(&source_v2, app_id);
+        write_main_exe(&source_v3, app_id);
 
         let mut packer_v2 = ArchivePacker::new(3).unwrap();
         packer_v2.add_directory(&source_v2, "").unwrap();
@@ -3524,6 +3562,7 @@ echo started > new-child-started
             format!("id: {app_id}\nversion: 1.1.0\nmainExe: payload.txt\n"),
         )
         .unwrap();
+        write_main_exe(&active_app_dir, app_id);
 
         let ctx = Arc::new(Context::new());
         ctx.set_storage(
@@ -3631,6 +3670,8 @@ echo started > new-child-started
         std::fs::write(source_v2.join("stable.txt"), "stable payload").unwrap();
         std::fs::write(source_v3.join("payload.txt"), "v3 payload").unwrap();
         std::fs::write(source_v3.join("stable.txt"), "stable payload").unwrap();
+        write_main_exe(&source_v2, app_id);
+        write_main_exe(&source_v3, app_id);
 
         let mut packer_v2 = ArchivePacker::new(3).unwrap();
         packer_v2.add_directory(&source_v2, "").unwrap();
@@ -3729,6 +3770,7 @@ echo started > new-child-started
             format!("id: {app_id}\nversion: 1.1.0\nmainExe: payload.txt\n"),
         )
         .unwrap();
+        write_main_exe(&active_app_dir, app_id);
 
         let ctx = Arc::new(Context::new());
         ctx.set_storage(
@@ -3818,6 +3860,7 @@ echo started > new-child-started
             std::fs::create_dir_all(d.join("bin")).unwrap();
             std::fs::write(d.join("payload.txt"), payload).unwrap();
             std::fs::write(d.join("bin").join("large.bin"), &blob).unwrap();
+            write_main_exe(&d, app_id);
             d
         };
         let source_v1 = source("source-v1", "v1 payload", large(0x55, false));
@@ -3931,6 +3974,7 @@ echo started > new-child-started
         std::fs::create_dir_all(active_app_dir.join(".surge")).unwrap();
         std::fs::write(active_app_dir.join("payload.txt"), "v1 payload").unwrap();
         std::fs::create_dir_all(active_app_dir.join("bin")).unwrap();
+        write_main_exe(&active_app_dir, app_id);
         let mut installed_blob = vec![0x11u8; 64 * 1024];
         installed_blob.extend(std::iter::repeat_n(0x55u8, 64 * 1024));
         std::fs::write(active_app_dir.join("bin").join("large.bin"), installed_blob).unwrap();
@@ -4325,6 +4369,9 @@ echo started > new-child-started
         .unwrap();
         std::fs::write(source_v2_bad.join("camera-tuner.deps.json"), "{\"deps\":\"bad-v2\"}\n").unwrap();
         std::fs::write(source_v3.join("camera-tuner.deps.json"), "{\"deps\":\"v3\"}\n").unwrap();
+        write_main_exe(&source_v2_good, app_id);
+        write_main_exe(&source_v2_bad, app_id);
+        write_main_exe(&source_v3, app_id);
 
         let mut good_v2_packer = ArchivePacker::new(3).unwrap();
         good_v2_packer.add_directory(&source_v2_good, "").unwrap();
@@ -4429,6 +4476,7 @@ echo started > new-child-started
             "{\"deps\":\"good-v2\"}\n",
         )
         .unwrap();
+        write_main_exe(&active_app_dir, app_id);
         std::fs::write(
             active_app_dir.join(crate::install::RUNTIME_MANIFEST_RELATIVE_PATH),
             format!("id: {app_id}\nversion: 1.1.0\nmainExe: payload.txt\n"),
@@ -4487,6 +4535,7 @@ echo started > new-child-started
 
         let mut packer = ArchivePacker::new(3).unwrap();
         packer.add_buffer("payload.txt", b"new payload", 0o644).unwrap();
+        pack_main_exe(&mut packer, app_id);
         packer.finalize_to_file(&full_path).unwrap();
 
         let full_size = std::fs::metadata(&full_path).unwrap().len() as i64;
@@ -4727,6 +4776,7 @@ echo started > new-child-started
 
         let mut packer = ArchivePacker::new(3).unwrap();
         packer.add_buffer("payload.txt", b"new payload", 0o644).unwrap();
+        pack_main_exe(&mut packer, app_id);
         packer.finalize_to_file(&full_path).unwrap();
 
         let full_size = std::fs::metadata(&full_path).unwrap().len() as i64;
@@ -4812,6 +4862,7 @@ echo started > new-child-started
 
         let mut packer = ArchivePacker::new(3).unwrap();
         packer.add_buffer("payload.txt", b"new payload", 0o644).unwrap();
+        pack_main_exe(&mut packer, app_id);
         packer.finalize_to_file(&full_path).unwrap();
 
         let full_size = std::fs::metadata(&full_path).unwrap().len() as i64;
@@ -4899,6 +4950,7 @@ echo started > new-child-started
 
         let mut packer = ArchivePacker::new(3).unwrap();
         packer.add_buffer("payload.txt", b"new payload", 0o644).unwrap();
+        pack_main_exe(&mut packer, app_id);
         packer.finalize_to_file(&full_path).unwrap();
 
         let full_size = std::fs::metadata(&full_path).unwrap().len() as i64;
@@ -4995,6 +5047,7 @@ echo started > new-child-started
 
         let mut packer = ArchivePacker::new(3).unwrap();
         packer.add_buffer("payload.txt", b"new payload", 0o644).unwrap();
+        pack_main_exe(&mut packer, app_id);
         packer.finalize_to_file(&latest_full_path).unwrap();
 
         let latest_full_size = std::fs::metadata(&latest_full_path).unwrap().len() as i64;

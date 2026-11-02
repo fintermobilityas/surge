@@ -38,6 +38,8 @@ pub fn extract_to(data: &[u8], dest_dir: &Path, progress: Option<&ExtractProgres
             .path()
             .map_err(|e| SurgeError::Archive(format!("Bad path: {e}")))?
             .into_owned();
+        let entry_type = entry.header().entry_type();
+        let declared_size = entry.size();
 
         // Security: prevent path traversal
         let full_path = dest_dir.join(&entry_path);
@@ -49,12 +51,35 @@ pub fn extract_to(data: &[u8], dest_dir: &Path, progress: Option<&ExtractProgres
             )));
         }
 
-        entry
+        let unpacked = entry
             .unpack_in(dest_dir)
             .map_err(|e| SurgeError::Archive(format!("Failed to extract: {e}")))?;
+        if !unpacked {
+            continue;
+        }
 
-        let size = entry.size();
-        bytes_done += size;
+        // A tar header can declare a size that the writer never delivered, so
+        // verify what actually landed on disk instead of trusting the header.
+        let written_size = if entry_type.is_file() {
+            let written_size = std::fs::symlink_metadata(&full_path)
+                .map_err(|e| {
+                    SurgeError::Archive(format!("Failed to stat extracted file '{}': {e}", entry_path.display()))
+                })?
+                .len();
+            if written_size != declared_size {
+                return Err(SurgeError::Archive(format!(
+                    "Extracted file '{}' is {written_size} bytes but the archive declares {declared_size} bytes",
+                    entry_path.display()
+                )));
+            }
+            written_size
+        } else {
+            // Directories, symlinks and hard links: a symlink header size is not
+            // the size of its target, so only regular files are size-checked.
+            declared_size
+        };
+
+        bytes_done += written_size;
         files_done += 1;
 
         if let Some(cb) = &progress {
@@ -160,5 +185,86 @@ mod tests {
         extract_to(&archive_data, dir.path(), None).unwrap();
         assert!(dir.path().join("hello.txt").exists());
         assert!(dir.path().join("sub/nested.txt").exists());
+    }
+
+    fn collect_progress(archive: &[u8], dest_dir: &Path) -> Vec<(u64, u64, u64, u64)> {
+        let observed = std::sync::Mutex::new(Vec::new());
+        let progress = |files_done: u64, files_total: u64, bytes_done: u64, bytes_total: u64| {
+            observed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((files_done, files_total, bytes_done, bytes_total));
+        };
+        extract_to(archive, dest_dir, Some(&progress)).unwrap();
+        observed.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[test]
+    fn extract_reports_actual_written_bytes() {
+        let blob = vec![0x5a_u8; 4096];
+        let mut packer = ArchivePacker::new(3).unwrap();
+        packer.add_buffer("hello.txt", b"Hello World", 0o644).unwrap();
+        packer.add_buffer("nested/blob.bin", &blob, 0o644).unwrap();
+        let archive = packer.finalize().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let observed = collect_progress(&archive, dir.path());
+
+        let (files_done, files_total, bytes_done, bytes_total) = *observed.last().unwrap();
+        let expected_bytes = 11 + 4096;
+        assert_eq!(files_done, 2);
+        assert_eq!(files_total, 2);
+        assert_eq!(bytes_done, expected_bytes);
+        assert_eq!(bytes_total, expected_bytes);
+        assert_eq!(
+            std::fs::metadata(dir.path().join("nested/blob.bin")).unwrap().len(),
+            4096
+        );
+    }
+
+    #[test]
+    fn extract_accepts_legitimately_empty_files() {
+        let mut packer = ArchivePacker::new(3).unwrap();
+        packer.add_buffer("empty.txt", b"", 0o644).unwrap();
+        let archive = packer.finalize().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let observed = collect_progress(&archive, dir.path());
+
+        let (files_done, _files_total, bytes_done, bytes_total) = *observed.last().unwrap();
+        assert_eq!(files_done, 1);
+        assert_eq!(bytes_done, 0);
+        assert_eq!(bytes_total, 0);
+        assert_eq!(std::fs::metadata(dir.path().join("empty.txt")).unwrap().len(), 0);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn extract_does_not_size_check_symlink_entries() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source_dir = tmp.path().join("source");
+        std::fs::create_dir_all(source_dir.join("native")).unwrap();
+        let library = source_dir.join("native/libfoo.so.1.2.3");
+        std::fs::write(&library, vec![0xfe_u8; 64 * 1024]).unwrap();
+        symlink("libfoo.so.1.2.3", source_dir.join("native/libfoo.so")).unwrap();
+
+        let mut packer = ArchivePacker::new(3).unwrap();
+        packer.add_directory(&source_dir, "").unwrap();
+        let archive = packer.finalize().unwrap();
+
+        let dest_dir = tmp.path().join("extracted");
+        let observed = collect_progress(&archive, &dest_dir);
+
+        let extracted_link = dest_dir.join("native/libfoo.so");
+        let link_metadata = std::fs::symlink_metadata(&extracted_link).unwrap();
+        assert!(link_metadata.file_type().is_symlink());
+        assert_eq!(
+            std::fs::read_link(&extracted_link).unwrap(),
+            Path::new("libfoo.so.1.2.3")
+        );
+        // Only the regular library contributes bytes; the symlink header is 0.
+        assert_eq!(observed.last().unwrap().2, 64 * 1024);
     }
 }

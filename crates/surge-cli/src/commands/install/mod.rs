@@ -814,6 +814,49 @@ mod tests {
         assert!(script.contains("\"$install_root\"/.surge-app-prev/\"$main_exe\""));
     }
 
+    #[test]
+    fn build_remote_app_copy_activation_script_verifies_payload_and_rolls_back() {
+        let script = build_remote_app_copy_activation_script(
+            Path::new("/home/demo/app"),
+            "demoapp",
+            "1.2.3",
+            &BTreeMap::new(),
+            &[],
+            None,
+            false,
+        )
+        .expect("script should build");
+
+        let stage_guard = script
+            .find("Remote install stage payload is unusable")
+            .expect("stage payload guard should be present");
+        let first_kill = script
+            .find("kill_matching \"$install_root/$main_exe\"")
+            .expect("kill_matching should be present");
+        let swap = script
+            .find("mv \"$next_app_dir\" \"$active_app_dir\"")
+            .expect("swap should be present");
+        let activated_guard = script
+            .find("Activated app directory is unusable")
+            .expect("activated payload guard should be present");
+        let prune_previous = script
+            .find("rm -rf \"$previous_app_dir\"")
+            .expect("previous app dir prune should be present");
+
+        // The staged payload is validated before anything is killed or moved, so a
+        // truncated transfer cannot take down a working install.
+        assert!(stage_guard < first_kill);
+        // The activated directory is validated after the swap and before the previous
+        // version is pruned, so the rollback below still has somewhere to roll back to.
+        assert!(swap < activated_guard);
+        assert!(activated_guard < prune_previous);
+
+        assert!(script.contains("[ ! -s \"$stage_dir/app/$main_exe\" ]"));
+        assert!(script.contains("[ ! -s \"$active_app_dir/$main_exe\" ]"));
+        assert!(script.contains("mv \"$previous_app_dir\" \"$active_app_dir\""));
+        assert!(script.contains("Rolled back to the previous app directory"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn build_remote_app_copy_activation_script_preserves_persistent_assets_and_prunes_snapshots() {

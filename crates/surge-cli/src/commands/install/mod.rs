@@ -348,30 +348,28 @@ pub async fn execute(
     } else {
         release.rid.as_str()
     };
-    if let Some(compatibility) = manifest
+    let compatibility = manifest
         .as_ref()
         .and_then(|manifest| manifest.find_target(&app_id, compatibility_rid))
         .and_then(|target| target.compatibility)
-        .filter(|compatibility| !compatibility.is_empty())
-    {
-        let compatibility_target = match &install_target {
-            InstallTarget::Local => CompatibilityInstallTarget::Local,
-            InstallTarget::Tailscale {
-                ssh_target,
-                file_target,
-            } => CompatibilityInstallTarget::Tailscale {
-                ssh_target,
-                file_target,
-            },
-        };
-        run_platform_compatibility_preflight(
-            compatibility_target,
-            compatibility_rid,
-            &compatibility,
-            behavior.platform_mismatch.allows_mismatch(),
-        )
-        .await?;
-    }
+        .unwrap_or_default();
+    let compatibility_target = match &install_target {
+        InstallTarget::Local => CompatibilityInstallTarget::Local,
+        InstallTarget::Tailscale {
+            ssh_target,
+            file_target,
+        } => CompatibilityInstallTarget::Tailscale {
+            ssh_target,
+            file_target,
+        },
+    };
+    run_platform_compatibility_preflight(
+        compatibility_target,
+        compatibility_rid,
+        &compatibility,
+        behavior.platform_mismatch.allows_mismatch(),
+    )
+    .await?;
 
     if behavior.mode.is_verify_stage() {
         match &install_target {

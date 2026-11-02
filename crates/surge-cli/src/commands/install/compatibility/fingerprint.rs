@@ -48,7 +48,7 @@ pub(super) fn collect_local_runtime_fingerprint(compatibility: &TargetCompatibil
         os_release: parse_os_release(&std::fs::read_to_string("/etc/os-release").unwrap_or_default()),
         arch: command_stdout("uname", &["-m"]).unwrap_or_else(|| std::env::consts::ARCH.to_string()),
         kernel: command_stdout("uname", &["-r"]).unwrap_or_default(),
-        gpu: detect_local_gpu_vendor(),
+        gpu: probe_local_gpu(compatibility),
         files: BTreeMap::new(),
         packages: BTreeMap::new(),
     };
@@ -78,6 +78,16 @@ fn command_stdout(command: &str, args: &[&str]) -> Option<String> {
     }
     let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
     (!value.is_empty()).then_some(value)
+}
+
+/// Detection shells out to `nvidia-smi` and `lspci`, so it only runs when the release
+/// declares a GPU expectation; otherwise the probed value would be discarded.
+fn probe_local_gpu(compatibility: &TargetCompatibilityConfig) -> String {
+    if compatibility.gpu.is_none() {
+        return String::new();
+    }
+
+    detect_local_gpu_vendor()
 }
 
 fn detect_local_gpu_vendor() -> String {
@@ -152,7 +162,14 @@ cat /etc/os-release 2>/dev/null || true
 echo __SURGE_OS_RELEASE_END__
 printf '__SURGE_FIELD\tarch\t%s\n' "$(uname -m 2>/dev/null || true)"
 printf '__SURGE_FIELD\tkernel\t%s\n' "$(uname -r 2>/dev/null || true)"
-gpu=unknown
+"#,
+    );
+
+    // The remote GPU probe is only worth its round trip when the release declares a
+    // GPU expectation; `evaluate_gpu` discards the value otherwise.
+    if compatibility.gpu.is_some() {
+        script.push_str(
+            r#"gpu=unknown
 if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
   gpu=nvidia
 elif command -v lspci >/dev/null 2>&1; then
@@ -166,7 +183,12 @@ elif command -v lspci >/dev/null 2>&1; then
   fi
 fi
 printf '__SURGE_FIELD\tgpu\t%s\n' "$gpu"
-probe_package_version() {
+"#,
+        );
+    }
+
+    script.push_str(
+        r#"probe_package_version() {
   pkg="$1"
   if command -v dpkg-query >/dev/null 2>&1; then
     dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null || printf '%s' __SURGE_MISSING__
@@ -324,7 +346,62 @@ fn unquote_os_release_value(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use surge_core::config::manifest::GpuCompatibilityConfig;
+
     use super::*;
+
+    fn compatibility_without_gpu() -> TargetCompatibilityConfig {
+        TargetCompatibilityConfig::default()
+    }
+
+    fn compatibility_with_gpu() -> TargetCompatibilityConfig {
+        TargetCompatibilityConfig {
+            gpu: Some(GpuCompatibilityConfig {
+                vendor: Some("nvidia".to_string()),
+            }),
+            ..TargetCompatibilityConfig::default()
+        }
+    }
+
+    #[test]
+    fn probe_omits_gpu_detection_when_release_declares_no_gpu() {
+        let script = build_runtime_fingerprint_probe(&compatibility_without_gpu());
+
+        assert!(script.contains(r"__SURGE_FIELD\tarch"));
+        assert!(script.contains(r"__SURGE_FIELD\tkernel"));
+        assert!(!script.contains("nvidia-smi"));
+        assert!(!script.contains("lspci"));
+        assert!(!script.contains(r"__SURGE_FIELD\tgpu"));
+    }
+
+    #[test]
+    fn probe_includes_gpu_detection_when_release_declares_gpu() {
+        let script = build_runtime_fingerprint_probe(&compatibility_with_gpu());
+
+        assert!(script.contains(r"__SURGE_FIELD\tarch"));
+        assert!(script.contains("nvidia-smi"));
+        assert!(script.contains("lspci"));
+        assert!(script.contains(r"__SURGE_FIELD\tgpu"));
+    }
+
+    #[test]
+    fn parses_output_without_gpu_field() {
+        let output = "\
+__SURGE_FINGERPRINT_BEGIN__
+__SURGE_OS_RELEASE_BEGIN__
+ID=ubuntu
+__SURGE_OS_RELEASE_END__
+__SURGE_FIELD\tarch\tx86_64
+__SURGE_FIELD\tkernel\t6.8.0
+";
+
+        let fingerprint = parse_runtime_fingerprint_output(output).unwrap();
+
+        assert_eq!(fingerprint.arch, "x86_64");
+        assert_eq!(fingerprint.kernel, "6.8.0");
+        assert_eq!(fingerprint.gpu, "");
+        assert_eq!(fingerprint.os_release.get("ID").map(String::as_str), Some("ubuntu"));
+    }
 
     #[test]
     fn parses_remote_fingerprint_output() {

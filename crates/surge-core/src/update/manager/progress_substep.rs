@@ -35,6 +35,7 @@ pub(crate) mod labels {
     pub const PACKAGE_APPLY_COMPLETED: &str = "package apply completed";
     pub const STARTING_EXTERNAL_FINALIZER: &str = "starting external finalizer";
     pub const WAITING_FOR_UPDATER_EXIT: &str = "waiting for updating app to exit";
+    pub const VERIFYING_PAYLOAD: &str = "verifying update payload";
     pub const STOPPING_SUPERVISOR: &str = "stopping supervisor";
     pub const QUIESCING_ACTIVE_APP: &str = "quiescing active app before swap";
     pub const PREPARING_SWAP: &str = "preparing app swap";

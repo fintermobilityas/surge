@@ -1,5 +1,6 @@
 mod activation;
 mod launch;
+mod payload_guard;
 mod persistent_assets;
 mod runtime_manifest;
 
@@ -13,6 +14,7 @@ pub use self::activation::{
     prune_version_snapshots,
 };
 pub use self::launch::{auto_start_after_install, auto_start_after_install_sequence, launch_installed_application};
+pub use self::payload_guard::{PayloadSurvey, survey_payload, verify_payload_for_activation};
 pub use self::persistent_assets::{copy_persistent_assets, validate_relative_persistent_asset_path};
 pub(crate) use self::runtime_manifest::read_runtime_manifest_identity;
 pub use self::runtime_manifest::{

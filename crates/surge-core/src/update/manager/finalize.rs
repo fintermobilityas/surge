@@ -153,6 +153,10 @@ where
     let supervisor_was_running = !current_supervisor_id.trim().is_empty()
         && supervisor_pid_file(&manager.install_dir, current_supervisor_id).is_file();
 
+    // Supervision may only be restored when the previous version actually stopped:
+    // a supervisor started while the old app still runs would watch the updater pid
+    // and launch a second instance of the app once the updater exits.
+    let mut previous_app_quiesced = false;
     let swap_result: Result<()> = async {
         if supervisor_was_running {
             progress_emitter
@@ -176,6 +180,7 @@ where
                 manager.allow_in_process_swap,
             )?;
         }
+        previous_app_quiesced = true;
         #[cfg(unix)]
         if previous_swap_dir.is_dir() {
             let previous_swap_identity = super::current_install::load_previous_swap(manager, &previous_swap_dir)?
@@ -220,10 +225,11 @@ where
     .await;
 
     if let Err(err) = swap_result {
-        restore_supervision_after_failed_swap(
+        let _ = restore_supervision_after_failed_swap(
             manager,
             latest,
             supervisor_was_running,
+            previous_app_quiesced,
             &active_app_dir,
             &previous_swap_dir,
             &err,
@@ -484,16 +490,41 @@ where
 /// Without this, any I/O or rename failure in the swap window leaves a node with
 /// no supervisor watching it. The original finalize error is still returned to
 /// the caller; a recovery restart that cannot be confirmed is only logged.
+/// What [`restore_supervision_after_failed_swap`] did, so the decision can be
+/// asserted without spawning a supervisor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SupervisionRecovery {
+    /// No supervisor was running before the update, so there is nothing to restore.
+    NotNeeded,
+    /// The previous version never stopped; starting a supervisor would duplicate it.
+    SkippedPreviousAppStillRunning,
+    /// A replacement supervisor was started for the previous version.
+    Attempted,
+}
+
 fn restore_supervision_after_failed_swap(
     manager: &UpdateManager,
     latest: &ReleaseEntry,
     supervisor_was_running: bool,
+    previous_app_quiesced: bool,
     active_app_dir: &Path,
     previous_swap_dir: &Path,
     error: &SurgeError,
-) {
+) -> SupervisionRecovery {
     if !supervisor_was_running {
-        return;
+        return SupervisionRecovery::NotNeeded;
+    }
+
+    // A replacement supervisor watches this updater process and starts the app once
+    // the updater exits. If the previous version never stopped, that would add a
+    // second instance beside the one still running, so leave it alone and say so.
+    if !previous_app_quiesced {
+        warn!(
+            version = %manager.current_version,
+            error = %error,
+            "Update finalize failed before the previous application stopped; leaving it running unsupervised instead of starting a supervisor that would launch a second instance"
+        );
+        return SupervisionRecovery::SkippedPreviousAppStillRunning;
     }
 
     let app_dir = if active_app_dir.is_dir() {
@@ -529,6 +560,8 @@ fn restore_supervision_after_failed_swap(
         ),
         SupervisorRestartOutcome::NotApplicable | SupervisorRestartOutcome::ExternalFinalizeScheduled => {}
     }
+
+    SupervisionRecovery::Attempted
 }
 
 #[cfg(test)]
@@ -560,6 +593,98 @@ mod tests {
             supervisor_id: supervisor_id.to_string(),
             ..ReleaseEntry::default()
         }
+    }
+
+    /// When the swap fails before the previous version stopped, a replacement
+    /// supervisor must NOT be started: it would watch this updater process and
+    /// launch a second copy of the app beside the one still running once the
+    /// updater exits. Leaving it unsupervised matches the behaviour before the
+    /// recovery path existed.
+    #[test]
+    fn supervision_is_not_restored_while_the_previous_app_is_still_running() {
+        let tmp = tempfile::tempdir().expect("temp dir should exist");
+        let install_dir = tmp.path().join("install");
+        let active_app_dir = install_dir.join("app");
+        let app_id = "sampleapp";
+        let supervisor_id = "sampleapp-supervisor";
+        write_file(&active_app_dir, app_id, b"previous release binary");
+
+        let ctx = Arc::new(Context::new());
+        ctx.set_storage(
+            StorageProvider::Filesystem,
+            tmp.path().to_str().expect("store root path"),
+            "",
+            "",
+            "",
+            "",
+        );
+        let mut manager = UpdateManager::new(
+            ctx,
+            app_id,
+            "1.0.0",
+            "stable",
+            install_dir.to_str().expect("install dir path"),
+        )
+        .expect("update manager should be created");
+        manager.current_release_identity = Some(super::super::current_install::ReleaseIdentity {
+            version: "1.0.0".to_string(),
+            main_exe: app_id.to_string(),
+            supervisor_id: supervisor_id.to_string(),
+            environment: BTreeMap::default(),
+        });
+        let latest = target_release(app_id, supervisor_id);
+        let error = SurgeError::Update("quiescing the active application failed".to_string());
+
+        let recovery = restore_supervision_after_failed_swap(
+            &manager,
+            &latest,
+            true,
+            false,
+            &active_app_dir,
+            &install_dir.join(".surge-app-prev"),
+            &error,
+        );
+
+        assert_eq!(recovery, SupervisionRecovery::SkippedPreviousAppStillRunning);
+    }
+
+    /// Nothing to restore when no supervisor was watching before the update.
+    #[test]
+    fn supervision_is_not_restored_when_none_was_running() {
+        let tmp = tempfile::tempdir().expect("temp dir should exist");
+        let install_dir = tmp.path().join("install");
+        std::fs::create_dir_all(&install_dir).expect("install dir should be created");
+        let ctx = Arc::new(Context::new());
+        ctx.set_storage(
+            StorageProvider::Filesystem,
+            tmp.path().to_str().expect("store root path"),
+            "",
+            "",
+            "",
+            "",
+        );
+        let manager = UpdateManager::new(
+            ctx,
+            "sampleapp",
+            "1.0.0",
+            "stable",
+            install_dir.to_str().expect("install dir path"),
+        )
+        .expect("update manager should be created");
+        let latest = target_release("sampleapp", "sampleapp-supervisor");
+        let error = SurgeError::Update("swap failed".to_string());
+
+        let recovery = restore_supervision_after_failed_swap(
+            &manager,
+            &latest,
+            false,
+            true,
+            &install_dir.join("app"),
+            &install_dir.join(".surge-app-prev"),
+            &error,
+        );
+
+        assert_eq!(recovery, SupervisionRecovery::NotNeeded);
     }
 
     /// A truncated payload (every entry extracted as 0 bytes, including the main

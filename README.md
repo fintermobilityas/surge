@@ -673,7 +673,7 @@ apps:
     environment:
       MY_VAR: value
     target:
-      rid: linux-x64             # linux-x64, win-x64, win-arm64, osx-x64, osx-arm64
+      rid: linux-x64             # linux-x64, win-x64, win-arm64, osx-arm64
 ```
 
 Target-level settings override app-level defaults for `icon`, `shortcuts`, `persistentAssets`, `installers`, and `environment`.

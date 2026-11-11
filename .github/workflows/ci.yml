@@ -130,7 +130,7 @@ jobs:
   rust-test:
     name: Rust tests (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: ${{ matrix.timeout_minutes || 30 }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -145,13 +145,6 @@ jobs:
             cache_key: windows-test
             nextest_asset: x86_64-pc-windows-msvc
             nextest_sha256: 8e7609fffb5a938c9b48d8788a89699fc83c39d07a9d9dbc61554f661b51d9d8
-          - os: macos-15-intel
-            name: macOS Intel
-            cache_key: macos-intel-test
-            nextest_asset: universal-apple-darwin
-            nextest_sha256: 47b9941765a9ff94e304a3fe5444ac1c7593da655525b8b69f8f2b31a9217507
-            macos_arch: x86_64
-            timeout_minutes: 45
           - os: macos-15
             name: macOS Apple Silicon
             cache_key: macos-arm64-test
@@ -268,18 +261,6 @@ jobs:
               target/release/surge-installer.exe
               target/release/surge-installer-ui.exe
               target/release/surge-supervisor.exe
-          - os: macos-15-intel
-            name: macOS Intel
-            cache_key: macos-intel-artifacts
-            artifact_name: osx-x64
-            build_strategy: host
-            macos_arch: x86_64
-            artifact_path: |
-              target/release/libsurge.dylib
-              target/release/surge
-              target/release/surge-installer
-              target/release/surge-installer-ui
-              target/release/surge-supervisor
           - os: macos-15
             name: macOS Apple Silicon
             cache_key: macos-arm64-artifacts

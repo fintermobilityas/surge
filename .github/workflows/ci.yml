@@ -196,8 +196,8 @@ jobs:
           fi
           mkdir nextest-bin
           tar -xzf nextest.tar.gz -C nextest-bin
-          mv nextest-bin/cargo-nextest* "${CARGO_HOME:-$HOME/.cargo}/bin/"
-          cargo nextest --version
+          echo "$RUNNER_TEMP/nextest-bin" >> "$GITHUB_PATH"
+          nextest-bin/cargo-nextest nextest --version
       # nextest runs the tests of every binary in one pool and does not stop at
       # the first failing binary; `cargo test` ran 2 of 13 binaries before it stopped.
       - name: Run tests

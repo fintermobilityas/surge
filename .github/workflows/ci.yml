@@ -19,6 +19,7 @@ jobs:
   version-sync:
     name: Version Sync
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
@@ -34,6 +35,7 @@ jobs:
   vendor-sync:
     name: Vendor Sync
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
         with:
@@ -44,23 +46,37 @@ jobs:
   msrv:
     name: Rust 1.95 MSRV
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
         with:
           submodules: true
       - name: Install Rust 1.95
         run: rustup toolchain install 1.95.0 --profile minimal
+      # Pull requests restore main's entries and do not save their own: PR-only
+      # copies were ~4 GB of the 10 GB cache budget and each save cost 53-140 s.
       - uses: Swatinem/rust-cache@v2
+        id: rust-cache
         with:
           cache-bin: false
           key: msrv-1.95
           prefix-key: v1-rust-no-bin
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Report rust-cache status
+        shell: bash
+        run: |
+          if [ "${{ steps.rust-cache.outputs.cache-hit }}" = "true" ]; then
+            echo "rust-cache: HIT" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "rust-cache: MISS or partial restore (lock bump or eviction)" >> "$GITHUB_STEP_SUMMARY"
+          fi
       - name: Check the full workspace on the declared MSRV
         run: cargo +1.95.0 check --workspace --all-targets --all-features --locked
 
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     if: github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@v7
@@ -70,6 +86,7 @@ jobs:
   maintainability:
     name: maintainability
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
       - name: Run maintainability guardrail
@@ -78,52 +95,42 @@ jobs:
   clippy:
     name: clippy
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
         with:
           submodules: true
       - uses: Swatinem/rust-cache@v2
+        id: rust-cache
         with:
           cache-bin: false
           prefix-key: v1-rust-no-bin
-      - run: rustup component add clippy
-      - run: cargo clippy --all-targets --all-features -- -D warnings
-
-  clippy-strict:
-    name: clippy strict
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          submodules: true
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-bin: false
-          prefix-key: v1-rust-no-bin
-      - run: rustup component add clippy
-      - run: cargo clippy --workspace --lib --bins --examples -- -D warnings -D clippy::unwrap_used -D clippy::expect_used
-
-  clippy-pedantic:
-    name: clippy pedantic (advisory)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          submodules: true
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-bin: false
-          prefix-key: v1-rust-no-bin
-      - run: rustup component add clippy
-      - name: Run pedantic audit (non-blocking)
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Report rust-cache status
+        shell: bash
         run: |
-          cargo clippy --workspace --all-targets --all-features -- -D warnings -W clippy::pedantic || {
+          if [ "${{ steps.rust-cache.outputs.cache-hit }}" = "true" ]; then
+            echo "rust-cache: HIT" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "rust-cache: MISS or partial restore (lock bump or eviction)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - run: rustup component add clippy
+      - name: clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: clippy strict
+        if: ${{ !cancelled() }}
+        run: cargo clippy --locked --workspace --lib --bins --examples -- -D warnings -D clippy::unwrap_used -D clippy::expect_used
+      - name: clippy pedantic (advisory)
+        if: ${{ !cancelled() }}
+        run: |
+          cargo clippy --locked --workspace --all-targets --all-features -- -D warnings -W clippy::pedantic || {
             echo "::warning::Pedantic lint debt detected (non-blocking advisory job)."
           }
 
   rust-test:
     name: Rust tests (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: ${{ matrix.timeout_minutes || 30 }}
     strategy:
       fail-fast: false
       matrix:
@@ -138,6 +145,7 @@ jobs:
             name: macOS Intel
             cache_key: macos-intel-test
             macos_arch: x86_64
+            timeout_minutes: 45
           - os: macos-15
             name: macOS Apple Silicon
             cache_key: macos-arm64-test
@@ -147,19 +155,55 @@ jobs:
         with:
           submodules: true
       - uses: Swatinem/rust-cache@v2
+        id: rust-cache
         with:
           cache-bin: false
           key: ${{ matrix.cache_key }}
           prefix-key: v1-rust-no-bin
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Report rust-cache status
+        shell: bash
+        run: |
+          if [ "${{ steps.rust-cache.outputs.cache-hit }}" = "true" ]; then
+            echo "rust-cache: HIT" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "rust-cache: MISS or partial restore (lock bump or eviction)" >> "$GITHUB_STEP_SUMMARY"
+          fi
       - name: Validate macOS runner and Rust host
         if: startsWith(matrix.os, 'macos-')
         run: bash ./scripts/check-macos-architecture.sh --arch "${{ matrix.macos_arch }}" --runner-only
-      - run: cargo test --release
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      # nextest runs the tests of every binary in one pool and does not stop at
+      # the first failing binary; `cargo test` ran 2 of 13 binaries before it stopped.
+      - name: Run tests
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo nextest run --locked --workspace --cargo-profile ci --profile ci 2>&1 | tee "$RUNNER_TEMP/nextest.log"
+      # nextest runs no doctests.
+      - name: Run doctests
+        if: ${{ !cancelled() }}
+        run: cargo test --locked --workspace --doc --profile ci
+      - name: Publish test summary
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          log="$RUNNER_TEMP/nextest.log"
+          [ -f "$log" ] || exit 0
+          {
+            echo '```'
+            # BSD sed and grep on macOS know neither `\x1b` nor `\s`.
+            sed -E $'s/\x1b\\[[0-9;]*[A-Za-z]//g' "$log" | grep -E '^[[:space:]]*(Summary|FAIL|SLOW|TIMEOUT|LEAK|SIGABRT|SIGSEGV|FLAKY|ABORT)[[:space:]]' | sort -u | head -200 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   rust-artifacts:
     name: Rust artifacts (${{ matrix.name }})
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
@@ -270,6 +314,7 @@ jobs:
   dotnet:
     name: .NET
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs: [version-sync]
     defaults:
       run:
@@ -316,6 +361,7 @@ jobs:
   dotnet-prerelease:
     name: .NET synthetic prerelease
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     env:
       SYNTHETIC_VERSION: 1.0.0-beta.999
     defaults:

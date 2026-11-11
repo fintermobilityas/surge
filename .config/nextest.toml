@@ -1,0 +1,6 @@
+# CI profile: run every test binary to the end and repeat each failure after
+# the run, so one failing binary no longer hides the rest.
+[profile.ci]
+fail-fast = false
+failure-output = "immediate-final"
+slow-timeout = { period = "30s" }

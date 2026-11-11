@@ -27,7 +27,7 @@ RUN curl -fsSL https://static.rust-lang.org/rustup/archive/1.29.1/x86_64-unknown
     && chown -R 10001:10001 /opt/surge/rustup \
     && rm /tmp/rustup-init
 
-# Exact actions/setup-dotnet pin from both .NET CI jobs. SHA512: Microsoft metadata.
+# The SDK version of global.json, which the .NET CI jobs install. SHA512: Microsoft metadata.
 RUN mkdir -p /opt/surge/dotnet \
     && curl -fsSL https://builds.dotnet.microsoft.com/dotnet/Sdk/11.0.100/dotnet-sdk-11.0.100-linux-x64.tar.gz -o /tmp/dotnet.tar.gz \
     && echo '1bec9cca2ec689b1e80245b84f2b53c9441d1aa6daccf2ceb27490768bffa95954fa585bd275def31069d874d543d9ba9e6591fe9ade2dbd9f34ec5c0fd0050c  /tmp/dotnet.tar.gz' | sha512sum -c - \

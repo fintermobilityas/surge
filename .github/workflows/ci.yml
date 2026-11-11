@@ -336,7 +336,7 @@ jobs:
           submodules: true
       - uses: actions/setup-dotnet@v6
         with:
-          dotnet-version: '11.0.100'
+          global-json-file: global.json
       - uses: actions/cache@v6
         with:
           path: ~/.nuget/packages
@@ -384,7 +384,7 @@ jobs:
           submodules: true
       - uses: actions/setup-dotnet@v6
         with:
-          dotnet-version: '11.0.100'
+          global-json-file: global.json
       - uses: actions/cache@v6
         with:
           path: ~/.nuget/packages

@@ -68,7 +68,15 @@ esac
 output_rel="${output_abs#${repo_root}/}"
 mkdir -p "${output_abs}"
 
-docker run --rm --platform linux/arm64 \
+# The resolver of the hosted arm64 runner has timed out for ubuntu.com names
+# while public resolvers answered. Fall back to them only in that case.
+dns_args=()
+if ! getent hosts ports.ubuntu.com >/dev/null 2>&1; then
+  printf 'The runner cannot resolve ports.ubuntu.com; the build container uses public DNS.\n' >&2
+  dns_args=(--dns 1.1.1.1 --dns 8.8.8.8)
+fi
+
+docker run --rm --platform linux/arm64 "${dns_args[@]}" \
   -e DEBIAN_FRONTEND=noninteractive \
   -e CARGO_HOME=/work/.cargo-bionic \
   -e RUSTUP_HOME=/work/.rustup-bionic \

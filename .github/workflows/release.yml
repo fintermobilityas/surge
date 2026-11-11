@@ -194,18 +194,6 @@ jobs:
               target/release/surge-installer.exe
               target/release/surge-installer-ui.exe
               target/release/surge-supervisor.exe
-          - os: macos-15-intel
-            name: macOS Intel
-            cache_key: macos-intel-release-artifacts
-            artifact_name: osx-x64
-            build_strategy: host
-            macos_arch: x86_64
-            artifact_path: |
-              target/release/libsurge.dylib
-              target/release/surge
-              target/release/surge-installer
-              target/release/surge-installer-ui
-              target/release/surge-supervisor
           - os: macos-15
             name: macOS Apple Silicon
             cache_key: macos-arm64-release-artifacts
@@ -551,7 +539,7 @@ jobs:
             exit 1
           fi
 
-          required_dirs=(linux-x64 linux-arm64 win-x64 osx-x64 osx-arm64)
+          required_dirs=(linux-x64 linux-arm64 win-x64 osx-arm64)
           for dir in "${required_dirs[@]}"; do
             if [ ! -d "artifacts/$dir" ]; then
               echo "::error::Missing required artifact directory: $dir"
@@ -600,7 +588,6 @@ jobs:
 
           normalize_unix_artifact artifacts/linux-x64 libsurge.so
           normalize_unix_artifact artifacts/linux-arm64 libsurge.so
-          normalize_unix_artifact artifacts/osx-x64 libsurge.dylib
           normalize_unix_artifact artifacts/osx-arm64 libsurge.dylib
 
           create_reproducible_tarball() {
@@ -629,8 +616,6 @@ jobs:
             artifacts/linux-x64 libsurge.so release-assets/surge-linux-x64.tar.gz
           create_reproducible_tarball \
             artifacts/linux-arm64 libsurge.so release-assets/surge-linux-arm64.tar.gz
-          create_reproducible_tarball \
-            artifacts/osx-x64 libsurge.dylib release-assets/surge-osx-x64.tar.gz
           create_reproducible_tarball \
             artifacts/osx-arm64 libsurge.dylib release-assets/surge-osx-arm64.tar.gz
 
@@ -689,7 +674,6 @@ jobs:
             surge-linux-arm64.tar.gz
             surge-linux-x64.tar.gz
             surge-osx-arm64.tar.gz
-            surge-osx-x64.tar.gz
             surge-win-x64.zip
             surge_api.h
           )
@@ -757,7 +741,6 @@ jobs:
             release-assets/surge-linux-arm64.tar.gz
             release-assets/surge-linux-x64.tar.gz
             release-assets/surge-osx-arm64.tar.gz
-            release-assets/surge-osx-x64.tar.gz
             release-assets/surge-win-x64.zip
             release-assets/surge_api.h
             release-assets/SHA256SUMS.txt

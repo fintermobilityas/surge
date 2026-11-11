@@ -90,3 +90,9 @@ undocumented_unsafe_blocks = "allow"
 [profile.release]
 lto = true
 strip = true
+
+# CI test builds: release optimizations without the whole-program LTO link,
+# which was 32-46 % of the compile time of every test job.
+[profile.ci]
+inherits = "release"
+lto = false

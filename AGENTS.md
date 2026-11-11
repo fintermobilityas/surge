@@ -78,6 +78,7 @@ dotnet test dotnet/Surge.slnx --configuration Release
 ```
 
 - Run the workspace validation commands non-interactively. Do not allocate a TTY/PTY for `cargo test --workspace` or the chained pre-push validation suite, because prompt-path tests can wait on an interactive terminal and hang the run.
+- CI runs the Rust suite with `cargo nextest run --workspace --cargo-profile ci --profile ci` and the doctests with `cargo test --workspace --doc --profile ci`. The `ci` Cargo profile is `release` without fat LTO; shipped artifacts are still built with `--release`.
 
 ## Mandatory Pre-Push Validation
 Before any push, run the same quality gates CI uses. Do not push if any command fails.

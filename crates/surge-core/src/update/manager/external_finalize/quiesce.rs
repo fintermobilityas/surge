@@ -324,24 +324,33 @@ fn executable_paths_equal(left: &Path, right: &Path) -> bool {
 
 #[cfg(all(test, unix))]
 mod tests {
+    use std::io::ErrorKind;
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
 
+    fn spawn_fixture(executable: &Path) -> std::process::Child {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match std::process::Command::new(executable).arg("30").spawn() {
+                Ok(child) => return child,
+                Err(error) if error.kind() == ErrorKind::ExecutableFileBusy && std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("could not start the fixture app: {error}"),
+            }
+        }
+    }
+
     #[test]
     fn quiesce_stops_only_the_exact_updating_executable() {
         let temp = tempfile::tempdir().unwrap();
-        let source = if Path::new("/bin/sleep").is_file() {
-            Path::new("/bin/sleep")
-        } else {
-            Path::new("/usr/bin/sleep")
-        };
         let executable = temp.path().join("surge-external-finalize-sleep");
-        std::fs::copy(source, &executable).unwrap();
+        std::fs::copy(crate::test_fixtures::standalone_sleep_binary(), &executable).unwrap();
         let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&executable, permissions).unwrap();
-        let mut child = std::process::Command::new(&executable).arg("30").spawn().unwrap();
+        let mut child = spawn_fixture(&executable);
         let start_time = process_start_time(child.id()).unwrap();
 
         quiesce_updating_application_with_timeouts(

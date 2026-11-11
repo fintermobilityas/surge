@@ -13,6 +13,8 @@ mod envfile;
 mod formatters;
 mod logline;
 mod prompts;
+#[cfg(all(test, target_os = "linux"))]
+mod test_fixtures;
 mod ui;
 
 use cli::{Cli, Commands, FleetStatusAction, InstallMethod, LockAction, TuneAction};

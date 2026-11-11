@@ -267,15 +267,30 @@ jobs:
     permissions:
       contents: write
     outputs:
+      dotnet_sdk_version: ${{ steps.sdk.outputs.version }}
       package_name: ${{ steps.package.outputs.package_name }}
       package_sha256: ${{ steps.package.outputs.package_sha256 }}
     steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ needs.validate-release.outputs.tag_commit }}
+      - id: sdk
+        name: Read the .NET SDK version of the workflow revision
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # The recovery of an older tag checks out a tree that can be without global.json,
+          # so the version comes from the revision of this workflow.
+          version="$(gh api "/repos/${{ github.repository }}/contents/global.json?ref=${{ github.sha }}" --jq .content | base64 -d | jq -er .sdk.version)"
+          if ! [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::global.json names no usable SDK version: ${version}"
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
       - uses: actions/setup-dotnet@v6
         with:
-          dotnet-version: '11.0.100'
+          dotnet-version: ${{ steps.sdk.outputs.version }}
       - uses: actions/cache@v6
         with:
           path: ~/.nuget/packages
@@ -433,7 +448,7 @@ jobs:
     steps:
       - uses: actions/setup-dotnet@v6
         with:
-          dotnet-version: '11.0.100'
+          dotnet-version: ${{ needs.package-nuget.outputs.dotnet_sdk_version }}
       - name: Download immutable NuGet package
         uses: actions/download-artifact@v8
         with:

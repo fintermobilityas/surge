@@ -138,17 +138,25 @@ jobs:
           - os: ubuntu-latest
             name: Linux x64
             cache_key: linux-test
+            nextest_asset: x86_64-unknown-linux-gnu
+            nextest_sha256: 32d1d8c0567b7a80bee2bad8bb09125c846da96bc009b2de11ec08557290c770
           - os: windows-latest
             name: Windows x64
             cache_key: windows-test
+            nextest_asset: x86_64-pc-windows-msvc
+            nextest_sha256: 8e7609fffb5a938c9b48d8788a89699fc83c39d07a9d9dbc61554f661b51d9d8
           - os: macos-15-intel
             name: macOS Intel
             cache_key: macos-intel-test
+            nextest_asset: universal-apple-darwin
+            nextest_sha256: 47b9941765a9ff94e304a3fe5444ac1c7593da655525b8b69f8f2b31a9217507
             macos_arch: x86_64
             timeout_minutes: 45
           - os: macos-15
             name: macOS Apple Silicon
             cache_key: macos-arm64-test
+            nextest_asset: universal-apple-darwin
+            nextest_sha256: 47b9941765a9ff94e304a3fe5444ac1c7593da655525b8b69f8f2b31a9217507
             macos_arch: arm64
     steps:
       - uses: actions/checkout@v7
@@ -172,9 +180,31 @@ jobs:
       - name: Validate macOS runner and Rust host
         if: startsWith(matrix.os, 'macos-')
         run: bash ./scripts/check-macos-architecture.sh --arch "${{ matrix.macos_arch }}" --runner-only
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: nextest
+      # The organization's action allowlist has no installer action for nextest,
+      # so the pinned release archive is downloaded and its SHA-256 is checked.
+      - name: Install cargo-nextest
+        shell: bash
+        env:
+          NEXTEST_VERSION: 0.9.149
+          NEXTEST_ASSET: ${{ matrix.nextest_asset }}
+          NEXTEST_SHA256: ${{ matrix.nextest_sha256 }}
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -fsSL --retry 3 -o nextest.tar.gz \
+            "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${NEXTEST_VERSION}/cargo-nextest-${NEXTEST_VERSION}-${NEXTEST_ASSET}.tar.gz"
+          if command -v sha256sum >/dev/null; then
+            actual="$(sha256sum nextest.tar.gz | cut -d' ' -f1)"
+          else
+            actual="$(shasum -a 256 nextest.tar.gz | cut -d' ' -f1)"
+          fi
+          if [ "$actual" != "$NEXTEST_SHA256" ]; then
+            echo "::error::cargo-nextest archive has SHA-256 ${actual}, expected ${NEXTEST_SHA256}"
+            exit 1
+          fi
+          mkdir nextest-bin
+          tar -xzf nextest.tar.gz -C nextest-bin
+          mv nextest-bin/cargo-nextest* "${CARGO_HOME:-$HOME/.cargo}/bin/"
+          cargo nextest --version
       # nextest runs the tests of every binary in one pool and does not stop at
       # the first failing binary; `cargo test` ran 2 of 13 binaries before it stopped.
       - name: Run tests

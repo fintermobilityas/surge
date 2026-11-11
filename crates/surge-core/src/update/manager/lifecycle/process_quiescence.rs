@@ -489,7 +489,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let active_app_dir = tmp.path().join("app");
         std::fs::create_dir_all(&active_app_dir).unwrap();
-        symlink("/bin/sleep", active_app_dir.join("demo")).unwrap();
+        symlink(
+            crate::test_fixtures::standalone_sleep_binary(),
+            active_app_dir.join("demo"),
+        )
+        .unwrap();
 
         let mut unrelated_child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
         let error = terminate_active_app_processes_except(&active_app_dir, "demo", u32::MAX, false).unwrap_err();

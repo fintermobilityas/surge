@@ -23,4 +23,6 @@ pub mod releases;
 pub mod storage;
 pub mod storage_config;
 pub mod supervisor;
+#[cfg(all(test, unix))]
+pub(crate) mod test_fixtures;
 pub mod update;

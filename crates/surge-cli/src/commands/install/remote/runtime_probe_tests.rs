@@ -39,7 +39,7 @@ fn fixture() -> tempfile::TempDir {
     let root = tempfile::tempdir().unwrap();
     let app = root.path().join("app");
     fs::create_dir(&app).unwrap();
-    fs::copy("/bin/sleep", app.join("demoapp")).unwrap();
+    fs::copy(crate::test_fixtures::standalone_sleep_binary(), app.join("demoapp")).unwrap();
     fs::copy("/bin/sh", app.join("surge-supervisor")).unwrap();
     fs::write(
         root.path().join(".surge-update-status.json"),
@@ -168,7 +168,11 @@ fn process_probe_rejects_superseded_app_alongside_current_child() {
     let mut processes = Processes(Vec::new());
     let retained = root.path().join("app-1.2.2");
     fs::create_dir(&retained).unwrap();
-    fs::copy("/bin/sleep", retained.join("demoapp")).unwrap();
+    fs::copy(
+        crate::test_fixtures::standalone_sleep_binary(),
+        retained.join("demoapp"),
+    )
+    .unwrap();
     processes
         .0
         .push(spawn(Command::new(retained.join("demoapp")).arg("30")));
@@ -309,7 +313,11 @@ fn process_probe_rejects_retained_symlink_target_changed_between_releases() {
     fs::create_dir(app.join("bin")).unwrap();
     fs::create_dir_all(&retained).unwrap();
     fs::rename(app.join("demoapp"), app.join("bin/actual-app")).unwrap();
-    fs::copy("/bin/sleep", retained.join("old-app")).unwrap();
+    fs::copy(
+        crate::test_fixtures::standalone_sleep_binary(),
+        retained.join("old-app"),
+    )
+    .unwrap();
     std::os::unix::fs::symlink("lib/old-app", root.path().join("app-1.2.2/demoapp")).unwrap();
     std::os::unix::fs::symlink("bin/actual-app", app.join("demoapp")).unwrap();
     let mut processes = Processes(Vec::new());
@@ -357,7 +365,11 @@ fn process_probe_rejects_process_using_replaced_active_executable() {
     let mut processes = Processes(Vec::new());
     spawn_supervisor(root.path(), "demo-supervisor", 999_999, &mut processes);
     fs::remove_file(root.path().join("app/demoapp")).unwrap();
-    fs::copy("/bin/sleep", root.path().join("app/demoapp")).unwrap();
+    fs::copy(
+        crate::test_fixtures::standalone_sleep_binary(),
+        root.path().join("app/demoapp"),
+    )
+    .unwrap();
     let result = run_probe(root.path());
     stop_spawned_child(root.path());
     assert_ne!(result, "ready");

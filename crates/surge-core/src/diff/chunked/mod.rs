@@ -922,10 +922,10 @@ mod tests {
         let mut off = header + bitset;
         let mut seen_changed = 0usize;
         let mut target_off = None;
-        for idx in 0..decoded.chunks.len() {
+        for &is_identity in &decoded.identity {
             let len = u64::from_le_bytes(patch[off..off + 8].try_into().unwrap()) as usize;
             off += 8 + len;
-            if !decoded.identity[idx] {
+            if !is_identity {
                 seen_changed += 1;
                 if seen_changed == 2 {
                     target_off = Some(off);

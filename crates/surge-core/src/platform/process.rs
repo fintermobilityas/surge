@@ -309,9 +309,10 @@ pub fn exec_replace(exe: &Path, args: &[&str]) -> Result<()> {
         .collect();
     let args_c = args_c.map_err(|e| SurgeError::Platform(format!("Invalid argument: {e}")))?;
 
-    nix::unistd::execv(&exe_c, &args_c).map_err(|e| SurgeError::Platform(format!("execv failed: {e}")))?;
-
-    unreachable!()
+    // `execv` only returns on failure, so its success type is uninhabited.
+    nix::unistd::execv(&exe_c, &args_c)
+        .map(|never| match never {})
+        .map_err(|e| SurgeError::Platform(format!("execv failed: {e}")))
 }
 
 #[cfg(not(unix))]

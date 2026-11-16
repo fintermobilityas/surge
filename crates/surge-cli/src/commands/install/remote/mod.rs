@@ -53,7 +53,9 @@ pub(crate) use self::watchdog::{RemoteSetupWatchdog, read_remote_update_status_f
 #[cfg(test)]
 pub(crate) use self::activation::build_remote_app_copy_activation_script;
 #[cfg(test)]
-pub(crate) use self::published_installer::{build_remote_installer_manifest, published_installer_public_url};
+pub(crate) use self::published_installer::{
+    build_remote_installer_manifest, published_installer_public_url, refresh_staged_installer_session_environment,
+};
 #[cfg(test)]
 pub(crate) use self::runtime::{
     REMOTE_PROCESS_VERIFICATION_POLL_INTERVAL, REMOTE_PROCESS_VERIFICATION_TIMEOUT,
@@ -308,7 +310,8 @@ pub(super) async fn install_release_via_tailscale(
 
     if matches!(transfer_strategy, RemoteTailscaleTransferStrategy::StagedInstallerCache) {
         installer_lock.ensure_held()?;
-        run_remote_staged_installer_setup(ssh_target, file_target, app_id, release, behavior.no_start).await?;
+        run_remote_staged_installer_setup(ssh_target, file_target, app_id, release, &launch_env, behavior.no_start)
+            .await?;
         verify_remote_runtime_after_install(
             ssh_target,
             file_target,

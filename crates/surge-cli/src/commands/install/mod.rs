@@ -503,11 +503,11 @@ mod tests {
         build_remote_staged_installer_setup_command, build_remote_stop_supervisor_command,
         missing_remote_installer_error, parse_remote_install_state, parse_remote_launch_environment,
         parse_remote_staged_payload_identity, plan_remote_convergence, plan_remote_published_installer,
-        plan_remote_published_installer_without_manifest, published_installer_public_url, remote_install_matches,
-        remote_launch_environment_probe, remote_staged_payload_identity, select_latest_remote_legacy_app_dir,
-        select_remote_installer_mode, select_remote_tailscale_transfer_strategy,
-        select_remote_tailscale_transfer_strategy_for_convergence, should_skip_remote_install,
-        try_prepare_published_installer_for_tailscale,
+        plan_remote_published_installer_without_manifest, published_installer_public_url,
+        refresh_staged_installer_session_environment, remote_install_matches, remote_launch_environment_probe,
+        remote_staged_payload_identity, select_latest_remote_legacy_app_dir, select_remote_installer_mode,
+        select_remote_tailscale_transfer_strategy, select_remote_tailscale_transfer_strategy_for_convergence,
+        should_skip_remote_install, try_prepare_published_installer_for_tailscale,
     };
     use super::resolution::{
         build_storage_config_without_manifest, resolve_install_app_id_without_manifest,
@@ -1113,11 +1113,242 @@ mod tests {
 
     #[test]
     fn build_remote_staged_installer_setup_command_quotes_install_root() {
-        let command = build_remote_staged_installer_setup_command(Path::new("/home/demo/apps/customer's app"), true);
+        let command =
+            build_remote_staged_installer_setup_command(Path::new("/home/demo/apps/customer's app"), true, None);
 
         assert!(command.contains("install_root='/home/demo/apps/customer'\"'\"'s app'"));
         assert!(command.contains("stage_dir=\"$install_root/.surge-cache/staged-installer\""));
         assert!(command.contains("\"$surge_bin\" setup \"$stage_dir\" --no-start"));
+        assert!(!command.contains("installer.yml.refresh"));
+    }
+
+    #[test]
+    fn build_remote_staged_installer_setup_command_refreshes_manifest_before_setup() {
+        let command = build_remote_staged_installer_setup_command(
+            Path::new("/home/demo/apps/demoapp"),
+            false,
+            Some("runtime:\n  name: Demo's app\n"),
+        );
+
+        let write = command
+            .find("> \"$stage_dir/installer.yml.refresh\"")
+            .expect("manifest write");
+        let rename = command
+            .find("mv -f \"$stage_dir/installer.yml.refresh\" \"$stage_dir/installer.yml\"")
+            .expect("manifest rename");
+        let setup = command.find("\"$surge_bin\" setup \"$stage_dir\"").expect("setup");
+        assert!(write < rename, "{command}");
+        assert!(rename < setup, "{command}");
+        assert!(command.contains("name: Demo'\"'\"'s app"), "{command}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_staged_installer_setup_command_hands_setup_the_refreshed_manifest() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let install_root = tmp.path().join("customer's app");
+        let stage_dir = install_root.join(".surge-cache").join("staged-installer");
+        std::fs::create_dir_all(&stage_dir).expect("stage dir");
+        std::fs::write(stage_dir.join("installer.yml"), "runtime:\n  name: stale\n").expect("staged manifest");
+        // Stands in for the staged `surge` binary: it records the manifest that
+        // setup would read, and the arguments it was started with.
+        let surge = stage_dir.join("surge");
+        std::fs::write(
+            &surge,
+            "#!/bin/sh\ncp \"$2/installer.yml\" \"$2/seen-by-setup.yml\"\nprintf '%s' \"$*\" > \"$2/seen-args\"\n",
+        )
+        .expect("fake surge");
+        std::fs::set_permissions(&surge, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let refreshed = "runtime:\n  name: Demo's app\n  environment:\n    PATTERN: 'a\\b %s $HOME'\n";
+        let command = build_remote_staged_installer_setup_command(&install_root, true, Some(refreshed));
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .status()
+            .expect("run setup command");
+
+        assert!(status.success(), "{command}");
+        assert_eq!(
+            std::fs::read_to_string(stage_dir.join("seen-by-setup.yml")).expect("manifest seen by setup"),
+            refreshed
+        );
+        assert_eq!(
+            std::fs::read_to_string(stage_dir.join("seen-args")).expect("setup arguments"),
+            format!("setup {} --no-start", stage_dir.display())
+        );
+        assert!(!stage_dir.join("installer.yml.refresh").exists());
+    }
+
+    fn staged_installer_manifest(launch_env: &RemoteLaunchEnvironment) -> String {
+        let mut release = release("1.2.3", "stable", "linux-x64", "demo.tar.zst");
+        release.environment.insert("DEMO_MODE".to_string(), "kiosk".to_string());
+        let manifest = build_remote_installer_manifest(
+            "demoapp",
+            &release,
+            "stable",
+            &storage_config("/tmp/releases"),
+            launch_env,
+            RemoteInstallerMode::Online,
+            CacheManifestConfig::default(),
+        );
+        let yaml = serde_yaml::to_string(&manifest).expect("installer manifest yaml");
+        // A field from a newer stager that this version does not know.
+        format!("{yaml}added_by_a_newer_stager: keep-me\n")
+    }
+
+    fn manifest_environment(manifest: &str) -> BTreeMap<String, String> {
+        let document: serde_yaml::Value = serde_yaml::from_str(manifest).expect("manifest yaml");
+        document
+            .get("runtime")
+            .and_then(|runtime| runtime.get("environment"))
+            .and_then(serde_yaml::Value::as_mapping)
+            .map(|environment| {
+                environment
+                    .iter()
+                    .map(|(key, value)| {
+                        (
+                            key.as_str().expect("key").to_string(),
+                            value.as_str().expect("value").to_string(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn stage_time_xorg_session() -> RemoteLaunchEnvironment {
+        RemoteLaunchEnvironment {
+            display: Some(":0".to_string()),
+            xauthority: Some("/run/user/1000/stage-time-auth".to_string()),
+            dbus_session_bus_address: Some("unix:path=/run/user/1000/bus".to_string()),
+            wayland_display: None,
+            xdg_runtime_dir: Some("/run/user/1000".to_string()),
+        }
+    }
+
+    #[test]
+    fn refresh_staged_installer_session_environment_replaces_values_from_the_stage_time_session() {
+        let staged = staged_installer_manifest(&stage_time_xorg_session());
+        let mut release = release("1.2.3", "stable", "linux-x64", "demo.tar.zst");
+        release.environment.insert("DEMO_MODE".to_string(), "kiosk".to_string());
+        let install_time_session = RemoteLaunchEnvironment {
+            display: Some(":0".to_string()),
+            xauthority: Some("/run/user/1000/install-time-auth".to_string()),
+            dbus_session_bus_address: Some("unix:path=/run/user/1000/bus".to_string()),
+            wayland_display: Some("wayland-0".to_string()),
+            xdg_runtime_dir: Some("/run/user/1000".to_string()),
+        };
+
+        let refreshed = refresh_staged_installer_session_environment(&staged, &release, &install_time_session)
+            .expect("refresh")
+            .expect("manifest changed");
+
+        assert_eq!(
+            manifest_environment(&refreshed),
+            BTreeMap::from([
+                (
+                    "DBUS_SESSION_BUS_ADDRESS".to_string(),
+                    "unix:path=/run/user/1000/bus".to_string()
+                ),
+                ("DEMO_MODE".to_string(), "kiosk".to_string()),
+                ("DISPLAY".to_string(), ":0".to_string()),
+                ("WAYLAND_DISPLAY".to_string(), "wayland-0".to_string()),
+                ("XAUTHORITY".to_string(), "/run/user/1000/install-time-auth".to_string()),
+                ("XDG_RUNTIME_DIR".to_string(), "/run/user/1000".to_string()),
+            ])
+        );
+
+        // Nothing but the session values may differ from the staged manifest.
+        let mut expected: serde_yaml::Value = serde_yaml::from_str(&staged).expect("staged yaml");
+        let mut actual: serde_yaml::Value = serde_yaml::from_str(&refreshed).expect("refreshed yaml");
+        for document in [&mut expected, &mut actual] {
+            document
+                .get_mut("runtime")
+                .and_then(serde_yaml::Value::as_mapping_mut)
+                .expect("runtime")
+                .remove("environment");
+        }
+        assert_eq!(actual, expected);
+        assert_eq!(
+            actual
+                .get("added_by_a_newer_stager")
+                .and_then(serde_yaml::Value::as_str),
+            Some("keep-me")
+        );
+    }
+
+    #[test]
+    fn refresh_staged_installer_session_environment_drops_values_the_live_session_does_not_set() {
+        let staged = staged_installer_manifest(&stage_time_xorg_session());
+        let mut release = release("1.2.3", "stable", "linux-x64", "demo.tar.zst");
+        release.environment.insert("DEMO_MODE".to_string(), "kiosk".to_string());
+        // The application declares its own display; the live session reports none.
+        release.environment.insert("DISPLAY".to_string(), ":7".to_string());
+        let install_time_session = RemoteLaunchEnvironment {
+            wayland_display: Some("wayland-0".to_string()),
+            ..RemoteLaunchEnvironment::default()
+        };
+
+        let refreshed = refresh_staged_installer_session_environment(&staged, &release, &install_time_session)
+            .expect("refresh")
+            .expect("manifest changed");
+
+        assert_eq!(
+            manifest_environment(&refreshed),
+            BTreeMap::from([
+                ("DEMO_MODE".to_string(), "kiosk".to_string()),
+                ("DISPLAY".to_string(), ":7".to_string()),
+                ("WAYLAND_DISPLAY".to_string(), "wayland-0".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn refresh_staged_installer_session_environment_keeps_stage_time_values_without_a_live_session() {
+        let staged = staged_installer_manifest(&stage_time_xorg_session());
+        let release = release("1.2.3", "stable", "linux-x64", "demo.tar.zst");
+        // A session bus alone is not a graphical session, and a failed probe
+        // reports nothing at all.
+        let bus_only = RemoteLaunchEnvironment {
+            dbus_session_bus_address: Some("unix:path=/run/user/1000/bus".to_string()),
+            xdg_runtime_dir: Some("/run/user/1000".to_string()),
+            ..RemoteLaunchEnvironment::default()
+        };
+
+        for launch_env in [RemoteLaunchEnvironment::default(), bus_only] {
+            assert_eq!(
+                refresh_staged_installer_session_environment(&staged, &release, &launch_env).expect("refresh"),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn refresh_staged_installer_session_environment_reports_no_change_when_already_current() {
+        let session = stage_time_xorg_session();
+        let staged = staged_installer_manifest(&session);
+        let mut release = release("1.2.3", "stable", "linux-x64", "demo.tar.zst");
+        release.environment.insert("DEMO_MODE".to_string(), "kiosk".to_string());
+
+        assert_eq!(
+            refresh_staged_installer_session_environment(&staged, &release, &session).expect("refresh"),
+            None
+        );
+    }
+
+    #[test]
+    fn refresh_staged_installer_session_environment_rejects_a_manifest_without_runtime() {
+        let release = release("1.2.3", "stable", "linux-x64", "demo.tar.zst");
+
+        for manifest in ["", "schema: 1\n", "runtime: not-a-mapping\n"] {
+            assert!(
+                refresh_staged_installer_session_environment(manifest, &release, &stage_time_xorg_session()).is_err(),
+                "{manifest:?}"
+            );
+        }
     }
 
     #[test]

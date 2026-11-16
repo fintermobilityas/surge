@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::context::StorageProvider;
 use crate::error::{Result, SurgeError};
+use crate::platform::session_environment::durable_environment;
 
 use super::InstallProfile;
 
@@ -144,6 +145,9 @@ pub fn write_runtime_manifest(
     profile: &InstallProfile<'_>,
     metadata: &RuntimeManifestMetadata<'_>,
 ) -> Result<PathBuf> {
+    // The manifest outlives the login that produced the launch environment, and
+    // its environment is applied again when a previous release is restarted.
+    let durable_environment = durable_environment(profile.environment);
     let manifest = RuntimeManifestFile {
         id: profile.app_id.trim(),
         version: metadata.version.trim(),
@@ -155,7 +159,7 @@ pub fn write_runtime_manifest(
         bucket: metadata.storage_bucket.trim(),
         region: metadata.storage_region.trim(),
         endpoint: metadata.storage_endpoint.trim(),
-        environment: profile.environment,
+        environment: &durable_environment,
     };
 
     if manifest.id.is_empty() {
@@ -260,5 +264,43 @@ mod tests {
 
         let identity = read_runtime_manifest_identity(tmp.path()).unwrap().unwrap();
         assert_eq!(identity.environment, environment);
+    }
+
+    #[test]
+    fn runtime_manifest_does_not_store_session_scoped_environment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shortcuts: [ShortcutLocation; 0] = [];
+        let persistent_assets: [String; 0] = [];
+        let environment = BTreeMap::from([
+            ("DEMO_MODE".to_string(), "recovery".to_string()),
+            ("DISPLAY".to_string(), ":0".to_string()),
+            ("XAUTHORITY".to_string(), "/run/user/1000/session-auth".to_string()),
+        ]);
+        let profile = InstallProfile::new(
+            "demo-app",
+            "Demo App",
+            "demo",
+            "demo-app",
+            "demo-supervisor",
+            "",
+            &shortcuts,
+            &persistent_assets,
+            &environment,
+        );
+        let metadata = RuntimeManifestMetadata::new("1.0.0", "stable", "filesystem", ".", "", "");
+
+        let manifest_path = write_runtime_manifest(tmp.path(), &profile, &metadata).unwrap();
+        let manifest = std::fs::read_to_string(manifest_path).unwrap();
+
+        assert!(!manifest.contains("XAUTHORITY"), "{manifest}");
+
+        let identity = read_runtime_manifest_identity(tmp.path()).unwrap().unwrap();
+        assert_eq!(
+            identity.environment,
+            BTreeMap::from([
+                ("DEMO_MODE".to_string(), "recovery".to_string()),
+                ("DISPLAY".to_string(), ":0".to_string()),
+            ])
+        );
     }
 }

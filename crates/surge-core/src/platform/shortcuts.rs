@@ -228,6 +228,77 @@ mod tests {
     }
 
     #[test]
+    fn test_render_linux_shortcut_files_never_store_session_scoped_environment() {
+        let _shortcut_env_lock = lock_test_shortcut_environment();
+        let install_root = PathBuf::from("/home/demo/.local/share/demoapp");
+        let exe_path = install_root.join("app").join("demoapp");
+        let icon_path = install_root.join("app").join("icon.png");
+        let env = BTreeMap::from([
+            ("DEMO_MODE".to_string(), "kiosk".to_string()),
+            ("DISPLAY".to_string(), ":0".to_string()),
+            ("XAUTHORITY".to_string(), "/run/user/1000/session-auth".to_string()),
+        ]);
+
+        let rendered = render_linux_shortcut_files(
+            "demo-app",
+            "Demo App",
+            &exe_path,
+            &icon_path,
+            "demo-supervisor",
+            &install_root,
+            &[ShortcutLocation::Desktop, ShortcutLocation::Startup],
+            &env,
+        );
+
+        assert_eq!(rendered.len(), 2);
+        for file in &rendered {
+            assert!(
+                !file.content.contains("XAUTHORITY"),
+                "{:?} entry must leave XAUTHORITY to the session: {}",
+                file.location,
+                file.content
+            );
+            assert!(
+                file.content.contains("Exec=env DEMO_MODE=kiosk DISPLAY=:0 "),
+                "{:?} entry must keep the durable environment: {}",
+                file.location,
+                file.content
+            );
+        }
+    }
+
+    #[test]
+    fn test_render_linux_shortcut_files_omit_env_wrapper_when_nothing_durable_remains() {
+        let _shortcut_env_lock = lock_test_shortcut_environment();
+        let install_root = PathBuf::from("/home/demo/.local/share/demoapp");
+        let exe_path = install_root.join("app").join("demoapp");
+        let icon_path = install_root.join("app").join("icon.png");
+        let env = BTreeMap::from([("XAUTHORITY".to_string(), "/run/user/1000/session-auth".to_string())]);
+
+        let rendered = render_linux_shortcut_files(
+            "demo-app",
+            "Demo App",
+            &exe_path,
+            &icon_path,
+            "demo-supervisor",
+            &install_root,
+            &[ShortcutLocation::Desktop, ShortcutLocation::Startup],
+            &env,
+        );
+
+        assert_eq!(rendered.len(), 2);
+        for file in &rendered {
+            assert!(
+                file.content.contains("\nExec=\""),
+                "{:?} entry must start the command directly: {}",
+                file.location,
+                file.content
+            );
+            assert!(!file.content.contains("Exec=env"), "{}", file.content);
+        }
+    }
+
+    #[test]
     fn test_render_linux_shortcut_files_emits_application_and_autostart_entries() {
         let _shortcut_env_lock = lock_test_shortcut_environment();
         let install_root = PathBuf::from("/home/demo/.local/share/demoapp");

@@ -5,6 +5,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use crate::config::manifest::ShortcutLocation;
+use crate::platform::session_environment::is_session_scoped;
 
 #[cfg(target_os = "linux")]
 use crate::error::{Result, SurgeError};
@@ -285,14 +286,17 @@ fn build_startup_entry_linux(
 }
 
 fn build_exec_line_linux(command: &str, environment: &BTreeMap<String, String>) -> String {
-    if environment.is_empty() {
+    // A desktop entry is started by the graphical session, which supplies its own
+    // session-scoped values. A stored copy would shadow them with a stale one.
+    let env_prefix = environment
+        .iter()
+        .filter(|(key, _)| !is_session_scoped(key))
+        .map(|(key, value)| format!("{}={}", escape_desktop_value(key), escape_desktop_value(value)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if env_prefix.is_empty() {
         format!("Exec={command}")
     } else {
-        let env_prefix = environment
-            .iter()
-            .map(|(key, value)| format!("{}={}", escape_desktop_value(key), escape_desktop_value(value)))
-            .collect::<Vec<_>>()
-            .join(" ");
         format!("Exec=env {env_prefix} {command}")
     }
 }

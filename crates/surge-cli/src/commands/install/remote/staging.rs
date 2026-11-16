@@ -5,7 +5,7 @@ use super::execution::{
     detect_remote_home_directory, run_tailscale_capture, run_tailscale_streaming,
     run_tailscale_streaming_with_status_watchdog, stream_directory_entries_to_tailscale_node_with_command,
 };
-use super::published_installer::build_remote_runtime_environment;
+use super::published_installer::{build_remote_runtime_environment, refresh_staged_installer_session_environment};
 use super::stage_manifest::{
     RemoteStageManifest, build_remote_stage_prepare_command, build_remote_stage_verify_command,
 };
@@ -218,11 +218,15 @@ pub(crate) async fn run_remote_staged_installer_setup(
     file_target: &str,
     app_id: &str,
     release: &ReleaseEntry,
+    launch_env: &RemoteLaunchEnvironment,
     no_start: bool,
 ) -> Result<()> {
     let remote_home = detect_remote_home_directory(ssh_node).await?;
     let install_root = remote_install_root(&remote_home, app_id, &release.install_directory)?;
-    let setup_command = build_remote_staged_installer_setup_command(&install_root, no_start);
+    let refreshed_installer_manifest =
+        refresh_remote_staged_installer_manifest(ssh_node, file_target, &install_root, release, launch_env).await;
+    let setup_command =
+        build_remote_staged_installer_setup_command(&install_root, no_start, refreshed_installer_manifest.as_deref());
     let ssh_command = format!("sh -lc {}", shell_single_quote(&setup_command));
     logline::info(&format!(
         "Using pre-staged installer cache for '{app_id}' v{} on '{file_target}'.",
@@ -230,6 +234,58 @@ pub(crate) async fn run_remote_staged_installer_setup(
     ));
     let watchdog = RemoteSetupWatchdog::new(ssh_node, &install_root);
     run_tailscale_streaming_with_status_watchdog(&["ssh", ssh_node, ssh_command.as_str()], "remote", watchdog).await
+}
+
+/// Read the staged installer manifest from the node and refresh its session
+/// values from the session that is live now.
+///
+/// A failure here must not stop the install: the staged manifest still holds
+/// the values that were valid at stage time, which is what an install from a
+/// stage used before this refresh existed.
+async fn refresh_remote_staged_installer_manifest(
+    ssh_node: &str,
+    file_target: &str,
+    install_root: &Path,
+    release: &ReleaseEntry,
+    launch_env: &RemoteLaunchEnvironment,
+) -> Option<String> {
+    if !launch_env.has_graphical_session() {
+        return None;
+    }
+
+    let manifest_path = install_root
+        .join(".surge-cache")
+        .join("staged-installer")
+        .join("installer.yml");
+    let read_command = format!(
+        "sh -c {}",
+        shell_single_quote(&format!("cat {}", shell_single_quote(&manifest_path.to_string_lossy())))
+    );
+    let staged_manifest = match run_tailscale_capture(&["ssh", ssh_node, read_command.as_str()]).await {
+        Ok(staged_manifest) => staged_manifest,
+        Err(error) => {
+            logline::warn(&format!(
+                "Could not read the staged installer manifest on '{file_target}'; starting with the session environment recorded at stage time: {error}"
+            ));
+            return None;
+        }
+    };
+
+    match refresh_staged_installer_session_environment(&staged_manifest, release, launch_env) {
+        Ok(Some(refreshed)) => {
+            logline::info(&format!(
+                "Refreshing the graphical session environment of the staged installer on '{file_target}'."
+            ));
+            Some(refreshed)
+        }
+        Ok(None) => None,
+        Err(error) => {
+            logline::warn(&format!(
+                "Could not refresh the staged installer manifest on '{file_target}'; starting with the session environment recorded at stage time: {error}"
+            ));
+            None
+        }
+    }
 }
 
 async fn sync_remote_app_copy_stage(
@@ -484,8 +540,22 @@ done",
     ))
 }
 
-pub(crate) fn build_remote_staged_installer_setup_command(install_root: &Path, no_start: bool) -> String {
+pub(crate) fn build_remote_staged_installer_setup_command(
+    install_root: &Path,
+    no_start: bool,
+    refreshed_installer_manifest: Option<&str>,
+) -> String {
     let no_start_flag = if no_start { " --no-start" } else { "" };
+    // Written through a sibling file and renamed, so setup never reads a
+    // half-written manifest.
+    let refresh_manifest = refreshed_installer_manifest.map_or_else(String::new, |manifest| {
+        format!(
+            "printf '%s' {} > \"$stage_dir/installer.yml.refresh\" \
+&& mv -f \"$stage_dir/installer.yml.refresh\" \"$stage_dir/installer.yml\" \
+|| {{ echo \"Failed to refresh the staged installer manifest\" >&2; exit 1; }}; ",
+            shell_single_quote(manifest)
+        )
+    });
     format!(
         "install_root={}; \
 stage_dir=\"$install_root/.surge-cache/staged-installer\"; \
@@ -495,6 +565,7 @@ if [ ! -d \"$stage_dir\" ] || [ ! -f \"$stage_dir/installer.yml\" ] || [ ! -f \"
   exit 1; \
 fi; \
 chmod +x \"$surge_bin\" || true; \
+{refresh_manifest}\
 cd \"$stage_dir\"; \
 \"$surge_bin\" setup \"$stage_dir\"{no_start_flag}",
         shell_single_quote(&install_root.to_string_lossy())

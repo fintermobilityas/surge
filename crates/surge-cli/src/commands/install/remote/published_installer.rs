@@ -357,6 +357,83 @@ pub(crate) fn build_remote_runtime_environment(
     environment
 }
 
+/// Session values that a remote install hands to a start it performs outside
+/// the node's graphical session.
+pub(crate) const REMOTE_SESSION_ENVIRONMENT_KEYS: [&str; 5] = [
+    "DISPLAY",
+    "XAUTHORITY",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "WAYLAND_DISPLAY",
+    "XDG_RUNTIME_DIR",
+];
+
+/// Bring the session values in a staged installer manifest up to date.
+///
+/// A staged installer is built at stage time and carries the session values
+/// that were probed then. The install can run under a later login or another
+/// kind of session, and `surge setup` applies the manifest's values to the
+/// start on top of its own environment, so a stale value wins over a live one.
+///
+/// Every session value is set to what an install without a stage would use
+/// now, or removed when that install would not set it. Everything else in the
+/// manifest is carried over untouched, including fields this version does not
+/// know. Returns `None` when the manifest is already current, and when no
+/// graphical session was detected, because then there is nothing to refresh
+/// from and the staged values are the best information available.
+pub(crate) fn refresh_staged_installer_session_environment(
+    installer_manifest: &str,
+    release: &ReleaseEntry,
+    launch_env: &RemoteLaunchEnvironment,
+) -> Result<Option<String>> {
+    if !launch_env.has_graphical_session() {
+        return Ok(None);
+    }
+
+    let mut document: serde_yaml::Value = serde_yaml::from_str(installer_manifest)
+        .map_err(|e| SurgeError::Config(format!("Failed to parse staged installer manifest: {e}")))?;
+    let runtime = document
+        .get_mut("runtime")
+        .and_then(serde_yaml::Value::as_mapping_mut)
+        .ok_or_else(|| SurgeError::Config("Staged installer manifest has no runtime section".to_string()))?;
+
+    let environment_key = serde_yaml::Value::String("environment".to_string());
+    let staged_environment = match runtime.get(&environment_key) {
+        Some(serde_yaml::Value::Mapping(environment)) => environment.clone(),
+        Some(serde_yaml::Value::Null) | None => serde_yaml::Mapping::new(),
+        Some(_) => {
+            return Err(SurgeError::Config(
+                "Staged installer manifest runtime environment is not a mapping".to_string(),
+            ));
+        }
+    };
+
+    let current_environment = build_remote_runtime_environment(release, launch_env);
+    let mut environment = staged_environment.clone();
+    for key in REMOTE_SESSION_ENVIRONMENT_KEYS {
+        let yaml_key = serde_yaml::Value::String(key.to_string());
+        match current_environment.get(key) {
+            Some(value) => {
+                environment.insert(yaml_key, serde_yaml::Value::String(value.clone()));
+            }
+            None => {
+                environment.remove(&yaml_key);
+            }
+        }
+    }
+    if environment == staged_environment {
+        return Ok(None);
+    }
+
+    if environment.is_empty() {
+        runtime.remove(&environment_key);
+    } else {
+        runtime.insert(environment_key, serde_yaml::Value::Mapping(environment));
+    }
+    serde_yaml::to_string(&document)
+        .map(Some)
+        .map_err(|e| SurgeError::Config(format!("Failed to serialize staged installer manifest: {e}")))
+}
+
 pub(crate) fn build_remote_installer_manifest(
     app_id: &str,
     release: &ReleaseEntry,

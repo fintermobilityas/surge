@@ -269,6 +269,14 @@ markers without a prefix match only the empty namespace and otherwise require
 restaging with an installer that records the prefix. Installation also waits for its current installer result
 and requires the requested target/installed version before accepting convergence.
 
+A staged installer records the graphical session values (`DISPLAY`, `XAUTHORITY`,
+`DBUS_SESSION_BUS_ADDRESS`, `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR`) that were probed at
+stage time. An install that reuses it probes the session again and rewrites those
+values in the staged `installer.yml` before it runs setup, so the application starts
+with what an install without a stage would use at that moment. The stage-time values
+are kept when no graphical session is detected at install time, or when the staged
+manifest cannot be read or refreshed.
+
 The detached job records whether its original convergence plan requires a running
 process. Reattachment preserves that intent: metadata-only repair does not require
 starting a previously stopped application. A live job missing that record is left

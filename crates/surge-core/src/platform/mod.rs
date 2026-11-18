@@ -1,4 +1,5 @@
 pub mod detect;
+pub mod durability;
 pub mod fs;
 pub mod paths;
 pub mod process;

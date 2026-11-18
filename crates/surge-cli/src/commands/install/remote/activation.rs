@@ -140,6 +140,10 @@ main_exe={main_exe_quoted}\n\
 version={version_quoted}\n\
 {persistent_asset_block}\
 \n\
+flush_to_disk() {{\n\
+  sync -f \"$1\" 2>/dev/null || sync\n\
+}}\n\
+\n\
 kill_matching() {{\n\
   pattern=\"$1\"\n\
   if ! command -v pgrep >/dev/null 2>&1; then\n\
@@ -198,6 +202,7 @@ if [ -n \"$main_exe\" ] && [ ! -s \"$stage_dir/app/$main_exe\" ]; then\n\
   echo \"Remote install stage payload is unusable: '$main_exe' is missing or 0 bytes\" >&2\n\
   exit 1\n\
 fi\n\
+flush_to_disk \"$stage_dir/app\"\n\
 kill_matching \"$install_root/$main_exe\"\n\
 kill_matching \"$install_root/app-\"\n\
 kill_matching \"$install_root/app/\"\n\
@@ -246,6 +251,7 @@ if [ -n \"${{persistent_source_dir:-}}\" ]; then\n\
   fi\n\
 fi\n\
 \n\
+flush_to_disk \"$active_app_dir\"\n\
 rm -rf \"$previous_app_dir\"\n\
 \n\
 for snapshot_dir in \"$install_root\"/app-[0-9]*; do\n\

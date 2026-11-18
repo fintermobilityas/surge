@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::context::StorageProvider;
 use crate::error::{Result, SurgeError};
+use crate::platform::durability::write_file_synced;
 use crate::platform::session_environment::durable_environment;
 
 use super::InstallProfile;
@@ -197,8 +198,8 @@ pub fn write_runtime_manifest(
     if !yaml.ends_with('\n') {
         yaml.push('\n');
     }
-    std::fs::write(&runtime_manifest_path, &yaml)?;
-    std::fs::write(&legacy_manifest_path, yaml)?;
+    write_file_synced(&runtime_manifest_path, yaml.as_bytes())?;
+    write_file_synced(&legacy_manifest_path, yaml.as_bytes())?;
     Ok(runtime_manifest_path)
 }
 

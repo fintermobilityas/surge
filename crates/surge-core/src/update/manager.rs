@@ -3,6 +3,7 @@
 mod apply;
 mod artifacts;
 mod current_install;
+mod durable_swap;
 mod external_finalize;
 mod finalize;
 mod lifecycle;
@@ -2267,6 +2268,20 @@ echo started > new-child-started
             finalize_phase::POST_UPDATE_HOOK,
             finalize_labels
         );
+
+        // The payload is flushed before anything destructive, and the swap is
+        // flushed before the previous version is pruned and the update reported.
+        let position = |label: &'static str| {
+            finalize_labels
+                .iter()
+                .position(|candidate| *candidate == label)
+                .unwrap_or_else(|| panic!("expected finalize substep '{label}' in {finalize_labels:?}"))
+        };
+        assert!(position(finalize_phase::VERIFYING_PAYLOAD) < position(finalize_phase::FLUSHING_PAYLOAD));
+        assert!(position(finalize_phase::FLUSHING_PAYLOAD) < position(finalize_phase::QUIESCING_ACTIVE_APP));
+        assert!(position(finalize_phase::FLUSHING_PAYLOAD) < position(finalize_phase::SWAPPING_APP_DIRECTORY));
+        assert!(position(finalize_phase::SWAPPING_APP_DIRECTORY) < position(finalize_phase::FLUSHING_ACTIVATED_APP));
+        assert!(position(finalize_phase::FLUSHING_ACTIVATED_APP) < position(finalize_phase::PRUNING_OLD_VERSIONS));
     }
 
     #[tokio::test]

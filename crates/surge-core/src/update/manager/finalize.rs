@@ -30,7 +30,9 @@ use crate::supervisor::state::supervisor_pid_file;
 
 use super::progress::{ProgressInfo, emit_progress};
 use super::progress_substep::{HEARTBEAT_INTERVAL, PhaseProgressEmitter, labels as finalize_phase};
-use super::{RELEASE_GRAPH_CHECKPOINT_FULLS, SupervisorRestartOutcome, UpdateInfo, UpdateManager, apply, lifecycle};
+use super::{
+    RELEASE_GRAPH_CHECKPOINT_FULLS, SupervisorRestartOutcome, UpdateInfo, UpdateManager, apply, durable_swap, lifecycle,
+};
 
 /// Bound the post-finalize storage read used to pick which artifacts to keep
 /// in the local cache. Pruning is best-effort, so an unreachable storage
@@ -113,6 +115,8 @@ where
         bytes = payload_survey.bytes,
         "Verified update payload before activation"
     );
+
+    durable_swap::flush_payload(progress_emitter, extracted_final_dir).await?;
 
     let current_app_dir = if active_app_dir.is_dir() {
         Some(active_app_dir.as_path())
@@ -277,6 +281,8 @@ where
         &storage_cfg.endpoint,
     );
     write_runtime_manifest(&active_app_dir, &runtime_manifest_profile, &runtime_manifest_metadata)?;
+
+    durable_swap::flush_activated_app(progress_emitter, &active_app_dir, &manager.install_dir).await?;
 
     // Start the replacement watch-supervisor as soon as the swapped app is
     // usable (directory swapped, persistent assets carried over, runtime

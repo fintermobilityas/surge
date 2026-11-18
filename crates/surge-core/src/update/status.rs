@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, SurgeError};
-use crate::platform::fs::write_file_atomic;
+use crate::platform::durability::write_file_durable;
 use crate::supervisor::state::supervisor_pid_file;
 
 mod handoff;
@@ -449,7 +449,7 @@ pub fn write_update_status(install_dir: &Path, record: &UpdateStatusRecord) -> R
     let path = update_status_path(install_dir);
     let json = serde_json::to_vec_pretty(record)
         .map_err(|e| SurgeError::Config(format!("Failed to encode update status: {e}")))?;
-    write_file_atomic(&path, &json)?;
+    write_file_durable(&path, &json)?;
     Ok(())
 }
 

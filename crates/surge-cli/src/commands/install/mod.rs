@@ -855,6 +855,44 @@ mod tests {
         assert!(script.contains("Rolled back to the previous app directory"));
     }
 
+    #[test]
+    fn build_remote_app_copy_activation_script_flushes_payload_before_swap_and_before_prune() {
+        let script = build_remote_app_copy_activation_script(
+            Path::new("/home/demo/app"),
+            "demoapp",
+            "1.2.3",
+            &BTreeMap::new(),
+            &[],
+            None,
+            false,
+        )
+        .expect("script should build");
+
+        let flush_stage = script
+            .find("flush_to_disk \"$stage_dir/app\"")
+            .expect("staged payload flush should be present");
+        let first_kill = script
+            .find("kill_matching \"$install_root/$main_exe\"")
+            .expect("kill_matching should be present");
+        let swap = script
+            .find("mv \"$next_app_dir\" \"$active_app_dir\"")
+            .expect("swap should be present");
+        let flush_active = script
+            .find("flush_to_disk \"$active_app_dir\"")
+            .expect("activated app flush should be present");
+        let prune_previous = script
+            .find("rm -rf \"$previous_app_dir\"")
+            .expect("previous app dir prune should be present");
+
+        // The payload reaches the disk while the previous version still runs, so a
+        // host reset after the swap cannot leave 0-byte application files.
+        assert!(flush_stage < first_kill);
+        assert!(flush_stage < swap);
+        // The swap is on disk before the only fallback is removed.
+        assert!(swap < flush_active);
+        assert!(flush_active < prune_previous);
+    }
+
     #[cfg(unix)]
     #[test]
     fn build_remote_app_copy_activation_script_preserves_persistent_assets_and_prunes_snapshots() {

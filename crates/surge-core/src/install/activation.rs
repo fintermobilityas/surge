@@ -4,6 +4,7 @@ use tracing::warn;
 
 use crate::archive::extractor::extract_file_to_with_progress;
 use crate::error::{Result, SurgeError};
+use crate::platform::durability::{sync_directory, sync_tree};
 use crate::platform::fs::list_directories;
 use crate::platform::paths::default_install_root;
 use crate::platform::shortcuts::install_shortcuts;
@@ -93,6 +94,9 @@ pub fn install_package_locally_at_root_with_progress(
         );
     };
     extract_file_to_with_progress(package_path, &next_app_dir, Some(&extract_progress))?;
+    // The payload must be on disk before it replaces the active install: a
+    // reset after the swap would otherwise leave 0-byte application files.
+    sync_tree(&next_app_dir)?;
     emit_install_progress(
         progress,
         InstallProgress {
@@ -152,6 +156,10 @@ pub fn install_package_locally_at_root_with_progress(
         }
 
         ensure_main_executable_mode(profile, &active_app_dir)?;
+
+        // Make the swap itself durable before the previous install is removed.
+        sync_tree(&active_app_dir)?;
+        sync_directory(install_root)?;
 
         if !profile.shortcuts.is_empty() {
             emit_install_progress(

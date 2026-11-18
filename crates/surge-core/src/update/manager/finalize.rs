@@ -20,6 +20,7 @@ use crate::install::{
     storage_provider_manifest_name, write_runtime_manifest,
 };
 use crate::installer_package::prune_install_artifact_cache_dir_with_stats;
+use crate::platform::durability::{sync_directory, sync_tree};
 use crate::platform::fs::atomic_rename;
 use crate::platform::shortcuts::install_shortcuts;
 use crate::releases::manifest::{ReleaseEntry, decompress_release_index};
@@ -113,6 +114,21 @@ where
         bytes = payload_survey.bytes,
         "Verified update payload before activation"
     );
+
+    // The verification above reads the payload back from the page cache, so it
+    // passes whether or not the data has reached the disk. Flush the payload
+    // while the previous version is still running: once it is swapped in, a
+    // host reset must find the new files complete, not 0 bytes long.
+    let payload_dir = extracted_final_dir.to_path_buf();
+    progress_emitter
+        .run_with_heartbeat(
+            6,
+            finalize_phase::FLUSHING_PAYLOAD,
+            90,
+            HEARTBEAT_INTERVAL,
+            flush_blocking(move || sync_tree(&payload_dir)),
+        )
+        .await?;
 
     let current_app_dir = if active_app_dir.is_dir() {
         Some(active_app_dir.as_path())
@@ -277,6 +293,18 @@ where
         &storage_cfg.endpoint,
     );
     write_runtime_manifest(&active_app_dir, &runtime_manifest_profile, &runtime_manifest_metadata)?;
+
+    // Make the swap durable before the new version is started, the previous
+    // one is removed and the update is reported done: the renames, the
+    // persistent assets and the runtime manifest written above.
+    progress_emitter.emit_substep(6, finalize_phase::FLUSHING_ACTIVATED_APP, 95);
+    let activated_app_dir = active_app_dir.clone();
+    let install_dir = manager.install_dir.clone();
+    flush_blocking(move || {
+        sync_tree(&activated_app_dir)?;
+        sync_directory(&install_dir)
+    })
+    .await?;
 
     // Start the replacement watch-supervisor as soon as the swapped app is
     // usable (directory swapped, persistent assets carried over, runtime
@@ -482,6 +510,17 @@ where
     );
 
     Ok(restart_outcome)
+}
+
+/// Run a blocking flush off the async executor so heartbeats keep firing while
+/// a slow disk catches up.
+async fn flush_blocking<F>(flush: F) -> Result<()>
+where
+    F: FnOnce() -> Result<()> + Send + 'static,
+{
+    tokio::task::spawn_blocking(flush)
+        .await
+        .map_err(|e| SurgeError::Update(format!("Flushing application files to disk was interrupted: {e}")))?
 }
 
 /// Restart supervision of the currently active app directory after finalize

@@ -36,12 +36,14 @@ pub(crate) mod labels {
     pub const STARTING_EXTERNAL_FINALIZER: &str = "starting external finalizer";
     pub const WAITING_FOR_UPDATER_EXIT: &str = "waiting for updating app to exit";
     pub const VERIFYING_PAYLOAD: &str = "verifying update payload";
+    pub const FLUSHING_PAYLOAD: &str = "flushing update payload to disk";
     pub const STOPPING_SUPERVISOR: &str = "stopping supervisor";
     pub const QUIESCING_ACTIVE_APP: &str = "quiescing active app before swap";
     pub const PREPARING_SWAP: &str = "preparing app swap";
     pub const SWAPPING_APP_DIRECTORY: &str = "swapping app directory";
     pub const COPYING_PERSISTENT_ASSETS: &str = "copying persistent assets";
     pub const WRITING_RUNTIME_MANIFEST: &str = "writing runtime metadata";
+    pub const FLUSHING_ACTIVATED_APP: &str = "flushing activated app to disk";
     pub const INSTALLING_SHORTCUTS: &str = "installing shortcuts";
     pub const PRUNING_OLD_VERSIONS: &str = "pruning old versions and caches";
     pub const POST_UPDATE_HOOK: &str = "running post-update hook";

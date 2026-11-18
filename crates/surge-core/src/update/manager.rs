@@ -3,6 +3,7 @@
 mod apply;
 mod artifacts;
 mod current_install;
+mod durable_swap;
 mod external_finalize;
 mod finalize;
 mod lifecycle;
